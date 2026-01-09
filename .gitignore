@@ -28,7 +28,7 @@ env/
 
 # uv
 .uv/
-uv.lock
+# Note: uv.lock is committed for reproducible builds
 
 # IDEs
 .idea/
