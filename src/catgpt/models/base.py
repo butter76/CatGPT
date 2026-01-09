@@ -1,6 +1,7 @@
 """Base model class for all CatGPT models."""
 
 from abc import ABC, abstractmethod
+from typing import Self
 
 import torch
 from torch import nn
@@ -15,7 +16,6 @@ class BaseModel(nn.Module, ABC):
 
     def __init__(self) -> None:
         super().__init__()
-        self._is_compiled = False
 
     @abstractmethod
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -42,17 +42,15 @@ class BaseModel(nn.Module, ABC):
             return sum(p.numel() for p in self.parameters() if p.requires_grad)
         return sum(p.numel() for p in self.parameters())
 
-    def compile(self, **kwargs) -> "BaseModel":
+    def compile_model(self, **kwargs: object) -> Self:
         """Compile the model using torch.compile for optimization.
+
+        Note: Named compile_model to avoid conflict with nn.Module.compile().
 
         Args:
             **kwargs: Arguments passed to torch.compile.
 
         Returns:
-            Compiled model.
+            Compiled model (same type as self).
         """
-        if self._is_compiled:
-            return self
-        compiled = torch.compile(self, **kwargs)
-        compiled._is_compiled = True
-        return compiled
+        return torch.compile(self, **kwargs)  # type: ignore[return-value]

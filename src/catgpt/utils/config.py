@@ -1,7 +1,7 @@
 """Configuration loading utilities."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from omegaconf import DictConfig, OmegaConf
 
@@ -15,6 +15,10 @@ def load_config(config_path: str | Path, overrides: list[str] | None = None) -> 
 
     Returns:
         Merged configuration as a DictConfig.
+
+    Raises:
+        FileNotFoundError: If config file doesn't exist.
+        TypeError: If config file doesn't contain a dictionary.
     """
     config_path = Path(config_path)
     if not config_path.exists():
@@ -23,9 +27,13 @@ def load_config(config_path: str | Path, overrides: list[str] | None = None) -> 
 
     config = OmegaConf.load(config_path)
 
+    if not isinstance(config, DictConfig):
+        msg = f"Config file must contain a dictionary, got {type(config).__name__}"
+        raise TypeError(msg)
+
     if overrides:
         override_conf = OmegaConf.from_dotlist(overrides)
-        config = OmegaConf.merge(config, override_conf)
+        config = cast("DictConfig", OmegaConf.merge(config, override_conf))
 
     return config
 

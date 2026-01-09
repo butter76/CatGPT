@@ -83,12 +83,16 @@ class Trainer:
         self.optimizer.zero_grad()
 
         # Move batch to device
-        batch = {k: v.to(self.config.device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+        batch = {
+            k: v.to(self.config.device) for k, v in batch.items() if isinstance(v, torch.Tensor)
+        }
 
         # Forward pass - subclasses should override this
         # This is a placeholder that assumes batch has 'input' and 'target' keys
-        output = self.model(batch.get("input"))
-        loss = nn.functional.mse_loss(output, batch.get("target"))
+        inputs = batch["input"]
+        targets = batch["target"]
+        output = self.model(inputs)
+        loss = nn.functional.mse_loss(output, targets)
 
         # Backward pass
         loss.backward()

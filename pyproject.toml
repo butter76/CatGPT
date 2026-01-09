@@ -62,6 +62,9 @@ packages = ["src/catgpt"]
 target-version = "py312"
 line-length = 100
 src = ["src", "tests"]
+extend-exclude = [
+    "src/catgpt/optimizer/splus.py",  # Third-party file
+]
 
 [tool.ruff.lint]
 select = [
@@ -97,7 +100,7 @@ skip-magic-trailing-comma = false
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 include = ["src"]
-exclude = ["**/__pycache__", "build", "dist", ".venv"]
+exclude = ["**/__pycache__", "build", "dist", ".venv", "src/catgpt/optimizer/splus.py"]
 reportMissingImports = true
 reportMissingTypeStubs = false
 

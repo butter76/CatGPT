@@ -16,7 +16,7 @@ ML research project for chess and beyond.
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone and install
-git clone https://github.com/your-org/catgpt.git
+git clone https://github.com/butter76/CatGPT.git
 cd catgpt
 
 # Install dependencies (creates .venv automatically)
