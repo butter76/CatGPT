@@ -1,0 +1,4 @@
+---
+alwaysApply: true
+---
+This repo is not out in production yet. Therefore, backwards compatability is not valued at all, and we strongly prefer rewrites that cleanup up legacy code entirely, instead of keeping them around as fallbacks.

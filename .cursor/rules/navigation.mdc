@@ -1,0 +1,4 @@
+---
+alwaysApply: true
+---
+If I am starting a fresh conversation with you and I make my first message to you (and it's related to the codebase and requires TODOs), please search the codebase for context before creating TODOs. This helps you understand my specific requirements before jumping to conclusions.

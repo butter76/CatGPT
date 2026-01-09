@@ -1,0 +1,48 @@
+# Base configuration for CatGPT training
+
+# Model configuration
+model:
+  name: "transformer"
+  hidden_size: 256
+  num_layers: 6
+  num_heads: 8
+  dropout: 0.1
+  activation: "gelu"
+
+# Training configuration
+training:
+  max_epochs: 100
+  batch_size: 64
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  warmup_steps: 1000
+  scheduler: "cosine"
+
+# Data configuration
+data:
+  train_path: "data/train"
+  val_path: "data/val"
+  test_path: "data/test"
+  num_workers: 4
+  pin_memory: true
+
+# Checkpointing
+checkpoint:
+  dir: "checkpoints"
+  save_every: 10
+  keep_last: 5
+
+# Logging
+logging:
+  level: "INFO"
+  log_dir: "outputs/logs"
+  wandb:
+    enabled: false
+    project: "catgpt"
+    entity: null
+
+# Hardware
+device: "auto"  # auto, cuda, cpu, mps
+seed: 42
+deterministic: false
