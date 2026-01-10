@@ -69,7 +69,6 @@ lightning_logs/
 *.onnx
 
 # Data
-data/
 *.csv
 *.parquet
 *.arrow
@@ -78,6 +77,7 @@ data/
 *.pkl
 *.pickle
 !configs/*.yaml
+leela_data/
 
 # Large files
 *.bin
@@ -99,8 +99,15 @@ Thumbs.db
 # Logs
 logs/
 *.log
+*.txt
 
 # Temporary files
 tmp/
 temp/
 *.tmp
+
+# Other repos
+chessbench/
+lc0/
+lczero-training/
+stockfish/

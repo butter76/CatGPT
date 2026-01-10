@@ -11,7 +11,7 @@ model:
 
 # Tokenizer configuration
 tokenizer:
-  sequence_length: 64  # 64 board
+  sequence_length: 64
   include_halfmove: false
 
 # Training configuration
