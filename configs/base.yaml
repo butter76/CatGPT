@@ -1,12 +1,15 @@
 # Base configuration for CatGPT training
+# Override values via CLI: python scripts/train.py model.hidden_size=512
 
-# Model configuration
+# Model architecture
 model:
   name: "transformer"
   hidden_size: 256
   num_layers: 6
   num_heads: 8
-  dropout: 0.1
+  ff_dim: null  # Defaults to 4 * hidden_size
+  vocab_size: 28  # From tokenizer (don't change unless tokenizer changes)
+  seq_length: 64  # Will be overridden by tokenizer.sequence_length
   activation: "gelu"
 
 # Tokenizer configuration
@@ -14,40 +17,70 @@ tokenizer:
   sequence_length: 64
   include_halfmove: false
 
-# Training configuration
-training:
-  max_epochs: 100
-  batch_size: 64
+# Optimizer configuration
+optimizer:
+  name: "adamw"  # Options: "adamw", "splus"
   learning_rate: 1.0e-4
   weight_decay: 0.01
-  gradient_clip: 1.0
-  warmup_steps: 1000
-  scheduler: "cosine"
+  # AdamW specific
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  # SPlus specific (only used when name="splus")
+  splus_b1: 0.9
+  splus_b2: 0.999
+  splus_ema_rate: 0.999
+  splus_inverse_every: 100
+  splus_max_dim: 10000
 
-# Data configuration
+# Learning rate scheduler
+scheduler:
+  name: "cosine"  # Options: "cosine", "linear", "constant"
+  warmup_steps: 1000
+  min_lr_ratio: 0.1  # Final LR = learning_rate * min_lr_ratio
+
+# Training loop configuration
+# Training is step-based with "pseudo-epochs" for validation/checkpointing
+training:
+  max_steps: 300000  # Total training steps
+  steps_per_epoch: 3000  # Steps per pseudo-epoch (validation interval)
+  batch_size: 64
+  gradient_clip: 1.0
+  gradient_accumulation_steps: 1
+  compile_model: true  # Use torch.compile for efficiency
+
+# Data loading
 data:
-  train_path: "data/train"
-  val_path: "data/val"
-  test_path: "data/test"
+  train_path: "data/train/*.bag"
+  val_path: "data/val/*.bag"
   num_workers: 4
   pin_memory: true
+  prefetch_factor: 2
 
 # Checkpointing
 checkpoint:
   dir: "checkpoints"
-  save_every: 10
+  save_every_epochs: 1  # Save every N pseudo-epochs
   keep_last: 5
+  save_optimizer: true
+
+# Weights & Biases logging
+wandb:
+  enabled: true
+  project: "catgpt"
+  entity: null  # Your W&B username or team
+  run_name: null  # Auto-generated if null
+  tags: []
+  log_every_steps: 10
+
+# Distributed training
+distributed:
+  enabled: false  # Auto-detected from environment
+  backend: "nccl"  # Use "gloo" for CPU
 
 # Logging
 logging:
   level: "INFO"
-  log_dir: "outputs/logs"
-  wandb:
-    enabled: false
-    project: "catgpt"
-    entity: null
 
-# Hardware
-device: "auto"  # auto, cuda, cpu, mps
+# Reproducibility
 seed: 42
-deterministic: false
+device: "auto"  # Options: "auto", "cuda", "cpu", "mps"

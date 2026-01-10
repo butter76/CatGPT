@@ -19,11 +19,37 @@ These coders provide efficient serialization for storing chess positions
 and games in .bag files using msgpack.
 """
 
+import abc
 from dataclasses import dataclass
 from typing import Any
 
+import grain.python as pygrain
 import msgpack
+import numpy as np
 from apache_beam import coders
+
+from catgpt.core.utils import TokenizerConfig, tokenizer
+
+STATE_VALUE_CODER = coders.TupleCoder((
+    coders.StrUtf8Coder(),
+    coders.FloatCoder(),
+))
+
+class ConvertToSequence(pygrain.MapTransform, abc.ABC):
+  """Base class for converting chess data to a sequence of integers."""
+
+  def __init__(self) -> None:
+    super().__init__()
+
+class ConvertStateValueDataToSequence(ConvertToSequence):
+  """Converts the fen, move, and win probability into a sequence of integers."""
+
+  def map(
+      self, element: bytes
+  ):
+    fen, win_prob = STATE_VALUE_CODER.decode(element)
+    state = tokenizer.tokenize(fen, TokenizerConfig())
+    return state, np.array([win_prob])
 
 
 @dataclass
@@ -191,40 +217,3 @@ def encode_game(game: list[LeelaPositionData]) -> bytes:
 def decode_game(encoded: bytes) -> list[LeelaPositionData]:
     """Decode bytes to a game (list of positions)."""
     return _game_coder.decode(encoded)
-
-
-# Also provide a generic pickle-based coder for arbitrary objects
-class PickleCoder(coders.Coder):
-    """Generic pickle-based coder for arbitrary Python objects.
-
-    Use this when you need to serialize arbitrary objects and don't
-    need deterministic encoding or maximum performance.
-    """
-
-    def encode(self, value: Any) -> bytes:
-        """Encode a value using msgpack (falls back to pickle for complex types)."""
-        import pickle
-
-        return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
-
-    def decode(self, encoded: bytes) -> Any:
-        """Decode bytes back to a value."""
-        import pickle
-
-        return pickle.loads(encoded)
-
-    def is_deterministic(self) -> bool:
-        return False
-
-
-_pickle_coder = PickleCoder()
-
-
-def encode_pickle(value: Any) -> bytes:
-    """Encode any Python object using pickle."""
-    return _pickle_coder.encode(value)
-
-
-def decode_pickle(encoded: bytes) -> Any:
-    """Decode pickle bytes back to a Python object."""
-    return _pickle_coder.decode(encoded)

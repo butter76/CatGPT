@@ -27,12 +27,9 @@ from catgpt.core.data.grain.coders import (
     LeelaGameCoder,
     LeelaPositionCoder,
     LeelaPositionData,
-    PickleCoder,
     decode_game,
-    decode_pickle,
     decode_position,
     encode_game,
-    encode_pickle,
     encode_position,
 )
 from catgpt.core.data.grain.tar_to_bag import convert_tar_to_bag
@@ -47,12 +44,9 @@ __all__ = [
     "LeelaGameCoder",
     "LeelaPositionCoder",
     "LeelaPositionData",
-    "PickleCoder",
     "convert_tar_to_bag",
     "decode_game",
-    "decode_pickle",
     "decode_position",
     "encode_game",
-    "encode_pickle",
     "encode_position",
 ]

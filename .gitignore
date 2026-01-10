@@ -78,6 +78,7 @@ lightning_logs/
 *.pickle
 !configs/*.yaml
 leela_data/
+chessbench_data/
 
 # Large files
 *.bin

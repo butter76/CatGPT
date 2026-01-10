@@ -1,5 +1,5 @@
 """PyTorch training utilities."""
 
-from catgpt.torch.training.trainer import Trainer, TrainerConfig
+from catgpt.torch.training.trainer import Trainer
 
-__all__ = ["Trainer", "TrainerConfig"]
+__all__ = ["Trainer"]
