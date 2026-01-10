@@ -37,31 +37,38 @@ def convert_tar_to_bag(
     *,
     max_games: int | None = None,
     skip_chess960: bool = True,
+    compress: bool = False,
     verbose: bool = False,
 ) -> int:
-    """Convert a Leela Chess .tar file to .bag format.
+    """Convert a Leela Chess .tar file to .bag/.bagz format.
 
     Each game (originally a .gz file in the tar) becomes a single record
     in the .bag file, serialized using LeelaGameCoder.
 
     Args:
         tar_path: Path to input .tar file containing .gz game files.
-        output_path: Path for output .bag file. If None, uses tar_path with
-            .bag extension.
+        output_path: Path for output file. If None, uses tar_path with
+            .bag or .bagz extension (depending on compress flag).
         max_games: Maximum number of games to convert. None = all games.
         skip_chess960: If True, skip Fischer Random (Chess960) games.
+        compress: If True, create compressed .bagz file. Otherwise, create
+            uncompressed .bag file for faster training.
         verbose: If True, print progress information.
 
     Returns:
-        Number of games written to the .bag file.
+        Number of games written to the output file.
     """
     tar_path = Path(tar_path)
 
-    output_path = tar_path.with_suffix(".bag") if output_path is None else Path(output_path)
+    if output_path is None:
+        suffix = ".bagz" if compress else ".bag"
+        output_path = tar_path.with_suffix(suffix)
+    else:
+        output_path = Path(output_path)
 
     games_written = 0
 
-    with BagWriter(str(output_path), compress=False) as writer:
+    with BagWriter(str(output_path), compress=compress) as writer:
         for game_positions in read_chunks_from_tar(
             tar_path,
             max_games=max_games,
@@ -118,8 +125,9 @@ if __name__ == "__main__":
         print("  input.tar          Path to input .tar file containing .gz game files")
         print()
         print("Options:")
-        print("  --output PATH      Output .bag file path (default: input.bag)")
+        print("  --output PATH      Output file path (default: input.bag or input.bagz)")
         print("  --max-games N      Convert at most N games")
+        print("  --compress, -c     Create compressed .bagz file (default: uncompressed .bag)")
         print("  --no-skip-960      Include Chess960 games (default: skip)")
         print("  --verbose, -v      Print progress information")
         sys.exit(0 if "--help" in sys.argv or "-h" in sys.argv else 1)
@@ -128,6 +136,7 @@ if __name__ == "__main__":
 
     # Parse arguments
     verbose = "--verbose" in sys.argv or "-v" in sys.argv
+    compress = "--compress" in sys.argv or "-c" in sys.argv
     skip_chess960 = "--no-skip-960" not in sys.argv
 
     output_path = None
@@ -148,6 +157,7 @@ if __name__ == "__main__":
         output_path=output_path,
         max_games=max_games,
         skip_chess960=skip_chess960,
+        compress=compress,
         verbose=verbose,
     )
 
