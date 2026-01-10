@@ -22,10 +22,11 @@ def version() -> None:
 @app.command()
 def train(
     config: str = typer.Option("base", "--config", "-c", help="Config name to use"),
+    framework: str = typer.Option("torch", "--framework", "-f", help="Framework to use (torch/jax)"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Run without training"),
 ) -> None:
     """Train a model with the specified configuration."""
-    console.print(f"[bold green]Training[/bold green] with config: {config}")
+    console.print(f"[bold green]Training[/bold green] with config: {config}, framework: {framework}")
     if dry_run:
         console.print("[yellow]Dry run mode - no training will occur[/yellow]")
         return
@@ -37,9 +38,10 @@ def train(
 @app.command()
 def evaluate(
     checkpoint: str = typer.Argument(..., help="Path to model checkpoint"),
+    framework: str = typer.Option("torch", "--framework", "-f", help="Framework to use (torch/jax)"),
 ) -> None:
     """Evaluate a trained model."""
-    console.print(f"[bold cyan]Evaluating[/bold cyan] checkpoint: {checkpoint}")
+    console.print(f"[bold cyan]Evaluating[/bold cyan] checkpoint: {checkpoint} (framework: {framework})")
     # TODO: Implement evaluation logic
     console.print("[dim]Evaluation not yet implemented[/dim]")
 

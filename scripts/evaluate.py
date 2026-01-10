@@ -3,6 +3,7 @@
 
 Usage:
     python scripts/evaluate.py --checkpoint checkpoints/model.pt
+    python scripts/evaluate.py --checkpoint checkpoints/model.pt --framework jax
 """
 
 from pathlib import Path
@@ -11,7 +12,7 @@ import typer
 from loguru import logger
 from rich.console import Console
 
-from catgpt.utils.logging import setup_logging
+from catgpt.core.utils import setup_logging
 
 app = typer.Typer()
 console = Console()
@@ -22,6 +23,7 @@ def evaluate(
     checkpoint: Path = typer.Argument(..., help="Path to model checkpoint"),
     config: str = typer.Option("base", "--config", "-c", help="Config name"),
     split: str = typer.Option("test", "--split", "-s", help="Data split to evaluate"),
+    framework: str = typer.Option("torch", "--framework", "-f", help="Framework (torch/jax)"),
 ) -> None:
     """Evaluate a trained model on a dataset split.
 
@@ -29,6 +31,7 @@ def evaluate(
         checkpoint: Path to the model checkpoint.
         config: Configuration name to use.
         split: Data split to evaluate on.
+        framework: ML framework to use.
     """
     setup_logging()
 
@@ -37,11 +40,11 @@ def evaluate(
         raise typer.Exit(1)
 
     logger.info(f"Evaluating checkpoint: {checkpoint}")
-    logger.info(f"Using config: {config}, split: {split}")
+    logger.info(f"Using config: {config}, split: {split}, framework: {framework}")
 
     # TODO: Implement actual evaluation
     # 1. Load config
-    # 2. Load model from checkpoint
+    # 2. Load model from checkpoint (torch or jax)
     # 3. Load test data
     # 4. Run evaluation
     # 5. Print metrics

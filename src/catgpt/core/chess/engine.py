@@ -1,8 +1,17 @@
 """Chess engine implementation."""
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import chess
+
+if TYPE_CHECKING:
+    from typing import Protocol
+
+    class ModelProtocol(Protocol):
+        """Protocol for neural network models used by ChessEngine."""
+
+        def evaluate(self, board: chess.Board) -> float: ...
 
 
 @dataclass
@@ -19,18 +28,19 @@ class ChessEngine:
     """Neural network-based chess engine.
 
     This engine uses a trained neural network to evaluate positions
-    and search for the best moves.
+    and search for the best moves. The engine itself is framework-agnostic;
+    pass in a model that implements the evaluate() method.
     """
 
-    def __init__(self, model_path: str | None = None) -> None:
+    def __init__(self, model: "ModelProtocol | None" = None) -> None:
         """Initialize the chess engine.
 
         Args:
-            model_path: Optional path to a trained model checkpoint.
+            model: Optional neural network model for position evaluation.
+                   Must have an evaluate(board) method that returns a float.
         """
         self.board = chess.Board()
-        self.model_path = model_path
-        self._model = None
+        self._model = model
 
     def reset(self) -> None:
         """Reset the board to the starting position."""
@@ -77,12 +87,14 @@ class ChessEngine:
         if not legal_moves:
             return None
 
-        # TODO: Implement actual neural network evaluation
-        # For now, return a random legal move with placeholder evaluation
+        # TODO: Implement actual search (MCTS or alpha-beta)
+        # For now, return first legal move with placeholder evaluation
         best_move = legal_moves[0]
+        score = self.evaluate_position()
+
         return MoveEvaluation(
             move=best_move,
-            score=0.0,
+            score=score,
             depth=depth,
             principal_variation=[best_move],
         )
@@ -94,8 +106,15 @@ class ChessEngine:
             Evaluation score from white's perspective.
             Positive = white is better, negative = black is better.
         """
-        # TODO: Implement neural network evaluation
-        # Placeholder: simple material count
+        # Use neural network if available
+        if self._model is not None:
+            return self._model.evaluate(self.board)
+
+        # Fallback: simple material count
+        return self._material_count()
+
+    def _material_count(self) -> float:
+        """Simple material-based evaluation."""
         piece_values = {
             chess.PAWN: 1,
             chess.KNIGHT: 3,

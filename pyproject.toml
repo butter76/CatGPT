@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "CatGPT Team" }]
-keywords = ["ml", "research", "chess", "deep-learning"]
+keywords = ["ml", "research", "chess", "deep-learning", "pytorch", "jax"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -15,8 +15,8 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
+# Core dependencies (framework-agnostic)
 dependencies = [
-    "torch>=2.2.0",
     "numpy>=1.26.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
@@ -30,6 +30,25 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# PyTorch framework
+torch = [
+    "torch>=2.2.0",
+]
+# JAX framework
+jax = [
+    "jax[cpu]>=0.4.20",
+    "flax>=0.8.0",
+    "optax>=0.2.0",
+    "orbax-checkpoint>=0.5.0",
+]
+# JAX with CUDA support
+jax-cuda = [
+    "jax[cuda12]>=0.4.20",
+    "flax>=0.8.0",
+    "optax>=0.2.0",
+    "orbax-checkpoint>=0.5.0",
+]
+# Development tools
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=4.1.0",
@@ -39,6 +58,7 @@ dev = [
     "pre-commit>=3.6.0",
     "ipython>=8.0.0",
 ]
+# Jupyter notebooks
 notebook = [
     "jupyter>=1.0.0",
     "ipykernel>=6.29.0",
@@ -46,7 +66,8 @@ notebook = [
     "seaborn>=0.13.0",
     "plotly>=5.18.0",
 ]
-all = ["catgpt[dev,notebook]"]
+# All frameworks and tools
+all = ["catgpt[torch,jax,dev,notebook]"]
 
 [project.scripts]
 catgpt = "catgpt.cli:app"
@@ -63,7 +84,8 @@ target-version = "py312"
 line-length = 100
 src = ["src", "tests"]
 extend-exclude = [
-    "src/catgpt/optimizer/splus.py",  # Third-party file
+    "src/catgpt/torch/optimizers/splus.py",  # Third-party file
+    "src/catgpt/jax/*",  # JAX code excluded until JAX is installed
 ]
 
 [tool.ruff.lint]
@@ -100,7 +122,14 @@ skip-magic-trailing-comma = false
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 include = ["src"]
-exclude = ["**/__pycache__", "build", "dist", ".venv", "src/catgpt/optimizer/splus.py"]
+exclude = [
+    "**/__pycache__",
+    "build",
+    "dist",
+    ".venv",
+    "src/catgpt/torch/optimizers/splus.py",
+    "src/catgpt/jax",  # JAX code excluded until JAX is installed
+]
 reportMissingImports = true
 reportMissingTypeStubs = false
 
@@ -115,12 +144,13 @@ addopts = [
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "gpu: marks tests that require GPU",
+    "jax: marks tests that require JAX",
 ]
 
 [tool.coverage.run]
 source = ["src/catgpt"]
 branch = true
-omit = ["*/tests/*", "*/__pycache__/*"]
+omit = ["*/tests/*", "*/__pycache__/*", "src/catgpt/jax/*"]
 
 [tool.coverage.report]
 exclude_lines = [

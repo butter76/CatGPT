@@ -13,7 +13,7 @@ import hydra
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 
-from catgpt.utils.logging import setup_logging
+from catgpt.core.utils import setup_logging
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="base")
@@ -30,7 +30,7 @@ def main(cfg: DictConfig) -> None:
 
     # TODO: Implement actual training pipeline
     # 1. Set up data loaders
-    # 2. Initialize model
+    # 2. Initialize model (from catgpt.torch or catgpt.jax)
     # 3. Create optimizer and scheduler
     # 4. Run training loop
 

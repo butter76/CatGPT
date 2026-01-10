@@ -2,7 +2,7 @@
 
 import chess
 
-from catgpt.chess.engine import ChessEngine, MoveEvaluation
+from catgpt.core.chess import ChessEngine, MoveEvaluation
 
 
 class TestChessEngine:

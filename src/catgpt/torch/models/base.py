@@ -1,4 +1,4 @@
-"""Base model class for all CatGPT models."""
+"""Base model class for PyTorch models."""
 
 from abc import ABC, abstractmethod
 from typing import Self
@@ -8,7 +8,7 @@ from torch import nn
 
 
 class BaseModel(nn.Module, ABC):
-    """Abstract base class for all models in CatGPT.
+    """Abstract base class for all PyTorch models in CatGPT.
 
     All models should inherit from this class and implement
     the required abstract methods.

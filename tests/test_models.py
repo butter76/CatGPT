@@ -1,4 +1,4 @@
-"""Tests for model implementations."""
+"""Tests for PyTorch model implementations."""
 
 import pytest
 import torch

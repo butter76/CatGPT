@@ -1,4 +1,4 @@
-"""Evaluation metrics for model performance."""
+"""PyTorch evaluation metrics for model performance."""
 
 import torch
 
