@@ -84,7 +84,7 @@ target-version = "py312"
 line-length = 100
 src = ["src", "tests"]
 extend-exclude = [
-    "src/catgpt/torch/optimizers/splus.py",  # Third-party file
+    "src/catgpt/torch/optimizers/*",  # Third-party file
     "src/catgpt/jax/*",  # JAX code excluded until JAX is installed
 ]
 
@@ -127,7 +127,7 @@ exclude = [
     "build",
     "dist",
     ".venv",
-    "src/catgpt/torch/optimizers/splus.py",
+    "src/catgpt/torch/optimizers",
     "src/catgpt/jax",  # JAX code excluded until JAX is installed
 ]
 reportMissingImports = true

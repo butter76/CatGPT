@@ -9,6 +9,11 @@ model:
   dropout: 0.1
   activation: "gelu"
 
+# Tokenizer configuration
+tokenizer:
+  sequence_length: 64  # 64 board
+  include_halfmove: false
+
 # Training configuration
 training:
   max_epochs: 100
