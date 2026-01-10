@@ -86,9 +86,6 @@ catgpt/
 # Run linting
 uv run ruff check src tests scripts
 
-# Run formatting
-uv run ruff format src tests scripts
-
 # Run type checking
 uv run pyright src
 
@@ -139,7 +136,7 @@ uv run python scripts/train.py training.learning_rate=0.001 model.num_layers=12
 
 1. Install dev dependencies: `uv sync --extra torch --extra dev`
 2. Make your changes
-3. Run checks: `uv run ruff check . && uv run pyright src && uv run pytest tests`
+3. Run checks: `uv run ruff check src tests scripts && uv run pyright src && uv run pytest tests`
 4. Submit a PR
 
 Bugbot will automatically review your PR for issues.
