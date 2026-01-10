@@ -133,6 +133,7 @@ exclude = [
     ".venv",
     "src/catgpt/torch/optimizers",
     "src/catgpt/jax",  # JAX code excluded until JAX is installed
+    "src/catgpt/core/data/grain",  # Third-party + low-level code
 ]
 reportMissingImports = true
 reportMissingTypeStubs = false
