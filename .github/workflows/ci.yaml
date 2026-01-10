@@ -45,7 +45,7 @@ jobs:
         run: uv python install ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        run: uv sync --extra dev --extra torch
 
       - name: Run pyright
         run: uv run pyright src
