@@ -71,7 +71,8 @@ class TransformerBlock(nn.Module):
             Output tensor, same shape as input.
         """
         # Self-attention with residual (NO causal mask = bidirectional)
-        normed = nn.LayerNorm(dtype=self.dtype)(x)
+        # LayerNorm in float32 for numerical stability, then cast back
+        normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
         attn_out = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             qkv_features=self.hidden_size,
@@ -82,7 +83,7 @@ class TransformerBlock(nn.Module):
         x = x + attn_out
 
         # Feed-forward with residual
-        normed = nn.LayerNorm(dtype=self.dtype)(x)
+        normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
         ff_out = nn.Dense(self.ff_dim, dtype=self.dtype)(normed)
         ff_out = self._get_activation()(ff_out)
         ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
@@ -166,40 +167,18 @@ class BidirectionalTransformer(nn.Module):
                 name=f"block_{i}",
             )(hidden, train=train)
 
-        # Final norm (in compute_dtype)
-        hidden = nn.LayerNorm(dtype=compute_dtype)(hidden)
+        # Final norm (float32 for stability, then cast back)
+        hidden = nn.LayerNorm(dtype=jnp.float32)(hidden.astype(jnp.float32)).astype(compute_dtype)
 
-        # Mean pooling over sequence dimension
-        pooled = hidden.mean(axis=1)  # (batch, hidden)
+        # Mean pooling over sequence dimension (in float32 for precision)
+        pooled = hidden.astype(jnp.float32).mean(axis=1)  # (batch, hidden)
 
-        # Output head (cast back to float32 for output stability)
-        pooled_f32 = pooled.astype(jnp.float32)
-        logits = nn.Dense(1, dtype=jnp.float32)(pooled_f32)  # (batch, 1)
+        # Output head (already float32 from pooling)
+        logits = nn.Dense(1, dtype=jnp.float32)(pooled)  # (batch, 1)
 
         if return_logits:
             return logits
         return jax.nn.sigmoid(logits)
-
-    def forward_logits(
-        self,
-        x: jax.Array,
-        *,
-        train: bool = False,
-        compute_dtype: Dtype = jnp.float32,
-    ) -> jax.Array:
-        """Forward pass returning raw logits (before sigmoid).
-
-        Useful for training with binary cross-entropy for numerical stability.
-
-        Args:
-            x: Input token indices, shape (batch, seq_len).
-            train: Whether in training mode.
-            compute_dtype: Dtype for intermediate computations.
-
-        Returns:
-            Raw logits, shape (batch, 1).
-        """
-        return self.__call__(x, train=train, return_logits=True, compute_dtype=compute_dtype)
 
     @classmethod
     def from_model_config(cls, config: JaxModelConfig) -> "BidirectionalTransformer":
