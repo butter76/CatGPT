@@ -17,6 +17,12 @@ class JaxOutputHeadConfig:
     - value_head: Win probability prediction (primary task)
 
     Loss weights control the contribution of each head to the total loss.
+
+    The value head uses HL-Gauss (Histogram Loss with Gaussian targets) which
+    converts scalar win probability into a soft categorical distribution,
+    enabling training with cross-entropy loss instead of MSE. This approach
+    scales better with larger networks and reduces overfitting.
+    See: https://arxiv.org/abs/2403.03950
     """
 
     # Head enable flags
@@ -26,6 +32,11 @@ class JaxOutputHeadConfig:
     # Loss weights
     self_weight: float = 0.1  # Usually lower than primary task
     value_weight: float = 1.0
+
+    # HL-Gauss configuration for value head
+    # Converts scalar win probability (0-1) to categorical distribution
+    value_num_bins: int = 81  # Number of bins for value distribution
+    value_sigma_ratio: float = 0.75  # sigma = ratio * bin_width (0.75 spreads to ~5 bins)
 
 
 @dataclass

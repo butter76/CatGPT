@@ -3,23 +3,101 @@
 from typing import TYPE_CHECKING
 
 import grain.python as pygrain
-import jax
-import jax.numpy as jnp
 import numpy as np
+from scipy import special as scipy_special
 
 from catgpt.core.data.grain.bagz import BagDataSource
 from catgpt.core.data.grain.coders import ConvertStateValueDataToSequence
 
 if TYPE_CHECKING:
-    from catgpt.jax.configs import JaxDataConfig, JaxTokenizerConfig
+    from catgpt.jax.configs import (
+        JaxDataConfig,
+        JaxOutputHeadConfig,
+        JaxTokenizerConfig,
+    )
+
+
+def _hl_gauss_transform_numpy(
+    target: np.ndarray,
+    num_bins: int = 81,
+    sigma_ratio: float = 0.75,
+    min_value: float = 0.0,
+    max_value: float = 1.0,
+) -> np.ndarray:
+    """Convert scalar target(s) to HL-Gauss probability distribution (numpy version).
+
+    This is a numpy implementation for use in data loading workers.
+
+    Args:
+        target: Scalar target value(s). Shape: (batch,) or (batch, 1)
+        num_bins: Number of bins for the categorical distribution.
+        sigma_ratio: Ratio of sigma to bin_width. sigma = sigma_ratio * bin_width.
+        min_value: Minimum value of the target range.
+        max_value: Maximum value of the target range.
+
+    Returns:
+        Probability distribution over bins. Shape: (batch, num_bins)
+    """
+    # Ensure target is 1D
+    target = np.asarray(target, dtype=np.float32).squeeze()
+    if target.ndim == 0:
+        target = target[np.newaxis]
+
+    # Bin edges (num_bins + 1 values)
+    support = np.linspace(min_value, max_value, num_bins + 1, dtype=np.float32)
+
+    # Compute sigma from bin width and ratio
+    bin_width = (max_value - min_value) / num_bins
+    sigma = sigma_ratio * bin_width
+
+    # Expand target for broadcasting: (batch,) -> (batch, 1)
+    target_expanded = target[:, np.newaxis]
+
+    # Compute CDF at each bin edge using the error function
+    cdf_evals = scipy_special.erf(
+        (support - target_expanded) / (np.sqrt(2.0) * sigma)
+    )
+
+    # Probability in each bin = CDF(right) - CDF(left)
+    bin_probs = cdf_evals[:, 1:] - cdf_evals[:, :-1]
+
+    # Normalize to ensure probabilities sum to 1
+    z = cdf_evals[:, -1] - cdf_evals[:, 0]
+    bin_probs = bin_probs / z[:, np.newaxis]
+
+    return bin_probs.astype(np.float32)
 
 
 class ConvertToJax(pygrain.MapTransform):
-    """Convert numpy arrays to JAX arrays.
+    """Convert numpy arrays to JAX-compatible arrays with HL-Gauss target transform.
 
     Transforms batched data from PyGrain (numpy) to JAX-compatible format.
     Expected input: tuple of (inputs, targets) where both are numpy arrays.
+
+    If HL-Gauss is enabled, converts scalar win probabilities to categorical
+    distributions over bins for training with cross-entropy loss.
     """
+
+    def __init__(
+        self,
+        output_heads_config: "JaxOutputHeadConfig | None" = None,
+    ):
+        """Initialize the transform.
+
+        Args:
+            output_heads_config: Output head configuration containing HL-Gauss
+                parameters (value_num_bins, value_sigma_ratio). If None, uses defaults.
+        """
+        super().__init__()
+        self._output_heads_config = output_heads_config
+
+        # Extract HL-Gauss params (use defaults if config not provided)
+        if output_heads_config is not None:
+            self._num_bins = output_heads_config.value_num_bins
+            self._sigma_ratio = output_heads_config.value_sigma_ratio
+        else:
+            self._num_bins = 81
+            self._sigma_ratio = 0.75
 
     def map(self, element):
         """Convert a batched element to JAX-compatible arrays.
@@ -28,23 +106,28 @@ class ConvertToJax(pygrain.MapTransform):
             element: Tuple of (inputs, targets) as numpy arrays.
 
         Returns:
-            Dictionary with 'input' and 'target' as numpy arrays
-            (JAX will convert them to device arrays when needed).
+            Dictionary with 'input' and 'target' as numpy arrays.
+            - 'input': Token indices, shape (batch, seq_len)
+            - 'target': HL-Gauss distribution, shape (batch, num_bins)
         """
         inputs, targets = element
 
         # Keep as numpy - JAX will convert when needed
         # This avoids unnecessary device transfers during data loading
         input_array = np.asarray(inputs, dtype=np.int32)  # Token indices
-        target_array = np.asarray(targets, dtype=np.float32)  # Win probabilities
 
-        # Squeeze target if it has unnecessary dimensions
-        if target_array.ndim > 1 and target_array.shape[-1] == 1:
-            target_array = target_array.squeeze(-1)
+        # Transform scalar win probabilities to HL-Gauss distribution
+        target_array = _hl_gauss_transform_numpy(
+            targets,
+            num_bins=self._num_bins,
+            sigma_ratio=self._sigma_ratio,
+            min_value=0.0,
+            max_value=1.0,
+        )
 
         return {
             "input": input_array,
-            "target": target_array,
+            "target": target_array,  # Shape: (batch, num_bins)
         }
 
 
@@ -57,6 +140,7 @@ def create_grain_dataloader(
     num_devices: int = 1,
     device_index: int = 0,
     tokenizer_config: "JaxTokenizerConfig | None" = None,
+    output_heads_config: "JaxOutputHeadConfig | None" = None,
 ) -> pygrain.DataLoader:
     """Create a PyGrain DataLoader for chess position data (JAX).
 
@@ -68,6 +152,7 @@ def create_grain_dataloader(
         num_devices: Total number of devices (for sharded loading).
         device_index: Current device index (for sharded loading).
         tokenizer_config: Tokenizer configuration (for proper sequence encoding).
+        output_heads_config: Output head configuration (for HL-Gauss transform).
 
     Returns:
         PyGrain DataLoader yielding batches.
@@ -118,7 +203,7 @@ def create_grain_dataloader(
     transformations = (
         ConvertStateValueDataToSequence(core_tokenizer_config),  # bytes -> (state, win_prob)
         pygrain.Batch(batch_size=batch_size, drop_remainder=split == "train"),
-        ConvertToJax(),  # numpy -> jax-compatible arrays
+        ConvertToJax(output_heads_config),  # numpy -> jax-compatible arrays with HL-Gauss
     )
 
     # Create and return dataloader
@@ -132,98 +217,16 @@ def create_grain_dataloader(
         ),
     )
 
+    # Log HL-Gauss configuration
+    num_bins = output_heads_config.value_num_bins if output_heads_config else 81
+    sigma_ratio = output_heads_config.value_sigma_ratio if output_heads_config else 0.75
     logger.info(
         f"Created JAX PyGrain DataLoader: batch_size={batch_size}, "
-        f"shuffle={shuffle}, workers={config.num_workers}"
+        f"shuffle={shuffle}, workers={config.num_workers}, "
+        f"hl_gauss(bins={num_bins}, sigma_ratio={sigma_ratio})"
     )
 
     return dataloader
-
-
-class PlaceholderDataset:
-    """Placeholder dataset for testing the JAX training pipeline.
-
-    Generates random data with the expected format.
-    """
-
-    def __init__(
-        self,
-        num_samples: int = 10000,
-        seq_length: int = 64,
-        vocab_size: int = 28,
-        seed: int = 42,
-    ) -> None:
-        """Initialize the placeholder dataset.
-
-        Args:
-            num_samples: Number of samples in the dataset.
-            seq_length: Sequence length for inputs.
-            vocab_size: Size of the token vocabulary.
-            seed: Random seed for reproducibility.
-        """
-        self.num_samples = num_samples
-        self.seq_length = seq_length
-        self.vocab_size = vocab_size
-        self.rng = np.random.default_rng(seed)
-
-    def __len__(self) -> int:
-        return self.num_samples
-
-    def __getitem__(self, idx: int) -> dict[str, np.ndarray]:
-        # Generate deterministic random tokens based on index
-        rng = np.random.default_rng(self.rng.integers(0, 2**31) + idx)
-        input_tokens = rng.integers(0, self.vocab_size, (self.seq_length,), dtype=np.int32)
-        target = np.float32(idx % 2)
-
-        return {
-            "input": input_tokens,
-            "target": target,
-        }
-
-
-class PlaceholderDataLoader:
-    """Simple iterable dataloader for placeholder dataset."""
-
-    def __init__(
-        self,
-        dataset: PlaceholderDataset,
-        batch_size: int = 64,
-        shuffle: bool = True,
-        drop_last: bool = True,
-    ) -> None:
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.drop_last = drop_last
-        self._rng = np.random.default_rng(42)
-
-    def __iter__(self):
-        indices = np.arange(len(self.dataset))
-        if self.shuffle:
-            self._rng.shuffle(indices)
-
-        batch_inputs = []
-        batch_targets = []
-
-        for idx in indices:
-            sample = self.dataset[idx]
-            batch_inputs.append(sample["input"])
-            batch_targets.append(sample["target"])
-
-            if len(batch_inputs) == self.batch_size:
-                yield {
-                    "input": np.stack(batch_inputs),
-                    "target": np.array(batch_targets),
-                }
-                batch_inputs = []
-                batch_targets = []
-
-        # Handle last batch
-        if batch_inputs and not self.drop_last:
-            yield {
-                "input": np.stack(batch_inputs),
-                "target": np.array(batch_targets),
-            }
 
 
 def create_dataloader(
@@ -234,11 +237,9 @@ def create_dataloader(
     num_devices: int = 1,
     device_index: int = 0,
     tokenizer_config: "JaxTokenizerConfig | None" = None,
-) -> pygrain.DataLoader | PlaceholderDataLoader:
+    output_heads_config: "JaxOutputHeadConfig | None" = None,
+) -> pygrain.DataLoader:
     """Create a DataLoader for JAX training or validation.
-
-    This is a compatibility wrapper that can use either PyGrain (real data)
-    or the placeholder dataset (for testing).
 
     Args:
         config: Data configuration (includes seed).
@@ -247,6 +248,7 @@ def create_dataloader(
         num_devices: Number of devices (for sharded loading).
         device_index: Current device index.
         tokenizer_config: Tokenizer configuration (for PyGrain).
+        output_heads_config: Output head configuration (for HL-Gauss transform).
 
     Returns:
         DataLoader instance.
@@ -260,4 +262,5 @@ def create_dataloader(
         num_devices=num_devices,
         device_index=device_index,
         tokenizer_config=tokenizer_config,
+        output_heads_config=output_heads_config,
     )

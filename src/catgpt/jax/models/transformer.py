@@ -105,7 +105,7 @@ class BidirectionalTransformer(nn.Module):
     """Bidirectional (non-causal) transformer for chess position evaluation.
 
     This model processes chess positions represented as token sequences
-    and outputs a win probability. Uses full attention (no causal mask)
+    and outputs a win probability distribution. Uses full attention (no causal mask)
     since all position information is available simultaneously.
 
     Architecture:
@@ -113,7 +113,13 @@ class BidirectionalTransformer(nn.Module):
     - Absolute (learnable) positional embedding
     - N transformer encoder blocks
     - Mean pooling over sequence
-    - Linear projection to win probability (sigmoid output)
+    - Linear projection to HL-Gauss categorical distribution
+
+    Value Head (HL-Gauss):
+    Instead of outputting a single scalar, the value head outputs logits over
+    bins representing the win probability range [0, 1]. This enables training
+    with cross-entropy loss which scales better than MSE regression.
+    See: https://arxiv.org/abs/2403.03950
 
     Supports mixed precision training via compute_dtype parameter.
     Embeddings and final output are kept in float32 for stability.
@@ -139,8 +145,9 @@ class BidirectionalTransformer(nn.Module):
         Returns:
             Dictionary with output heads:
             - "self": Token reconstruction logits (batch, seq, vocab_size) if self_head enabled
-            - "value": Win probability after sigmoid (batch, 1) if value_head enabled
-            - "value_logit": Win probability logits before sigmoid (batch, 1) if value_head enabled
+            - "value_logit": HL-Gauss logits (batch, num_bins) for cross-entropy loss
+            - "value_probs": Softmax probabilities (batch, num_bins) for visualization
+            - "value": Expected win probability scalar (batch,) for metrics/inference
         """
         batch_size, seq_len = x.shape
         head_config = self.config.output_heads
@@ -191,19 +198,30 @@ class BidirectionalTransformer(nn.Module):
             )(hidden)  # (batch, seq, vocab_size)
             outputs["self"] = self_logits
 
-        # Value head: from pooled representation
+        # Value head: HL-Gauss categorical distribution from pooled representation
         if head_config.value_head:
             # Mean pooling over sequence dimension
             pooled = hidden.mean(axis=1)  # (batch, hidden)
 
+            # Output logits for each bin in the HL-Gauss distribution
+            num_bins = head_config.value_num_bins
             value_logits = nn.Dense(
-                1,
+                num_bins,
                 dtype=jnp.float32,
                 name="value_head",
-            )(pooled)  # (batch, 1)
+            )(pooled)  # (batch, num_bins)
 
-            outputs["value_logit"] = value_logits
-            outputs["value"] = jax.nn.sigmoid(value_logits)
+            # Softmax to get probability distribution
+            value_probs = jax.nn.softmax(value_logits, axis=-1)  # (batch, num_bins)
+
+            # Expected value: weighted sum of bin centers
+            # Bins span [0, 1], so centers are at (i + 0.5) / num_bins for i in [0, num_bins)
+            bin_centers = (jnp.arange(num_bins) + 0.5) / num_bins  # (num_bins,)
+            expected_value = jnp.sum(value_probs * bin_centers, axis=-1)  # (batch,)
+
+            outputs["value_logit"] = value_logits  # For cross-entropy loss
+            outputs["value_probs"] = value_probs  # For visualization
+            outputs["value"] = expected_value  # Scalar for metrics/inference
 
         return outputs
 

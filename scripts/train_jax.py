@@ -44,11 +44,7 @@ from catgpt.jax.configs import (
     JaxWandbConfig,
     jax_config_from_dict,
 )
-from catgpt.jax.data.dataloader import (
-    PlaceholderDataLoader,
-    PlaceholderDataset,
-    create_dataloader,
-)
+from catgpt.jax.data.dataloader import create_dataloader
 from catgpt.jax.models.transformer import BidirectionalTransformer, TransformerConfig
 from catgpt.jax.optimizers.factory import create_optimizer_with_gradient_clipping
 from catgpt.jax.training.trainer import Trainer
@@ -108,7 +104,7 @@ def main(cfg: DictConfig) -> None:
     model_cfg = experiment_config.model
     tokenizer_cfg = experiment_config.tokenizer
 
-    # Update model config with tokenizer info
+    # Update model config with tokenizer info and output head settings
     transformer_config = TransformerConfig(
         hidden_size=model_cfg.hidden_size,
         num_layers=model_cfg.num_layers,
@@ -118,6 +114,7 @@ def main(cfg: DictConfig) -> None:
         seq_length=tokenizer_cfg.sequence_length,
         activation=model_cfg.activation,
         dropout_rate=model_cfg.dropout_rate,
+        output_heads=model_cfg.output_heads,  # Include HL-Gauss config
     )
 
     # Create model
@@ -143,55 +140,27 @@ def main(cfg: DictConfig) -> None:
     logger.info("Creating data loaders...")
     num_devices = len(devices)
 
-    try:
-        train_dataloader = create_dataloader(
+    train_dataloader = create_dataloader(
+        experiment_config.data,
+        split="train",
+        batch_size=experiment_config.training.batch_size,
+        num_devices=num_devices,
+        device_index=0,
+        tokenizer_config=tokenizer_cfg,
+        output_heads_config=model_cfg.output_heads,  # For HL-Gauss transform
+    )
+
+    val_dataloader = None
+    if experiment_config.data.val_path:
+        val_dataloader = create_dataloader(
             experiment_config.data,
-            split="train",
+            split="val",
             batch_size=experiment_config.training.batch_size,
             num_devices=num_devices,
             device_index=0,
             tokenizer_config=tokenizer_cfg,
+            output_heads_config=model_cfg.output_heads,  # For HL-Gauss transform
         )
-    except Exception as e:
-        logger.warning(f"Failed to create grain dataloader: {e}")
-        logger.info("Falling back to placeholder dataset...")
-        train_dataset = PlaceholderDataset(
-            num_samples=10000,
-            seq_length=tokenizer_cfg.sequence_length,
-            vocab_size=model_cfg.vocab_size,
-            seed=experiment_config.data.seed,
-        )
-        train_dataloader = PlaceholderDataLoader(
-            train_dataset,
-            batch_size=experiment_config.training.batch_size,
-            shuffle=True,
-        )
-
-    val_dataloader = None
-    if experiment_config.data.val_path:
-        try:
-            val_dataloader = create_dataloader(
-                experiment_config.data,
-                split="val",
-                batch_size=experiment_config.training.batch_size,
-                num_devices=num_devices,
-                device_index=0,
-                tokenizer_config=tokenizer_cfg,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to create validation dataloader: {e}")
-            val_dataset = PlaceholderDataset(
-                num_samples=1000,
-                seq_length=tokenizer_cfg.sequence_length,
-                vocab_size=model_cfg.vocab_size,
-                seed=experiment_config.data.seed + 1,
-            )
-            val_dataloader = PlaceholderDataLoader(
-                val_dataset,
-                batch_size=experiment_config.training.batch_size,
-                shuffle=False,
-                drop_last=False,
-            )
 
     # Debug: Check first batch
     logger.info("Testing data loader with first batch...")
@@ -204,7 +173,11 @@ def main(cfg: DictConfig) -> None:
             f"target dtype: {sample_batch['target'].dtype}"
         )
         logger.info(f"Sample input (first 10 tokens): {sample_batch['input'][0, :10].tolist()}")
-        logger.info(f"Sample target (first 3): {sample_batch['target'][:3].tolist()}")
+        # Target is now HL-Gauss distribution - show expected value instead
+        num_bins = sample_batch['target'].shape[-1]
+        bin_centers = (np.arange(num_bins) + 0.5) / num_bins
+        expected_values = np.sum(sample_batch['target'][:3] * bin_centers, axis=-1)
+        logger.info(f"Sample target expected values (first 3): {expected_values.tolist()}")
     except Exception as e:
         logger.error(f"Error loading first batch: {e}")
         raise

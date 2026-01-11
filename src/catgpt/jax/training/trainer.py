@@ -201,7 +201,7 @@ class Trainer:
 
         Args:
             state: Current train state.
-            batch: Batch with 'input' (tokens) and 'target' (win probability).
+            batch: Batch with 'input' (tokens) and 'target' (HL-Gauss distribution).
 
         Returns:
             Tuple of (new state, metrics dict).
@@ -230,15 +230,13 @@ class Trainer:
                 weight = head_config.self_weight if head_config else 0.1
                 losses["self"] = self_loss * weight
 
-            # Value head: BCE with logits (ONLY on value_logit)
+            # Value head: cross-entropy with HL-Gauss target distribution
             if "value_logit" in outputs:
-                targets = batch["target"]
-                if targets.ndim == 1:
-                    targets = targets[:, None]
-
-                value_loss = optax.sigmoid_binary_cross_entropy(
+                # outputs["value_logit"]: (batch, num_bins) logits
+                # batch["target"]: (batch, num_bins) HL-Gauss probability distribution
+                value_loss = optax.softmax_cross_entropy(
                     outputs["value_logit"].astype(jnp.float32),
-                    targets.astype(jnp.float32),
+                    batch["target"].astype(jnp.float32),
                 ).mean()
                 weight = head_config.value_weight if head_config else 1.0
                 losses["value"] = value_loss * weight
@@ -259,19 +257,21 @@ class Trainer:
         for head_name, head_loss in losses.items():
             metrics[f"{head_name}_loss"] = head_loss
 
-        # Value metrics (using post-sigmoid value)
+        # Value metrics (using expected value from HL-Gauss distribution)
         if "value" in outputs:
-            targets = batch["target"]
-            if targets.ndim == 1:
-                targets = targets[:, None]
+            # outputs["value"] is the expected value (batch,)
+            # For target expected value, compute from target distribution
+            num_bins = batch["target"].shape[-1]
+            bin_centers = (jnp.arange(num_bins) + 0.5) / num_bins
+            target_expected = jnp.sum(batch["target"] * bin_centers, axis=-1)  # (batch,)
 
-            # MSE (on probability scale)
-            value_mse = jnp.mean((outputs["value"] - targets.astype(jnp.float32)) ** 2)
+            # MSE (on probability scale, comparing expected values)
+            value_mse = jnp.mean((outputs["value"] - target_expected.astype(jnp.float32)) ** 2)
             metrics["value_mse"] = value_mse
 
             # Binary accuracy (binarize both predictions AND targets)
             preds = (outputs["value"] > 0.5).astype(jnp.float32)
-            targets_binary = (targets > 0.5).astype(jnp.float32)
+            targets_binary = (target_expected > 0.5).astype(jnp.float32)
             accuracy = (preds == targets_binary).mean()
             metrics["accuracy"] = accuracy
 
@@ -293,7 +293,7 @@ class Trainer:
 
         Args:
             state: Current train state.
-            batch: Batch with 'input' (tokens) and 'target' (win probability).
+            batch: Batch with 'input' (tokens) and 'target' (HL-Gauss distribution).
 
         Returns:
             Metrics dict.
@@ -318,15 +318,13 @@ class Trainer:
             weight = head_config.self_weight if head_config else 0.1
             losses["self"] = self_loss * weight
 
-        # Value head: BCE with logits
+        # Value head: cross-entropy with HL-Gauss target distribution
         if "value_logit" in outputs:
-            targets = batch["target"]
-            if targets.ndim == 1:
-                targets = targets[:, None]
-
-            value_loss = optax.sigmoid_binary_cross_entropy(
+            # outputs["value_logit"]: (batch, num_bins) logits
+            # batch["target"]: (batch, num_bins) HL-Gauss probability distribution
+            value_loss = optax.softmax_cross_entropy(
                 outputs["value_logit"].astype(jnp.float32),
-                targets.astype(jnp.float32),
+                batch["target"].astype(jnp.float32),
             ).mean()
             weight = head_config.value_weight if head_config else 1.0
             losses["value"] = value_loss * weight
@@ -340,19 +338,21 @@ class Trainer:
         for head_name, head_loss in losses.items():
             metrics[f"{head_name}_loss"] = head_loss
 
-        # Value metrics
+        # Value metrics (using expected value from HL-Gauss distribution)
         if "value" in outputs:
-            targets = batch["target"]
-            if targets.ndim == 1:
-                targets = targets[:, None]
+            # outputs["value"] is the expected value (batch,)
+            # For target expected value, compute from target distribution
+            num_bins = batch["target"].shape[-1]
+            bin_centers = (jnp.arange(num_bins) + 0.5) / num_bins
+            target_expected = jnp.sum(batch["target"] * bin_centers, axis=-1)  # (batch,)
 
-            # MSE (on probability scale)
-            value_mse = jnp.mean((outputs["value"] - targets.astype(jnp.float32)) ** 2)
+            # MSE (on probability scale, comparing expected values)
+            value_mse = jnp.mean((outputs["value"] - target_expected.astype(jnp.float32)) ** 2)
             metrics["value_mse"] = value_mse
 
             # Binary accuracy (binarize both predictions AND targets)
             preds = (outputs["value"] > 0.5).astype(jnp.float32)
-            targets_binary = (targets > 0.5).astype(jnp.float32)
+            targets_binary = (target_expected > 0.5).astype(jnp.float32)
             accuracy = (preds == targets_binary).mean()
             metrics["accuracy"] = accuracy
 
