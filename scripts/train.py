@@ -125,8 +125,6 @@ def main(cfg: DictConfig) -> None:
     train_dataloader = create_dataloader(
         experiment_config.data,
         split="train",
-        seq_length=tokenizer_cfg.sequence_length,
-        vocab_size=model_cfg.vocab_size,
         batch_size=experiment_config.training.batch_size,
         world_size=world_size,
         rank=rank,
@@ -138,8 +136,6 @@ def main(cfg: DictConfig) -> None:
         val_dataloader = create_dataloader(
             experiment_config.data,
             split="val",
-            seq_length=tokenizer_cfg.sequence_length,
-            vocab_size=model_cfg.vocab_size,
             batch_size=experiment_config.training.batch_size,
             world_size=world_size,
             rank=rank,

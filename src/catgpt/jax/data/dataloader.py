@@ -230,13 +230,10 @@ def create_dataloader(
     config: "JaxDataConfig",
     *,
     split: str = "train",
-    seq_length: int = 64,
-    vocab_size: int = 28,
     batch_size: int = 64,
     num_devices: int = 1,
     device_index: int = 0,
     tokenizer_config: "JaxTokenizerConfig | None" = None,
-    use_grain: bool = True,
 ) -> pygrain.DataLoader | PlaceholderDataLoader:
     """Create a DataLoader for JAX training or validation.
 
@@ -246,46 +243,21 @@ def create_dataloader(
     Args:
         config: Data configuration (includes seed).
         split: Data split ("train" or "val").
-        seq_length: Sequence length for inputs (used for placeholder only).
-        vocab_size: Vocabulary size (used for placeholder only).
         batch_size: Batch size per device.
         num_devices: Number of devices (for sharded loading).
         device_index: Current device index.
         tokenizer_config: Tokenizer configuration (for PyGrain).
-        use_grain: If True, use PyGrain with real data. If False, use placeholder.
 
     Returns:
         DataLoader instance.
     """
-    if use_grain:
-        try:
-            shuffle = split == "train"
-            return create_grain_dataloader(
-                config,
-                split=split,
-                batch_size=batch_size,
-                shuffle=shuffle,
-                num_devices=num_devices,
-                device_index=device_index,
-                tokenizer_config=tokenizer_config,
-            )
-        except (FileNotFoundError, ValueError) as e:
-            from loguru import logger
-
-            logger.warning(f"Failed to load real data ({e}), using placeholder dataset")
-            use_grain = False
-
-    if not use_grain:
-        dataset = PlaceholderDataset(
-            num_samples=10000 if split == "train" else 1000,
-            seq_length=seq_length,
-            vocab_size=vocab_size,
-            seed=config.seed,
-        )
-
-        return PlaceholderDataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=split == "train",
-            drop_last=split == "train",
-        )
+    shuffle = split == "train"
+    return create_grain_dataloader(
+        config,
+        split=split,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_devices=num_devices,
+        device_index=device_index,
+        tokenizer_config=tokenizer_config,
+    )

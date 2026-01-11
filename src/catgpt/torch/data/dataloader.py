@@ -170,13 +170,10 @@ def create_dataloader(
     config: "DataConfig",
     *,
     split: str = "train",
-    seq_length: int = 64,
-    vocab_size: int = 28,
     batch_size: int = 64,
     world_size: int = 1,
     rank: int = 0,
     tokenizer_config: "TokenizerConfig | None" = None,
-    use_grain: bool = True,
 ) -> pygrain.DataLoader | torch.utils.data.DataLoader:
     """Create a DataLoader for training or validation.
 
@@ -192,61 +189,17 @@ def create_dataloader(
         world_size: Number of GPUs (for distributed sampler).
         rank: Current GPU rank.
         tokenizer_config: Tokenizer configuration (for PyGrain).
-        use_grain: If True, use PyGrain with real data. If False, use placeholder.
 
     Returns:
         DataLoader instance.
     """
-    if use_grain:
-        # Use real PyGrain dataloader
-        try:
-            shuffle = split == "train"
-            return create_grain_dataloader(
-                config,
-                split=split,
-                batch_size=batch_size,
-                shuffle=shuffle,
-                world_size=world_size,
-                rank=rank,
-                tokenizer_config=tokenizer_config,
-            )
-        except (FileNotFoundError, ValueError) as e:
-            # Fall back to placeholder if data files don't exist
-            from loguru import logger
-
-            logger.warning(f"Failed to load real data ({e}), using placeholder dataset")
-            use_grain = False
-
-    if not use_grain:
-        # Use placeholder dataset for testing
-        from torch.utils.data import DataLoader, DistributedSampler
-
-        dataset = PlaceholderDataset(
-            num_samples=10000 if split == "train" else 1000,
-            seq_length=seq_length,
-            vocab_size=vocab_size,
-        )
-
-        sampler = None
-        shuffle = split == "train"
-
-        if world_size > 1:
-            sampler = DistributedSampler(
-                dataset,
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=shuffle,
-            )
-            shuffle = False
-
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            sampler=sampler,
-            num_workers=config.num_workers,
-            pin_memory=config.pin_memory,
-            prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
-            persistent_workers=config.num_workers > 0,
-            drop_last=split == "train",
-        )
+    shuffle = split == "train"
+    return create_grain_dataloader(
+        config,
+        split=split,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        world_size=world_size,
+        rank=rank,
+        tokenizer_config=tokenizer_config,
+    )

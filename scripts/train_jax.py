@@ -147,13 +147,10 @@ def main(cfg: DictConfig) -> None:
         train_dataloader = create_dataloader(
             experiment_config.data,
             split="train",
-            seq_length=tokenizer_cfg.sequence_length,
-            vocab_size=model_cfg.vocab_size,
             batch_size=experiment_config.training.batch_size,
             num_devices=num_devices,
             device_index=0,
             tokenizer_config=tokenizer_cfg,
-            use_grain=True,
         )
     except Exception as e:
         logger.warning(f"Failed to create grain dataloader: {e}")
@@ -176,13 +173,10 @@ def main(cfg: DictConfig) -> None:
             val_dataloader = create_dataloader(
                 experiment_config.data,
                 split="val",
-                seq_length=tokenizer_cfg.sequence_length,
-                vocab_size=model_cfg.vocab_size,
                 batch_size=experiment_config.training.batch_size,
                 num_devices=num_devices,
                 device_index=0,
                 tokenizer_config=tokenizer_cfg,
-                use_grain=True,
             )
         except Exception as e:
             logger.warning(f"Failed to create validation dataloader: {e}")

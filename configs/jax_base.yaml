@@ -7,7 +7,7 @@ model:
   hidden_size: 256
   num_layers: 16
   num_heads: 16
-  ff_dim: 3  # Defaults to 4 * hidden_size
+  ff_dim: 768  # Defaults to 4 * hidden_size
   vocab_size: 28  # From tokenizer (don't change unless tokenizer changes)
   seq_length: 64  # Will be overridden by tokenizer.sequence_length
   activation: "gelu"
