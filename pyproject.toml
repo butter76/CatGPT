@@ -30,6 +30,7 @@ dependencies = [
     "wandb>=0.23.1",
     "zstandard>=0.25.0",
     "apache-beam>=2.70.0",
+    "grain>=0.2.0",
 ]
 
 [project.optional-dependencies]
@@ -108,6 +109,8 @@ select = [
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
+    "F401",   # unused imports
+    "F841",   # unused variables
     "B008",   # do not perform function calls in argument defaults
     "C901",   # too complex
     "ARG001", # unused function argument

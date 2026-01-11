@@ -1,24 +1,136 @@
-"""DataLoader utilities for PyTorch training.
+"""DataLoader utilities for PyTorch training using PyGrain."""
 
-This module provides a placeholder for PyGrain-based data loading.
-The actual implementation will be added later.
-"""
+from typing import TYPE_CHECKING
 
-from typing import TYPE_CHECKING, Any
-
+import grain.python as pygrain
 import torch
-from torch.utils.data import DataLoader, Dataset
+
+from catgpt.core.data.grain.bagz import BagDataSource
+from catgpt.core.data.grain.coders import ConvertStateValueDataToSequence
 
 if TYPE_CHECKING:
     from catgpt.core.configs.schema import DataConfig
+    from catgpt.core.utils import TokenizerConfig
 
 
-class PlaceholderDataset(Dataset):
+class ConvertToTorch(pygrain.MapTransform):
+    """Convert numpy arrays to PyTorch tensors.
+
+    Transforms batched data from PyGrain (numpy) to PyTorch tensors.
+    Expected input: tuple of (inputs, targets) where both are numpy arrays.
+    """
+
+    def map(self, element):
+        """Convert a batched element to PyTorch tensors.
+
+        Args:
+            element: Tuple of (inputs, targets) as numpy arrays.
+
+        Returns:
+            Dictionary with 'input' and 'target' as PyTorch tensors.
+        """
+        inputs, targets = element
+
+        # Convert to tensors
+        input_tensor = torch.from_numpy(inputs).long()  # Token indices
+        target_tensor = torch.from_numpy(targets).float()  # Win probabilities
+
+        # Squeeze target if it has unnecessary dimensions
+        if target_tensor.dim() > 1 and target_tensor.shape[-1] == 1:
+            target_tensor = target_tensor.squeeze(-1)
+
+        return {
+            "input": input_tensor,
+            "target": target_tensor,
+        }
+
+
+def create_grain_dataloader(
+    config: "DataConfig",
+    *,
+    split: str = "train",
+    batch_size: int = 64,
+    shuffle: bool = True,
+    world_size: int = 1,
+    rank: int = 0,
+    tokenizer_config: "TokenizerConfig | None" = None,
+) -> pygrain.DataLoader:
+    """Create a PyGrain DataLoader for chess position data.
+
+    Args:
+        config: Data configuration (includes seed).
+        split: Data split ("train" or "val").
+        batch_size: Batch size per worker.
+        shuffle: Whether to shuffle the data.
+        world_size: Total number of processes (for distributed training).
+        rank: Current process rank (for distributed training).
+        tokenizer_config: Tokenizer configuration (for proper sequence encoding).
+
+    Returns:
+        PyGrain DataLoader yielding batches.
+    """
+    # Determine data path
+    if split == "train":
+        data_path = config.train_path
+    elif split == "val":
+        data_path = config.val_path
+        if data_path is None:
+            raise ValueError("Validation path not configured")
+    else:
+        raise ValueError(f"Unknown split: {split}")
+
+    # Create bag data source
+    from loguru import logger
+
+    bag_source = BagDataSource(data_path)
+    logger.info(f"Loaded {split} data from {data_path}: {len(bag_source)} samples")
+
+    # Create sampler with sharding for distributed training
+    if world_size > 1:
+        shard_options = pygrain.ShardByJaxProcess(shard_count=world_size, shard_index=rank)
+    else:
+        shard_options = pygrain.NoSharding()
+
+    sampler = pygrain.IndexSampler(
+        num_records=len(bag_source),
+        shard_options=shard_options,
+        shuffle=shuffle,
+        seed=config.seed,  # Use seed from config
+        num_epochs=None,  # Infinite epochs for step-based training
+    )
+
+    # Define transformations pipeline
+    transformations = (
+        ConvertStateValueDataToSequence(tokenizer_config),  # bytes -> (state, win_prob)
+        pygrain.Batch(batch_size=batch_size, drop_remainder=split == "train"),
+        ConvertToTorch(),  # numpy -> torch tensors dict
+    )
+
+    # Create and return dataloader
+    dataloader = pygrain.DataLoader(
+        data_source=bag_source,
+        sampler=sampler,
+        operations=transformations,
+        worker_count=config.num_workers,
+        read_options=pygrain.ReadOptions(
+            prefetch_buffer_size=config.prefetch_factor,
+        ),
+    )
+
+    logger.info(
+        f"Created PyGrain DataLoader: batch_size={batch_size}, "
+        f"shuffle={shuffle}, workers={config.num_workers}, "
+        f"tokenizer_config={tokenizer_config}"
+    )
+
+    return dataloader
+
+
+class PlaceholderDataset:
     """Placeholder dataset for testing the training pipeline.
 
-    Generates random data with the expected format:
-    - input: Token indices (batch, seq_len)
-    - target: Win probability (batch,)
+    Generates random data with the expected format.
+    This is kept for backward compatibility and testing.
     """
 
     def __init__(
@@ -63,96 +175,78 @@ def create_dataloader(
     batch_size: int = 64,
     world_size: int = 1,
     rank: int = 0,
-) -> DataLoader:
+    tokenizer_config: "TokenizerConfig | None" = None,
+    use_grain: bool = True,
+) -> pygrain.DataLoader | torch.utils.data.DataLoader:
     """Create a DataLoader for training or validation.
 
-    NOTE: This is a placeholder implementation that returns random data.
-    The actual PyGrain-based implementation will be added later.
+    This is a compatibility wrapper that can use either PyGrain (real data)
+    or the placeholder dataset (for testing).
 
     Args:
-        config: Data configuration.
+        config: Data configuration (includes seed).
         split: Data split ("train" or "val").
-        seq_length: Sequence length for inputs.
-        vocab_size: Vocabulary size.
+        seq_length: Sequence length for inputs (used for placeholder only).
+        vocab_size: Vocabulary size (used for placeholder only).
         batch_size: Batch size per GPU.
         world_size: Number of GPUs (for distributed sampler).
         rank: Current GPU rank.
+        tokenizer_config: Tokenizer configuration (for PyGrain).
+        use_grain: If True, use PyGrain with real data. If False, use placeholder.
 
     Returns:
         DataLoader instance.
     """
-    # TODO: Replace with PyGrain-based data loading
-    # from catgpt.core.data.grain.bagz import BagDataSource
-    # data_path = config.train_path if split == "train" else config.val_path
+    if use_grain:
+        # Use real PyGrain dataloader
+        try:
+            shuffle = split == "train"
+            return create_grain_dataloader(
+                config,
+                split=split,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                world_size=world_size,
+                rank=rank,
+                tokenizer_config=tokenizer_config,
+            )
+        except (FileNotFoundError, ValueError) as e:
+            # Fall back to placeholder if data files don't exist
+            from loguru import logger
 
-    # For now, use placeholder dataset
-    num_samples = 10000 if split == "train" else 1000
-    dataset = PlaceholderDataset(
-        num_samples=num_samples,
-        seq_length=seq_length,
-        vocab_size=vocab_size,
-    )
+            logger.warning(f"Failed to load real data ({e}), using placeholder dataset")
+            use_grain = False
 
-    # Create sampler for distributed training
-    sampler = None
-    shuffle = split == "train"
+    if not use_grain:
+        # Use placeholder dataset for testing
+        from torch.utils.data import DataLoader, DistributedSampler
 
-    if world_size > 1:
-        from torch.utils.data.distributed import DistributedSampler
-
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=shuffle,
+        dataset = PlaceholderDataset(
+            num_samples=10000 if split == "train" else 1000,
+            seq_length=seq_length,
+            vocab_size=vocab_size,
         )
-        shuffle = False  # Sampler handles shuffling
 
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
-        num_workers=config.num_workers,
-        pin_memory=config.pin_memory,
-        prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
-        persistent_workers=config.num_workers > 0,
-        drop_last=split == "train",  # Drop incomplete batches during training
-    )
+        sampler = None
+        shuffle = split == "train"
 
+        if world_size > 1:
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=shuffle,
+            )
+            shuffle = False
 
-# Placeholder for future PyGrain integration
-class GrainDataLoader:
-    """PyGrain-based DataLoader (to be implemented).
-
-    This will wrap the BagDataSource from catgpt.core.data.grain.bagz
-    to provide efficient, multi-worker data loading with:
-    - Automatic sharding across workers
-    - Prefetching and parallel decoding
-    - Deterministic shuffling for reproducibility
-    """
-
-    def __init__(
-        self,
-        data_path: str,
-        batch_size: int,
-        *,
-        shuffle: bool = True,
-        num_workers: int = 4,
-        world_size: int = 1,
-        rank: int = 0,
-    ) -> None:
-        """Initialize the PyGrain DataLoader.
-
-        Args:
-            data_path: Path to .bag file(s) (supports glob patterns).
-            batch_size: Batch size per GPU.
-            shuffle: Whether to shuffle data.
-            num_workers: Number of worker processes.
-            world_size: Number of GPUs.
-            rank: Current GPU rank.
-        """
-        raise NotImplementedError(
-            "GrainDataLoader is not yet implemented. "
-            "Use create_dataloader() with PlaceholderDataset for now."
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            sampler=sampler,
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory,
+            prefetch_factor=config.prefetch_factor if config.num_workers > 0 else None,
+            persistent_workers=config.num_workers > 0,
+            drop_last=split == "train",
         )

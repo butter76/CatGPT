@@ -5,9 +5,9 @@
 model:
   name: "transformer"
   hidden_size: 256
-  num_layers: 6
-  num_heads: 8
-  ff_dim: null  # Defaults to 4 * hidden_size
+  num_layers: 8
+  num_heads: 16
+  ff_dim: 3  # Defaults to 4 * hidden_size
   vocab_size: 28  # From tokenizer (don't change unless tokenizer changes)
   seq_length: 64  # Will be overridden by tokenizer.sequence_length
   activation: "gelu"
@@ -20,7 +20,7 @@ tokenizer:
 # Optimizer configuration
 optimizer:
   name: "adamw"  # Options: "adamw", "splus"
-  learning_rate: 1.0e-4
+  learning_rate: 2.0e-4
   weight_decay: 0.01
   # AdamW specific
   betas: [0.9, 0.999]
@@ -43,18 +43,20 @@ scheduler:
 training:
   max_steps: 300000  # Total training steps
   steps_per_epoch: 3000  # Steps per pseudo-epoch (validation interval)
-  batch_size: 64
+  batch_size: 2048
   gradient_clip: 1.0
   gradient_accumulation_steps: 1
+  max_eval_steps: 33  # Max validation steps (prevents infinite loop)
   compile_model: true  # Use torch.compile for efficiency
 
 # Data loading
 data:
-  train_path: "data/train/*.bag"
-  val_path: "data/val/*.bag"
-  num_workers: 4
+  train_path: "chessbench_data/train/*.bag"
+  val_path: "chessbench_data/test/*.bag"
+  num_workers: 2
   pin_memory: true
-  prefetch_factor: 2
+  prefetch_factor: 100
+  seed: 42
 
 # Checkpointing
 checkpoint:
@@ -65,10 +67,10 @@ checkpoint:
 
 # Weights & Biases logging
 wandb:
-  enabled: true
+  enabled: false
   project: "catgpt"
-  entity: null  # Your W&B username or team
-  run_name: null  # Auto-generated if null
+  entity: "nreddy"  # Your W&B username or team
+  run_name: "catgpt-test"  # Auto-generated if null
   tags: []
   log_every_steps: 10
 
@@ -83,4 +85,4 @@ logging:
 
 # Reproducibility
 seed: 42
-device: "auto"  # Options: "auto", "cuda", "cpu", "mps"
+device: "cuda"  # Options: "auto", "cuda", "cpu", "mps"

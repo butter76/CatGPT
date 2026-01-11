@@ -1,6 +1,5 @@
 """Bidirectional Transformer model for chess position evaluation."""
 
-import math
 from dataclasses import dataclass
 from typing import Self
 

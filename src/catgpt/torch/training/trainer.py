@@ -199,19 +199,20 @@ class Trainer:
         accumulation_steps = self.training_config.gradient_accumulation_steps
         data_iter = self._infinite_dataloader()
 
-        # Progress bar for entire training
-        pbar = None
-        if is_main_process():
-            pbar = tqdm(
-                total=max_steps,
-                initial=self.global_step,
-                desc="Training",
-                unit="step",
-            )
-
         epoch_loss = 0.0
         epoch_batches = 0
         last_epoch = self.current_epoch
+
+        # Progress bar for current pseudo-epoch
+        epoch_pbar = None
+        if is_main_process():
+            steps_in_current_epoch = self.global_step % steps_per_epoch
+            epoch_pbar = tqdm(
+                total=steps_per_epoch,
+                initial=steps_in_current_epoch,
+                desc=f"Epoch {self.current_epoch}/{total_epochs}",
+                unit="step",
+            )
 
         while self.global_step < max_steps:
             # Get next batch
@@ -242,11 +243,10 @@ class Trainer:
                 self.global_step += 1
 
                 # Update progress bar
-                if pbar is not None:
-                    pbar.update(1)
-                    pbar.set_postfix(
+                if epoch_pbar is not None:
+                    epoch_pbar.update(1)
+                    epoch_pbar.set_postfix(
                         loss=f"{loss.item():.4f}",
-                        epoch=self.current_epoch,
                     )
 
                 # Log step metrics
@@ -258,14 +258,26 @@ class Trainer:
 
                 # Check for pseudo-epoch boundary
                 if self.current_epoch > last_epoch:
+                    # Close current epoch progress bar
+                    if epoch_pbar is not None:
+                        epoch_pbar.close()
+
                     self._on_epoch_end(epoch_loss / max(epoch_batches, 1))
                     epoch_loss = 0.0
                     epoch_batches = 0
                     last_epoch = self.current_epoch
 
+                    # Start new epoch progress bar
+                    if is_main_process() and self.global_step < max_steps:
+                        epoch_pbar = tqdm(
+                            total=steps_per_epoch,
+                            desc=f"Epoch {self.current_epoch}/{total_epochs}",
+                            unit="step",
+                        )
+
         # Close progress bar
-        if pbar is not None:
-            pbar.close()
+        if epoch_pbar is not None:
+            epoch_pbar.close()
 
         # Final epoch end (if we didn't just finish one)
         if epoch_batches > 0:
@@ -360,7 +372,24 @@ class Trainer:
         total_correct = 0
         total_samples = 0
 
-        for batch in self.val_dataloader:
+        # Progress bar for validation
+        max_eval_steps = self.training_config.max_eval_steps
+        val_iterator = self.val_dataloader
+        if is_main_process():
+            val_iterator = tqdm(
+                self.val_dataloader,
+                desc="Validation",
+                unit="batch",
+                leave=False,
+                total=max_eval_steps,
+            )
+
+        for step_idx, batch in enumerate(val_iterator):
+            # Break if we've reached max_eval_steps
+            if max_eval_steps is not None and step_idx >= max_eval_steps:
+                break
+
+
             inputs = batch["input"].to(self.device)
             targets = batch["target"].to(self.device).float()
 

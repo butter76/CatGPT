@@ -119,6 +119,9 @@ def main(cfg: DictConfig) -> None:
     optimizer = create_optimizer(model.parameters(), experiment_config.optimizer)
 
     # Create data loaders
+    if is_main_process():
+        logger.info("Creating data loaders...")
+
     train_dataloader = create_dataloader(
         experiment_config.data,
         split="train",
@@ -127,6 +130,7 @@ def main(cfg: DictConfig) -> None:
         batch_size=experiment_config.training.batch_size,
         world_size=world_size,
         rank=rank,
+        tokenizer_config=tokenizer_cfg,
     )
 
     val_dataloader = None
@@ -139,7 +143,25 @@ def main(cfg: DictConfig) -> None:
             batch_size=experiment_config.training.batch_size,
             world_size=world_size,
             rank=rank,
+            tokenizer_config=tokenizer_cfg,
         )
+
+    # Debug: Check first batch
+    if is_main_process():
+        logger.info("Testing data loader with first batch...")
+        try:
+            sample_batch = next(iter(train_dataloader))
+            logger.info(
+                f"Sample batch - input shape: {sample_batch['input'].shape}, "
+                f"target shape: {sample_batch['target'].shape}, "
+                f"input dtype: {sample_batch['input'].dtype}, "
+                f"target dtype: {sample_batch['target'].dtype}"
+            )
+            logger.info(f"Sample input (first 10 tokens): {sample_batch['input'][0, :10].tolist()}")
+            logger.info(f"Sample target (first 3): {sample_batch['target'][:3].tolist()}")
+        except Exception as e:
+            logger.error(f"Error loading first batch: {e}")
+            raise
 
     # Create scheduler (use max_steps from config)
     scheduler = create_scheduler(

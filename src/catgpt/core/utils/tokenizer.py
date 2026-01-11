@@ -135,9 +135,6 @@ def tokenize(fen: str, config: TokenizerConfig | None = None) -> np.ndarray:
     # Parse FEN fields
     raw_board, side, castling, en_passant, halfmoves_str, _ = fen.split(" ")
 
-    if len(halfmoves_str) > 2:
-        raise ValueError(f"Halfmove clock must be 2 digits or less, got: {halfmoves_str!r}")
-
     # Build board as a list (mutable, efficient for modifications)
     board: list[str] = []
     for char in raw_board:
@@ -174,6 +171,9 @@ def tokenize(fen: str, config: TokenizerConfig | None = None) -> np.ndarray:
     if config.include_halfmove:
         board.append("." if len(halfmoves_str) == 1 else halfmoves_str[0])
         board.append(halfmoves_str[0] if len(halfmoves_str) == 1 else halfmoves_str[1])
+
+        if len(halfmoves_str) > 2:
+            raise ValueError(f"Halfmove clock must be 2 digits or less, got: {halfmoves_str!r}")
 
     # Convert to numpy array with padding
     result = np.full(config.sequence_length, _PAD_TOKEN, dtype=np.uint8)

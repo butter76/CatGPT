@@ -44,11 +44,20 @@ class ConvertToSequence(pygrain.MapTransform, abc.ABC):
 class ConvertStateValueDataToSequence(ConvertToSequence):
   """Converts the fen, move, and win probability into a sequence of integers."""
 
+  def __init__(self, tokenizer_config: TokenizerConfig | None = None) -> None:
+    """Initialize with tokenizer configuration.
+
+    Args:
+      tokenizer_config: Configuration for tokenization. If None, uses default.
+    """
+    super().__init__()
+    self.tokenizer_config = tokenizer_config or TokenizerConfig()
+
   def map(
       self, element: bytes
   ):
     fen, win_prob = STATE_VALUE_CODER.decode(element)
-    state = tokenizer.tokenize(fen, TokenizerConfig())
+    state = tokenizer.tokenize(fen, self.tokenizer_config)
     return state, np.array([win_prob])
 
 

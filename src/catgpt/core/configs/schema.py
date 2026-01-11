@@ -82,6 +82,7 @@ class TrainingConfig:
     batch_size: int = 64
     gradient_clip: float | None = 1.0
     gradient_accumulation_steps: int = 1
+    max_eval_steps: int | None = None  # Max validation steps (None = full dataset)
 
     # Compilation
     compile_model: bool = True  # Use torch.compile
@@ -96,6 +97,7 @@ class DataConfig:
     num_workers: int = 4
     pin_memory: bool = True
     prefetch_factor: int = 2
+    seed: int = 42  # Random seed for data shuffling
 
 
 @dataclass
