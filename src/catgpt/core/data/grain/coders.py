@@ -20,6 +20,7 @@ and games in .bag files using msgpack.
 """
 
 import abc
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,6 +30,31 @@ import numpy as np
 from apache_beam import coders
 
 from catgpt.core.utils import TokenizerConfig, tokenizer
+
+
+def convert_old_win_prob_to_new(old_win_prob: float) -> float:
+    """Convert win probability from old Lichess formula to new formula.
+
+    Old formula: win_prob = 1 / (1 + exp(-0.00368208 * cp))
+    New formula: Q = atan(cp / 90) / 1.5637541897, win_prob = (Q + 1) / 2
+
+    Args:
+        old_win_prob: Win probability computed with the old formula.
+
+    Returns:
+        Win probability computed with the new formula.
+    """
+    # Clamp to avoid division by zero or log of zero
+    old_win_prob = max(1e-10, min(1 - 1e-10, old_win_prob))
+
+    # Inverse of old formula: cp = ln(win_prob / (1 - win_prob)) / 0.00368208
+    cp = math.log(old_win_prob / (1 - old_win_prob)) / 0.00368208
+
+    # New formula
+    q = math.atan(cp / 90) / 1.5637541897
+    new_win_prob = (q + 1) / 2
+
+    return new_win_prob
 
 STATE_VALUE_CODER = coders.TupleCoder((
     coders.StrUtf8Coder(),
@@ -56,8 +82,9 @@ class ConvertStateValueDataToSequence(ConvertToSequence):
   def map(
       self, element: bytes
   ):
-    fen, win_prob = STATE_VALUE_CODER.decode(element)
+    fen, old_win_prob = STATE_VALUE_CODER.decode(element)
     state = tokenizer.tokenize(fen, self.tokenizer_config)
+    win_prob = convert_old_win_prob_to_new(old_win_prob)
     return state, np.array([win_prob])
 
 
