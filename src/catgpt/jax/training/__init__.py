@@ -1,5 +1,8 @@
 """JAX training utilities."""
 
-from catgpt.jax.training.trainer import Trainer, TrainerConfig
+from catgpt.jax.training.trainer import TrainState, Trainer
 
-__all__ = ["Trainer", "TrainerConfig"]
+__all__ = [
+    "TrainState",
+    "Trainer",
+]

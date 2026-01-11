@@ -1,5 +1,3 @@
-"""JAX evaluation metrics."""
+"""JAX evaluation utilities."""
 
-from catgpt.jax.evaluation.metrics import accuracy, top_k_accuracy
-
-__all__ = ["accuracy", "top_k_accuracy"]
+__all__: list[str] = []

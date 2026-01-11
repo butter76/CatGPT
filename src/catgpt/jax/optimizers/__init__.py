@@ -1,10 +1,19 @@
-"""JAX/Optax optimizers.
+"""JAX/Optax optimizer definitions."""
 
-For now, use Optax optimizers directly:
-    import optax
-    optimizer = optax.adamw(learning_rate=1e-4)
+from catgpt.jax.optimizers.factory import (
+    create_optimizer,
+    create_optimizer_with_gradient_clipping,
+)
+from catgpt.jax.optimizers.splus import (
+    SPlusState,
+    splus,
+    splus_get_eval_params,
+)
 
-Custom optimizers will be added here as needed.
-"""
-
-__all__: list[str] = []
+__all__ = [
+    "SPlusState",
+    "create_optimizer",
+    "create_optimizer_with_gradient_clipping",
+    "splus",
+    "splus_get_eval_params",
+]

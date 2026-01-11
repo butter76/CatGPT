@@ -57,6 +57,7 @@ htmlcov/
 
 # ML artifacts
 checkpoints/
+checkpoints_jax/
 outputs/
 runs/
 wandb/

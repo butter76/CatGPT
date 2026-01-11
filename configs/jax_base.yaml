@@ -1,0 +1,97 @@
+# JAX configuration for CatGPT training
+# Override values via CLI: uv run python scripts/train_jax.py model.hidden_size=512
+
+# Model architecture
+model:
+  name: "transformer"
+  hidden_size: 256
+  num_layers: 16
+  num_heads: 16
+  ff_dim: null  # Defaults to 4 * hidden_size
+  vocab_size: 28  # From tokenizer (don't change unless tokenizer changes)
+  seq_length: 64  # Will be overridden by tokenizer.sequence_length
+  activation: "gelu"
+  dropout_rate: 0.0  # JAX-specific: explicit dropout rate
+
+# Tokenizer configuration
+tokenizer:
+  sequence_length: 64
+  include_halfmove: false
+
+# Optimizer configuration
+optimizer:
+  name: "adamw"  # Options: "adamw", "splus", "sgd"
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  # AdamW/SGD specific
+  b1: 0.9
+  b2: 0.999
+  eps: 1.0e-8
+  # SPlus specific (only used when name="splus")
+  splus_b1: 0.9
+  splus_b2: 0.999
+  splus_ema_rate: 0.999
+  splus_inverse_every: 100
+  splus_max_dim: 10000
+
+# Learning rate scheduler
+scheduler:
+  name: "cosine"  # Options: "cosine", "linear", "constant"
+  warmup_steps: 1000
+  min_lr_ratio: 0.1  # Final LR = learning_rate * min_lr_ratio
+
+# Training loop configuration
+# Training is step-based with "pseudo-epochs" for validation/checkpointing
+training:
+  max_steps: 300000  # Total training steps
+  steps_per_epoch: 3000  # Steps per pseudo-epoch (validation interval)
+  batch_size: 2048
+  gradient_clip: 1.0
+  gradient_accumulation_steps: 1
+  max_eval_steps: 33  # Max validation steps (prevents infinite loop)
+  # JAX-specific options
+  jit_compile: true  # JIT compile train/eval steps
+  use_pmap: false  # Use pmap for multi-device (experimental)
+  donate_argnums: true  # Donate buffers for memory efficiency
+  # Mixed precision settings
+  mixed_precision: true  # Enable bfloat16 mixed precision
+  precision_dtype: "bfloat16"  # "bfloat16" or "float16"
+  matmul_precision: "high"  # "default", "high" (TF32), or "highest" (full precision)
+
+# Data loading
+data:
+  train_path: "chessbench_data/train/*.bag"
+  val_path: "chessbench_data/test/*.bag"
+  num_workers: 2
+  prefetch_factor: 10
+  seed: 42
+
+# Checkpointing
+checkpoint:
+  dir: "checkpoints_jax"
+  save_every_epochs: 1  # Save every N pseudo-epochs
+  keep_last: 5
+  save_optimizer: true
+  use_orbax: true  # Use Orbax for checkpointing (recommended)
+
+# Weights & Biases logging
+wandb:
+  enabled: false
+  project: "catgpt-jax"
+  entity: null  # Your W&B username or team
+  run_name: null  # Auto-generated if null
+  tags: ["jax"]
+  log_every_steps: 10
+
+# Distributed training (JAX-specific)
+distributed:
+  enabled: false
+  mesh_shape: null  # e.g., [2, 4] for 2x4 device mesh
+  data_axis: "data"  # Name of data parallelism axis
+
+# Logging
+logging:
+  level: "INFO"
+
+# Reproducibility
+seed: 42
