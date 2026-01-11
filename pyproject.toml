@@ -31,6 +31,7 @@ dependencies = [
     "zstandard>=0.25.0",
     "apache-beam>=2.70.0",
     "grain>=0.2.0",
+    "google-crc32c>=1.8.0",
 ]
 
 [project.optional-dependencies]
