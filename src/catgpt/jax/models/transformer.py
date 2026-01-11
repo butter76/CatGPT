@@ -1,13 +1,13 @@
 """Bidirectional Transformer model for chess position evaluation (JAX/Flax)."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from catgpt.jax.configs import JaxModelConfig
+from catgpt.jax.configs import JaxModelConfig, JaxOutputHeadConfig
 
 # Type alias for dtype
 Dtype = Any
@@ -26,6 +26,9 @@ class TransformerConfig:
     activation: str = "gelu"
     dropout_rate: float = 0.0
 
+    # Output head configuration
+    output_heads: JaxOutputHeadConfig = field(default_factory=JaxOutputHeadConfig)
+
     def __post_init__(self) -> None:
         """Set defaults and validate."""
         if self.ff_dim is None:
@@ -34,6 +37,10 @@ class TransformerConfig:
         if self.hidden_size % self.num_heads != 0:
             msg = f"hidden_size ({self.hidden_size}) must be divisible by num_heads ({self.num_heads})"
             raise ValueError(msg)
+
+        # Convert dict to JaxOutputHeadConfig if needed
+        if isinstance(self.output_heads, dict):
+            object.__setattr__(self, "output_heads", JaxOutputHeadConfig(**self.output_heads))
 
 
 class TransformerBlock(nn.Module):
@@ -120,22 +127,23 @@ class BidirectionalTransformer(nn.Module):
         x: jax.Array,
         *,
         train: bool = False,
-        return_logits: bool = False,
         compute_dtype: Dtype = jnp.float32,
-    ) -> jax.Array:
-        """Forward pass computing win probability.
+    ) -> dict[str, jax.Array]:
+        """Forward pass returning dict of output heads.
 
         Args:
             x: Input token indices, shape (batch, seq_len).
             train: Whether in training mode.
-            return_logits: If True, return raw logits instead of probabilities.
             compute_dtype: Dtype for intermediate computations (bfloat16 for mixed precision).
 
         Returns:
-            Win probability, shape (batch, 1), values in [0, 1].
-            If return_logits=True, returns raw logits instead.
+            Dictionary with output heads:
+            - "self": Token reconstruction logits (batch, seq, vocab_size) if self_head enabled
+            - "value": Win probability after sigmoid (batch, 1) if value_head enabled
+            - "value_logit": Win probability logits before sigmoid (batch, 1) if value_head enabled
         """
         batch_size, seq_len = x.shape
+        head_config = self.config.output_heads
 
         # Token embedding (keep in float32 for stability, then cast)
         token_emb = nn.Embed(
@@ -167,18 +175,37 @@ class BidirectionalTransformer(nn.Module):
                 name=f"block_{i}",
             )(hidden, train=train)
 
-        # Final norm (float32 for stability, then cast back)
-        hidden = nn.LayerNorm(dtype=jnp.float32)(hidden.astype(jnp.float32)).astype(compute_dtype)
+        # Final norm (float32 for stability)
+        hidden = nn.LayerNorm(dtype=jnp.float32)(hidden.astype(jnp.float32))
+        # hidden: (batch, seq, hidden) - per-token representations
 
-        # Mean pooling over sequence dimension (in float32 for precision)
-        pooled = hidden.astype(jnp.float32).mean(axis=1)  # (batch, hidden)
+        # === Output heads ===
+        outputs: dict[str, jax.Array] = {}
 
-        # Output head (already float32 from pooling)
-        logits = nn.Dense(1, dtype=jnp.float32)(pooled)  # (batch, 1)
+        # Self head: per-token reconstruction (BEFORE pooling)
+        if head_config.self_head:
+            self_logits = nn.Dense(
+                self.config.vocab_size,
+                dtype=jnp.float32,
+                name="self_head",
+            )(hidden)  # (batch, seq, vocab_size)
+            outputs["self"] = self_logits
 
-        if return_logits:
-            return logits
-        return jax.nn.sigmoid(logits)
+        # Value head: from pooled representation
+        if head_config.value_head:
+            # Mean pooling over sequence dimension
+            pooled = hidden.mean(axis=1)  # (batch, hidden)
+
+            value_logits = nn.Dense(
+                1,
+                dtype=jnp.float32,
+                name="value_head",
+            )(pooled)  # (batch, 1)
+
+            outputs["value_logit"] = value_logits
+            outputs["value"] = jax.nn.sigmoid(value_logits)
+
+        return outputs
 
     @classmethod
     def from_model_config(cls, config: JaxModelConfig) -> "BidirectionalTransformer":
@@ -199,6 +226,7 @@ class BidirectionalTransformer(nn.Module):
             seq_length=config.seq_length,
             activation=config.activation,
             dropout_rate=config.dropout_rate,
+            output_heads=config.output_heads,
         )
         return cls(config=transformer_config)
 

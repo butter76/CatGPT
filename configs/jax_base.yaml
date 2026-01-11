@@ -13,6 +13,13 @@ model:
   activation: "gelu"
   dropout_rate: 0.0  # JAX-specific: explicit dropout rate
 
+  # Output heads configuration
+  output_heads:
+    self_head: true      # Token reconstruction (auxiliary task for stability)
+    value_head: true     # Win probability prediction (primary task)
+    self_weight: 0.1     # Loss weight for self head
+    value_weight: 1.0    # Loss weight for value head
+
 # Tokenizer configuration
 tokenizer:
   sequence_length: 64
@@ -21,7 +28,7 @@ tokenizer:
 # Optimizer configuration
 optimizer:
   name: "adamw"  # Options: "adamw", "splus", "sgd"
-  learning_rate: 2.0e-4
+  learning_rate: 5.0e-4
   weight_decay: 0.01
   # AdamW/SGD specific
   b1: 0.9

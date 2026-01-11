@@ -207,45 +207,80 @@ class Trainer:
             Tuple of (new state, metrics dict).
         """
         compute_dtype = self.compute_dtype
+        head_config = self.model_config.output_heads if self.model_config else None
 
         def loss_fn(params):
-            logits = state.apply_fn(
+            outputs = state.apply_fn(
                 params,
                 batch["input"],
                 train=True,
-                return_logits=True,
                 compute_dtype=compute_dtype,
-            )
+            )  # dict[str, jax.Array]
 
-            targets = batch["target"]
-            if targets.ndim == 1:
-                targets = targets[:, None]
+            losses = {}
 
-            # Cast logits to float32 for loss computation (numerical stability)
-            logits_f32 = logits.astype(jnp.float32)
-            targets_f32 = targets.astype(jnp.float32)
+            # Self head: cross-entropy token reconstruction
+            if "self" in outputs:
+                # outputs["self"]: (batch, seq, vocab_size)
+                # batch["input"]: (batch, seq) integer tokens
+                self_loss = optax.softmax_cross_entropy_with_integer_labels(
+                    outputs["self"],
+                    batch["input"],
+                ).mean()
+                weight = head_config.self_weight if head_config else 0.1
+                losses["self"] = self_loss * weight
 
-            # Binary cross-entropy with logits
-            loss = optax.sigmoid_binary_cross_entropy(logits_f32, targets_f32).mean()
-            return loss, logits_f32
+            # Value head: BCE with logits (ONLY on value_logit)
+            if "value_logit" in outputs:
+                targets = batch["target"]
+                if targets.ndim == 1:
+                    targets = targets[:, None]
+
+                value_loss = optax.sigmoid_binary_cross_entropy(
+                    outputs["value_logit"].astype(jnp.float32),
+                    targets.astype(jnp.float32),
+                ).mean()
+                weight = head_config.value_weight if head_config else 1.0
+                losses["value"] = value_loss * weight
+
+            total_loss = sum(losses.values())
+            return total_loss, (outputs, losses)
 
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        (loss, logits), grads = grad_fn(state.params)
+        (total_loss, (outputs, losses)), grads = grad_fn(state.params)
 
         # Update state
         state = state.apply_gradients(grads=grads)
 
-        # Compute accuracy
-        preds = (jax.nn.sigmoid(logits) > 0.5).astype(jnp.float32)
-        targets = batch["target"]
-        if targets.ndim == 1:
-            targets = targets[:, None]
-        accuracy = (preds == targets.astype(jnp.float32)).mean()
+        # Compute metrics
+        metrics = {"loss": total_loss}
 
-        metrics = {
-            "loss": loss,
-            "accuracy": accuracy,
-        }
+        # Per-head losses for logging
+        for head_name, head_loss in losses.items():
+            metrics[f"{head_name}_loss"] = head_loss
+
+        # Value metrics (using post-sigmoid value)
+        if "value" in outputs:
+            targets = batch["target"]
+            if targets.ndim == 1:
+                targets = targets[:, None]
+
+            # MSE (on probability scale)
+            value_mse = jnp.mean((outputs["value"] - targets.astype(jnp.float32)) ** 2)
+            metrics["value_mse"] = value_mse
+
+            # Binary accuracy (binarize both predictions AND targets)
+            preds = (outputs["value"] > 0.5).astype(jnp.float32)
+            targets_binary = (targets > 0.5).astype(jnp.float32)
+            accuracy = (preds == targets_binary).mean()
+            metrics["accuracy"] = accuracy
+
+        # Self head metrics
+        if "self" in outputs:
+            # Token prediction accuracy
+            pred_tokens = jnp.argmax(outputs["self"], axis=-1)  # (batch, seq)
+            self_accuracy = (pred_tokens == batch["input"]).mean()
+            metrics["self_accuracy"] = self_accuracy
 
         return state, metrics
 
@@ -263,33 +298,71 @@ class Trainer:
         Returns:
             Metrics dict.
         """
-        logits = state.apply_fn(
+        head_config = self.model_config.output_heads if self.model_config else None
+
+        outputs = state.apply_fn(
             state.params,
             batch["input"],
             train=False,
-            return_logits=True,
             compute_dtype=self.compute_dtype,
-        )
+        )  # dict[str, jax.Array]
 
-        targets = batch["target"]
-        if targets.ndim == 1:
-            targets = targets[:, None]
+        losses = {}
 
-        # Cast to float32 for loss computation (numerical stability)
-        logits_f32 = logits.astype(jnp.float32)
-        targets_f32 = targets.astype(jnp.float32)
+        # Self head: cross-entropy token reconstruction
+        if "self" in outputs:
+            self_loss = optax.softmax_cross_entropy_with_integer_labels(
+                outputs["self"],
+                batch["input"],
+            ).mean()
+            weight = head_config.self_weight if head_config else 0.1
+            losses["self"] = self_loss * weight
 
-        # Binary cross-entropy with logits
-        loss = optax.sigmoid_binary_cross_entropy(logits_f32, targets_f32).mean()
+        # Value head: BCE with logits
+        if "value_logit" in outputs:
+            targets = batch["target"]
+            if targets.ndim == 1:
+                targets = targets[:, None]
 
-        # Compute accuracy
-        preds = (jax.nn.sigmoid(logits_f32) > 0.5).astype(jnp.float32)
-        accuracy = (preds == targets_f32).mean()
+            value_loss = optax.sigmoid_binary_cross_entropy(
+                outputs["value_logit"].astype(jnp.float32),
+                targets.astype(jnp.float32),
+            ).mean()
+            weight = head_config.value_weight if head_config else 1.0
+            losses["value"] = value_loss * weight
 
-        return {
-            "loss": loss,
-            "accuracy": accuracy,
-        }
+        total_loss = sum(losses.values())
+
+        # Compute metrics
+        metrics = {"loss": total_loss}
+
+        # Per-head losses
+        for head_name, head_loss in losses.items():
+            metrics[f"{head_name}_loss"] = head_loss
+
+        # Value metrics
+        if "value" in outputs:
+            targets = batch["target"]
+            if targets.ndim == 1:
+                targets = targets[:, None]
+
+            # MSE (on probability scale)
+            value_mse = jnp.mean((outputs["value"] - targets.astype(jnp.float32)) ** 2)
+            metrics["value_mse"] = value_mse
+
+            # Binary accuracy (binarize both predictions AND targets)
+            preds = (outputs["value"] > 0.5).astype(jnp.float32)
+            targets_binary = (targets > 0.5).astype(jnp.float32)
+            accuracy = (preds == targets_binary).mean()
+            metrics["accuracy"] = accuracy
+
+        # Self head metrics
+        if "self" in outputs:
+            pred_tokens = jnp.argmax(outputs["self"], axis=-1)
+            self_accuracy = (pred_tokens == batch["input"]).mean()
+            metrics["self_accuracy"] = self_accuracy
+
+        return metrics
 
     def fit(self) -> dict[str, Any]:
         """Run the full training loop.
@@ -348,13 +421,20 @@ class Trainer:
                 self.global_step += 1
                 accumulation_count = 0
 
-                # Update progress bar
+                # Update progress bar with key metrics
                 epoch_pbar.update(1)
-                epoch_pbar.set_postfix(loss=f"{loss:.4f}")
+                postfix = {"loss": f"{loss:.4f}"}
+                if "value_mse" in metrics:
+                    postfix["mse"] = f"{float(metrics['value_mse']):.6f}"
+                if "accuracy" in metrics:
+                    postfix["acc"] = f"{float(metrics['accuracy']):.2%}"
+                if "self_accuracy" in metrics:
+                    postfix["self"] = f"{float(metrics['self_accuracy']):.2%}"
+                epoch_pbar.set_postfix(postfix)
 
                 # Log step metrics
                 if self.global_step % self.wandb_config.log_every_steps == 0:
-                    self._log_step(loss)
+                    self._log_step(metrics)
 
                 # Check for pseudo-epoch boundary
                 if self.current_epoch > last_epoch:
@@ -424,8 +504,8 @@ class Trainer:
         Returns:
             Dictionary of validation metrics.
         """
-        total_loss = 0.0
-        total_correct = 0.0
+        # Accumulators for weighted averaging
+        metric_sums: dict[str, float] = {}
         total_samples = 0
 
         max_eval_steps = self.training_config.max_eval_steps
@@ -448,41 +528,73 @@ class Trainer:
             metrics = self._eval_step(self.state, batch)
 
             batch_size = batch["input"].shape[0]
-            total_loss += float(metrics["loss"]) * batch_size
-            total_correct += float(metrics["accuracy"]) * batch_size
             total_samples += batch_size
 
-        val_loss = total_loss / max(total_samples, 1)
-        val_accuracy = total_correct / max(total_samples, 1)
+            # Accumulate all metrics
+            for key, value in metrics.items():
+                if key not in metric_sums:
+                    metric_sums[key] = 0.0
+                metric_sums[key] += float(value) * batch_size
 
-        return {
-            "val_loss": val_loss,
-            "val_accuracy": val_accuracy,
-        }
+            # Update progress bar with running averages
+            postfix = {}
+            if "loss" in metric_sums:
+                postfix["loss"] = f"{metric_sums['loss'] / total_samples:.4f}"
+            if "value_mse" in metric_sums:
+                postfix["mse"] = f"{metric_sums['value_mse'] / total_samples:.6f}"
+            if "accuracy" in metric_sums:
+                postfix["acc"] = f"{metric_sums['accuracy'] / total_samples:.2%}"
+            if "self_accuracy" in metric_sums:
+                postfix["self"] = f"{metric_sums['self_accuracy'] / total_samples:.2%}"
+            val_iterator.set_postfix(postfix)
+
+        # Average all metrics
+        result = {}
+        for key, total in metric_sums.items():
+            result[f"val_{key}"] = total / max(total_samples, 1)
+
+        return result
 
     def _should_save_checkpoint(self) -> bool:
         """Check if we should save a checkpoint this pseudo-epoch."""
         return (self.current_epoch + 1) % self.checkpoint_config.save_every_epochs == 0
 
-    def _log_step(self, loss: float) -> None:
-        """Log metrics for a training step."""
+    def _log_step(self, metrics: dict[str, jax.Array]) -> None:
+        """Log metrics for a training step.
+
+        Args:
+            metrics: Dictionary of metrics from training step.
+        """
         if self._wandb_run is not None:
             import wandb
 
             # Get current learning rate from optimizer state
-            # This is a simplified version - full implementation would
-            # extract from the optax state
             lr = self._get_current_lr()
 
-            wandb.log(
-                {
-                    "train/loss": loss,
-                    "train/learning_rate": lr,
-                    "train/global_step": self.global_step,
-                    "train/epoch": self.current_epoch,
-                },
-                step=self.global_step,
-            )
+            log_dict = {
+                "train/loss": float(metrics["loss"]),
+                "train/learning_rate": lr,
+                "train/global_step": self.global_step,
+                "train/epoch": self.current_epoch,
+            }
+
+            # Add per-head losses
+            if "value_loss" in metrics:
+                log_dict["train/value_loss"] = float(metrics["value_loss"])
+            if "self_loss" in metrics:
+                log_dict["train/self_loss"] = float(metrics["self_loss"])
+
+            # Add value metrics
+            if "value_mse" in metrics:
+                log_dict["train/value_mse"] = float(metrics["value_mse"])
+            if "accuracy" in metrics:
+                log_dict["train/accuracy"] = float(metrics["accuracy"])
+
+            # Add self head metrics
+            if "self_accuracy" in metrics:
+                log_dict["train/self_accuracy"] = float(metrics["self_accuracy"])
+
+            wandb.log(log_dict, step=self.global_step)
 
     def _get_current_lr(self) -> float:
         """Get current learning rate from optimizer state."""

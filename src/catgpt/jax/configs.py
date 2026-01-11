@@ -9,6 +9,26 @@ from typing import Any
 
 
 @dataclass
+class JaxOutputHeadConfig:
+    """Configuration for output heads.
+
+    The model can have multiple output heads for different tasks:
+    - self_head: Token reconstruction (auxiliary task for stability)
+    - value_head: Win probability prediction (primary task)
+
+    Loss weights control the contribution of each head to the total loss.
+    """
+
+    # Head enable flags
+    self_head: bool = True  # Token reconstruction (auxiliary task)
+    value_head: bool = True  # Win probability
+
+    # Loss weights
+    self_weight: float = 0.1  # Usually lower than primary task
+    value_weight: float = 1.0
+
+
+@dataclass
 class JaxModelConfig:
     """Configuration for JAX model architecture."""
 
@@ -22,6 +42,9 @@ class JaxModelConfig:
     activation: str = "gelu"
     dropout_rate: float = 0.0  # JAX models often use explicit dropout
 
+    # Output head configuration
+    output_heads: JaxOutputHeadConfig = field(default_factory=JaxOutputHeadConfig)
+
     def __post_init__(self) -> None:
         """Set defaults and validate."""
         if self.ff_dim is None:
@@ -30,6 +53,10 @@ class JaxModelConfig:
         if self.hidden_size % self.num_heads != 0:
             msg = f"hidden_size ({self.hidden_size}) must be divisible by num_heads ({self.num_heads})"
             raise ValueError(msg)
+
+        # Convert dict to JaxOutputHeadConfig if needed (for YAML loading)
+        if isinstance(self.output_heads, dict):
+            self.output_heads = JaxOutputHeadConfig(**self.output_heads)
 
 
 @dataclass
