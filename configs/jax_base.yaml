@@ -83,7 +83,7 @@ checkpoint:
 
 # Weights & Biases logging
 wandb:
-  enabled: false
+  enabled: true
   project: "catgpt-jax"
   entity: null  # Your W&B username or team
   run_name: null  # Auto-generated if null

@@ -24,6 +24,8 @@ Usage:
     uv run python scripts/train_jax.py training.max_steps=100 training.steps_per_epoch=50
 """
 
+from pathlib import Path
+
 import hydra
 import jax
 import jax.numpy as jnp
@@ -46,7 +48,7 @@ from catgpt.jax.configs import (
 )
 from catgpt.jax.data.dataloader import create_dataloader
 from catgpt.jax.models.transformer import BidirectionalTransformer, TransformerConfig
-from catgpt.jax.optimizers.factory import create_optimizer_with_gradient_clipping
+from catgpt.jax.optimizers.factory import create_lr_schedule, create_optimizer_with_gradient_clipping
 from catgpt.jax.training.trainer import Trainer
 
 
@@ -75,6 +77,26 @@ def setup_logging_jax(level: str = "INFO") -> None:
     )
 
 
+def prompt_run_name() -> str:
+    """Prompt user for a run name to organize checkpoints.
+
+    Returns:
+        The run name entered by the user.
+    """
+    print("\n" + "=" * 50)
+    print("CatGPT JAX Training")
+    print("=" * 50)
+    run_name = input("Enter run name: ").strip()
+    if not run_name:
+        raise ValueError("Run name cannot be empty")
+    # Sanitize: replace spaces with underscores, remove problematic chars
+    run_name = run_name.replace(" ", "_")
+    run_name = "".join(c for c in run_name if c.isalnum() or c in "_-")
+    print(f"Checkpoints will be saved to: checkpoints_jax/{run_name}/")
+    print("=" * 50 + "\n")
+    return run_name
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="jax_base")
 def main(cfg: DictConfig) -> None:
     """Main JAX training entry point.
@@ -82,9 +104,13 @@ def main(cfg: DictConfig) -> None:
     Args:
         cfg: Hydra configuration.
     """
+    # Prompt for run name first (before any logging setup)
+    run_name = prompt_run_name()
+
     # Setup logging
     setup_logging_jax(level=cfg.get("logging", {}).get("level", "INFO"))
     logger.info("Starting CatGPT JAX training")
+    logger.info(f"Run name: {run_name}")
     logger.info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
 
     # Log JAX device info
@@ -99,6 +125,15 @@ def main(cfg: DictConfig) -> None:
     # Convert OmegaConf to typed config
     config_dict = OmegaConf.to_container(cfg, resolve=True)
     experiment_config = jax_config_from_dict(config_dict)  # type: ignore[arg-type]
+
+    # Update checkpoint directory with run name
+    base_checkpoint_dir = experiment_config.checkpoint.dir
+    experiment_config.checkpoint.dir = Path(base_checkpoint_dir) / run_name
+    logger.info(f"Checkpoint directory: {experiment_config.checkpoint.dir}")
+
+    # Use run name for WandB if not already set
+    if experiment_config.wandb.run_name is None:
+        experiment_config.wandb.run_name = run_name
 
     # Create model config
     model_cfg = experiment_config.model
@@ -127,6 +162,13 @@ def main(cfg: DictConfig) -> None:
 
     param_count = sum(p.size for p in jax.tree_util.tree_leaves(params))
     logger.info(f"Model parameters: {param_count:,}")
+
+    # Create learning rate schedule (for WandB logging)
+    lr_schedule = create_lr_schedule(
+        experiment_config.optimizer.learning_rate,
+        experiment_config.scheduler,
+        total_steps=experiment_config.training.max_steps,
+    )
 
     # Create optimizer with gradient clipping
     optimizer = create_optimizer_with_gradient_clipping(
@@ -195,6 +237,7 @@ def main(cfg: DictConfig) -> None:
         model_config=model_cfg,
         tokenizer_config=tokenizer_cfg,
         full_config=experiment_config,
+        lr_schedule=lr_schedule,
         rng=rng,
     )
 

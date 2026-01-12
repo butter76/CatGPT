@@ -70,6 +70,7 @@ class Trainer:
         model_config: "JaxModelConfig | None" = None,
         tokenizer_config: "JaxTokenizerConfig | None" = None,
         full_config: "JaxExperimentConfig | None" = None,
+        lr_schedule: optax.Schedule | float | None = None,
         rng: jax.Array | None = None,
     ) -> None:
         """Initialize the trainer.
@@ -86,6 +87,7 @@ class Trainer:
             model_config: Model config to save with checkpoints.
             tokenizer_config: Tokenizer config to save with checkpoints.
             full_config: Full experiment config for W&B logging.
+            lr_schedule: Learning rate schedule for accurate WandB logging.
             rng: PRNG key for randomness. If None, uses jax.random.key(0).
         """
         self.training_config = training_config
@@ -94,6 +96,7 @@ class Trainer:
         self.model_config = model_config
         self.tokenizer_config = tokenizer_config
         self.full_config = full_config
+        self.lr_schedule = lr_schedule
 
         self.model = model
         self.train_dataloader = train_dataloader
@@ -597,7 +600,12 @@ class Trainer:
             wandb.log(log_dict, step=self.global_step)
 
     def _get_current_lr(self) -> float:
-        """Get current learning rate from optimizer state."""
+        """Get current learning rate from schedule or optimizer state."""
+        # Use the schedule if provided (most accurate)
+        if self.lr_schedule is not None:
+            if callable(self.lr_schedule):
+                return float(self.lr_schedule(self.global_step))
+            return float(self.lr_schedule)
         # Try to extract from hyperparams if available
         opt_state = self.state.opt_state
         if hasattr(opt_state, "hyperparams") and "learning_rate" in opt_state.hyperparams:

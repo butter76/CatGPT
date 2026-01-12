@@ -31,7 +31,7 @@ def create_optimizer(
     name = config.name.lower()
 
     # Get learning rate (possibly with schedule)
-    learning_rate = _create_learning_rate(
+    learning_rate = create_lr_schedule(
         config.learning_rate, scheduler_config, total_steps
     )
 
@@ -65,7 +65,7 @@ def create_optimizer(
     raise ValueError(msg)
 
 
-def _create_learning_rate(
+def create_lr_schedule(
     base_lr: float,
     scheduler_config: "JaxSchedulerConfig | None",
     total_steps: int | None,
