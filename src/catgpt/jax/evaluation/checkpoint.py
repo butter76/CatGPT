@@ -36,13 +36,16 @@ class LoadedCheckpoint:
     checkpoint_path: Path
 
 
-def load_checkpoint(path: Path | str) -> LoadedCheckpoint:
+def load_checkpoint(path: Path | str, *, evaluation: bool = True) -> LoadedCheckpoint:
     """Load a model checkpoint from a directory.
 
     Supports both Orbax and simple msgpack checkpoint formats.
 
     Args:
         path: Path to the checkpoint directory containing params and config files.
+        evaluation: If True (default), prefer EMA params for SPlus optimizer checkpoints
+            (better for inference/evaluation). If False, load regular training params
+            (use this when resuming training).
 
     Returns:
         LoadedCheckpoint containing model, params, and configs.
@@ -57,7 +60,7 @@ def load_checkpoint(path: Path | str) -> LoadedCheckpoint:
         msg = f"Checkpoint directory not found: {path}"
         raise FileNotFoundError(msg)
 
-    logger.info(f"Loading checkpoint from {path}")
+    logger.info(f"Loading checkpoint from {path} (evaluation={evaluation})")
 
     # Load model config
     model_config = _load_model_config(path)
@@ -80,7 +83,7 @@ def load_checkpoint(path: Path | str) -> LoadedCheckpoint:
     model = BidirectionalTransformer(config=transformer_config)
 
     # Load parameters
-    params = _load_params(path, model, tokenizer_config.sequence_length)
+    params = _load_params(path, model, tokenizer_config.sequence_length, evaluation=evaluation)
 
     logger.info(f"Loaded checkpoint with {_count_params(params):,} parameters")
 
@@ -154,37 +157,56 @@ def _load_tokenizer_config(path: Path) -> JaxTokenizerConfig:
     return JaxTokenizerConfig()
 
 
-def _load_params(path: Path, model: BidirectionalTransformer, seq_length: int) -> dict:
+def _load_params(
+    path: Path,
+    model: BidirectionalTransformer,
+    seq_length: int,
+    *,
+    evaluation: bool = True,
+) -> dict:
     """Load model parameters from checkpoint directory.
 
-    For SPlus optimizer checkpoints, prefers EMA params (stored separately) over
-    training params. EMA params are the bias-corrected exponential moving average
-    which should be used for evaluation/inference.
+    Args:
+        path: Checkpoint directory path.
+        model: Model instance (needed for msgpack deserialization).
+        seq_length: Sequence length for dummy input creation.
+        evaluation: If True, prefer EMA params for SPlus optimizer checkpoints
+            (better for inference). If False, load regular training params.
 
-    Tries Orbax format first, then falls back to simple msgpack format.
+    Returns:
+        Model parameters as a pytree dict.
+
+    Raises:
+        FileNotFoundError: If no valid checkpoint found.
     """
-    # First check for SPlus EMA params (preferred for evaluation)
-    # Try Orbax format
-    ema_params_dir = path / "ema_params"
-    if ema_params_dir.exists():
-        logger.info("Loading SPlus EMA params (Orbax format)")
-        return _load_params_orbax(ema_params_dir)
+    # For evaluation, prefer EMA params (SPlus optimizer stores these separately)
+    if evaluation:
+        # Try Orbax format for EMA params
+        ema_params_dir = path / "ema_params"
+        if ema_params_dir.exists():
+            logger.info("Loading SPlus EMA params (Orbax format)")
+            return _load_params_orbax(ema_params_dir)
 
-    # Try simple msgpack format for EMA params
-    ema_msgpack_path = path / "ema_params.msgpack"
-    if ema_msgpack_path.exists():
-        logger.info("Loading SPlus EMA params (msgpack format)")
-        return _load_params_msgpack(ema_msgpack_path, model, seq_length)
+        # Try simple msgpack format for EMA params
+        ema_msgpack_path = path / "ema_params.msgpack"
+        if ema_msgpack_path.exists():
+            logger.info("Loading SPlus EMA params (msgpack format)")
+            return _load_params_msgpack(ema_msgpack_path, model, seq_length)
 
-    # Fall back to regular params
+        # Fall through to regular params if no EMA params found
+        logger.debug("No EMA params found, falling back to regular params")
+
+    # Load regular training params
     # Try Orbax format (params/ directory)
     params_dir = path / "params"
     if params_dir.exists():
+        logger.info("Loading params (Orbax format)")
         return _load_params_orbax(params_dir)
 
     # Try simple msgpack format
     msgpack_path = path / "params.msgpack"
     if msgpack_path.exists():
+        logger.info("Loading params (msgpack format)")
         return _load_params_msgpack(msgpack_path, model, seq_length)
 
     # Try flax checkpoint format
@@ -193,6 +215,7 @@ def _load_params(path: Path, model: BidirectionalTransformer, seq_length: int) -
 
         params = checkpoints.restore_checkpoint(path, target=None, prefix="params_")
         if params is not None:
+            logger.info("Loading params (flax checkpoint format)")
             return params
     except Exception:
         pass

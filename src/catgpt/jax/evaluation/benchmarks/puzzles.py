@@ -21,8 +21,8 @@ class Puzzle:
         id: Unique puzzle identifier.
         rating: Puzzle difficulty rating.
         fen: Starting position in FEN notation.
-        moves: List of UCI moves. Odd indices (0, 2, 4, ...) are opponent moves,
-               even indices (1, 3, 5, ...) are the moves the engine must find.
+        moves: List of UCI moves. Even indices (0, 2, 4, ...) are opponent moves,
+               odd indices (1, 3, 5, ...) are the moves the engine must find.
     """
 
     id: str
