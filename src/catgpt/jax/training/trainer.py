@@ -17,6 +17,8 @@ from loguru import logger
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
+from catgpt.jax.optimizers.splus import splus_get_eval_params
+
 # dtype mapping for mixed precision
 DTYPE_MAP = {
     "float32": jnp.float32,
@@ -97,6 +99,12 @@ class Trainer:
         self.tokenizer_config = tokenizer_config
         self.full_config = full_config
         self.lr_schedule = lr_schedule
+
+        # Check if using SPlus optimizer (requires different eval params)
+        self.use_splus = (
+            full_config is not None
+            and full_config.optimizer.name.lower() == "splus"
+        )
 
         self.model = model
         self.train_dataloader = train_dataloader
@@ -295,7 +303,7 @@ class Trainer:
         """Perform a single evaluation step (implementation).
 
         Args:
-            state: Current train state.
+            state: Train state (params may be EMA params for SPlus).
             batch: Batch with 'input' (tokens) and 'target' (HL-Gauss distribution).
 
         Returns:
@@ -501,12 +509,60 @@ class Trainer:
             )
             self._cleanup_old_checkpoints()
 
+    def get_eval_params(self) -> dict:
+        """Get parameters for evaluation.
+
+        For SPlus optimizer, returns EMA-corrected parameters.
+        For other optimizers, returns the regular params.
+
+        Returns:
+            Parameters to use for evaluation.
+        """
+        if self.use_splus:
+            splus_state = self._find_splus_state(self.state.opt_state)
+            if splus_state is None:
+                logger.warning("Could not find SPlusState in opt_state, using regular params")
+                return self.state.params
+            return splus_get_eval_params(splus_state)
+        return self.state.params
+
+    def _find_splus_state(self, opt_state):
+        """Recursively find SPlusState in the optimizer state tree.
+
+        The optimizer may be wrapped with gradient clipping, so the structure
+        varies. This function searches for the SPlusState which has the 'ema'
+        attribute needed for evaluation.
+
+        Args:
+            opt_state: Optimizer state (potentially nested tuple).
+
+        Returns:
+            SPlusState if found, None otherwise.
+        """
+        from catgpt.jax.optimizers.splus import SPlusState
+
+        # Check if this is the SPlusState
+        if isinstance(opt_state, SPlusState):
+            return opt_state
+
+        # If it's a tuple/list, search recursively
+        if isinstance(opt_state, (tuple, list)):
+            for item in opt_state:
+                result = self._find_splus_state(item)
+                if result is not None:
+                    return result
+
+        return None
+
     def _eval(self) -> dict[str, float]:
         """Run evaluation on validation set.
 
         Returns:
             Dictionary of validation metrics.
         """
+        # Get eval params (EMA for SPlus, regular params otherwise)
+        eval_params = self.get_eval_params()
+
         # Accumulators for weighted averaging
         metric_sums: dict[str, float] = {}
         total_samples = 0
@@ -521,6 +577,9 @@ class Trainer:
             total=max_eval_steps,
         )
 
+        # Create eval state with appropriate params (EMA for SPlus)
+        eval_state = self.state.replace(params=eval_params)
+
         for step_idx, batch in enumerate(val_iterator):
             if max_eval_steps is not None and step_idx >= max_eval_steps:
                 break
@@ -528,7 +587,7 @@ class Trainer:
             # Convert to JAX arrays
             batch = {k: jnp.array(v) for k, v in batch.items()}
 
-            metrics = self._eval_step(self.state, batch)
+            metrics = self._eval_step(eval_state, batch)
 
             batch_size = batch["input"].shape[0]
             total_samples += batch_size
@@ -714,6 +773,15 @@ class Trainer:
                     self.state.opt_state,
                     force=True,  # Allow overwriting existing checkpoints
                 )
+
+            # For SPlus, also save the EMA params for inference use
+            if self.use_splus:
+                ema_params = self.get_eval_params()
+                checkpointer.save(
+                    path / "ema_params",
+                    ema_params,
+                    force=True,
+                )
         except ImportError:
             logger.warning("Orbax not installed, falling back to simple checkpointing")
             self._save_checkpoint_simple(path)
@@ -728,6 +796,12 @@ class Trainer:
         if self.checkpoint_config.save_optimizer:
             with (path / "opt_state.msgpack").open("wb") as f:
                 f.write(to_bytes(self.state.opt_state))
+
+        # For SPlus, also save the EMA params for inference use
+        if self.use_splus:
+            ema_params = self.get_eval_params()
+            with (path / "ema_params.msgpack").open("wb") as f:
+                f.write(to_bytes(ema_params))
 
     def load_checkpoint(self, path: Path | str) -> None:
         """Load a training checkpoint to resume training.

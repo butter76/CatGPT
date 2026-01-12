@@ -157,8 +157,26 @@ def _load_tokenizer_config(path: Path) -> JaxTokenizerConfig:
 def _load_params(path: Path, model: BidirectionalTransformer, seq_length: int) -> dict:
     """Load model parameters from checkpoint directory.
 
+    For SPlus optimizer checkpoints, prefers EMA params (stored separately) over
+    training params. EMA params are the bias-corrected exponential moving average
+    which should be used for evaluation/inference.
+
     Tries Orbax format first, then falls back to simple msgpack format.
     """
+    # First check for SPlus EMA params (preferred for evaluation)
+    # Try Orbax format
+    ema_params_dir = path / "ema_params"
+    if ema_params_dir.exists():
+        logger.info("Loading SPlus EMA params (Orbax format)")
+        return _load_params_orbax(ema_params_dir)
+
+    # Try simple msgpack format for EMA params
+    ema_msgpack_path = path / "ema_params.msgpack"
+    if ema_msgpack_path.exists():
+        logger.info("Loading SPlus EMA params (msgpack format)")
+        return _load_params_msgpack(ema_msgpack_path, model, seq_length)
+
+    # Fall back to regular params
     # Try Orbax format (params/ directory)
     params_dir = path / "params"
     if params_dir.exists():

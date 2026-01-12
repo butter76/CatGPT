@@ -15,7 +15,7 @@ class SPlusState(NamedTuple):
     ema_rate: float
 
 def splus_get_eval_params(state):
-    ema_hat = jax.tree_map(lambda e: e / (1 - state.ema_rate ** state.step), state.ema)
+    ema_hat = jax.tree.map(lambda e: e / (1 - state.ema_rate ** state.step), state.ema)
     return ema_hat
 
 def splus(
@@ -43,12 +43,12 @@ def splus(
                 return [jnp.zeros((d, d)) if d < max_dim
                         else None for d in p.shape]
             return None
-        sides = jax.tree_map(sides_decomp, params)
+        sides = jax.tree.map(sides_decomp, params)
         def qs_decomp(p):
             if len(p.shape) == 2:
                 return [jnp.eye(d) if d < max_dim
                         else None for d in p.shape]
-        q_sides = jax.tree_map(qs_decomp, params)
+        q_sides = jax.tree.map(qs_decomp, params)
         step = 0
         return SPlusState(ema, momentum, sides, q_sides, step, ema_rate)
 
@@ -91,10 +91,10 @@ def splus(
                 tensor_shapes[p.shape] = tensor_shapes.get(p.shape, 0) + 1
                 return jax.device_put(p, devices[idx])
             sides = jax.experimental.multihost_utils.process_allgather(sides)
-            sides = jax.tree_map(put_device_staggered, sides)
-        q_sides = jax.tree_map(get_eigvecs, sides)
+            sides = jax.tree.map(put_device_staggered, sides)
+        q_sides = jax.tree.map(get_eigvecs, sides)
         if jit_broadcast_computation:
-            q_sides = jax.tree_map(lambda _, x: jax.device_get(x), sides, q_sides)
+            q_sides = jax.tree.map(lambda _, x: jax.device_get(x), sides, q_sides)
             if jit_original_sharding is not None:
                 q_sides = jax.jit(lambda x: x, out_shardings=jit_original_sharding.q_sides)(q_sides)
         return q_sides
@@ -103,12 +103,12 @@ def splus(
         step = state.step + 1
 
         # Rotate to eigenbasis, take sign, unrotate.
-        momentum = jax.tree_map(lambda m, g: b1 * m + (1 - b1) * g, state.momentum, grads)
-        momentum_rot = jax.tree_map(rot, momentum, state.q_sides)
-        updates_rot = jax.tree_map(lambda m: jnp.sign(m), momentum_rot)
-        updates = jax.tree_map(unrot, updates_rot, state.q_sides)
-        sides = jax.tree_map(update_sides, grads, state.sides)
-        ema = jax.tree_map(lambda e, g: ema_rate * e + (1 - ema_rate) * g, state.ema, params)
+        momentum = jax.tree.map(lambda m, g: b1 * m + (1 - b1) * g, state.momentum, grads)
+        momentum_rot = jax.tree.map(rot, momentum, state.q_sides)
+        updates_rot = jax.tree.map(lambda m: jnp.sign(m), momentum_rot)
+        updates = jax.tree.map(unrot, updates_rot, state.q_sides)
+        sides = jax.tree.map(update_sides, grads, state.sides)
+        ema = jax.tree.map(lambda e, g: ema_rate * e + (1 - ema_rate) * g, state.ema, params)
 
         # Every `inverse_every` steps, we update the inverse eigendecomposition.
         do_inverse = (step % inverse_every == 0) | (step == 1)

@@ -27,8 +27,8 @@ tokenizer:
 
 # Optimizer configuration
 optimizer:
-  name: "adamw"  # Options: "adamw", "splus", "sgd"
-  learning_rate: 5.0e-4
+  name: "splus"  # Options: "adamw", "splus", "sgd"
+  learning_rate: 0.12
   weight_decay: 0.01
   # AdamW/SGD specific
   b1: 0.9
@@ -83,7 +83,7 @@ checkpoint:
 
 # Weights & Biases logging
 wandb:
-  enabled: true
+  enabled: false
   project: "catgpt-jax"
   entity: null  # Your W&B username or team
   run_name: null  # Auto-generated if null
