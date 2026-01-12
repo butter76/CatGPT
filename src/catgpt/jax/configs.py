@@ -145,6 +145,11 @@ class JaxDataConfig:
     prefetch_factor: int = 2
     seed: int = 42  # Random seed for data shuffling
 
+    # GPU prefetch: number of batches to keep ready on GPU
+    # Overlaps CPU→GPU transfer with computation. 2 is usually optimal.
+    # Set to 0 to disable (synchronous transfer).
+    gpu_prefetch_count: int = 2
+
 
 @dataclass
 class JaxCheckpointConfig:

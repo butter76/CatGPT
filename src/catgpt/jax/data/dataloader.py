@@ -1,8 +1,11 @@
 """DataLoader utilities for JAX training using PyGrain."""
 
+from collections import deque
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 import grain.python as pygrain
+import jax
 import numpy as np
 from scipy import special as scipy_special
 
@@ -227,6 +230,77 @@ def create_grain_dataloader(
     )
 
     return dataloader
+
+
+def prefetch_to_device(
+    iterator: Iterator[dict[str, np.ndarray]],
+    device: jax.Device | None = None,
+    prefetch_count: int = 2,
+) -> Iterator[dict[str, jax.Array]]:
+    """Prefetch batches to GPU using a background thread.
+
+    Uses a dedicated thread to continuously transfer batches to GPU,
+    overlapping CPU→GPU transfer with GPU computation.
+
+    Args:
+        iterator: Source iterator yielding numpy batch dicts.
+        device: Target JAX device. Defaults to first GPU/TPU.
+        prefetch_count: Number of batches to keep prefetched on device.
+            2 is usually sufficient for full overlap.
+
+    Yields:
+        Batches as JAX arrays already on the target device.
+
+    Example:
+        >>> data_iter = prefetch_to_device(dataloader, prefetch_count=2)
+        >>> for batch in data_iter:
+        ...     # batch is already on GPU, no transfer wait
+        ...     train_step(batch)
+    """
+    import queue
+    import threading
+
+    if prefetch_count < 1:
+        # No prefetching - just transfer synchronously
+        for batch in iterator:
+            yield jax.tree.map(lambda x: jax.device_put(x, device), batch)
+        return
+
+    device = device or jax.devices()[0]
+
+    # Thread-safe queue for GPU batches
+    # maxsize ensures backpressure if consumer is slow
+    batch_queue: queue.Queue[dict[str, jax.Array] | None] = queue.Queue(
+        maxsize=prefetch_count
+    )
+
+    def transfer_batch(batch: dict[str, np.ndarray]) -> dict[str, jax.Array]:
+        """Transfer a batch to device."""
+        return jax.tree.map(lambda x: jax.device_put(x, device), batch)
+
+    def prefetch_thread():
+        """Background thread that transfers batches to GPU."""
+        try:
+            for batch in iterator:
+                gpu_batch = transfer_batch(batch)
+                batch_queue.put(gpu_batch)  # Blocks if queue full
+        finally:
+            # Signal end of data
+            batch_queue.put(None)
+
+    # Start background prefetch thread
+    thread = threading.Thread(target=prefetch_thread, daemon=True)
+    thread.start()
+
+    # Yield batches as they become available
+    while True:
+        batch = batch_queue.get()  # Blocks until batch ready
+        if batch is None:
+            break
+        yield batch
+
+    # Ensure thread completes
+    thread.join()
 
 
 def create_dataloader(

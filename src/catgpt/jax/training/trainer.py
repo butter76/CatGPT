@@ -198,10 +198,29 @@ class Trainer:
         except Exception as e:
             logger.warning(f"Failed to initialize W&B: {e}")
 
-    def _infinite_dataloader(self) -> Iterator[dict[str, np.ndarray]]:
-        """Create an infinite iterator over the training dataloader."""
-        while True:
-            yield from self.train_dataloader
+    def _infinite_dataloader(self) -> Iterator[dict[str, jax.Array]]:
+        """Create an infinite iterator over the training dataloader with GPU prefetch.
+
+        Uses async double-buffering to overlap CPU→GPU transfer with computation.
+        """
+        from catgpt.jax.data.dataloader import prefetch_to_device
+
+        gpu_prefetch_count = (
+            self.full_config.data.gpu_prefetch_count
+            if self.full_config is not None
+            else 2
+        )
+
+        def infinite_iter():
+            while True:
+                yield from self.train_dataloader
+
+        # Wrap with GPU prefetching for async transfer
+        yield from prefetch_to_device(
+            infinite_iter(),
+            device=self.local_devices[0],
+            prefetch_count=gpu_prefetch_count,
+        )
 
     def _train_step_impl(
         self,
@@ -413,11 +432,8 @@ class Trainer:
         accumulation_count = 0
 
         while self.global_step < max_steps:
-            # Get next batch
+            # Get next batch (already on GPU via prefetch_to_device)
             batch = next(data_iter)
-
-            # Convert to JAX arrays
-            batch = {k: jnp.array(v) for k, v in batch.items()}
 
             # Training step
             self.state, metrics = self._train_step(self.state, batch)
@@ -560,6 +576,8 @@ class Trainer:
         Returns:
             Dictionary of validation metrics.
         """
+        from catgpt.jax.data.dataloader import prefetch_to_device
+
         # Get eval params (EMA for SPlus, regular params otherwise)
         eval_params = self.get_eval_params()
 
@@ -569,8 +587,20 @@ class Trainer:
 
         max_eval_steps = self.training_config.max_eval_steps
 
+        # Wrap validation dataloader with GPU prefetch
+        gpu_prefetch_count = (
+            self.full_config.data.gpu_prefetch_count
+            if self.full_config is not None
+            else 2
+        )
+        prefetched_val = prefetch_to_device(
+            iter(self.val_dataloader),
+            device=self.local_devices[0],
+            prefetch_count=gpu_prefetch_count,
+        )
+
         val_iterator = tqdm(
-            self.val_dataloader,
+            prefetched_val,
             desc="Validation",
             unit="batch",
             leave=False,
@@ -584,9 +614,7 @@ class Trainer:
             if max_eval_steps is not None and step_idx >= max_eval_steps:
                 break
 
-            # Convert to JAX arrays
-            batch = {k: jnp.array(v) for k, v in batch.items()}
-
+            # Batch is already on GPU via prefetch_to_device
             metrics = self._eval_step(eval_state, batch)
 
             batch_size = batch["input"].shape[0]

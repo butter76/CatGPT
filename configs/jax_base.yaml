@@ -27,7 +27,7 @@ tokenizer:
 
 # Optimizer configuration
 optimizer:
-  name: "splus"  # Options: "adamw", "splus", "sgd"
+  name: "adamw"  # Options: "adamw", "splus", "sgd"
   learning_rate: 0.12
   weight_decay: 0.01
   # AdamW/SGD specific
@@ -72,6 +72,8 @@ data:
   num_workers: 4
   prefetch_factor: 10
   seed: 42
+  # GPU prefetch: batches to keep ready on GPU (overlaps transfer with compute)
+  gpu_prefetch_count: 2
 
 # Checkpointing
 checkpoint:
