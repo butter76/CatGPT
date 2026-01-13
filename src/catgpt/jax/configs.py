@@ -53,6 +53,11 @@ class JaxModelConfig:
     activation: str = "gelu"
     dropout_rate: float = 0.0  # JAX models often use explicit dropout
 
+    # HybridNorm* variant: special treatment of first transformer block
+    # When True, first block uses Pre-Norm + QKV-Norm in attention and Pre-Norm in FFN
+    # See: https://arxiv.org/abs/2503.04598 Section 3 "Special Treatment of First Block"
+    hybridnorm_star: bool = True
+
     # Output head configuration
     output_heads: JaxOutputHeadConfig = field(default_factory=JaxOutputHeadConfig)
 

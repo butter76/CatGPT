@@ -1,4 +1,18 @@
-"""Bidirectional Transformer model for chess position evaluation (JAX/Flax)."""
+"""Bidirectional Transformer model for chess position evaluation (JAX/Flax).
+
+Uses HybridNorm architecture from "HybridNorm: Towards Stable and Efficient
+Transformer Training via Hybrid Normalization" (https://arxiv.org/abs/2503.04598).
+
+HybridNorm combines:
+- QKV Normalization in attention: per-head normalization of Q, K, V vectors for stable information flow
+- Post-Norm in FFN: FFN(Norm(x)) + Norm(x) where residual is the normalized input
+
+HybridNorm* variant (enabled via hybridnorm_star=True):
+The first transformer block receives special treatment to stabilize early training:
+- First block attention: Pre-Norm + QKV-Norm (MHA_QKV(Norm(x)) + x)
+- First block FFN: Pre-Norm (FFN(Norm(y)) + y, residual is non-normalized)
+All subsequent blocks use standard HybridNorm.
+"""
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -26,6 +40,11 @@ class TransformerConfig:
     activation: str = "gelu"
     dropout_rate: float = 0.0
 
+    # HybridNorm* variant: special treatment of first transformer block
+    # When True, first block uses Pre-Norm + QKV-Norm in attention and Pre-Norm in FFN
+    # See: https://arxiv.org/abs/2503.04598 Section 3 "Special Treatment of First Block"
+    hybridnorm_star: bool = False
+
     # Output head configuration
     output_heads: JaxOutputHeadConfig = field(default_factory=JaxOutputHeadConfig)
 
@@ -43,8 +62,87 @@ class TransformerConfig:
             object.__setattr__(self, "output_heads", JaxOutputHeadConfig(**self.output_heads))
 
 
+class QKVNormAttention(nn.Module):
+    """Multi-head attention with QKV normalization (HybridNorm).
+
+    Applies LayerNorm to Q, K, V vectors individually before computing attention.
+    This stabilizes information flow between layers without dampening the residual path.
+    """
+
+    num_heads: int
+    hidden_size: int
+    dropout_rate: float = 0.0
+    dtype: Dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, x: jax.Array, *, train: bool = False) -> jax.Array:
+        """Forward pass with QKV normalization.
+
+        Args:
+            x: Input tensor, shape (batch, seq_len, hidden_size).
+            train: Whether in training mode.
+
+        Returns:
+            Output tensor, same shape as input.
+        """
+        batch_size, seq_len, _ = x.shape
+        head_dim = self.hidden_size // self.num_heads
+
+        # Project to Q, K, V
+        q = nn.Dense(self.hidden_size, dtype=self.dtype, name="query")(x)
+        k = nn.Dense(self.hidden_size, dtype=self.dtype, name="key")(x)
+        v = nn.Dense(self.hidden_size, dtype=self.dtype, name="value")(x)
+
+        # Reshape to (batch, seq_len, num_heads, head_dim) BEFORE normalization
+        # This is critical for HybridNorm: normalize per-head, not across all heads
+        q = q.reshape(batch_size, seq_len, self.num_heads, head_dim)
+        k = k.reshape(batch_size, seq_len, self.num_heads, head_dim)
+        v = v.reshape(batch_size, seq_len, self.num_heads, head_dim)
+
+        # QKV Normalization: normalize each head independently (per-head norm)
+        # LayerNorm in float32 for numerical stability, operates on last dim (head_dim)
+        q = nn.LayerNorm(dtype=jnp.float32, name="q_norm")(q.astype(jnp.float32)).astype(self.dtype)
+        k = nn.LayerNorm(dtype=jnp.float32, name="k_norm")(k.astype(jnp.float32)).astype(self.dtype)
+        v = nn.LayerNorm(dtype=jnp.float32, name="v_norm")(v.astype(jnp.float32)).astype(self.dtype)
+
+        # Transpose to (batch, num_heads, seq_len, head_dim) for attention
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+
+        # Scaled dot-product attention
+        scale = head_dim**-0.5
+        attn_weights = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
+        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+        attn_weights = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(attn_weights)
+
+        # Apply attention to values
+        attn_out = jnp.einsum("bhqk,bhkd->bhqd", attn_weights, v)
+
+        # Reshape back to (batch, seq_len, hidden_size)
+        attn_out = attn_out.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, self.hidden_size)
+
+        # Output projection
+        attn_out = nn.Dense(self.hidden_size, dtype=self.dtype, name="out_proj")(attn_out)
+        attn_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(attn_out)
+
+        return attn_out
+
+
 class TransformerBlock(nn.Module):
-    """Single transformer encoder block with bidirectional attention."""
+    """Single transformer encoder block with HybridNorm architecture.
+
+    HybridNorm combines:
+    - QKV Normalization in attention: per-head LayerNorm on Q/K/V after reshape
+    - Post-Norm in FFN: FFN(Norm(x)) + Norm(x), residual is the normalized input
+
+    HybridNorm* (first block only, when is_first_block=True):
+    - Pre-Norm + QKV Normalization in attention: Norm before MHA input, plus QKV-Norm
+    - Pre-Norm in FFN: FFN(Norm(x)) + x, residual is the original (non-normalized) input
+
+    This provides stable training (from QKV norm) while maintaining effective
+    depth and strong performance (from the FFN normalization structure).
+    """
 
     hidden_size: int
     num_heads: int
@@ -52,6 +150,7 @@ class TransformerBlock(nn.Module):
     activation: str = "gelu"
     dropout_rate: float = 0.0
     dtype: Dtype = jnp.float32  # Compute dtype for mixed precision
+    is_first_block: bool = False  # Enable HybridNorm* treatment for first block
 
     def _get_activation(self) -> callable:
         """Get activation function by name."""
@@ -68,7 +167,7 @@ class TransformerBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array, *, train: bool = False) -> jax.Array:
-        """Forward pass with pre-norm architecture.
+        """Forward pass with HybridNorm architecture.
 
         Args:
             x: Input tensor, shape (batch, seq_len, hidden_size).
@@ -77,26 +176,55 @@ class TransformerBlock(nn.Module):
         Returns:
             Output tensor, same shape as input.
         """
-        # Self-attention with residual (NO causal mask = bidirectional)
-        # LayerNorm in float32 for numerical stability, then cast back
-        normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
-        attn_out = nn.MultiHeadDotProductAttention(
-            num_heads=self.num_heads,
-            qkv_features=self.hidden_size,
-            deterministic=not train,
-            dropout_rate=self.dropout_rate,
-            dtype=self.dtype,
-        )(normed, normed)
-        x = x + attn_out
+        if self.is_first_block:
+            # === HybridNorm* First Block ===
+            # Attention: Pre-Norm + QKV-Norm
+            # Y^0 = MHA_QKV(Norm(X^0)) + X^0
+            attn_input = nn.LayerNorm(dtype=jnp.float32, name="attn_norm")(
+                x.astype(jnp.float32)
+            ).astype(self.dtype)
+            attn_out = QKVNormAttention(
+                num_heads=self.num_heads,
+                hidden_size=self.hidden_size,
+                dropout_rate=self.dropout_rate,
+                dtype=self.dtype,
+            )(attn_input, train=train)
+            y = x + attn_out  # Residual is original x
 
-        # Feed-forward with residual
-        normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
-        ff_out = nn.Dense(self.ff_dim, dtype=self.dtype)(normed)
-        ff_out = self._get_activation()(ff_out)
-        ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
-        ff_out = nn.Dense(self.hidden_size, dtype=self.dtype)(ff_out)
-        ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
-        x = x + ff_out
+            # FFN: Pre-Norm (residual is y, not normalized y)
+            # X^1 = FFN(Norm(Y^0)) + Y^0
+            ffn_input = nn.LayerNorm(dtype=jnp.float32, name="ffn_norm")(
+                y.astype(jnp.float32)
+            ).astype(self.dtype)
+            ff_out = nn.Dense(self.ff_dim, dtype=self.dtype)(ffn_input)
+            ff_out = self._get_activation()(ff_out)
+            ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
+            ff_out = nn.Dense(self.hidden_size, dtype=self.dtype)(ff_out)
+            ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
+            x = ff_out + y  # Residual is y (non-normalized)
+        else:
+            # === Standard HybridNorm (blocks l > 0) ===
+            # Attention with QKV Normalization (no pre-norm)
+            # Y^l = MHA_QKV(X^l) + X^l
+            attn_out = QKVNormAttention(
+                num_heads=self.num_heads,
+                hidden_size=self.hidden_size,
+                dropout_rate=self.dropout_rate,
+                dtype=self.dtype,
+            )(x, train=train)
+            x = x + attn_out
+
+            # FFN with Post-Norm: FFN(Norm(x)) + Norm(x)
+            # X^{l+1} = FFN(Norm(Y^l)) + Norm(Y^l)
+            x = nn.LayerNorm(dtype=jnp.float32, name="ffn_norm")(
+                x.astype(jnp.float32)
+            ).astype(self.dtype)
+            ff_out = nn.Dense(self.ff_dim, dtype=self.dtype)(x)
+            ff_out = self._get_activation()(ff_out)
+            ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
+            ff_out = nn.Dense(self.hidden_size, dtype=self.dtype)(ff_out)
+            ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
+            x = ff_out + x  # Residual is the normalized x
 
         return x
 
@@ -108,10 +236,12 @@ class BidirectionalTransformer(nn.Module):
     and outputs a win probability distribution. Uses full attention (no causal mask)
     since all position information is available simultaneously.
 
-    Architecture:
+    Architecture (HybridNorm):
     - Token embedding
     - Absolute (learnable) positional embedding
-    - N transformer encoder blocks
+    - N transformer encoder blocks with HybridNorm:
+        - QKV Normalization in attention
+        - Post-Norm in FFN
     - Mean pooling over sequence
     - Linear projection to HL-Gauss categorical distribution
 
@@ -171,7 +301,10 @@ class BidirectionalTransformer(nn.Module):
         hidden = (token_emb + pos_emb).astype(compute_dtype)
 
         # Pass through transformer blocks (in compute_dtype)
+        # Each block uses HybridNorm: QKV-norm in attention + FFN(Norm(x))+Norm(x) structure
+        # If hybridnorm_star is enabled, first block uses special treatment (Pre-Norm + QKV-Norm)
         for i in range(self.config.num_layers):
+            is_first_block = (i == 0) and self.config.hybridnorm_star
             hidden = TransformerBlock(
                 hidden_size=self.config.hidden_size,
                 num_heads=self.config.num_heads,
@@ -179,11 +312,12 @@ class BidirectionalTransformer(nn.Module):
                 activation=self.config.activation,
                 dropout_rate=self.config.dropout_rate,
                 dtype=compute_dtype,
+                is_first_block=is_first_block,
                 name=f"block_{i}",
             )(hidden, train=train)
 
-        # Final norm (float32 for stability)
-        hidden = nn.LayerNorm(dtype=jnp.float32)(hidden.astype(jnp.float32))
+        # Cast back to float32 for output heads (blocks end with LayerNorm in float32)
+        hidden = hidden.astype(jnp.float32)
         # hidden: (batch, seq, hidden) - per-token representations
 
         # === Output heads ===
@@ -244,6 +378,7 @@ class BidirectionalTransformer(nn.Module):
             seq_length=config.seq_length,
             activation=config.activation,
             dropout_rate=config.dropout_rate,
+            hybridnorm_star=config.hybridnorm_star,
             output_heads=config.output_heads,
         )
         return cls(config=transformer_config)
