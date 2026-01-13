@@ -44,11 +44,20 @@ class TransformerConfig:
 
 
 class TransformerBlock(nn.Module):
-    """Single transformer encoder block with bidirectional attention."""
+    """Single transformer encoder block with bidirectional attention.
+
+    Uses Mix-LN (https://arxiv.org/abs/2412.13795) which combines Post-LN for
+    early layers and Pre-LN for later layers. This ensures effective gradient
+    flow throughout the network:
+    - Post-LN in early layers: maintains larger gradients in deeper layers
+    - Pre-LN in later layers: prevents gradient vanishing in early layers
+    """
 
     hidden_size: int
     num_heads: int
     ff_dim: int
+    layer_idx: int  # Current layer index (0-indexed)
+    num_layers: int  # Total number of layers
     activation: str = "gelu"
     dropout_rate: float = 0.0
     dtype: Dtype = jnp.float32  # Compute dtype for mixed precision
@@ -66,9 +75,17 @@ class TransformerBlock(nn.Module):
             raise ValueError(msg)
         return activations[self.activation]
 
+    def _use_post_ln(self) -> bool:
+        """Determine if this layer should use Post-LN (early layers) or Pre-LN (later layers)."""
+        # Mix-LN: Post-LN for first half, Pre-LN for second half
+        return self.layer_idx < self.num_layers // 4
+
     @nn.compact
     def __call__(self, x: jax.Array, *, train: bool = False) -> jax.Array:
-        """Forward pass with pre-norm architecture.
+        """Forward pass with Mix-LN architecture.
+
+        Mix-LN applies Post-LN to early layers and Pre-LN to later layers,
+        combining the benefits of both normalization strategies.
 
         Args:
             x: Input tensor, shape (batch, seq_len, hidden_size).
@@ -77,26 +94,49 @@ class TransformerBlock(nn.Module):
         Returns:
             Output tensor, same shape as input.
         """
-        # Self-attention with residual (NO causal mask = bidirectional)
-        # LayerNorm in float32 for numerical stability, then cast back
-        normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
-        attn_out = nn.MultiHeadDotProductAttention(
-            num_heads=self.num_heads,
-            qkv_features=self.hidden_size,
-            deterministic=not train,
-            dropout_rate=self.dropout_rate,
-            dtype=self.dtype,
-        )(normed, normed)
-        x = x + attn_out
+        use_post_ln = self._use_post_ln()
 
-        # Feed-forward with residual
-        normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
-        ff_out = nn.Dense(self.ff_dim, dtype=self.dtype)(normed)
-        ff_out = self._get_activation()(ff_out)
-        ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
-        ff_out = nn.Dense(self.hidden_size, dtype=self.dtype)(ff_out)
-        ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
-        x = x + ff_out
+        if use_post_ln:
+            # Post-LN: normalize AFTER adding residual
+            # Self-attention with residual
+            attn_out = nn.MultiHeadDotProductAttention(
+                num_heads=self.num_heads,
+                qkv_features=self.hidden_size,
+                deterministic=not train,
+                dropout_rate=self.dropout_rate,
+                dtype=self.dtype,
+            )(x, x)
+            x = nn.LayerNorm(dtype=jnp.float32)((x + attn_out).astype(jnp.float32)).astype(self.dtype)
+
+            # Feed-forward with residual
+            ff_out = nn.Dense(self.ff_dim, dtype=self.dtype)(x)
+            ff_out = self._get_activation()(ff_out)
+            ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
+            ff_out = nn.Dense(self.hidden_size, dtype=self.dtype)(ff_out)
+            ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
+            x = nn.LayerNorm(dtype=jnp.float32)((x + ff_out).astype(jnp.float32)).astype(self.dtype)
+        else:
+            # Pre-LN: normalize BEFORE sublayer
+            # Self-attention with residual (NO causal mask = bidirectional)
+            # LayerNorm in float32 for numerical stability, then cast back
+            normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
+            attn_out = nn.MultiHeadDotProductAttention(
+                num_heads=self.num_heads,
+                qkv_features=self.hidden_size,
+                deterministic=not train,
+                dropout_rate=self.dropout_rate,
+                dtype=self.dtype,
+            )(normed, normed)
+            x = x + attn_out
+
+            # Feed-forward with residual
+            normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
+            ff_out = nn.Dense(self.ff_dim, dtype=self.dtype)(normed)
+            ff_out = self._get_activation()(ff_out)
+            ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
+            ff_out = nn.Dense(self.hidden_size, dtype=self.dtype)(ff_out)
+            ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
+            x = x + ff_out
 
         return x
 
@@ -171,11 +211,15 @@ class BidirectionalTransformer(nn.Module):
         hidden = (token_emb + pos_emb).astype(compute_dtype)
 
         # Pass through transformer blocks (in compute_dtype)
-        for i in range(self.config.num_layers):
+        # Uses Mix-LN: Post-LN for first half of layers, Pre-LN for second half
+        num_layers = self.config.num_layers
+        for i in range(num_layers):
             hidden = TransformerBlock(
                 hidden_size=self.config.hidden_size,
                 num_heads=self.config.num_heads,
                 ff_dim=self.config.ff_dim or (4 * self.config.hidden_size),
+                layer_idx=i,
+                num_layers=num_layers,
                 activation=self.config.activation,
                 dropout_rate=self.config.dropout_rate,
                 dtype=compute_dtype,
