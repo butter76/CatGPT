@@ -149,6 +149,7 @@ def main(cfg: DictConfig) -> None:
         seq_length=tokenizer_cfg.sequence_length,
         activation=model_cfg.activation,
         dropout_rate=model_cfg.dropout_rate,
+        hybridnorm_star=model_cfg.hybridnorm_star,
         output_heads=model_cfg.output_heads,  # Include HL-Gauss config
     )
 
