@@ -68,7 +68,15 @@ class TransformerBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array, *, train: bool = False) -> jax.Array:
-        """Forward pass with pre-norm architecture.
+        """Forward pass with Peri-LN architecture.
+
+        Peri-LN applies layer normalization peripherally around each sublayer,
+        i.e., both before (input) AND after (output) each module:
+            y = x + Norm(Module(Norm(x)))
+
+        This strikes an ideal balance in variance growth, avoiding both vanishing
+        gradients (Post-LN) and massive activations (Pre-LN).
+        See: https://arxiv.org/abs/2502.02732
 
         Args:
             x: Input tensor, shape (batch, seq_len, hidden_size).
@@ -77,8 +85,8 @@ class TransformerBlock(nn.Module):
         Returns:
             Output tensor, same shape as input.
         """
-        # Self-attention with residual (NO causal mask = bidirectional)
-        # LayerNorm in float32 for numerical stability, then cast back
+        # Self-attention with Peri-LN (NO causal mask = bidirectional)
+        # Input norm: LayerNorm in float32 for numerical stability, then cast back
         normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
         attn_out = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
@@ -87,15 +95,20 @@ class TransformerBlock(nn.Module):
             dropout_rate=self.dropout_rate,
             dtype=self.dtype,
         )(normed, normed)
+        # Output norm: normalize attention output before residual addition
+        attn_out = nn.LayerNorm(dtype=jnp.float32)(attn_out.astype(jnp.float32)).astype(self.dtype)
         x = x + attn_out
 
-        # Feed-forward with residual
+        # Feed-forward with Peri-LN
+        # Input norm
         normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
         ff_out = nn.Dense(self.ff_dim, dtype=self.dtype)(normed)
         ff_out = self._get_activation()(ff_out)
         ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
         ff_out = nn.Dense(self.hidden_size, dtype=self.dtype)(ff_out)
         ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
+        # Output norm: normalize MLP output before residual addition
+        ff_out = nn.LayerNorm(dtype=jnp.float32)(ff_out.astype(jnp.float32)).astype(self.dtype)
         x = x + ff_out
 
         return x
@@ -111,9 +124,18 @@ class BidirectionalTransformer(nn.Module):
     Architecture:
     - Token embedding
     - Absolute (learnable) positional embedding
-    - N transformer encoder blocks
+    - Initial embedding LayerNorm (Peri-LN)
+    - N transformer encoder blocks with Peri-LN
+    - Final LayerNorm
     - Mean pooling over sequence
     - Linear projection to HL-Gauss categorical distribution
+
+    Normalization (Peri-LN):
+    Uses Peri-LN architecture which applies layer normalization peripherally
+    around each sublayer (both input AND output): y = x + Norm(Module(Norm(x)))
+    This provides more stable training than Pre-LN (prone to massive activations)
+    or Post-LN (prone to vanishing gradients).
+    See: https://arxiv.org/abs/2502.02732
 
     Value Head (HL-Gauss):
     Instead of outputting a single scalar, the value head outputs logits over
@@ -169,6 +191,12 @@ class BidirectionalTransformer(nn.Module):
 
         # Combine embeddings and cast to compute dtype
         hidden = (token_emb + pos_emb).astype(compute_dtype)
+
+        # Initial embedding normalization (Peri-LN requirement)
+        # This normalizes the combined embedding before entering transformer blocks
+        hidden = nn.LayerNorm(dtype=jnp.float32, name="embed_norm")(
+            hidden.astype(jnp.float32)
+        ).astype(compute_dtype)
 
         # Pass through transformer blocks (in compute_dtype)
         for i in range(self.config.num_layers):
