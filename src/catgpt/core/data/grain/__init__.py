@@ -23,6 +23,15 @@ from catgpt.core.data.grain.bagz import (
     BagShardReader,
     BagWriter,
 )
+from catgpt.core.data.grain.bagz_to_bag import (
+    MetaFeatures,
+    TrainingPositionData,
+    VerificationError,
+    compute_meta_features,
+    convert_bagz_to_bag,
+    decode_training_position,
+    encode_training_position,
+)
 from catgpt.core.data.grain.coders import (
     LeelaGameCoder,
     LeelaPositionCoder,
@@ -44,9 +53,16 @@ __all__ = [
     "LeelaGameCoder",
     "LeelaPositionCoder",
     "LeelaPositionData",
+    "MetaFeatures",
+    "TrainingPositionData",
+    "VerificationError",
+    "compute_meta_features",
+    "convert_bagz_to_bag",
     "convert_tar_to_bag",
     "decode_game",
     "decode_position",
+    "decode_training_position",
     "encode_game",
     "encode_position",
+    "encode_training_position",
 ]
