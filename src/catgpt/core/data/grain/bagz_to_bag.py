@@ -81,6 +81,15 @@ class MetaFeatures:
     # Format: square -> current location (e.g., "e5" -> "e2", or "e8" -> "e7q" for promotion)
     square_will_be_occupied_by_piece_on: dict[str, str]
 
+    # Current location of the piece that will be captured next (None if no future captures)
+    # This is where the piece is at the current position, even if it moves before capture.
+    # For en passant captures, this correctly tracks the captured pawn's current location.
+    next_capture_square: str | None
+
+    # Square of the pawn that will move next (None if no future pawn moves)
+    # This is the current location of the pawn before it moves
+    next_pawn_move_square: str | None
+
 
 def _boards_match(board1: chess.Board, board2: chess.Board) -> bool:
     """Check if two boards have the same piece placement."""
@@ -192,6 +201,10 @@ def compute_meta_features(positions: list[LeelaPositionData]) -> list[MetaFeatur
     will_move_to: dict[str, str] = {}
     piece_at: dict[str, str] = {}  # Traces back to current location
 
+    # Capture and pawn move tracking
+    next_capture_sq: str | None = None  # Square of next captured piece
+    next_pawn_sq: str | None = None  # Square of next pawn to move
+
     # Results collected in reverse order
     results_reversed: list[MetaFeatures] = []
 
@@ -269,6 +282,45 @@ def compute_meta_features(positions: list[LeelaPositionData]) -> list[MetaFeatur
                         piece_at[sq] = source_with_promo
                 piece_at[to_sq_name] = source_with_promo
 
+            # Track captures: update next_capture_sq if this move is a capture,
+            # or trace back if this move affects the piece that will be captured
+            if boards[i].is_capture(move):
+                if boards[i].is_en_passant(move):
+                    # En passant: captured pawn is on same file as destination, same rank as source
+                    captured_sq = chess.square(
+                        chess.square_file(move.to_square),
+                        chess.square_rank(move.from_square),
+                    )
+                    next_capture_sq = chess.square_name(captured_sq)
+                else:
+                    # Normal capture: captured piece is on destination square
+                    next_capture_sq = chess.square_name(move.to_square)
+            elif next_capture_sq is not None:
+                # Trace back: if this move places a piece on next_capture_sq,
+                # update to the source (where the piece is at position i)
+                if boards[i].is_castling(move):
+                    # Check king move
+                    if next_capture_sq == to_sq_name:
+                        next_capture_sq = from_sq
+                    # Check rook move
+                    if boards[i].is_kingside_castling(move):
+                        rook_from = "h1" if boards[i].turn == chess.WHITE else "h8"
+                        rook_to = "f1" if boards[i].turn == chess.WHITE else "f8"
+                    else:
+                        rook_from = "a1" if boards[i].turn == chess.WHITE else "a8"
+                        rook_to = "d1" if boards[i].turn == chess.WHITE else "d8"
+                    if next_capture_sq == rook_to:
+                        next_capture_sq = rook_from
+                else:
+                    # Normal move
+                    if next_capture_sq == to_sq_name:
+                        next_capture_sq = from_sq
+
+            # Track pawn moves: update next_pawn_sq if this move is by a pawn
+            piece = boards[i].piece_at(move.from_square)
+            if piece is not None and piece.piece_type == chess.PAWN:
+                next_pawn_sq = from_sq
+
         # Record meta-features for position i based on current board state
         piece_dest: dict[str, str] = {}
         square_occup: dict[str, str] = {}
@@ -296,6 +348,8 @@ def compute_meta_features(positions: list[LeelaPositionData]) -> list[MetaFeatur
                 piece_will_move_to=piece_dest,
                 square_will_be_occupied_from=square_occup,
                 square_will_be_occupied_by_piece_on=square_occup_current,
+                next_capture_square=next_capture_sq,
+                next_pawn_move_square=next_pawn_sq,
             )
         )
 
@@ -323,6 +377,8 @@ class TrainingPositionData:
     piece_will_move_to: dict[str, str]  # occupied_square -> destination
     square_will_be_occupied_from: dict[str, str]  # any_square -> immediate source of move
     square_will_be_occupied_by_piece_on: dict[str, str]  # any_square -> current location of piece
+    next_capture_square: str | None  # current square of piece that will be captured next
+    next_pawn_move_square: str | None  # square of pawn that will move next
 
 
 def encode_training_position(position: TrainingPositionData) -> bytes:
@@ -338,6 +394,8 @@ def encode_training_position(position: TrainingPositionData) -> bytes:
         "piece_will_move_to": position.piece_will_move_to,
         "square_will_be_occupied_from": position.square_will_be_occupied_from,
         "square_will_be_occupied_by_piece_on": position.square_will_be_occupied_by_piece_on,
+        "next_capture_square": position.next_capture_square,
+        "next_pawn_move_square": position.next_pawn_move_square,
     }
     return msgpack.packb(data, use_bin_type=True)
 
@@ -356,6 +414,8 @@ def decode_training_position(encoded: bytes) -> TrainingPositionData:
         piece_will_move_to=data["piece_will_move_to"],
         square_will_be_occupied_from=data["square_will_be_occupied_from"],
         square_will_be_occupied_by_piece_on=data["square_will_be_occupied_by_piece_on"],
+        next_capture_square=data["next_capture_square"],
+        next_pawn_move_square=data["next_pawn_move_square"],
     )
 
 
@@ -572,6 +632,8 @@ def convert_bagz_to_bag(
                     piece_will_move_to=meta.piece_will_move_to,
                     square_will_be_occupied_from=meta.square_will_be_occupied_from,
                     square_will_be_occupied_by_piece_on=meta.square_will_be_occupied_by_piece_on,
+                    next_capture_square=meta.next_capture_square,
+                    next_pawn_move_square=meta.next_pawn_move_square,
                 )
 
                 encoded = encode_training_position(training_pos)
@@ -617,6 +679,8 @@ if __name__ == "__main__":
         print("     - square_will_be_occupied_from: immediate source of next move to each square")
         print("     - square_will_be_occupied_by_piece_on: current location of piece that will")
         print("       eventually occupy each square (traces through multiple moves)")
+        print("     - next_capture_square: current location of the piece that will be captured next")
+        print("     - next_pawn_move_square: square of the pawn that will move next")
         print("  3. Sub-selects positions where index % 3 == cycle (cycling 0,1,2 per game)")
         print("  4. Deduplicates by FEN (ignoring half-move and full-move counters)")
         print()
