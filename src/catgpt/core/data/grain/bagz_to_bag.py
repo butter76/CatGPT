@@ -63,13 +63,13 @@ class MetaFeatures:
 
     # Piece movement tracking
     # For occupied squares: where will the piece move next?
-    # Format: square -> destination (e.g., "e2" -> "e4", or "e7" -> "e8q" for promotion)
+    # Format: square -> destination (e.g., "e2" -> "e4", or "e7" -> "e8" for promotion)
     piece_will_move_to: dict[str, str]
 
     # For any square (empty or occupied): from which square will the next piece come?
     # This is the IMMEDIATE source - the FROM square of the move that occupies this square.
     # Includes both moves to empty squares and captures.
-    # Format: square -> source (e.g., "e4" -> "e2", or "e8" -> "e7q" for promotion)
+    # Format: square -> source (e.g., "e4" -> "e2", or "e8" -> "e7" for promotion)
     square_will_be_occupied_from: dict[str, str]
 
     # For any square: where is the piece CURRENTLY located that will eventually occupy it?
@@ -78,7 +78,7 @@ class MetaFeatures:
     #   square_will_be_occupied_by_piece_on["e5"] = "e2" (current location)
     # If a knight on g1 goes g1->f3->g1, at position 0:
     #   square_will_be_occupied_by_piece_on["g1"] = "g1" (same piece returns)
-    # Format: square -> current location (e.g., "e5" -> "e2", or "e8" -> "e7q" for promotion)
+    # Format: square -> current location (e.g., "e5" -> "e2", or "e8" -> "e7" for promotion)
     square_will_be_occupied_by_piece_on: dict[str, str]
 
     # Current location of the piece that will be captured next (None if no future captures)
@@ -123,22 +123,6 @@ def find_move_between_positions(
         f"No legal move found between positions: "
         f"{board_before.fen()} -> {board_after.fen()}"
     )
-
-
-def _format_move_destination(to_square: int, promotion: int | None) -> str:
-    """Format destination square with optional promotion piece.
-
-    Args:
-        to_square: The destination square index.
-        promotion: The promotion piece type (chess.QUEEN, etc.) or None.
-
-    Returns:
-        Square name, optionally with promotion suffix (e.g., "e8q").
-    """
-    sq_name = chess.square_name(to_square)
-    if promotion is not None:
-        sq_name += chess.piece_symbol(promotion)
-    return sq_name
 
 
 def compute_meta_features(positions: list[LeelaPositionData]) -> list[MetaFeatures]:
@@ -213,7 +197,6 @@ def compute_meta_features(positions: list[LeelaPositionData]) -> list[MetaFeatur
         move = moves[i]
         if move is not None:
             from_sq = chess.square_name(move.from_square)
-            to_sq_with_promo = _format_move_destination(move.to_square, move.promotion)
             to_sq_name = chess.square_name(move.to_square)
 
             # CRITICAL: If this is a capture, the captured piece doesn't move.
@@ -231,15 +214,10 @@ def compute_meta_features(positions: list[LeelaPositionData]) -> list[MetaFeatur
                 # Normal capture: captured piece is on destination square
                 del will_move_to[to_sq_name]
 
-            # Compute source_with_promo for piece tracing (used in multiple places)
-            source_with_promo = from_sq
-            if move.promotion is not None:
-                source_with_promo += chess.piece_symbol(move.promotion)
-
             # Handle castling: both king and rook move
             if boards[i].is_castling(move):
                 # King move is already in from_sq/to_sq
-                will_move_to[from_sq] = to_sq_with_promo
+                will_move_to[from_sq] = to_sq_name
                 will_be_occupied_from[to_sq_name] = from_sq
 
                 # Update piece_at: trace any square pointing to to_sq back to from_sq
@@ -272,15 +250,15 @@ def compute_meta_features(positions: list[LeelaPositionData]) -> list[MetaFeatur
                 piece_at[rook_to] = rook_from
             else:
                 # Normal move (including captures and promotions)
-                will_move_to[from_sq] = to_sq_with_promo
-                will_be_occupied_from[to_sq_name] = source_with_promo
+                will_move_to[from_sq] = to_sq_name
+                will_be_occupied_from[to_sq_name] = from_sq
 
                 # Update piece_at: trace any square pointing to to_sq back to source
                 # This chains through multiple moves (e.g., e2->e4->e5 traces e5 back to e2)
                 for sq in list(piece_at.keys()):
                     if piece_at[sq] == to_sq_name:
-                        piece_at[sq] = source_with_promo
-                piece_at[to_sq_name] = source_with_promo
+                        piece_at[sq] = from_sq
+                piece_at[to_sq_name] = from_sq
 
             # Track captures: update next_capture_sq if this move is a capture,
             # or trace back if this move affects the piece that will be captured
