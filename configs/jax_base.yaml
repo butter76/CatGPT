@@ -11,7 +11,6 @@ model:
   vocab_size: 28  # From tokenizer (don't change unless tokenizer changes)
   seq_length: 64  # Will be overridden by tokenizer.sequence_length
   activation: "gelu"
-  dropout_rate: 0.0  # JAX-specific: explicit dropout rate
 
   # Output heads configuration
   output_heads:
@@ -83,7 +82,7 @@ checkpoint:
 
 # Weights & Biases logging
 wandb:
-  enabled: true
+  enabled: false
   project: "catgpt-jax"
   entity: null  # Your W&B username or team
   run_name: null  # Auto-generated if null

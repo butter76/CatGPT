@@ -24,7 +24,6 @@ class TransformerConfig:
     vocab_size: int = 28  # From tokenizer.VOCAB_SIZE
     seq_length: int = 64
     activation: str = "gelu"
-    dropout_rate: float = 0.0
 
     # Output head configuration
     output_heads: JaxOutputHeadConfig = field(default_factory=JaxOutputHeadConfig)
@@ -55,7 +54,6 @@ class QKVNormMultiHeadAttention(nn.Module):
     num_heads: int
     qkv_features: int
     deterministic: bool = True
-    dropout_rate: float = 0.0
     dtype: Dtype = jnp.float32
 
     @nn.compact
@@ -109,9 +107,6 @@ class QKVNormMultiHeadAttention(nn.Module):
         attn_weights = jnp.matmul(query, jnp.transpose(key, (0, 1, 3, 2))) / jnp.sqrt(head_dim)
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
 
-        # Apply dropout to attention weights
-        attn_weights = nn.Dropout(rate=self.dropout_rate, deterministic=self.deterministic)(attn_weights)
-
         # Apply attention to values
         # (batch, num_heads, seq_len, seq_len) @ (batch, num_heads, seq_len, head_dim)
         # -> (batch, num_heads, seq_len, head_dim)
@@ -125,7 +120,6 @@ class QKVNormMultiHeadAttention(nn.Module):
 
         # Final output projection
         output = nn.Dense(self.qkv_features, dtype=self.dtype, name="out")(attn_output)
-        output = nn.Dropout(rate=self.dropout_rate, deterministic=self.deterministic)(output)
 
         return output
 
@@ -137,7 +131,6 @@ class TransformerBlock(nn.Module):
     num_heads: int
     ff_dim: int
     activation: str = "gelu"
-    dropout_rate: float = 0.0
     dtype: Dtype = jnp.float32  # Compute dtype for mixed precision
 
     def _get_activation(self) -> callable:
@@ -182,7 +175,6 @@ class TransformerBlock(nn.Module):
             num_heads=self.num_heads,
             qkv_features=self.hidden_size,
             deterministic=not train,
-            dropout_rate=self.dropout_rate,
             dtype=self.dtype,
         )(normed, normed)
         # Output norm: normalize attention output before residual addition
@@ -194,9 +186,7 @@ class TransformerBlock(nn.Module):
         normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
         ff_out = nn.Dense(self.ff_dim, dtype=self.dtype)(normed)
         ff_out = self._get_activation()(ff_out)
-        ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
         ff_out = nn.Dense(self.hidden_size, dtype=self.dtype)(ff_out)
-        ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
         # Output norm: normalize MLP output before residual addition
         ff_out = nn.LayerNorm(dtype=jnp.float32)(ff_out.astype(jnp.float32)).astype(self.dtype)
         x = x + ff_out
@@ -295,7 +285,6 @@ class BidirectionalTransformer(nn.Module):
                 num_heads=self.config.num_heads,
                 ff_dim=self.config.ff_dim or (4 * self.config.hidden_size),
                 activation=self.config.activation,
-                dropout_rate=self.config.dropout_rate,
                 dtype=compute_dtype,
                 name=f"block_{i}",
             )(hidden, train=train)
@@ -361,7 +350,6 @@ class BidirectionalTransformer(nn.Module):
             vocab_size=config.vocab_size,
             seq_length=config.seq_length,
             activation=config.activation,
-            dropout_rate=config.dropout_rate,
             output_heads=config.output_heads,
         )
         return cls(config=transformer_config)

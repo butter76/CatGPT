@@ -27,7 +27,7 @@ class BaseModel(nn.Module):
 
         Args:
             x: Input tensor of token indices, shape (batch, seq_len).
-            train: Whether in training mode (affects dropout, etc.).
+            train: Whether in training mode (for future training-specific behavior).
 
         Returns:
             Output tensor (model-specific shape).

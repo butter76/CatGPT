@@ -77,7 +77,6 @@ def load_checkpoint(path: Path | str, *, evaluation: bool = True) -> LoadedCheck
         vocab_size=model_config.vocab_size,
         seq_length=tokenizer_config.sequence_length,
         activation=model_config.activation,
-        dropout_rate=model_config.dropout_rate,
         output_heads=model_config.output_heads,
     )
     model = BidirectionalTransformer(config=transformer_config)
@@ -125,7 +124,6 @@ def _load_model_config(path: Path) -> JaxModelConfig:
         vocab_size=config_dict.get("vocab_size", 28),
         seq_length=config_dict.get("seq_length", 64),
         activation=config_dict.get("activation", "gelu"),
-        dropout_rate=config_dict.get("dropout_rate", 0.0),
         output_heads=output_heads,
     )
 

@@ -148,7 +148,6 @@ def main(cfg: DictConfig) -> None:
         vocab_size=model_cfg.vocab_size,
         seq_length=tokenizer_cfg.sequence_length,
         activation=model_cfg.activation,
-        dropout_rate=model_cfg.dropout_rate,
         output_heads=model_cfg.output_heads,  # Include HL-Gauss config
     )
 
