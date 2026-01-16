@@ -272,12 +272,6 @@ class BidirectionalTransformer(nn.Module):
         # Combine embeddings and cast to compute dtype
         hidden = (token_emb + pos_emb).astype(compute_dtype)
 
-        # Initial embedding normalization (Peri-LN requirement)
-        # This normalizes the combined embedding before entering transformer blocks
-        hidden = nn.LayerNorm(dtype=jnp.float32, name="embed_norm")(
-            hidden.astype(jnp.float32)
-        ).astype(compute_dtype)
-
         # Pass through transformer blocks (in compute_dtype)
         for i in range(self.config.num_layers):
             hidden = TransformerBlock(
