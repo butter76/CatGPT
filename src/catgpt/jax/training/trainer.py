@@ -263,6 +263,23 @@ class Trainer:
                 weight = head_config.policy_weight if head_config else 1.0
                 losses["policy"] = policy_loss * weight
 
+            # Soft policy head: auxiliary head for softened policy target (KataGo method)
+            # Applies temperature to soften the policy target, forcing the model to learn
+            # relative rankings of lower-probability moves, not just the top 1-2.
+            if "soft_policy_logit" in outputs and "policy_target" in batch:
+                # Compute soft target: p^(1/T) then renormalize
+                temp = head_config.soft_policy_temperature if head_config else 4.0
+                # Add small epsilon for numerical stability before taking power
+                soft_target = jnp.pow(batch["policy_target"] + 1e-10, 1.0 / temp)
+                soft_target = soft_target / jnp.sum(soft_target, axis=-1, keepdims=True)
+
+                soft_policy_loss = optax.softmax_cross_entropy(
+                    outputs["soft_policy_logit"].astype(jnp.float32),
+                    soft_target.astype(jnp.float32),
+                ).mean()
+                weight = head_config.soft_policy_weight if head_config else 8.0
+                losses["soft_policy"] = soft_policy_loss * weight
+
             total_loss = sum(losses.values())
             return total_loss, (outputs, losses)
 
@@ -369,6 +386,20 @@ class Trainer:
             ).mean()
             weight = head_config.policy_weight if head_config else 1.0
             losses["policy"] = policy_loss * weight
+
+        # Soft policy head: auxiliary head for softened policy target (KataGo method)
+        if "soft_policy_logit" in outputs and "policy_target" in batch:
+            # Compute soft target: p^(1/T) then renormalize
+            temp = head_config.soft_policy_temperature if head_config else 4.0
+            soft_target = jnp.pow(batch["policy_target"] + 1e-10, 1.0 / temp)
+            soft_target = soft_target / jnp.sum(soft_target, axis=-1, keepdims=True)
+
+            soft_policy_loss = optax.softmax_cross_entropy(
+                outputs["soft_policy_logit"].astype(jnp.float32),
+                soft_target.astype(jnp.float32),
+            ).mean()
+            weight = head_config.soft_policy_weight if head_config else 8.0
+            losses["soft_policy"] = soft_policy_loss * weight
 
         total_loss = sum(losses.values())
 
@@ -689,6 +720,8 @@ class Trainer:
                 log_dict["train/self_loss"] = float(metrics["self_loss"])
             if "policy_loss" in metrics:
                 log_dict["train/policy_loss"] = float(metrics["policy_loss"])
+            if "soft_policy_loss" in metrics:
+                log_dict["train/soft_policy_loss"] = float(metrics["soft_policy_loss"])
 
             # Add value metrics
             if "value_mse" in metrics:

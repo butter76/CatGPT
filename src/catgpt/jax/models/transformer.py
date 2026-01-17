@@ -344,6 +344,23 @@ class BidirectionalTransformer(nn.Module):
 
             outputs["policy_logit"] = policy_logits_flat
 
+        # Soft policy head: auxiliary head for softened policy target (KataGo method)
+        # Uses a separate head to predict policy^(1/T) which forces the model to learn
+        # relative rankings of lower-probability moves, not just the top 1-2.
+        # See: https://github.com/lightvector/KataGo/blob/master/docs/KataGoMethods.md#auxiliary-soft-policy-target
+        if head_config.soft_policy_head:
+            # Same architecture as policy head but separate parameters
+            soft_policy_logits = nn.Dense(
+                _POLICY_TO_DIM,
+                dtype=jnp.float32,
+                name="soft_policy_head",
+            )(hidden)  # (batch, 64, 73)
+
+            # Flatten for cross-entropy loss: (batch, 64*73) = (batch, 4672)
+            soft_policy_logits_flat = soft_policy_logits.reshape(batch_size, -1)
+
+            outputs["soft_policy_logit"] = soft_policy_logits_flat
+
         return outputs
 
     @classmethod

@@ -41,6 +41,14 @@ class JaxOutputHeadConfig:
     value_weight: float = 1.0
     policy_weight: float = 1.0
 
+    # Soft policy auxiliary target (KataGo method)
+    # Applies temperature to soften the policy target, forcing the model to learn
+    # relative rankings of lower-probability moves, not just the top 1-2.
+    # See: https://github.com/lightvector/KataGo/blob/master/docs/KataGoMethods.md#auxiliary-soft-policy-target
+    soft_policy_head: bool = False  # Enable auxiliary soft policy head
+    soft_policy_temperature: float = 4.0  # Temperature for softening (higher = more uniform)
+    soft_policy_weight: float = 8.0  # Loss weight (compensates for smaller gradients)
+
     # HL-Gauss configuration for value head
     # Converts scalar win probability (0-1) to categorical distribution
     value_num_bins: int = 81  # Number of bins for value distribution
