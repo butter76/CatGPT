@@ -15,6 +15,7 @@ class JaxOutputHeadConfig:
     The model can have multiple output heads for different tasks:
     - self_head: Token reconstruction (auxiliary task for stability)
     - value_head: Win probability prediction (primary task)
+    - policy_head: Move distribution prediction
 
     Loss weights control the contribution of each head to the total loss.
 
@@ -23,15 +24,22 @@ class JaxOutputHeadConfig:
     enabling training with cross-entropy loss instead of MSE. This approach
     scales better with larger networks and reduces overfitting.
     See: https://arxiv.org/abs/2403.03950
+
+    The policy head outputs a (64, 73) tensor representing move probabilities
+    over (from_square, to_square) pairs. The 73 "to" indices are:
+    - 0-63: Normal destination squares
+    - 64-72: Underpromotion targets (3 pieces × 3 directions)
     """
 
     # Head enable flags
     self_head: bool = True  # Token reconstruction (auxiliary task)
     value_head: bool = True  # Win probability
+    policy_head: bool = False  # Move distribution
 
     # Loss weights
     self_weight: float = 0.1  # Usually lower than primary task
     value_weight: float = 1.0
+    policy_weight: float = 1.0
 
     # HL-Gauss configuration for value head
     # Converts scalar win probability (0-1) to categorical distribution

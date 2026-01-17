@@ -29,7 +29,79 @@ import msgpack
 import numpy as np
 from apache_beam import coders
 
-from catgpt.core.utils import TokenizerConfig, tokenizer
+from catgpt.core.utils import TokenizerConfig, flip_square, parse_square, tokenizer
+
+# Policy target dimensions
+# 64 normal destination squares + 9 underpromotion targets
+# Underpromotions: 3 pieces (knight, bishop, rook) x 3 directions (left, straight, right)
+POLICY_TO_DIM = 73
+POLICY_SHAPE = (64, POLICY_TO_DIM)  # (from_square, to_square)
+
+# Underpromotion piece type to index offset
+_UNDERPROMO_PIECE_OFFSET = {"n": 0, "b": 1, "r": 2}
+
+
+def parse_uci_move(uci: str) -> tuple[str, str, str | None]:
+    """Parse a UCI move string into (from_square, to_square, promotion).
+
+    Args:
+        uci: UCI move string (e.g., "e2e4", "e7e8q", "a7a8n").
+
+    Returns:
+        Tuple of (from_square, to_square, promotion_piece or None).
+        promotion_piece is lowercase: 'q', 'r', 'b', 'n'.
+    """
+    from_sq = uci[:2]
+    to_sq = uci[2:4]
+    promo = uci[4].lower() if len(uci) > 4 else None
+    return from_sq, to_sq, promo
+
+
+def encode_policy_target(
+    legal_moves: list[tuple[str, float]],
+    flip: bool = False,
+) -> np.ndarray:
+    """Convert legal moves with policy to (64, 73) target tensor.
+
+    The policy target encodes the move distribution over a (from_square, to_square)
+    tensor. Normal moves use to_square indices 0-63. Underpromotions (non-queen
+    promotions) use indices 64-72:
+        64-66: knight promotions (left capture, straight, right capture)
+        67-69: bishop promotions (left capture, straight, right capture)
+        70-72: rook promotions (left capture, straight, right capture)
+
+    Queen promotions use the normal destination square (0-63).
+
+    Args:
+        legal_moves: List of (uci_move, probability) tuples.
+        flip: Whether to flip squares (for black to move, to match tokenizer).
+
+    Returns:
+        Shape (64, 73) array with policy probabilities.
+    """
+    target = np.zeros(POLICY_SHAPE, dtype=np.float32)
+
+    for uci_move, prob in legal_moves:
+        from_sq, to_sq, promo = parse_uci_move(uci_move)
+
+        if flip:
+            from_sq = flip_square(from_sq)
+            to_sq = flip_square(to_sq)
+
+        from_idx = parse_square(from_sq)
+
+        if promo and promo != "q":
+            # Underpromotion: map to indices 64-72
+            # file_diff: -1 (capture left), 0 (straight), +1 (capture right)
+            file_diff = ord(to_sq[0]) - ord(from_sq[0])
+            to_idx = 64 + _UNDERPROMO_PIECE_OFFSET[promo] * 3 + (file_diff + 1)
+        else:
+            # Normal move or queen promotion: use destination square
+            to_idx = parse_square(to_sq)
+
+        target[from_idx, to_idx] = prob
+
+    return target
 
 
 def convert_old_win_prob_to_new(old_win_prob: float) -> float:
@@ -94,7 +166,11 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
   This coder handles the new .bag format produced by bagz_to_bag.py, which
   contains msgpack-encoded TrainingPositionData with rich meta-features.
 
-  For now, we only extract fen and root_q (converted to win_prob).
+  Extracts:
+  - fen: tokenized board state
+  - root_q: converted to win probability
+  - legal_moves: converted to policy target (64, 73) tensor
+
   Future versions can leverage additional fields like:
   - game_result: final game outcome
   - piece_will_move_to: next move predictions
@@ -103,25 +179,34 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
   - next_pawn_move_square: pawn structure
   """
 
-  def __init__(self, tokenizer_config: TokenizerConfig | None = None) -> None:
+  def __init__(
+      self,
+      tokenizer_config: TokenizerConfig | None = None,
+      *,
+      include_policy: bool = True,
+  ) -> None:
     """Initialize with tokenizer configuration.
 
     Args:
       tokenizer_config: Configuration for tokenization. If None, uses default.
+      include_policy: Whether to include policy target in output.
     """
     super().__init__()
     self.tokenizer_config = tokenizer_config or TokenizerConfig()
+    self.include_policy = include_policy
 
   def map(self, element: bytes):
-    """Map a training position to (state_tokens, win_prob).
+    """Map a training position to (state_tokens, win_prob, policy_target).
 
     Args:
       element: Msgpack-encoded TrainingPositionData.
 
     Returns:
-      Tuple of (state_tokens, win_prob):
+      Tuple of (state_tokens, win_prob, policy_target):
         - state_tokens: np.ndarray of tokenized FEN
         - win_prob: np.ndarray of shape (1,) with win probability in [0, 1]
+        - policy_target: np.ndarray of shape (64, 73) with move probabilities
+          (only if include_policy=True, otherwise tuple has 2 elements)
     """
     # Decode msgpack data
     data = msgpack.unpackb(element, raw=False)
@@ -130,13 +215,24 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
     fen = data["fen"]
     root_q = data["root_q"]  # Q value in [-1, 1]
 
-    # Tokenize FEN
+    # Determine if black to move (need to flip for policy target)
+    side_to_move = fen.split()[1]
+    flip = side_to_move == "b"
+
+    # Tokenize FEN (tokenizer handles flip internally)
     state = tokenizer.tokenize(fen, self.tokenizer_config)
 
     # Convert Q to win probability: Q ∈ [-1, 1] → win_prob ∈ [0, 1]
     win_prob = (1.0 + root_q) / 2.0
 
-    return state, np.array([win_prob])
+    if not self.include_policy:
+      return state, np.array([win_prob])
+
+    # Build policy target from legal moves
+    legal_moves = data["legal_moves"]
+    policy_target = encode_policy_target(legal_moves, flip=flip)
+
+    return state, np.array([win_prob]), policy_target
 
 
 @dataclass

@@ -7,10 +7,14 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from catgpt.core.data.grain.coders import POLICY_SHAPE, POLICY_TO_DIM
 from catgpt.jax.configs import JaxModelConfig, JaxOutputHeadConfig
 
 # Type alias for dtype
 Dtype = Any
+
+# Policy output dimensions: (64 from_squares, 73 to_squares)
+_POLICY_FROM_DIM, _POLICY_TO_DIM = POLICY_SHAPE
 
 
 @dataclass
@@ -250,6 +254,7 @@ class BidirectionalTransformer(nn.Module):
             - "value_logit": HL-Gauss logits (batch, num_bins) for cross-entropy loss
             - "value_probs": Softmax probabilities (batch, num_bins) for visualization
             - "value": Expected win probability scalar (batch,) for metrics/inference
+            - "policy_logit": Move distribution logits (batch, 64*73) if policy_head enabled
         """
         batch_size, seq_len = x.shape
         head_config = self.config.output_heads
@@ -323,6 +328,21 @@ class BidirectionalTransformer(nn.Module):
             outputs["value_logit"] = value_logits  # For cross-entropy loss
             outputs["value_probs"] = value_probs  # For visualization
             outputs["value"] = expected_value  # Scalar for metrics/inference
+
+        # Policy head: per-token projection to (64, 73) move distribution
+        if head_config.policy_head:
+            # Project each of the 64 token representations to 73 dimensions
+            # hidden: (batch, 64, hidden_size) -> (batch, 64, 73)
+            policy_logits = nn.Dense(
+                _POLICY_TO_DIM,
+                dtype=jnp.float32,
+                name="policy_head",
+            )(hidden)  # (batch, 64, 73)
+
+            # Flatten for cross-entropy loss: (batch, 64*73) = (batch, 4672)
+            policy_logits_flat = policy_logits.reshape(batch_size, -1)
+
+            outputs["policy_logit"] = policy_logits_flat
 
         return outputs
 

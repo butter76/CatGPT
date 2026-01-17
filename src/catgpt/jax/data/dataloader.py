@@ -72,7 +72,7 @@ class ConvertToJax(pygrain.MapTransform):
     """Convert numpy arrays to JAX-compatible arrays with HL-Gauss target transform.
 
     Transforms batched data from PyGrain (numpy) to JAX-compatible format.
-    Expected input: tuple of (inputs, targets) where both are numpy arrays.
+    Expected input: tuple of (inputs, targets) or (inputs, targets, policy_targets).
 
     If HL-Gauss is enabled, converts scalar win probabilities to categorical
     distributions over bins for training with cross-entropy loss.
@@ -86,7 +86,8 @@ class ConvertToJax(pygrain.MapTransform):
 
         Args:
             output_heads_config: Output head configuration containing HL-Gauss
-                parameters (value_num_bins, value_sigma_ratio). If None, uses defaults.
+                parameters (value_num_bins, value_sigma_ratio) and policy_head flag.
+                If None, uses defaults.
         """
         super().__init__()
         self._output_heads_config = output_heads_config
@@ -95,22 +96,30 @@ class ConvertToJax(pygrain.MapTransform):
         if output_heads_config is not None:
             self._num_bins = output_heads_config.value_num_bins
             self._sigma_ratio = output_heads_config.value_sigma_ratio
+            self._include_policy = output_heads_config.policy_head
         else:
             self._num_bins = 81
             self._sigma_ratio = 0.75
+            self._include_policy = False
 
     def map(self, element):
         """Convert a batched element to JAX-compatible arrays.
 
         Args:
-            element: Tuple of (inputs, targets) as numpy arrays.
+            element: Tuple of (inputs, targets) or (inputs, targets, policy_targets)
+                as numpy arrays.
 
         Returns:
-            Dictionary with 'input' and 'target' as numpy arrays.
+            Dictionary with 'input', 'target', and optionally 'policy_target' as numpy arrays.
             - 'input': Token indices, shape (batch, seq_len)
             - 'target': HL-Gauss distribution, shape (batch, num_bins)
+            - 'policy_target': Flattened policy distribution, shape (batch, 64*73)
         """
-        inputs, targets = element
+        if self._include_policy:
+            inputs, targets, policy_targets = element
+        else:
+            inputs, targets = element
+            policy_targets = None
 
         # Keep as numpy - JAX will convert when needed
         # This avoids unnecessary device transfers during data loading
@@ -125,10 +134,19 @@ class ConvertToJax(pygrain.MapTransform):
             max_value=1.0,
         )
 
-        return {
+        result = {
             "input": input_array,
             "target": target_array,  # Shape: (batch, num_bins)
         }
+
+        # Add policy target if enabled
+        if self._include_policy and policy_targets is not None:
+            # policy_targets: (batch, 64, 73) -> flatten to (batch, 64*73)
+            policy_array = np.asarray(policy_targets, dtype=np.float32)
+            policy_array = policy_array.reshape(policy_array.shape[0], -1)
+            result["policy_target"] = policy_array
+
+        return result
 
 
 def create_grain_dataloader(
@@ -199,9 +217,17 @@ def create_grain_dataloader(
             include_halfmove=tokenizer_config.include_halfmove,
         )
 
+    # Determine if policy head is enabled
+    include_policy = (
+        output_heads_config is not None and output_heads_config.policy_head
+    )
+
     # Define transformations pipeline
     transformations = (
-        ConvertTrainingBagDataToSequence(core_tokenizer_config),  # bytes -> (state, win_prob)
+        ConvertTrainingBagDataToSequence(
+            core_tokenizer_config,
+            include_policy=include_policy,
+        ),  # bytes -> (state, win_prob) or (state, win_prob, policy)
         pygrain.Batch(batch_size=batch_size, drop_remainder=split == "train"),
         ConvertToJax(output_heads_config),  # numpy -> jax-compatible arrays with HL-Gauss
     )
@@ -217,13 +243,14 @@ def create_grain_dataloader(
         ),
     )
 
-    # Log HL-Gauss configuration
+    # Log configuration
     num_bins = output_heads_config.value_num_bins if output_heads_config else 81
     sigma_ratio = output_heads_config.value_sigma_ratio if output_heads_config else 0.75
     logger.info(
         f"Created JAX PyGrain DataLoader: batch_size={batch_size}, "
         f"shuffle={shuffle}, workers={config.num_workers}, "
-        f"hl_gauss(bins={num_bins}, sigma_ratio={sigma_ratio})"
+        f"hl_gauss(bins={num_bins}, sigma_ratio={sigma_ratio}), "
+        f"policy={include_policy}"
     )
 
     return dataloader

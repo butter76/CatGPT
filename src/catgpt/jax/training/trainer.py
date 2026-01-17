@@ -252,6 +252,17 @@ class Trainer:
                 weight = head_config.value_weight if head_config else 1.0
                 losses["value"] = value_loss * weight
 
+            # Policy head: cross-entropy with soft policy targets
+            if "policy_logit" in outputs and "policy_target" in batch:
+                # outputs["policy_logit"]: (batch, 64*73) logits
+                # batch["policy_target"]: (batch, 64*73) policy distribution
+                policy_loss = optax.softmax_cross_entropy(
+                    outputs["policy_logit"].astype(jnp.float32),
+                    batch["policy_target"].astype(jnp.float32),
+                ).mean()
+                weight = head_config.policy_weight if head_config else 1.0
+                losses["policy"] = policy_loss * weight
+
             total_loss = sum(losses.values())
             return total_loss, (outputs, losses)
 
@@ -292,6 +303,14 @@ class Trainer:
             pred_tokens = jnp.argmax(outputs["self"], axis=-1)  # (batch, seq)
             self_accuracy = (pred_tokens == batch["input"]).mean()
             metrics["self_accuracy"] = self_accuracy
+
+        # Policy head metrics
+        if "policy_logit" in outputs and "policy_target" in batch:
+            # Top-1 accuracy: compare argmax of prediction vs argmax of target
+            pred_moves = jnp.argmax(outputs["policy_logit"], axis=-1)  # (batch,)
+            target_moves = jnp.argmax(batch["policy_target"], axis=-1)  # (batch,)
+            policy_accuracy = (pred_moves == target_moves).mean()
+            metrics["policy_accuracy"] = policy_accuracy
 
         return state, metrics
 
@@ -340,6 +359,17 @@ class Trainer:
             weight = head_config.value_weight if head_config else 1.0
             losses["value"] = value_loss * weight
 
+        # Policy head: cross-entropy with soft policy targets
+        if "policy_logit" in outputs and "policy_target" in batch:
+            # outputs["policy_logit"]: (batch, 64*73) logits
+            # batch["policy_target"]: (batch, 64*73) policy distribution
+            policy_loss = optax.softmax_cross_entropy(
+                outputs["policy_logit"].astype(jnp.float32),
+                batch["policy_target"].astype(jnp.float32),
+            ).mean()
+            weight = head_config.policy_weight if head_config else 1.0
+            losses["policy"] = policy_loss * weight
+
         total_loss = sum(losses.values())
 
         # Compute metrics
@@ -372,6 +402,14 @@ class Trainer:
             pred_tokens = jnp.argmax(outputs["self"], axis=-1)
             self_accuracy = (pred_tokens == batch["input"]).mean()
             metrics["self_accuracy"] = self_accuracy
+
+        # Policy head metrics
+        if "policy_logit" in outputs and "policy_target" in batch:
+            # Top-1 accuracy: compare argmax of prediction vs argmax of target
+            pred_moves = jnp.argmax(outputs["policy_logit"], axis=-1)  # (batch,)
+            target_moves = jnp.argmax(batch["policy_target"], axis=-1)  # (batch,)
+            policy_accuracy = (pred_moves == target_moves).mean()
+            metrics["policy_accuracy"] = policy_accuracy
 
         return metrics
 
@@ -441,6 +479,8 @@ class Trainer:
                     postfix["acc"] = f"{float(metrics['accuracy']):.2%}"
                 if "self_accuracy" in metrics:
                     postfix["self"] = f"{float(metrics['self_accuracy']):.2%}"
+                if "policy_accuracy" in metrics:
+                    postfix["pol"] = f"{float(metrics['policy_accuracy']):.2%}"
                 epoch_pbar.set_postfix(postfix)
 
                 # Log step metrics
@@ -608,6 +648,8 @@ class Trainer:
                 postfix["acc"] = f"{metric_sums['accuracy'] / total_samples:.2%}"
             if "self_accuracy" in metric_sums:
                 postfix["self"] = f"{metric_sums['self_accuracy'] / total_samples:.2%}"
+            if "policy_accuracy" in metric_sums:
+                postfix["pol"] = f"{metric_sums['policy_accuracy'] / total_samples:.2%}"
             val_iterator.set_postfix(postfix)
 
         # Average all metrics
@@ -645,6 +687,8 @@ class Trainer:
                 log_dict["train/value_loss"] = float(metrics["value_loss"])
             if "self_loss" in metrics:
                 log_dict["train/self_loss"] = float(metrics["self_loss"])
+            if "policy_loss" in metrics:
+                log_dict["train/policy_loss"] = float(metrics["policy_loss"])
 
             # Add value metrics
             if "value_mse" in metrics:
@@ -655,6 +699,10 @@ class Trainer:
             # Add self head metrics
             if "self_accuracy" in metrics:
                 log_dict["train/self_accuracy"] = float(metrics["self_accuracy"])
+
+            # Add policy head metrics
+            if "policy_accuracy" in metrics:
+                log_dict["train/policy_accuracy"] = float(metrics["policy_accuracy"])
 
             wandb.log(log_dict, step=self.global_step)
 

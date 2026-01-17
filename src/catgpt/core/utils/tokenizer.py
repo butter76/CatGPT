@@ -15,6 +15,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from catgpt.core.utils.squares import parse_square
+
 # Character vocabulary for tokenization
 # Digits 0-9 are used for the halfmove clock
 # Lowercase letters are black pieces, uppercase are white pieces
@@ -31,9 +33,8 @@ _CHARACTERS = [
 _CHARACTERS_INDEX = {letter: index for index, letter in enumerate(_CHARACTERS)}
 _SPACE_DIGITS = frozenset({"1", "2", "3", "4", "5", "6", "7", "8"})
 
-# File letters and rank numbers for square parsing
-_FILES = "abcdefgh"
-_RANKS = "12345678"
+# Re-export for backwards compatibility
+_parse_square = parse_square
 
 
 @dataclass(frozen=True)
@@ -58,42 +59,6 @@ class TokenizerConfig:
                 f"(got {self.sequence_length}, include_halfmove={self.include_halfmove})"
             )
             raise ValueError(msg)
-
-
-def _parse_square(square: str, *, flip: bool = False) -> int:
-    """Convert algebraic notation to board index (0-63, row-major from a8 to h1).
-
-    Args:
-        square: Algebraic notation for a square (e.g., 'a1', 'h8').
-        flip: If True, flip the board vertically (swap ranks 1↔8, 2↔7, etc.).
-
-    Returns:
-        Index into a 64-element array representing the board in row-major order,
-        starting from a8 (index 0) to h1 (index 63).
-
-    Raises:
-        ValueError: If the square notation is invalid.
-    """
-    if len(square) != 2:
-        msg = f"Invalid square notation: {square!r}"
-        raise ValueError(msg)
-
-    file_char, rank_char = square[0].lower(), square[1]
-
-    if file_char not in _FILES or rank_char not in _RANKS:
-        msg = f"Invalid square notation: {square!r}"
-        raise ValueError(msg)
-
-    file_idx = _FILES.index(file_char)  # 0-7 (a-h)
-    rank_idx = _RANKS.index(rank_char)  # 0-7 (1-8)
-
-    if flip:
-        rank_idx = 7 - rank_idx
-
-    # Convert to row-major index (a8=0, h8=7, a7=8, ..., h1=63)
-    # rank 8 is row 0, rank 1 is row 7
-    row = 7 - rank_idx
-    return row * 8 + file_idx
 
 
 # Precomputed constants for castling square indices

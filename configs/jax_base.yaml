@@ -16,8 +16,10 @@ model:
   output_heads:
     self_head: true      # Token reconstruction (auxiliary task for stability)
     value_head: true     # Win probability prediction (primary task)
+    policy_head: true    # Policy prediction (primary task)
     self_weight: 0.1     # Loss weight for self head
     value_weight: 1.0    # Loss weight for value head
+    policy_weight: 1.0    # Loss weight for policy head
 
 # Tokenizer configuration
 tokenizer:
