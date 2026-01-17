@@ -341,9 +341,10 @@ class BagDataSource:
     """Creates a new BagDataSource object.
 
     Args:
-      path: The path to the bag file.
+      path: The path to the bag file. Supports tilde (~) expansion.
     """
-    self._path = os.fspath(path)
+    # Expand tilde and convert to string
+    self._path = os.path.expanduser(os.fspath(path))
     self._reader = BagReader(self._path)
     self._num_records = len(self._reader)
 

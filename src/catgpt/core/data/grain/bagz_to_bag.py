@@ -178,8 +178,8 @@ def compute_meta_features(positions: list[LeelaPositionData]) -> list[MetaFeatur
     # Piece movement computation (backward scan)
     # -------------------------------------------------------------------------
     # State: tracking what happens AFTER each position
-    # will_be_occupied_from[sq] = source square (with promo suffix) of next piece to land
-    # will_move_to[sq] = destination (with promo suffix) of next move from this square
+    # will_be_occupied_from[sq] = source square of next piece to land
+    # will_move_to[sq] = destination of next move from this square
     # piece_at[sq] = current location of piece that will eventually occupy sq (traced through moves)
     will_be_occupied_from: dict[str, str] = {}
     will_move_to: dict[str, str] = {}

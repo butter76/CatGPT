@@ -7,7 +7,7 @@ import numpy as np
 from scipy import special as scipy_special
 
 from catgpt.core.data.grain.bagz import BagDataSource
-from catgpt.core.data.grain.coders import ConvertStateValueDataToSequence
+from catgpt.core.data.grain.coders import ConvertTrainingBagDataToSequence
 
 if TYPE_CHECKING:
     from catgpt.jax.configs import (
@@ -201,7 +201,7 @@ def create_grain_dataloader(
 
     # Define transformations pipeline
     transformations = (
-        ConvertStateValueDataToSequence(core_tokenizer_config),  # bytes -> (state, win_prob)
+        ConvertTrainingBagDataToSequence(core_tokenizer_config),  # bytes -> (state, win_prob)
         pygrain.Batch(batch_size=batch_size, drop_remainder=split == "train"),
         ConvertToJax(output_heads_config),  # numpy -> jax-compatible arrays with HL-Gauss
     )

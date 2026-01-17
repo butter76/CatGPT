@@ -88,6 +88,57 @@ class ConvertStateValueDataToSequence(ConvertToSequence):
     return state, np.array([win_prob])
 
 
+class ConvertTrainingBagDataToSequence(ConvertToSequence):
+  """Converts training .bag data (from bagz_to_bag.py) to a sequence of integers.
+
+  This coder handles the new .bag format produced by bagz_to_bag.py, which
+  contains msgpack-encoded TrainingPositionData with rich meta-features.
+
+  For now, we only extract fen and root_q (converted to win_prob).
+  Future versions can leverage additional fields like:
+  - game_result: final game outcome
+  - piece_will_move_to: next move predictions
+  - square_will_be_occupied_from: forward board state
+  - next_capture_square: tactical awareness
+  - next_pawn_move_square: pawn structure
+  """
+
+  def __init__(self, tokenizer_config: TokenizerConfig | None = None) -> None:
+    """Initialize with tokenizer configuration.
+
+    Args:
+      tokenizer_config: Configuration for tokenization. If None, uses default.
+    """
+    super().__init__()
+    self.tokenizer_config = tokenizer_config or TokenizerConfig()
+
+  def map(self, element: bytes):
+    """Map a training position to (state_tokens, win_prob).
+
+    Args:
+      element: Msgpack-encoded TrainingPositionData.
+
+    Returns:
+      Tuple of (state_tokens, win_prob):
+        - state_tokens: np.ndarray of tokenized FEN
+        - win_prob: np.ndarray of shape (1,) with win probability in [0, 1]
+    """
+    # Decode msgpack data
+    data = msgpack.unpackb(element, raw=False)
+
+    # Extract fields
+    fen = data["fen"]
+    root_q = data["root_q"]  # Q value in [-1, 1]
+
+    # Tokenize FEN
+    state = tokenizer.tokenize(fen, self.tokenizer_config)
+
+    # Convert Q to win probability: Q ∈ [-1, 1] → win_prob ∈ [0, 1]
+    win_prob = (1.0 + root_q) / 2.0
+
+    return state, np.array([win_prob])
+
+
 @dataclass
 class LeelaPositionData:
     """Stripped-down position data for training.

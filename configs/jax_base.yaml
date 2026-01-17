@@ -54,7 +54,7 @@ training:
   batch_size: 2048
   gradient_clip: 1.0
   gradient_accumulation_steps: 1
-  max_eval_steps: 33  # Max validation steps (prevents infinite loop)
+  max_eval_steps: 200  # Max validation steps (prevents infinite loop)
   # JAX-specific options
   jit_compile: true  # JIT compile train/eval steps
   use_pmap: false  # Use pmap for multi-device (experimental)
@@ -66,8 +66,8 @@ training:
 
 # Data loading
 data:
-  train_path: "chessbench_data/train/*.bag"
-  val_path: "chessbench_data/test/*.bag"
+  train_path: "~/training_bag/training-run1-test80-202507*.bag"
+  val_path: "~/training_bag/training-run1-test80-202508*.bag"
   num_workers: 4
   prefetch_factor: 10
   seed: 42
@@ -82,8 +82,8 @@ checkpoint:
 
 # Weights & Biases logging
 wandb:
-  enabled: false
-  project: "catgpt-jax"
+  enabled: true
+  project: "catgpt-leela"
   entity: null  # Your W&B username or team
   run_name: null  # Auto-generated if null
   tags: ["jax"]

@@ -6,7 +6,7 @@ import grain.python as pygrain
 import torch
 
 from catgpt.core.data.grain.bagz import BagDataSource
-from catgpt.core.data.grain.coders import ConvertStateValueDataToSequence
+from catgpt.core.data.grain.coders import ConvertTrainingBagDataToSequence
 
 if TYPE_CHECKING:
     from catgpt.core.configs.schema import DataConfig
@@ -101,7 +101,7 @@ def create_grain_dataloader(
 
     # Define transformations pipeline
     transformations = (
-        ConvertStateValueDataToSequence(tokenizer_config),  # bytes -> (state, win_prob)
+        ConvertTrainingBagDataToSequence(tokenizer_config),  # bytes -> (state, win_prob)
         pygrain.Batch(batch_size=batch_size, drop_remainder=split == "train"),
         ConvertToTorch(),  # numpy -> torch tensors dict
     )
