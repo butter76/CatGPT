@@ -51,7 +51,6 @@ class JaxModelConfig:
     vocab_size: int = 28  # From tokenizer.VOCAB_SIZE
     seq_length: int = 64
     activation: str = "gelu"
-    dropout_rate: float = 0.0  # JAX models often use explicit dropout
 
     # Output head configuration
     output_heads: JaxOutputHeadConfig = field(default_factory=JaxOutputHeadConfig)

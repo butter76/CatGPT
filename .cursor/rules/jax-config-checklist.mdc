@@ -1,0 +1,34 @@
+# JAX Configuration Checklist
+
+When adding a new configuration field for JAX training, you MUST update ALL of these files in order:
+
+## 1. Add to YAML config (`configs/jax_base.yaml`)
+- Add the field with a descriptive comment
+- Set a sensible default value
+
+## 2. Add to config dataclass (`src/catgpt/jax/configs.py`)
+- Add field to the appropriate `Jax*Config` dataclass (e.g., `JaxModelConfig`, `JaxTrainingConfig`)
+- Match the type and default value from YAML
+- Add comment explaining what it does
+
+## 3. Update training script (`scripts/train_jax.py`)
+- **CRITICAL**: Pass the field from config to the actual component
+- For model configs: Add to `TransformerConfig` initialization (~line 143)
+- For training configs: Already passed via `training_config` parameter
+- For optimizer configs: Already passed via `create_optimizer_with_gradient_clipping`
+
+## 4. Use in implementation
+- Model fields: Used in `src/catgpt/jax/models/transformer.py`
+- Training fields: Used in `src/catgpt/jax/training/trainer.py`
+- Optimizer fields: Used in `src/catgpt/jax/optimizers/factory.py`
+- Data fields: Used in `src/catgpt/jax/data/dataloader.py`
+
+## Common mistake: Missing step 3!
+The most common bug is adding the field to steps 1 and 2, but forgetting to pass it through in `train_jax.py`. Always verify the field flows from YAML → config dataclass → train_jax.py → implementation.
+
+## Quick verification
+After adding a config field, grep for it across the JAX codebase:
+```bash
+rg "your_field_name" src/catgpt/jax/ configs/ scripts/train_jax.py
+```
+You should see it in at least: the YAML, the config dataclass, train_jax.py, and the implementation file.

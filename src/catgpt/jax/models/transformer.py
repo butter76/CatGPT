@@ -24,7 +24,6 @@ class TransformerConfig:
     vocab_size: int = 28  # From tokenizer.VOCAB_SIZE
     seq_length: int = 64
     activation: str = "gelu"
-    dropout_rate: float = 0.0
 
     # Output head configuration
     output_heads: JaxOutputHeadConfig = field(default_factory=JaxOutputHeadConfig)
@@ -43,6 +42,88 @@ class TransformerConfig:
             object.__setattr__(self, "output_heads", JaxOutputHeadConfig(**self.output_heads))
 
 
+class QKVNormMultiHeadAttention(nn.Module):
+    """Multi-head attention with per-head QKV normalization.
+
+    Implements QKV-Norm as described in HybridNorm (https://arxiv.org/abs/2503.04598):
+        attn_QKV(Q, K, V) = softmax(Norm(Q) * Norm(K)^T / sqrt(d_k)) * Norm(V)
+
+    Normalization is applied per-head (not along the full hidden dimension).
+    """
+
+    num_heads: int
+    qkv_features: int
+    deterministic: bool = True
+    dtype: Dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, inputs_q: jax.Array, inputs_kv: jax.Array) -> jax.Array:
+        """Apply multi-head attention with QKV normalization.
+
+        Args:
+            inputs_q: Query input, shape (batch, seq_len, features).
+            inputs_kv: Key/Value input, shape (batch, seq_len, features).
+
+        Returns:
+            Attention output, shape (batch, seq_len, features).
+        """
+        batch_size, seq_len, _ = inputs_q.shape
+        head_dim = self.qkv_features // self.num_heads
+
+        if self.qkv_features % self.num_heads != 0:
+            msg = f"qkv_features ({self.qkv_features}) must be divisible by num_heads ({self.num_heads})"
+            raise ValueError(msg)
+
+        # Project to Q, K, V
+        query = nn.Dense(self.qkv_features, dtype=self.dtype, name="query")(inputs_q)
+        key = nn.Dense(self.qkv_features, dtype=self.dtype, name="key")(inputs_kv)
+        value = nn.Dense(self.qkv_features, dtype=self.dtype, name="value")(inputs_kv)
+
+        # Reshape to (batch, seq_len, num_heads, head_dim)
+        query = query.reshape(batch_size, seq_len, self.num_heads, head_dim)
+        key = key.reshape(batch_size, seq_len, self.num_heads, head_dim)
+        value = value.reshape(batch_size, seq_len, self.num_heads, head_dim)
+
+        # Apply per-head LayerNorm along head_dim (last axis)
+        # Normalize in float32 for stability, then cast back
+        query = nn.LayerNorm(dtype=jnp.float32, name="query_norm")(
+            query.astype(jnp.float32)
+        ).astype(self.dtype)
+        key = nn.LayerNorm(dtype=jnp.float32, name="key_norm")(
+            key.astype(jnp.float32)
+        ).astype(self.dtype)
+        value = nn.LayerNorm(dtype=jnp.float32, name="value_norm")(
+            value.astype(jnp.float32)
+        ).astype(self.dtype)
+
+        # Transpose to (batch, num_heads, seq_len, head_dim) for attention computation
+        query = jnp.transpose(query, (0, 2, 1, 3))
+        key = jnp.transpose(key, (0, 2, 1, 3))
+        value = jnp.transpose(value, (0, 2, 1, 3))
+
+        # Scaled dot-product attention
+        # (batch, num_heads, seq_len, head_dim) @ (batch, num_heads, head_dim, seq_len)
+        # -> (batch, num_heads, seq_len, seq_len)
+        attn_weights = jnp.matmul(query, jnp.transpose(key, (0, 1, 3, 2))) / jnp.sqrt(head_dim)
+        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+
+        # Apply attention to values
+        # (batch, num_heads, seq_len, seq_len) @ (batch, num_heads, seq_len, head_dim)
+        # -> (batch, num_heads, seq_len, head_dim)
+        attn_output = jnp.matmul(attn_weights, value)
+
+        # Transpose back to (batch, seq_len, num_heads, head_dim)
+        attn_output = jnp.transpose(attn_output, (0, 2, 1, 3))
+
+        # Reshape to (batch, seq_len, qkv_features)
+        attn_output = attn_output.reshape(batch_size, seq_len, self.qkv_features)
+
+        # Final output projection
+        output = nn.Dense(self.qkv_features, dtype=self.dtype, name="out")(attn_output)
+
+        return output
+
+
 class TransformerBlock(nn.Module):
     """Single transformer encoder block with bidirectional attention."""
 
@@ -50,7 +131,6 @@ class TransformerBlock(nn.Module):
     num_heads: int
     ff_dim: int
     activation: str = "gelu"
-    dropout_rate: float = 0.0
     dtype: Dtype = jnp.float32  # Compute dtype for mixed precision
 
     def _get_activation(self) -> callable:
@@ -68,7 +148,18 @@ class TransformerBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array, *, train: bool = False) -> jax.Array:
-        """Forward pass with pre-norm architecture.
+        """Forward pass with Peri-LN architecture and QKV-Norm.
+
+        Peri-LN applies layer normalization peripherally around each sublayer,
+        i.e., both before (input) AND after (output) each module:
+            y = x + Norm(Module(Norm(x)))
+
+        This strikes an ideal balance in variance growth, avoiding both vanishing
+        gradients (Post-LN) and massive activations (Pre-LN).
+        See: https://arxiv.org/abs/2502.02732
+
+        QKV-Norm is applied within the attention mechanism per-head for improved
+        training stability. See: https://arxiv.org/abs/2503.04598
 
         Args:
             x: Input tensor, shape (batch, seq_len, hidden_size).
@@ -77,25 +168,27 @@ class TransformerBlock(nn.Module):
         Returns:
             Output tensor, same shape as input.
         """
-        # Self-attention with residual (NO causal mask = bidirectional)
-        # LayerNorm in float32 for numerical stability, then cast back
+        # Self-attention with Peri-LN and QKV-Norm (NO causal mask = bidirectional)
+        # Input norm: LayerNorm in float32 for numerical stability, then cast back
         normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
-        attn_out = nn.MultiHeadDotProductAttention(
+        attn_out = QKVNormMultiHeadAttention(
             num_heads=self.num_heads,
             qkv_features=self.hidden_size,
             deterministic=not train,
-            dropout_rate=self.dropout_rate,
             dtype=self.dtype,
         )(normed, normed)
+        # Output norm: normalize attention output before residual addition
+        attn_out = nn.LayerNorm(dtype=jnp.float32)(attn_out.astype(jnp.float32)).astype(self.dtype)
         x = x + attn_out
 
-        # Feed-forward with residual
+        # Feed-forward with Peri-LN
+        # Input norm
         normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
         ff_out = nn.Dense(self.ff_dim, dtype=self.dtype)(normed)
         ff_out = self._get_activation()(ff_out)
-        ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
         ff_out = nn.Dense(self.hidden_size, dtype=self.dtype)(ff_out)
-        ff_out = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(ff_out)
+        # Output norm: normalize MLP output before residual addition
+        ff_out = nn.LayerNorm(dtype=jnp.float32)(ff_out.astype(jnp.float32)).astype(self.dtype)
         x = x + ff_out
 
         return x
@@ -111,9 +204,18 @@ class BidirectionalTransformer(nn.Module):
     Architecture:
     - Token embedding
     - Absolute (learnable) positional embedding
-    - N transformer encoder blocks
+    - Initial embedding LayerNorm (Peri-LN)
+    - N transformer encoder blocks with Peri-LN
+    - Final LayerNorm
     - Mean pooling over sequence
     - Linear projection to HL-Gauss categorical distribution
+
+    Normalization (Peri-LN):
+    Uses Peri-LN architecture which applies layer normalization peripherally
+    around each sublayer (both input AND output): y = x + Norm(Module(Norm(x)))
+    This provides more stable training than Pre-LN (prone to massive activations)
+    or Post-LN (prone to vanishing gradients).
+    See: https://arxiv.org/abs/2502.02732
 
     Value Head (HL-Gauss):
     Instead of outputting a single scalar, the value head outputs logits over
@@ -177,7 +279,6 @@ class BidirectionalTransformer(nn.Module):
                 num_heads=self.config.num_heads,
                 ff_dim=self.config.ff_dim or (4 * self.config.hidden_size),
                 activation=self.config.activation,
-                dropout_rate=self.config.dropout_rate,
                 dtype=compute_dtype,
                 name=f"block_{i}",
             )(hidden, train=train)
@@ -243,7 +344,6 @@ class BidirectionalTransformer(nn.Module):
             vocab_size=config.vocab_size,
             seq_length=config.seq_length,
             activation=config.activation,
-            dropout_rate=config.dropout_rate,
             output_heads=config.output_heads,
         )
         return cls(config=transformer_config)

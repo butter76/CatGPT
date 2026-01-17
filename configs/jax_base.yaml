@@ -4,14 +4,13 @@
 # Model architecture
 model:
   name: "transformer"
-  hidden_size: 256
+  hidden_size: 512
   num_layers: 16
-  num_heads: 16
-  ff_dim: 768  # Defaults to 4 * hidden_size
+  num_heads: 32
+  ff_dim: 1536  # Defaults to 4 * hidden_size
   vocab_size: 28  # From tokenizer (don't change unless tokenizer changes)
   seq_length: 64  # Will be overridden by tokenizer.sequence_length
   activation: "gelu"
-  dropout_rate: 0.0  # JAX-specific: explicit dropout rate
 
   # Output heads configuration
   output_heads:
@@ -28,7 +27,7 @@ tokenizer:
 # Optimizer configuration
 optimizer:
   name: "splus"  # Options: "adamw", "splus", "sgd"
-  learning_rate: 0.12
+  learning_rate: 0.095
   weight_decay: 0.01
   # AdamW/SGD specific
   b1: 0.9
