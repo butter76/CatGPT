@@ -304,10 +304,10 @@ class BidirectionalTransformer(nn.Module):
             )(hidden)  # (batch, seq, vocab_size)
             outputs["self"] = self_logits
 
-        # Value head: HL-Gauss categorical distribution from pooled representation
+        # Value head: HL-Gauss categorical distribution from last token
         if head_config.value_head:
-            # Mean pooling over sequence dimension
-            pooled = hidden.mean(axis=1)  # (batch, hidden)
+            # Use last token representation (similar to GPT-style classification)
+            pooled = hidden[:, -1, :]  # (batch, hidden)
 
             # Output logits for each bin in the HL-Gauss distribution
             num_bins = head_config.value_num_bins
