@@ -108,8 +108,11 @@ class QKVNormMultiHeadAttention(nn.Module):
         # Scaled dot-product attention
         # (batch, num_heads, seq_len, head_dim) @ (batch, num_heads, head_dim, seq_len)
         # -> (batch, num_heads, seq_len, seq_len)
-        attn_weights = jnp.matmul(query, jnp.transpose(key, (0, 1, 3, 2))) / jnp.sqrt(head_dim)
-        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+        attn_weights = jnp.matmul(query, jnp.transpose(key, (0, 1, 3, 2)))
+        # Scale and softmax in float32 for numerical stability, then cast back
+        attn_weights = jax.nn.softmax(
+            attn_weights.astype(jnp.float32) / jnp.sqrt(head_dim), axis=-1
+        ).astype(self.dtype)
 
         # Apply attention to values
         # (batch, num_heads, seq_len, seq_len) @ (batch, num_heads, seq_len, head_dim)
