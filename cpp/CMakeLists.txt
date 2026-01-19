@@ -19,6 +19,10 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
+# === Chess Library (header-only) ===
+set(CHESS_LIBRARY_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/external/chess-library/include")
+message(STATUS "Chess library include: ${CHESS_LIBRARY_INCLUDE_DIR}")
+
 # === CUDA (runtime only, no compilation) ===
 set(CUDA_ROOT "/usr/local/cuda-12.8" CACHE PATH "CUDA installation root")
 set(CUDA_INCLUDE_DIR "${CUDA_ROOT}/include")
@@ -41,6 +45,15 @@ message(STATUS "TensorRT nvinfer: ${NVINFER_LIB}")
 # === Hello World executable (no dependencies) ===
 add_executable(chess_engine
     src/main.cpp
+)
+
+# === Chess Library Tests ===
+add_executable(chess_lib_tests
+    tests/chess_lib_tests.cpp
+)
+
+target_include_directories(chess_lib_tests PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
 )
 
 # === TensorRT Benchmark executable ===
@@ -71,4 +84,5 @@ set_target_properties(trt_benchmark PROPERTIES
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)
     target_compile_options(trt_benchmark PRIVATE -fdiagnostics-color=always)
+    target_compile_options(chess_lib_tests PRIVATE -fdiagnostics-color=always)
 endif()
