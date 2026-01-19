@@ -13,7 +13,12 @@ import jax.numpy as jnp
 from loguru import logger
 from omegaconf import OmegaConf
 
-from catgpt.jax.configs import JaxModelConfig, JaxOutputHeadConfig, JaxTokenizerConfig
+from catgpt.jax.configs import (
+    JaxModelConfig,
+    JaxOutputHeadConfig,
+    JaxTokenizerConfig,
+    SmolgenConfig,
+)
 from catgpt.jax.models.transformer import BidirectionalTransformer, TransformerConfig
 
 
@@ -109,6 +114,13 @@ def _load_model_config(path: Path) -> JaxModelConfig:
     else:
         output_heads = output_heads_data
 
+    # Handle smolgen as dict or SmolgenConfig
+    smolgen_data = config_dict.get("smolgen", {})
+    if isinstance(smolgen_data, dict):
+        smolgen = SmolgenConfig(**smolgen_data)
+    else:
+        smolgen = smolgen_data
+
     return JaxModelConfig(
         name=config_dict.get("name", "transformer"),
         hidden_size=config_dict["hidden_size"],
@@ -119,6 +131,7 @@ def _load_model_config(path: Path) -> JaxModelConfig:
         seq_length=config_dict.get("seq_length", 64),
         activation=config_dict.get("activation", "gelu"),
         output_heads=output_heads,
+        smolgen=smolgen,
     )
 
 
