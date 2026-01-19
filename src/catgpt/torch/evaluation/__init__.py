@@ -1,2 +1,0 @@
-"""PyTorch evaluation metrics."""
-

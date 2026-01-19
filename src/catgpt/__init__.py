@@ -1,8 +1,7 @@
 """CatGPT: ML research project for chess and beyond.
 
-This package supports multiple ML frameworks:
-- PyTorch: `from catgpt.torch import ...`
-- JAX: `from catgpt.jax import ...` (requires `pip install catgpt[jax]`)
+This package uses JAX/Flax as its ML framework:
+- JAX: `from catgpt.jax import ...`
 
 Shared utilities are in `catgpt.core`:
 - `from catgpt.core import setup_logging, load_config`

@@ -85,7 +85,7 @@ class TrainingConfig:
     max_eval_steps: int | None = None  # Max validation steps (None = full dataset)
 
     # Compilation
-    compile_model: bool = True  # Use torch.compile
+    compile_model: bool = True  # JIT compile the model
 
 
 @dataclass
@@ -132,7 +132,7 @@ class DistributedConfig:
     """Configuration for distributed training."""
 
     enabled: bool = False
-    backend: str = "nccl"  # "nccl" for GPU, "gloo" for CPU
+    backend: str = "jax"  # JAX distributed training
 
 
 @dataclass
@@ -150,20 +150,6 @@ class ExperimentConfig:
     distributed: DistributedConfig = field(default_factory=DistributedConfig)
 
     seed: int = 42
-    device: str = "auto"  # "auto" | "cuda" | "cpu" | "mps"
-
-    def resolve_device(self) -> str:
-        """Resolve 'auto' device to actual device."""
-        if self.device != "auto":
-            return self.device
-
-        import torch
-
-        if torch.cuda.is_available():
-            return "cuda"
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
 
 
 def config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
@@ -186,7 +172,6 @@ def config_from_dict(data: dict[str, Any]) -> ExperimentConfig:
         wandb=WandbConfig(**data.get("wandb", {})),
         distributed=DistributedConfig(**data.get("distributed", {})),
         seed=data.get("seed", 42),
-        device=data.get("device", "auto"),
     )
 
 

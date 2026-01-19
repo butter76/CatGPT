@@ -1,6 +1,6 @@
 # CatGPT 🐱
 
-ML research project for chess and beyond. Supports both **PyTorch** and **JAX** frameworks.
+ML research project for chess and beyond built with **JAX** and **Flax**.
 
 ## Quick Start
 
@@ -19,29 +19,21 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/your-org/catgpt.git
 cd catgpt
 
-# Install with PyTorch (default)
-uv sync --extra torch
-
-# Or install with JAX
+# Install with JAX (CPU)
 uv sync --extra jax
 
-# Or install with both frameworks
-uv sync --extra torch --extra jax
+# Or install with JAX (CUDA)
+uv sync --extra jax-cuda
 
 # Install with dev dependencies
-uv sync --extra torch --extra dev
+uv sync --extra jax --extra dev
 ```
 
 ## Framework Support
 
-CatGPT supports multiple ML frameworks with a unified interface:
+CatGPT is built on JAX/Flax for high-performance machine learning:
 
 ```python
-# PyTorch
-from catgpt.torch.models import BaseModel
-from catgpt.torch.training import Trainer
-from catgpt.torch.optimizers import SPlus
-
 # JAX/Flax
 from catgpt.jax.models import BaseModel
 from catgpt.jax.training import Trainer
@@ -62,12 +54,6 @@ catgpt/
 │   │   ├── data/            # Common data types
 │   │   ├── evaluation/      # Shared evaluation logic
 │   │   └── utils/           # Logging, etc.
-│   ├── torch/               # PyTorch implementations
-│   │   ├── models/          # PyTorch models
-│   │   ├── optimizers/      # Custom optimizers (SPlus)
-│   │   ├── training/        # Training loops
-│   │   ├── evaluation/      # PyTorch metrics
-│   │   └── data/            # PyTorch datasets
 │   └── jax/                 # JAX/Flax implementations
 │       ├── models/          # Flax models
 │       ├── optimizers/      # Optax extensions
@@ -102,39 +88,36 @@ uv run pytest tests -v --cov=src/catgpt
 # Show version
 uv run catgpt version
 
-# Train a model (PyTorch)
-uv run catgpt train --config base --framework torch
-
 # Train a model (JAX)
-uv run catgpt train --config base --framework jax
+uv run python scripts/train_jax.py
 
 # Evaluate a checkpoint
-uv run catgpt evaluate checkpoints/model.pt --framework torch
+uv run python scripts/evaluate_jax.py --checkpoint checkpoints/model
 ```
 
 ## Configuration
 
-Configurations are managed with [Hydra](https://hydra.cc/). Base config is in `configs/base.yaml`.
+Configurations are managed with [Hydra](https://hydra.cc/). Base config is in `configs/jax_base.yaml`.
 
 Override any value from CLI:
 ```bash
-uv run python scripts/train.py training.learning_rate=0.001 model.num_layers=12
+uv run python scripts/train_jax.py training.learning_rate=0.001 model.num_layers=12
 ```
 
 ## Optional Dependencies
 
 | Extra | Packages | Install |
 |-------|----------|---------|
-| `torch` | PyTorch | `uv sync --extra torch` |
 | `jax` | JAX, Flax, Optax (CPU) | `uv sync --extra jax` |
 | `jax-cuda` | JAX, Flax, Optax (CUDA) | `uv sync --extra jax-cuda` |
 | `dev` | pytest, ruff, pyright | `uv sync --extra dev` |
 | `notebook` | Jupyter, matplotlib | `uv sync --extra notebook` |
+| `export` | ONNX, TensorFlow (for model export) | `uv sync --extra export` |
 | `all` | Everything | `uv sync --extra all` |
 
 ## Contributing
 
-1. Install dev dependencies: `uv sync --extra torch --extra dev`
+1. Install dev dependencies: `uv sync --extra jax --extra dev`
 2. Make your changes
 3. Run checks: `uv run ruff check src tests scripts && uv run pyright src && uv run pytest tests`
 4. Submit a PR
