@@ -296,6 +296,7 @@ dependencies = [
     { name = "tensorflow", extra = ["and-cuda"] },
     { name = "tensorrt" },
     { name = "tensorrt-cu12" },
+    { name = "tf2onnx" },
     { name = "tqdm" },
     { name = "typer" },
     { name = "wandb" },
@@ -394,6 +395,7 @@ requires-dist = [
     { name = "tensorflow", extras = ["and-cuda"], specifier = ">=2.20.0" },
     { name = "tensorrt", specifier = ">=10.14.1.48.post1" },
     { name = "tensorrt-cu12", specifier = ">=10.13.3.9" },
+    { name = "tf2onnx", specifier = ">=1.8.4" },
     { name = "torch", marker = "extra == 'torch'", specifier = ">=2.2.0" },
     { name = "tqdm", specifier = ">=4.66.0" },
     { name = "typer", specifier = ">=0.12.0" },
@@ -4297,6 +4299,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/8a/11/965c6fd8e5cc254f1fe142d547387da17a8ebfd75a3455f637c663fb38a0/terminado-0.18.1.tar.gz", hash = "sha256:de09f2c4b85de4765f7714688fff57d3e75bad1f909b589fde880460c753fd2e", size = 32701, upload-time = "2024-03-12T14:34:39.026Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6a/9e/2064975477fdc887e47ad42157e214526dcad8f317a948dee17e1659a62f/terminado-0.18.1-py3-none-any.whl", hash = "sha256:a4468e1b37bb318f8a86514f65814e1afc977cf29b3992a4500d9dd305dcceb0", size = 14154, upload-time = "2024-03-12T14:34:36.569Z" },
+]
+
+[[package]]
+name = "tf2onnx"
+version = "1.8.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "flatbuffers" },
+    { name = "numpy" },
+    { name = "onnx" },
+    { name = "requests" },
+    { name = "six" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/db/32/33ce509a79c207a39cf04bfa3ec3353da15d1e6553a6ad912f117cc29130/tf2onnx-1.8.4-py3-none-any.whl", hash = "sha256:1ebabb96c914da76e23222b6107a8b248a024bf259d77f027e6690099512d457", size = 345298, upload-time = "2021-03-17T19:37:21.224Z" },
 ]
 
 [[package]]
