@@ -114,3 +114,31 @@ lc0/
 lczero-training/
 stockfish/
 puzzles/
+*.onnx
+*.data
+*.trt
+
+# C++ Build Artifacts
+engine/build/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+compile_commands.json
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+!CMakePresets.json
+
+# clangd
+.cache/
+.clangd/

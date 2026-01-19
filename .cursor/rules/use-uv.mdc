@@ -2,4 +2,4 @@
 alwaysApply: true
 ---
 
-Use 'uv' over raw 'python' always.
+Use 'uv' over raw 'python' and 'pip' always.
