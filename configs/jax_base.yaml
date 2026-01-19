@@ -12,6 +12,15 @@ model:
   seq_length: 64  # Will be overridden by tokenizer.sequence_length
   activation: "gelu"
 
+  # Smolgen: dynamic attention bias generation
+  # Generates position-dependent attention biases conditioned on input
+  # See: https://lczero.org/blog/2024/02/transformer-progress/
+  smolgen:
+    enabled: false
+    hidden_channels: 32  # Compression dimension
+    hidden_size: 256     # Hidden layer size
+    gen_size: 256        # Per-head generation dimension
+
   # Output heads configuration
   output_heads:
     self_head: true      # Token reconstruction (auxiliary task for stability)

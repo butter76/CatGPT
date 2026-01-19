@@ -48,7 +48,10 @@ from catgpt.jax.configs import (
 )
 from catgpt.jax.data.dataloader import create_dataloader
 from catgpt.jax.models.transformer import BidirectionalTransformer, TransformerConfig
-from catgpt.jax.optimizers.factory import create_lr_schedule, create_optimizer_with_gradient_clipping
+from catgpt.jax.optimizers.factory import (
+    create_lr_schedule,
+    create_optimizer_with_gradient_clipping,
+)
 from catgpt.jax.training.trainer import Trainer
 
 
@@ -139,20 +142,12 @@ def main(cfg: DictConfig) -> None:
     model_cfg = experiment_config.model
     tokenizer_cfg = experiment_config.tokenizer
 
-    # Update model config with tokenizer info and output head settings
-    transformer_config = TransformerConfig(
-        hidden_size=model_cfg.hidden_size,
-        num_layers=model_cfg.num_layers,
-        num_heads=model_cfg.num_heads,
-        ff_dim=model_cfg.ff_dim,
-        vocab_size=model_cfg.vocab_size,
-        seq_length=tokenizer_cfg.sequence_length,
-        activation=model_cfg.activation,
-        output_heads=model_cfg.output_heads,  # Include HL-Gauss config
-    )
+    # Override seq_length from tokenizer config
+    model_cfg.seq_length = tokenizer_cfg.sequence_length
 
-    # Create model
-    model = BidirectionalTransformer(config=transformer_config)
+    # Create model using from_model_config which properly handles all config fields
+    # (including output_heads and smolgen)
+    model = BidirectionalTransformer.from_model_config(model_cfg)
 
     # Initialize model parameters
     rng, init_rng = jax.random.split(rng)

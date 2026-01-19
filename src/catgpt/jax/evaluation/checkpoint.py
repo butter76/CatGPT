@@ -68,18 +68,12 @@ def load_checkpoint(path: Path | str, *, evaluation: bool = True) -> LoadedCheck
     # Load tokenizer config
     tokenizer_config = _load_tokenizer_config(path)
 
-    # Create model from config
-    transformer_config = TransformerConfig(
-        hidden_size=model_config.hidden_size,
-        num_layers=model_config.num_layers,
-        num_heads=model_config.num_heads,
-        ff_dim=model_config.ff_dim,
-        vocab_size=model_config.vocab_size,
-        seq_length=tokenizer_config.sequence_length,
-        activation=model_config.activation,
-        output_heads=model_config.output_heads,
-    )
-    model = BidirectionalTransformer(config=transformer_config)
+    # Override seq_length from tokenizer config
+    model_config.seq_length = tokenizer_config.sequence_length
+
+    # Create model using from_model_config which properly handles all config fields
+    # (including output_heads and smolgen)
+    model = BidirectionalTransformer.from_model_config(model_config)
 
     # Load parameters
     params = _load_params(path, model, tokenizer_config.sequence_length, evaluation=evaluation)

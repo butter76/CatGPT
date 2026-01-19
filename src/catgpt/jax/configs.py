@@ -56,6 +56,33 @@ class JaxOutputHeadConfig:
 
 
 @dataclass
+class SmolgenConfig:
+    """Configuration for Smolgen attention bias generation.
+
+    Smolgen dynamically generates position-dependent attention biases conditioned
+    on the input, rather than using fixed positional encodings. This allows the
+    model to learn that certain square pairs should attend differently based on
+    the actual board state (e.g., open vs closed positions).
+
+    Architecture:
+    1. Compress: (seq_len, hidden) → (seq_len, hidden_channels) - no bias
+    2. Flatten: → (seq_len * hidden_channels,) - global representation
+    3. Dense1 → GELU → LayerNorm: → (hidden_size,)
+    4. Dense2 → GELU → LayerNorm: → (num_heads * gen_size,)
+    5. Shared weight_gen: → (num_heads, seq_len, seq_len) - no activation
+
+    The final weight_gen layer is shared across all transformer blocks.
+
+    See: https://lczero.org/blog/2024/02/transformer-progress/
+    """
+
+    enabled: bool = False
+    hidden_channels: int = 32  # Compression dimension
+    hidden_size: int = 256  # Hidden layer size
+    gen_size: int = 256  # Per-head generation dimension
+
+
+@dataclass
 class JaxModelConfig:
     """Configuration for JAX model architecture."""
 
@@ -71,6 +98,9 @@ class JaxModelConfig:
     # Output head configuration
     output_heads: JaxOutputHeadConfig = field(default_factory=JaxOutputHeadConfig)
 
+    # Smolgen: dynamic attention bias generation
+    smolgen: SmolgenConfig = field(default_factory=SmolgenConfig)
+
     def __post_init__(self) -> None:
         """Set defaults and validate."""
         if self.ff_dim is None:
@@ -80,9 +110,11 @@ class JaxModelConfig:
             msg = f"hidden_size ({self.hidden_size}) must be divisible by num_heads ({self.num_heads})"
             raise ValueError(msg)
 
-        # Convert dict to JaxOutputHeadConfig if needed (for YAML loading)
+        # Convert dict to dataclass if needed (for YAML loading)
         if isinstance(self.output_heads, dict):
             self.output_heads = JaxOutputHeadConfig(**self.output_heads)
+        if isinstance(self.smolgen, dict):
+            self.smolgen = SmolgenConfig(**self.smolgen)
 
 
 @dataclass

@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from catgpt.core.data.grain.coders import POLICY_SHAPE, POLICY_TO_DIM
-from catgpt.jax.configs import JaxModelConfig, JaxOutputHeadConfig
+from catgpt.jax.configs import JaxModelConfig, JaxOutputHeadConfig, SmolgenConfig
 
 # Type alias for dtype
 Dtype = Any
@@ -32,6 +32,9 @@ class TransformerConfig:
     # Output head configuration
     output_heads: JaxOutputHeadConfig = field(default_factory=JaxOutputHeadConfig)
 
+    # Smolgen configuration
+    smolgen: SmolgenConfig = field(default_factory=SmolgenConfig)
+
     def __post_init__(self) -> None:
         """Set defaults and validate."""
         if self.ff_dim is None:
@@ -41,9 +44,11 @@ class TransformerConfig:
             msg = f"hidden_size ({self.hidden_size}) must be divisible by num_heads ({self.num_heads})"
             raise ValueError(msg)
 
-        # Convert dict to JaxOutputHeadConfig if needed
+        # Convert dict to dataclass if needed
         if isinstance(self.output_heads, dict):
             object.__setattr__(self, "output_heads", JaxOutputHeadConfig(**self.output_heads))
+        if isinstance(self.smolgen, dict):
+            object.__setattr__(self, "smolgen", SmolgenConfig(**self.smolgen))
 
 
 class QKVNormMultiHeadAttention(nn.Module):
@@ -61,12 +66,19 @@ class QKVNormMultiHeadAttention(nn.Module):
     dtype: Dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, inputs_q: jax.Array, inputs_kv: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        inputs_q: jax.Array,
+        inputs_kv: jax.Array,
+        smolgen_bias: jax.Array | None = None,
+    ) -> jax.Array:
         """Apply multi-head attention with QKV normalization.
 
         Args:
             inputs_q: Query input, shape (batch, seq_len, features).
             inputs_kv: Key/Value input, shape (batch, seq_len, features).
+            smolgen_bias: Optional attention bias from Smolgen,
+                shape (batch, num_heads, seq_len, seq_len).
 
         Returns:
             Attention output, shape (batch, seq_len, features).
@@ -108,11 +120,15 @@ class QKVNormMultiHeadAttention(nn.Module):
         # Scaled dot-product attention
         # (batch, num_heads, seq_len, head_dim) @ (batch, num_heads, head_dim, seq_len)
         # -> (batch, num_heads, seq_len, seq_len)
-        attn_weights = jnp.matmul(query, jnp.transpose(key, (0, 1, 3, 2)))
-        # Scale and softmax in float32 for numerical stability, then cast back
-        attn_weights = jax.nn.softmax(
-            attn_weights.astype(jnp.float32) / jnp.sqrt(head_dim), axis=-1
-        ).astype(self.dtype)
+        attn_logits = jnp.matmul(query, jnp.transpose(key, (0, 1, 3, 2)))
+        attn_logits = attn_logits.astype(jnp.float32) / jnp.sqrt(head_dim)
+
+        # Add Smolgen bias if provided (dynamic position-dependent attention bias)
+        if smolgen_bias is not None:
+            attn_logits = attn_logits + smolgen_bias.astype(jnp.float32)
+
+        # Softmax in float32 for numerical stability, then cast back
+        attn_weights = jax.nn.softmax(attn_logits, axis=-1).astype(self.dtype)
 
         # Apply attention to values
         # (batch, num_heads, seq_len, seq_len) @ (batch, num_heads, seq_len, head_dim)
@@ -131,14 +147,101 @@ class QKVNormMultiHeadAttention(nn.Module):
         return output
 
 
+class Smolgen(nn.Module):
+    """Smolgen: Dynamic attention bias generation.
+
+    Generates position-dependent attention biases conditioned on the input,
+    allowing the model to learn that certain square pairs should attend
+    differently based on the actual board state.
+
+    Architecture:
+    1. Compress: (batch, seq_len, hidden) → (batch, seq_len, hidden_channels)
+    2. Flatten: → (batch, seq_len * hidden_channels)
+    3. Dense1 → GELU → LayerNorm: → (batch, hidden_size)
+    4. Dense2 → GELU → LayerNorm: → (batch, num_heads * gen_size)
+    5. Reshape: → (batch, num_heads, gen_size)
+    6. Shared weight_gen (external): → (batch, num_heads, seq_len * seq_len)
+    7. Reshape: → (batch, num_heads, seq_len, seq_len)
+
+    The weight_gen layer is passed in externally and shared across all blocks.
+
+    See: https://lczero.org/blog/2024/02/transformer-progress/
+    """
+
+    num_heads: int
+    seq_length: int
+    hidden_channels: int = 32
+    hidden_size: int = 256
+    gen_size: int = 256
+    dtype: Dtype = jnp.float32
+
+    @nn.compact
+    def __call__(
+        self, x: jax.Array, weight_gen_kernel: jax.Array
+    ) -> jax.Array:
+        """Generate attention bias from input.
+
+        Args:
+            x: Input tensor, shape (batch, seq_len, hidden_size).
+            weight_gen_kernel: Shared weight generation kernel from parent model,
+                shape (gen_size, seq_len * seq_len). No bias.
+
+        Returns:
+            Attention bias, shape (batch, num_heads, seq_len, seq_len).
+        """
+        batch_size = x.shape[0]
+
+        # 1. Compress: (batch, seq_len, hidden) → (batch, seq_len, hidden_channels)
+        compressed = nn.Dense(
+            self.hidden_channels,
+            use_bias=False,
+            dtype=self.dtype,
+            name="compress",
+        )(x)
+
+        # 2. Flatten: → (batch, seq_len * hidden_channels)
+        compressed = compressed.reshape(batch_size, -1)
+
+        # 3. Dense1 → GELU → LayerNorm
+        hidden = nn.Dense(self.hidden_size, dtype=self.dtype, name="dense1")(compressed)
+        hidden = nn.gelu(hidden)
+        hidden = nn.LayerNorm(dtype=jnp.float32, name="ln1")(
+            hidden.astype(jnp.float32)
+        ).astype(self.dtype)
+
+        # 4. Dense2 → GELU → LayerNorm → reshape to (batch, num_heads, gen_size)
+        gen_from = nn.Dense(
+            self.num_heads * self.gen_size, dtype=self.dtype, name="dense2"
+        )(hidden)
+        gen_from = nn.gelu(gen_from)
+        gen_from = nn.LayerNorm(dtype=jnp.float32, name="ln2")(
+            gen_from.astype(jnp.float32)
+        ).astype(self.dtype)
+        gen_from = gen_from.reshape(batch_size, self.num_heads, self.gen_size)
+
+        # 5. Apply shared weight_gen: (batch, num_heads, gen_size) @ (gen_size, seq*seq)
+        #    → (batch, num_heads, seq_len * seq_len)
+        # Cast kernel to compute dtype for mixed precision consistency
+        # No activation on final output
+        kernel = weight_gen_kernel.astype(self.dtype)
+        out = jnp.einsum("bhg,go->bho", gen_from, kernel)
+
+        # 6. Reshape to (batch, num_heads, seq_len, seq_len)
+        return out.reshape(batch_size, self.num_heads, self.seq_length, self.seq_length)
+
+
 class TransformerBlock(nn.Module):
     """Single transformer encoder block with bidirectional attention."""
 
     hidden_size: int
     num_heads: int
     ff_dim: int
+    seq_length: int = 64
     activation: str = "gelu"
     dtype: Dtype = jnp.float32  # Compute dtype for mixed precision
+
+    # Smolgen configuration (None = disabled)
+    smolgen_config: SmolgenConfig | None = None
 
     def _get_activation(self) -> callable:
         """Get activation function by name."""
@@ -154,7 +257,13 @@ class TransformerBlock(nn.Module):
         return activations[self.activation]
 
     @nn.compact
-    def __call__(self, x: jax.Array, *, train: bool = False) -> jax.Array:
+    def __call__(
+        self,
+        x: jax.Array,
+        *,
+        train: bool = False,
+        smolgen_weight_kernel: jax.Array | None = None,
+    ) -> jax.Array:
         """Forward pass with Peri-LN architecture and QKV-Norm.
 
         Peri-LN applies layer normalization peripherally around each sublayer,
@@ -171,10 +280,27 @@ class TransformerBlock(nn.Module):
         Args:
             x: Input tensor, shape (batch, seq_len, hidden_size).
             train: Whether in training mode.
+            smolgen_weight_kernel: Shared weight generation kernel for Smolgen,
+                shape (gen_size, seq_len * seq_len). Required if smolgen_config is set.
 
         Returns:
             Output tensor, same shape as input.
         """
+        # Generate Smolgen bias if enabled
+        smolgen_bias = None
+        if self.smolgen_config is not None and self.smolgen_config.enabled:
+            if smolgen_weight_kernel is None:
+                raise ValueError("smolgen_weight_kernel required when smolgen is enabled")
+            smolgen_bias = Smolgen(
+                num_heads=self.num_heads,
+                seq_length=self.seq_length,
+                hidden_channels=self.smolgen_config.hidden_channels,
+                hidden_size=self.smolgen_config.hidden_size,
+                gen_size=self.smolgen_config.gen_size,
+                dtype=self.dtype,
+                name="smolgen",
+            )(x, smolgen_weight_kernel)
+
         # Self-attention with Peri-LN and QKV-Norm (NO causal mask = bidirectional)
         # Input norm: LayerNorm in float32 for numerical stability, then cast back
         normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
@@ -183,7 +309,7 @@ class TransformerBlock(nn.Module):
             qkv_features=self.hidden_size,
             deterministic=not train,
             dtype=self.dtype,
-        )(normed, normed)
+        )(normed, normed, smolgen_bias=smolgen_bias)
         # Output norm: normalize attention output before residual addition
         attn_out = nn.LayerNorm(dtype=jnp.float32)(attn_out.astype(jnp.float32)).astype(self.dtype)
         x = x + attn_out
@@ -261,6 +387,7 @@ class BidirectionalTransformer(nn.Module):
         """
         batch_size, seq_len = x.shape
         head_config = self.config.output_heads
+        smolgen_config = self.config.smolgen
 
         # Token embedding (keep in float32 for stability, then cast)
         token_emb = nn.Embed(
@@ -280,16 +407,28 @@ class BidirectionalTransformer(nn.Module):
         # Combine embeddings and cast to compute dtype
         hidden = (token_emb + pos_emb).astype(compute_dtype)
 
+        # Create shared Smolgen weight generation kernel if enabled
+        # This kernel is shared across ALL transformer blocks
+        smolgen_weight_kernel = None
+        if smolgen_config.enabled:
+            smolgen_weight_kernel = self.param(
+                "smolgen_weight_gen",
+                nn.initializers.lecun_normal(),
+                (smolgen_config.gen_size, self.config.seq_length * self.config.seq_length),
+            )
+
         # Pass through transformer blocks (in compute_dtype)
         for i in range(self.config.num_layers):
             hidden = TransformerBlock(
                 hidden_size=self.config.hidden_size,
                 num_heads=self.config.num_heads,
                 ff_dim=self.config.ff_dim or (4 * self.config.hidden_size),
+                seq_length=self.config.seq_length,
                 activation=self.config.activation,
                 dtype=compute_dtype,
+                smolgen_config=smolgen_config if smolgen_config.enabled else None,
                 name=f"block_{i}",
-            )(hidden, train=train)
+            )(hidden, train=train, smolgen_weight_kernel=smolgen_weight_kernel)
 
         # Final norm (float32 for stability)
         hidden = nn.LayerNorm(dtype=jnp.float32)(hidden.astype(jnp.float32))
@@ -385,6 +524,7 @@ class BidirectionalTransformer(nn.Module):
             seq_length=config.seq_length,
             activation=config.activation,
             output_heads=config.output_heads,
+            smolgen=config.smolgen,
         )
         return cls(config=transformer_config)
 
