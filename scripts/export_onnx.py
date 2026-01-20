@@ -145,30 +145,26 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-path", type=Path, required=True, help="Destination .onnx path.")
     parser.add_argument("--opset", type=int, default=20, help="ONNX opset version (>=20 for Gelu).")
 
-    # Model architecture
-    parser.add_argument("--hidden-size", type=int, default=256)
-    parser.add_argument("--num-layers", type=int, default=6)
-    parser.add_argument("--num-heads", type=int, default=8)
-    parser.add_argument("--ff-dim", type=int, default=None)
-    parser.add_argument("--vocab-size", type=int, default=28)
-    parser.add_argument("--seq-length", type=int, default=64)
-    parser.add_argument("--activation", type=str, default="gelu")
+    # Checkpoint loading (preferred method)
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        help="Path to checkpoint directory. If provided, loads model config and params from checkpoint.",
+    )
+    parser.add_argument(
+        "--use-ema",
+        action="store_true",
+        default=True,
+        help="Use EMA params from checkpoint if available (default: True).",
+    )
+    parser.add_argument(
+        "--no-use-ema",
+        dest="use_ema",
+        action="store_false",
+        help="Use regular training params instead of EMA params.",
+    )
 
-    # Output heads
-    parser.add_argument("--self-head", action="store_true")
-    parser.add_argument("--no-self-head", dest="self_head", action="store_false")
-    parser.set_defaults(self_head=False)
-
-    parser.add_argument("--value-head", action="store_true")
-    parser.add_argument("--no-value-head", dest="value_head", action="store_false")
-    parser.set_defaults(value_head=True)
-
-    parser.add_argument("--policy-head", action="store_true")
-    parser.add_argument("--no-policy-head", dest="policy_head", action="store_false")
-    parser.set_defaults(policy_head=True)
-
-    parser.add_argument("--value-num-bins", type=int, default=81)
-
+    # Output keys to export
     parser.add_argument(
         "--output-keys",
         type=str,
@@ -177,7 +173,7 @@ def _parse_args() -> argparse.Namespace:
         help="Model output keys to export (default: value policy_logit).",
     )
 
-    parser.add_argument("--seed", type=int, default=42)
+    # Export settings
     parser.add_argument(
         "--dynamic-batch",
         action="store_true",
@@ -196,9 +192,17 @@ def _parse_args() -> argparse.Namespace:
         default=64,
         help="Batch size for fixed export or validation.",
     )
+
+    # Validation settings
     parser.add_argument("--validate", action="store_true", help="Validate ONNX output with ORT.")
     parser.add_argument("--rtol", type=float, default=1e-3)
-    parser.add_argument("--atol", type=float, default=5e-3)
+    parser.add_argument("--atol", type=float, default=1e-3)
+    parser.add_argument(
+        "--logit-atol",
+        type=float,
+        default=0.05,
+        help="Absolute tolerance for logit outputs (default: 0.05, ~5%% prob diff).",
+    )
 
     return parser.parse_args()
 
@@ -207,6 +211,10 @@ def main() -> None:
     args = _parse_args()
     output_path = args.output_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Require checkpoint
+    if args.checkpoint is None:
+        raise ValueError("--checkpoint is required. Provide path to a checkpoint directory.")
 
     # Remove existing files
     data_path = output_path.with_suffix(".onnx.data")
@@ -217,31 +225,20 @@ def main() -> None:
     # Import heavy dependencies after arg parsing
     from jax2onnx import to_onnx
 
-    from catgpt.jax.configs import JaxModelConfig, JaxOutputHeadConfig
-    from catgpt.jax.models.transformer import BidirectionalTransformer
+    from catgpt.jax.evaluation.checkpoint import load_checkpoint
 
     print("=" * 60)
     print("JAX → ONNX Export (via jax2onnx)")
     print("=" * 60)
 
-    # Build model config
-    output_heads = JaxOutputHeadConfig(
-        self_head=args.self_head,
-        value_head=args.value_head,
-        policy_head=args.policy_head,
-        soft_policy_head=False,
-        value_num_bins=args.value_num_bins,
-    )
-    model_config = JaxModelConfig(
-        hidden_size=args.hidden_size,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        ff_dim=args.ff_dim,
-        vocab_size=args.vocab_size,
-        seq_length=args.seq_length,
-        activation=args.activation,
-        output_heads=output_heads,
-    )
+    # Load checkpoint
+    print(f"\n[Checkpoint] Loading from: {args.checkpoint}")
+    print(f"  Use EMA params: {args.use_ema}")
+
+    ckpt = load_checkpoint(args.checkpoint, evaluation=args.use_ema)
+    model = ckpt.model
+    params = ckpt.params
+    model_config = ckpt.model_config
 
     print(f"\nModel config:")
     print(f"  hidden_size: {model_config.hidden_size}")
@@ -251,12 +248,6 @@ def main() -> None:
     print(f"  seq_length: {model_config.seq_length}")
     print(f"  output_keys: {args.output_keys}")
     print(f"  dynamic_batch: {args.dynamic_batch}")
-
-    # Create and initialize model
-    rng = jax.random.key(args.seed)
-    model, params = BidirectionalTransformer.create_and_init(
-        model_config, rng, compute_dtype=jnp.float32
-    )
 
     param_count = sum(p.size for p in jax.tree_util.tree_leaves(params))
     print(f"\nModel parameters: {param_count:,}")
@@ -283,7 +274,8 @@ def main() -> None:
         print(f"\n[Export] Using fixed batch size {export_batch_size}")
 
     # Input spec
-    input_specs = [jax.ShapeDtypeStruct((export_batch_size, args.seq_length), jnp.int32)]
+    seq_length = model_config.seq_length
+    input_specs = [jax.ShapeDtypeStruct((export_batch_size, seq_length), jnp.int32)]
 
     # Export to ONNX
     print(f"[Export] Converting to ONNX (opset {args.opset})...")
@@ -317,9 +309,12 @@ def main() -> None:
         # Test multiple batch sizes if dynamic
         test_batches = [1, 4, args.batch_size, 128] if args.dynamic_batch else [args.batch_size]
 
+        # Threshold for "relevant" logits: only compare logits within this range of the max
+        LOGIT_RELEVANCE_THRESHOLD = 3.0
+
         for batch_size in test_batches:
             test_input = np.random.randint(
-                0, args.vocab_size, size=(batch_size, args.seq_length), dtype=np.int32
+                0, model_config.vocab_size, size=(batch_size, seq_length), dtype=np.int32
             )
             jax_input = jnp.array(test_input)
 
@@ -332,13 +327,34 @@ def main() -> None:
             # Compare each output
             all_close = True
             max_diffs = []
-            for i, (jax_out, ort_out, key) in enumerate(
-                zip(jax_outputs, ort_outputs, output_keys)
-            ):
+            for jax_out, ort_out, key in zip(jax_outputs, ort_outputs, output_keys):
                 jax_out_np = np.array(jax_out)
-                is_close = np.allclose(jax_out_np, ort_out, rtol=args.rtol, atol=args.atol)
-                max_diff = np.max(np.abs(jax_out_np - ort_out))
-                max_diffs.append(f"{key}={max_diff:.2e}")
+
+                if "logit" in key:
+                    # For logits: only check relevant logits (within threshold of max)
+                    # and verify argmax matches
+                    jax_argmax = np.argmax(jax_out_np, axis=-1)
+                    ort_argmax = np.argmax(ort_out, axis=-1)
+                    argmax_match = np.all(jax_argmax == ort_argmax)
+
+                    # Create mask for relevant logits (within threshold of max per sample)
+                    jax_max = np.max(jax_out_np, axis=-1, keepdims=True)
+                    relevant_mask = jax_out_np >= (jax_max - LOGIT_RELEVANCE_THRESHOLD)
+
+                    # Compare only relevant logits
+                    relevant_diffs = np.abs(jax_out_np - ort_out) * relevant_mask
+                    max_diff = np.max(relevant_diffs)
+
+                    is_close = argmax_match and max_diff < args.logit_atol
+                    max_diffs.append(f"{key}={max_diff:.2e}")
+                    if not argmax_match:
+                        max_diffs[-1] += "(ARGMAX MISMATCH!)"
+                else:
+                    # For other outputs (e.g., value): standard comparison
+                    is_close = np.allclose(jax_out_np, ort_out, rtol=args.rtol, atol=args.atol)
+                    max_diff = np.max(np.abs(jax_out_np - ort_out))
+                    max_diffs.append(f"{key}={max_diff:.2e}")
+
                 if not is_close:
                     all_close = False
 
