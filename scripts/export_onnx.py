@@ -17,10 +17,154 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+# Use highest matmul precision to match ONNX Runtime's float32 behavior
+# (JAX defaults to TF32 on Ampere+ GPUs which has lower precision)
+jax.config.update("jax_default_matmul_precision", "highest")
 
 # Magic batch size - chosen to be unlikely to collide with real tensor dimensions
 # (hidden_size, ff_dim, num_heads, seq_length, vocab_size, etc.)
 MAGIC_BATCH_SIZE = 477
+
+
+def dump_onnx_ir(onnx_path: str | Path, output_path: str | Path | None = None) -> str:
+    """Dump ONNX model IR to a human-readable text file.
+
+    Args:
+        onnx_path: Path to the ONNX model.
+        output_path: Path for the text file. If None, uses onnx_path with .txt extension.
+
+    Returns:
+        Path to the output text file.
+    """
+    import onnx
+    from onnx import numpy_helper
+
+    onnx_path = Path(onnx_path)
+    output_path = Path(output_path) if output_path else onnx_path.with_suffix(".txt")
+
+    model = onnx.load(str(onnx_path))
+    graph = model.graph
+
+    lines = []
+    lines.append(f"# ONNX Model IR: {onnx_path.name}")
+    lines.append(f"# IR Version: {model.ir_version}")
+    opsets = [f"{o.domain or 'ai.onnx'}:{o.version}" for o in model.opset_import]
+    lines.append(f"# Opset: {opsets}")
+    lines.append("")
+
+    # Inputs
+    lines.append("=" * 80)
+    lines.append("INPUTS")
+    lines.append("=" * 80)
+    for inp in graph.input:
+        shape = _format_shape(inp.type.tensor_type.shape)
+        dtype = _format_dtype(inp.type.tensor_type.elem_type)
+        lines.append(f"  {inp.name}: {dtype}{shape}")
+    lines.append("")
+
+    # Outputs
+    lines.append("=" * 80)
+    lines.append("OUTPUTS")
+    lines.append("=" * 80)
+    for out in graph.output:
+        shape = _format_shape(out.type.tensor_type.shape)
+        dtype = _format_dtype(out.type.tensor_type.elem_type)
+        lines.append(f"  {out.name}: {dtype}{shape}")
+    lines.append("")
+
+    # Initializers (weights) - just shapes
+    lines.append("=" * 80)
+    lines.append(f"INITIALIZERS ({len(graph.initializer)} tensors)")
+    lines.append("=" * 80)
+    for init in graph.initializer:
+        dtype = _format_dtype(init.data_type)
+        shape = list(init.dims)
+        size = np.prod(shape) if shape else 1
+        lines.append(f"  {init.name}: {dtype}{shape} ({size:,} params)")
+    lines.append("")
+
+    # Nodes
+    lines.append("=" * 80)
+    lines.append(f"NODES ({len(graph.node)} ops)")
+    lines.append("=" * 80)
+    for i, node in enumerate(graph.node):
+        inputs_str = ", ".join(node.input) if node.input else "(none)"
+        outputs_str = ", ".join(node.output) if node.output else "(none)"
+
+        lines.append(f"[{i:4d}] {node.op_type}")
+        lines.append(f"       name: {node.name or '(unnamed)'}")
+        lines.append(f"       inputs: [{inputs_str}]")
+        lines.append(f"       outputs: [{outputs_str}]")
+
+        # Attributes
+        if node.attribute:
+            for attr in node.attribute:
+                attr_val = _format_attribute(attr)
+                lines.append(f"       {attr.name}: {attr_val}")
+        lines.append("")
+
+    # Write to file
+    with open(output_path, "w") as f:
+        f.write("\n".join(lines))
+
+    return str(output_path)
+
+
+def _format_shape(shape) -> str:
+    """Format ONNX TensorShapeProto to string."""
+    if not shape or not shape.dim:
+        return "[]"
+    dims = []
+    for d in shape.dim:
+        if d.HasField("dim_value"):
+            dims.append(str(d.dim_value))
+        elif d.HasField("dim_param"):
+            dims.append(d.dim_param)
+        else:
+            dims.append("?")
+    return "[" + ", ".join(dims) + "]"
+
+
+def _format_dtype(elem_type: int) -> str:
+    """Format ONNX data type to string."""
+    import onnx
+
+    dtype_map = {
+        onnx.TensorProto.FLOAT: "f32",
+        onnx.TensorProto.FLOAT16: "f16",
+        onnx.TensorProto.BFLOAT16: "bf16",
+        onnx.TensorProto.DOUBLE: "f64",
+        onnx.TensorProto.INT32: "i32",
+        onnx.TensorProto.INT64: "i64",
+        onnx.TensorProto.INT8: "i8",
+        onnx.TensorProto.UINT8: "u8",
+        onnx.TensorProto.BOOL: "bool",
+    }
+    return dtype_map.get(elem_type, f"dtype({elem_type})")
+
+
+def _format_attribute(attr) -> str:
+    """Format ONNX AttributeProto to string."""
+    import onnx
+
+    if attr.type == onnx.AttributeProto.FLOAT:
+        return f"{attr.f}"
+    elif attr.type == onnx.AttributeProto.INT:
+        return f"{attr.i}"
+    elif attr.type == onnx.AttributeProto.STRING:
+        return f'"{attr.s.decode()}"'
+    elif attr.type == onnx.AttributeProto.FLOATS:
+        return f"[{', '.join(str(x) for x in attr.floats)}]"
+    elif attr.type == onnx.AttributeProto.INTS:
+        return f"[{', '.join(str(x) for x in attr.ints)}]"
+    elif attr.type == onnx.AttributeProto.TENSOR:
+        from onnx import numpy_helper
+        arr = numpy_helper.to_array(attr.t)
+        if arr.size <= 8:
+            return f"tensor({arr.tolist()})"
+        return f"tensor(shape={list(arr.shape)}, dtype={arr.dtype})"
+    else:
+        return f"<{attr.type}>"
 
 
 def make_onnx_dynamic_batch(onnx_path: str | Path, output_path: str | Path | None = None) -> str:
@@ -204,6 +348,13 @@ def _parse_args() -> argparse.Namespace:
         help="Absolute tolerance for logit outputs (default: 0.05, ~5%% prob diff).",
     )
 
+    # Debug/inspection
+    parser.add_argument(
+        "--dump-ir",
+        action="store_true",
+        help="Dump ONNX IR to a human-readable text file (.txt).",
+    )
+
     return parser.parse_args()
 
 
@@ -294,6 +445,11 @@ def main() -> None:
     # Post-process for dynamic batch
     if args.dynamic_batch:
         make_onnx_dynamic_batch(output_path)
+
+    # Dump IR for inspection
+    if args.dump_ir:
+        ir_path = dump_onnx_ir(output_path)
+        print(f"\n[IR Dump] Written to: {ir_path}")
 
     # Validate with ONNX Runtime
     if args.validate:
