@@ -72,7 +72,7 @@ class ConvertToJax(pygrain.MapTransform):
     """Convert numpy arrays to JAX-compatible arrays with HL-Gauss target transform.
 
     Transforms batched data from PyGrain (numpy) to JAX-compatible format.
-    Expected input: tuple of (inputs, targets) or (inputs, targets, policy_targets).
+    Expected input: tuple of (inputs, targets, [policy_targets], [next_capture], [next_pawn]).
 
     If HL-Gauss is enabled, converts scalar win probabilities to categorical
     distributions over bins for training with cross-entropy loss.
@@ -86,7 +86,7 @@ class ConvertToJax(pygrain.MapTransform):
 
         Args:
             output_heads_config: Output head configuration containing HL-Gauss
-                parameters (value_num_bins, value_sigma_ratio) and policy_head flag.
+                parameters (value_num_bins, value_sigma_ratio) and head flags.
                 If None, uses defaults.
         """
         super().__init__()
@@ -97,29 +97,45 @@ class ConvertToJax(pygrain.MapTransform):
             self._num_bins = output_heads_config.value_num_bins
             self._sigma_ratio = output_heads_config.value_sigma_ratio
             self._include_policy = output_heads_config.policy_head
+            self._include_next_capture = output_heads_config.next_capture_head
+            self._include_next_pawn_move = output_heads_config.next_pawn_move_head
         else:
             self._num_bins = 81
             self._sigma_ratio = 0.75
             self._include_policy = False
+            self._include_next_capture = False
+            self._include_next_pawn_move = False
 
     def map(self, element):
         """Convert a batched element to JAX-compatible arrays.
 
         Args:
-            element: Tuple of (inputs, targets) or (inputs, targets, policy_targets)
-                as numpy arrays.
+            element: Tuple of (inputs, targets, [policy_targets], [next_capture], [next_pawn])
+                as numpy arrays. Optional elements depend on head configuration.
 
         Returns:
-            Dictionary with 'input', 'target', and optionally 'policy_target' as numpy arrays.
+            Dictionary with 'input', 'target', and optional targets as numpy arrays.
             - 'input': Token indices, shape (batch, seq_len)
             - 'target': HL-Gauss distribution, shape (batch, num_bins)
             - 'policy_target': Flattened policy distribution, shape (batch, 64*73)
+            - 'next_capture_target': Square indices, shape (batch,), -1 = invalid
+            - 'next_pawn_move_target': Square indices, shape (batch,), -1 = invalid
         """
+        # Unpack tuple based on configuration
+        element = list(element)
+        inputs = element.pop(0)
+        targets = element.pop(0)
+
+        policy_targets = None
+        next_capture_targets = None
+        next_pawn_move_targets = None
+
         if self._include_policy:
-            inputs, targets, policy_targets = element
-        else:
-            inputs, targets = element
-            policy_targets = None
+            policy_targets = element.pop(0)
+        if self._include_next_capture:
+            next_capture_targets = element.pop(0)
+        if self._include_next_pawn_move:
+            next_pawn_move_targets = element.pop(0)
 
         # Keep as numpy - JAX will convert when needed
         # This avoids unnecessary device transfers during data loading
@@ -145,6 +161,20 @@ class ConvertToJax(pygrain.MapTransform):
             policy_array = np.asarray(policy_targets, dtype=np.float32)
             policy_array = policy_array.reshape(policy_array.shape[0], -1)
             result["policy_target"] = policy_array
+
+        # Add next capture target if enabled
+        if self._include_next_capture and next_capture_targets is not None:
+            # next_capture_targets: (batch,) int in [-1, 63]
+            result["next_capture_target"] = np.asarray(
+                next_capture_targets, dtype=np.int32
+            )
+
+        # Add next pawn move target if enabled
+        if self._include_next_pawn_move and next_pawn_move_targets is not None:
+            # next_pawn_move_targets: (batch,) int in [-1, 63]
+            result["next_pawn_move_target"] = np.asarray(
+                next_pawn_move_targets, dtype=np.int32
+            )
 
         return result
 
@@ -217,9 +247,15 @@ def create_grain_dataloader(
             include_halfmove=tokenizer_config.include_halfmove,
         )
 
-    # Determine if policy head is enabled
+    # Determine which heads are enabled
     include_policy = (
         output_heads_config is not None and output_heads_config.policy_head
+    )
+    include_next_capture = (
+        output_heads_config is not None and output_heads_config.next_capture_head
+    )
+    include_next_pawn_move = (
+        output_heads_config is not None and output_heads_config.next_pawn_move_head
     )
 
     # Define transformations pipeline
@@ -227,7 +263,9 @@ def create_grain_dataloader(
         ConvertTrainingBagDataToSequence(
             core_tokenizer_config,
             include_policy=include_policy,
-        ),  # bytes -> (state, win_prob) or (state, win_prob, policy)
+            include_next_capture=include_next_capture,
+            include_next_pawn_move=include_next_pawn_move,
+        ),  # bytes -> (state, win_prob, [policy], [next_capture], [next_pawn])
         pygrain.Batch(batch_size=batch_size, drop_remainder=split == "train"),
         ConvertToJax(output_heads_config),  # numpy -> jax-compatible arrays with HL-Gauss
     )
@@ -250,7 +288,8 @@ def create_grain_dataloader(
         f"Created JAX PyGrain DataLoader: batch_size={batch_size}, "
         f"shuffle={shuffle}, workers={config.num_workers}, "
         f"hl_gauss(bins={num_bins}, sigma_ratio={sigma_ratio}), "
-        f"policy={include_policy}"
+        f"policy={include_policy}, next_capture={include_next_capture}, "
+        f"next_pawn_move={include_next_pawn_move}"
     )
 
     return dataloader

@@ -57,6 +57,23 @@ def parse_uci_move(uci: str) -> tuple[str, str, str | None]:
     return from_sq, to_sq, promo
 
 
+def square_to_index(square_name: str | None, flip: bool = False) -> int:
+    """Convert square name to 0-63 index, or -1 if None.
+
+    Args:
+        square_name: Square name like "e4", or None.
+        flip: Whether to flip the square (for black to move).
+
+    Returns:
+        Index 0-63 for valid squares, -1 for None.
+    """
+    if square_name is None:
+        return -1
+    if flip:
+        square_name = flip_square(square_name)
+    return parse_square(square_name)
+
+
 def encode_policy_target(
     legal_moves: list[tuple[str, float]],
     flip: bool = False,
@@ -170,13 +187,13 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
   - fen: tokenized board state
   - root_q: converted to win probability
   - legal_moves: converted to policy target (64, 73) tensor
+  - next_capture_square: square index of piece to be captured (auxiliary target)
+  - next_pawn_move_square: square index of pawn that will move (auxiliary target)
 
   Future versions can leverage additional fields like:
   - game_result: final game outcome
   - piece_will_move_to: next move predictions
   - square_will_be_occupied_from: forward board state
-  - next_capture_square: tactical awareness
-  - next_pawn_move_square: pawn structure
   """
 
   def __init__(
@@ -184,29 +201,36 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
       tokenizer_config: TokenizerConfig | None = None,
       *,
       include_policy: bool = True,
+      include_next_capture: bool = False,
+      include_next_pawn_move: bool = False,
   ) -> None:
     """Initialize with tokenizer configuration.
 
     Args:
       tokenizer_config: Configuration for tokenization. If None, uses default.
       include_policy: Whether to include policy target in output.
+      include_next_capture: Whether to include next_capture_square target.
+      include_next_pawn_move: Whether to include next_pawn_move_square target.
     """
     super().__init__()
     self.tokenizer_config = tokenizer_config or TokenizerConfig()
     self.include_policy = include_policy
+    self.include_next_capture = include_next_capture
+    self.include_next_pawn_move = include_next_pawn_move
 
   def map(self, element: bytes):
-    """Map a training position to (state_tokens, win_prob, policy_target).
+    """Map a training position to (state_tokens, win_prob, ...).
 
     Args:
       element: Msgpack-encoded TrainingPositionData.
 
     Returns:
-      Tuple of (state_tokens, win_prob, policy_target):
+      Tuple with variable length depending on configuration:
         - state_tokens: np.ndarray of tokenized FEN
         - win_prob: np.ndarray of shape (1,) with win probability in [0, 1]
-        - policy_target: np.ndarray of shape (64, 73) with move probabilities
-          (only if include_policy=True, otherwise tuple has 2 elements)
+        - policy_target: np.ndarray of shape (64, 73) (if include_policy)
+        - next_capture_idx: int in [-1, 63] (if include_next_capture)
+        - next_pawn_move_idx: int in [-1, 63] (if include_next_pawn_move)
     """
     # Decode msgpack data
     data = msgpack.unpackb(element, raw=False)
@@ -215,9 +239,12 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
     fen = data["fen"]
     root_q = data["root_q"]  # Q value in [-1, 1]
 
-    # Determine if black to move (need to flip for policy target)
-    side_to_move = fen.split()[1]
+    # Parse FEN fields
+    fen_parts = fen.split()
+    side_to_move = fen_parts[1]
     flip = side_to_move == "b"
+    # Full move counter is the 6th field (1-indexed move number)
+    fullmove = int(fen_parts[5])
 
     # Tokenize FEN (tokenizer handles flip internally)
     state = tokenizer.tokenize(fen, self.tokenizer_config)
@@ -225,14 +252,36 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
     # Convert Q to win probability: Q ∈ [-1, 1] → win_prob ∈ [0, 1]
     win_prob = (1.0 + root_q) / 2.0
 
-    if not self.include_policy:
-      return state, np.array([win_prob])
+    # Build result tuple
+    result = [state, np.array([win_prob])]
 
-    # Build policy target from legal moves
-    legal_moves = data["legal_moves"]
-    policy_target = encode_policy_target(legal_moves, flip=flip)
+    if self.include_policy:
+      # Build policy target from legal moves
+      legal_moves = data["legal_moves"]
+      policy_target = encode_policy_target(legal_moves, flip=flip)
+      result.append(policy_target)
 
-    return state, np.array([win_prob]), policy_target
+    if self.include_next_capture:
+      # Convert square name to index (-1 if None)
+      # Only train on positions where fullmove > 15 (opening phase is too noisy)
+      if fullmove > 15:
+        next_capture_sq = data.get("next_capture_square")
+        next_capture_idx = square_to_index(next_capture_sq, flip=flip)
+      else:
+        next_capture_idx = -1  # Masked out
+      result.append(next_capture_idx)
+
+    if self.include_next_pawn_move:
+      # Convert square name to index (-1 if None)
+      # Only train on positions where fullmove > 15 (opening phase is too noisy)
+      if fullmove > 15:
+        next_pawn_sq = data.get("next_pawn_move_square")
+        next_pawn_idx = square_to_index(next_pawn_sq, flip=flip)
+      else:
+        next_pawn_idx = -1  # Masked out
+      result.append(next_pawn_idx)
+
+    return tuple(result)
 
 
 @dataclass

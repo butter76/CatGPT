@@ -503,6 +503,30 @@ class BidirectionalTransformer(nn.Module):
 
             outputs["soft_policy_logit"] = soft_policy_logits_flat
 
+        # Next capture head: predict which square has the piece to be captured next
+        # This is a noisy auxiliary target - many games have no future captures
+        if head_config.next_capture_head:
+            # Mean pooling over sequence (like value head)
+            pooled = hidden.mean(axis=1)  # (batch, hidden)
+            next_capture_logits = nn.Dense(
+                64,  # One logit per square
+                dtype=jnp.float32,
+                name="next_capture_head",
+            )(pooled)  # (batch, 64)
+            outputs["next_capture_logit"] = next_capture_logits
+
+        # Next pawn move head: predict which square has the pawn that will move next
+        # This is a noisy auxiliary target - many positions have no future pawn moves
+        if head_config.next_pawn_move_head:
+            # Mean pooling over sequence (like value head)
+            pooled = hidden.mean(axis=1)  # (batch, hidden)
+            next_pawn_move_logits = nn.Dense(
+                64,  # One logit per square
+                dtype=jnp.float32,
+                name="next_pawn_move_head",
+            )(pooled)  # (batch, 64)
+            outputs["next_pawn_move_logit"] = next_pawn_move_logits
+
         return outputs
 
     @classmethod

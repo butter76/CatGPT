@@ -49,6 +49,15 @@ class JaxOutputHeadConfig:
     soft_policy_temperature: float = 4.0  # Temperature for softening (higher = more uniform)
     soft_policy_weight: float = 8.0  # Loss weight (compensates for smaller gradients)
 
+    # Square prediction heads (noisy auxiliary targets)
+    # Predict which square has the piece that will be captured next / pawn that will move next
+    # These are 64-way classification tasks with masking for positions without valid targets
+    next_capture_head: bool = False
+    next_capture_weight: float = 0.1  # Small weight for noisy auxiliary target
+
+    next_pawn_move_head: bool = False
+    next_pawn_move_weight: float = 0.1  # Small weight for noisy auxiliary target
+
     # HL-Gauss configuration for value head
     # Converts scalar win probability (0-1) to categorical distribution
     value_num_bins: int = 81  # Number of bins for value distribution

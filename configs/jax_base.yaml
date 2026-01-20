@@ -32,6 +32,11 @@ model:
     soft_policy_head: false  # Enable soft policy
     soft_policy_temperature: 4.0  # KataGo default
     soft_policy_weight: 8.0  # KataGo default (compensates for smaller gradients)
+    # Square prediction heads (noisy auxiliary targets)
+    next_capture_head: true  # Predict square of piece to be captured next
+    next_capture_weight: 1.0  # Small weight for noisy auxiliary target
+    next_pawn_move_head: false  # Predict square of pawn that will move next
+    next_pawn_move_weight: 0.1  # Small weight for noisy auxiliary target
 
 # Tokenizer configuration
 tokenizer:

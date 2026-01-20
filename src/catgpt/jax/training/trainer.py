@@ -280,6 +280,40 @@ class Trainer:
                 weight = head_config.soft_policy_weight if head_config else 8.0
                 losses["soft_policy"] = soft_policy_loss * weight
 
+            # Next capture head: cross-entropy with masking for None values
+            # Target is -1 for positions without future captures
+            if "next_capture_logit" in outputs and "next_capture_target" in batch:
+                target = batch["next_capture_target"]  # (batch,) int32, -1 = invalid
+                mask = (target >= 0).astype(jnp.float32)  # (batch,)
+
+                # Replace -1 with 0 for safe indexing (masked out anyway)
+                safe_target = jnp.maximum(target, 0)
+                per_sample_loss = optax.softmax_cross_entropy_with_integer_labels(
+                    outputs["next_capture_logit"].astype(jnp.float32),
+                    safe_target,
+                )
+                # Average over valid samples only
+                masked_loss = jnp.sum(per_sample_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+                weight = head_config.next_capture_weight if head_config else 0.1
+                losses["next_capture"] = masked_loss * weight
+
+            # Next pawn move head: cross-entropy with masking for None values
+            # Target is -1 for positions without future pawn moves
+            if "next_pawn_move_logit" in outputs and "next_pawn_move_target" in batch:
+                target = batch["next_pawn_move_target"]  # (batch,) int32, -1 = invalid
+                mask = (target >= 0).astype(jnp.float32)  # (batch,)
+
+                # Replace -1 with 0 for safe indexing (masked out anyway)
+                safe_target = jnp.maximum(target, 0)
+                per_sample_loss = optax.softmax_cross_entropy_with_integer_labels(
+                    outputs["next_pawn_move_logit"].astype(jnp.float32),
+                    safe_target,
+                )
+                # Average over valid samples only
+                masked_loss = jnp.sum(per_sample_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+                weight = head_config.next_pawn_move_weight if head_config else 0.1
+                losses["next_pawn_move"] = masked_loss * weight
+
             total_loss = sum(losses.values())
             return total_loss, (outputs, losses)
 
@@ -328,6 +362,28 @@ class Trainer:
             target_moves = jnp.argmax(batch["policy_target"], axis=-1)  # (batch,)
             policy_accuracy = (pred_moves == target_moves).mean()
             metrics["policy_accuracy"] = policy_accuracy
+
+        # Next capture head metrics (accuracy on valid samples only)
+        if "next_capture_logit" in outputs and "next_capture_target" in batch:
+            target = batch["next_capture_target"]
+            mask = target >= 0
+            pred = jnp.argmax(outputs["next_capture_logit"], axis=-1)
+            correct = (pred == target) & mask
+            accuracy = jnp.sum(correct.astype(jnp.float32)) / jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
+            metrics["next_capture_accuracy"] = accuracy
+            # Also track fraction of valid samples
+            metrics["next_capture_valid_frac"] = jnp.mean(mask.astype(jnp.float32))
+
+        # Next pawn move head metrics (accuracy on valid samples only)
+        if "next_pawn_move_logit" in outputs and "next_pawn_move_target" in batch:
+            target = batch["next_pawn_move_target"]
+            mask = target >= 0
+            pred = jnp.argmax(outputs["next_pawn_move_logit"], axis=-1)
+            correct = (pred == target) & mask
+            accuracy = jnp.sum(correct.astype(jnp.float32)) / jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
+            metrics["next_pawn_move_accuracy"] = accuracy
+            # Also track fraction of valid samples
+            metrics["next_pawn_move_valid_frac"] = jnp.mean(mask.astype(jnp.float32))
 
         return state, metrics
 
@@ -401,6 +457,34 @@ class Trainer:
             weight = head_config.soft_policy_weight if head_config else 8.0
             losses["soft_policy"] = soft_policy_loss * weight
 
+        # Next capture head: cross-entropy with masking for None values
+        if "next_capture_logit" in outputs and "next_capture_target" in batch:
+            target = batch["next_capture_target"]
+            mask = (target >= 0).astype(jnp.float32)
+
+            safe_target = jnp.maximum(target, 0)
+            per_sample_loss = optax.softmax_cross_entropy_with_integer_labels(
+                outputs["next_capture_logit"].astype(jnp.float32),
+                safe_target,
+            )
+            masked_loss = jnp.sum(per_sample_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+            weight = head_config.next_capture_weight if head_config else 0.1
+            losses["next_capture"] = masked_loss * weight
+
+        # Next pawn move head: cross-entropy with masking for None values
+        if "next_pawn_move_logit" in outputs and "next_pawn_move_target" in batch:
+            target = batch["next_pawn_move_target"]
+            mask = (target >= 0).astype(jnp.float32)
+
+            safe_target = jnp.maximum(target, 0)
+            per_sample_loss = optax.softmax_cross_entropy_with_integer_labels(
+                outputs["next_pawn_move_logit"].astype(jnp.float32),
+                safe_target,
+            )
+            masked_loss = jnp.sum(per_sample_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+            weight = head_config.next_pawn_move_weight if head_config else 0.1
+            losses["next_pawn_move"] = masked_loss * weight
+
         total_loss = sum(losses.values())
 
         # Compute metrics
@@ -441,6 +525,26 @@ class Trainer:
             target_moves = jnp.argmax(batch["policy_target"], axis=-1)  # (batch,)
             policy_accuracy = (pred_moves == target_moves).mean()
             metrics["policy_accuracy"] = policy_accuracy
+
+        # Next capture head metrics (accuracy on valid samples only)
+        if "next_capture_logit" in outputs and "next_capture_target" in batch:
+            target = batch["next_capture_target"]
+            mask = target >= 0
+            pred = jnp.argmax(outputs["next_capture_logit"], axis=-1)
+            correct = (pred == target) & mask
+            accuracy = jnp.sum(correct.astype(jnp.float32)) / jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
+            metrics["next_capture_accuracy"] = accuracy
+            metrics["next_capture_valid_frac"] = jnp.mean(mask.astype(jnp.float32))
+
+        # Next pawn move head metrics (accuracy on valid samples only)
+        if "next_pawn_move_logit" in outputs and "next_pawn_move_target" in batch:
+            target = batch["next_pawn_move_target"]
+            mask = target >= 0
+            pred = jnp.argmax(outputs["next_pawn_move_logit"], axis=-1)
+            correct = (pred == target) & mask
+            accuracy = jnp.sum(correct.astype(jnp.float32)) / jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
+            metrics["next_pawn_move_accuracy"] = accuracy
+            metrics["next_pawn_move_valid_frac"] = jnp.mean(mask.astype(jnp.float32))
 
         return metrics
 
@@ -736,6 +840,22 @@ class Trainer:
             # Add policy head metrics
             if "policy_accuracy" in metrics:
                 log_dict["train/policy_accuracy"] = float(metrics["policy_accuracy"])
+
+            # Add next capture head metrics
+            if "next_capture_loss" in metrics:
+                log_dict["train/next_capture_loss"] = float(metrics["next_capture_loss"])
+            if "next_capture_accuracy" in metrics:
+                log_dict["train/next_capture_accuracy"] = float(metrics["next_capture_accuracy"])
+            if "next_capture_valid_frac" in metrics:
+                log_dict["train/next_capture_valid_frac"] = float(metrics["next_capture_valid_frac"])
+
+            # Add next pawn move head metrics
+            if "next_pawn_move_loss" in metrics:
+                log_dict["train/next_pawn_move_loss"] = float(metrics["next_pawn_move_loss"])
+            if "next_pawn_move_accuracy" in metrics:
+                log_dict["train/next_pawn_move_accuracy"] = float(metrics["next_pawn_move_accuracy"])
+            if "next_pawn_move_valid_frac" in metrics:
+                log_dict["train/next_pawn_move_valid_frac"] = float(metrics["next_pawn_move_valid_frac"])
 
             wandb.log(log_dict, step=self.global_step)
 
