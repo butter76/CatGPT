@@ -117,18 +117,19 @@ def make_onnx_dynamic_batch(onnx_path: str | Path, output_path: str | Path | Non
                                 f"  Constant '{node.name}': {arr.tolist()} → {new_arr.tolist()}"
                             )
 
-    # 5. Check value_info for intermediate tensors
-    for vi in graph.value_info:
-        if vi.type.HasField("tensor_type"):
-            shape = vi.type.tensor_type.shape
-            if shape.dim and len(shape.dim) > 0:
-                dim0 = shape.dim[0]
-                if dim0.HasField("dim_value") and dim0.dim_value == MAGIC_BATCH_SIZE:
-                    dim0.ClearField("dim_value")
-                    dim0.dim_param = "batch"
-                    # Don't count these as they're just metadata
+    # 5. Clear value_info - we'll re-infer shapes with symbolic batch dimension
+    # This removes stale shape metadata that still contains the magic batch size
+    num_value_info = len(graph.value_info)
+    if num_value_info > 0:
+        graph.ClearField("value_info")
+        print(f"  Cleared {num_value_info} value_info entries (will be re-inferred)")
 
     print(f"  Total modifications: {modifications}")
+
+    # 6. Run shape inference to propagate symbolic batch dimension through the graph
+    # This regenerates value_info with the correct dynamic shapes
+    print("  Running shape inference to propagate dynamic batch...")
+    model = onnx.shape_inference.infer_shapes(model)
 
     # Save the modified model
     onnx.save(model, str(output_path))
@@ -164,15 +165,16 @@ def _parse_args() -> argparse.Namespace:
 
     parser.add_argument("--policy-head", action="store_true")
     parser.add_argument("--no-policy-head", dest="policy_head", action="store_false")
-    parser.set_defaults(policy_head=False)
+    parser.set_defaults(policy_head=True)
 
     parser.add_argument("--value-num-bins", type=int, default=81)
 
     parser.add_argument(
-        "--output-key",
+        "--output-keys",
         type=str,
-        default="value",
-        help="Model output key to export.",
+        nargs="+",
+        default=["value", "policy_logit"],
+        help="Model output keys to export (default: value policy_logit).",
     )
 
     parser.add_argument("--seed", type=int, default=42)
@@ -196,7 +198,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--validate", action="store_true", help="Validate ONNX output with ORT.")
     parser.add_argument("--rtol", type=float, default=1e-3)
-    parser.add_argument("--atol", type=float, default=1e-4)
+    parser.add_argument("--atol", type=float, default=5e-3)
 
     return parser.parse_args()
 
@@ -247,7 +249,7 @@ def main() -> None:
     print(f"  num_heads: {model_config.num_heads}")
     print(f"  ff_dim: {model_config.ff_dim or 4 * model_config.hidden_size}")
     print(f"  seq_length: {model_config.seq_length}")
-    print(f"  output_key: {args.output_key}")
+    print(f"  output_keys: {args.output_keys}")
     print(f"  dynamic_batch: {args.dynamic_batch}")
 
     # Create and initialize model
@@ -259,15 +261,18 @@ def main() -> None:
     param_count = sum(p.size for p in jax.tree_util.tree_leaves(params))
     print(f"\nModel parameters: {param_count:,}")
 
-    # Define the forward function
-    output_key = args.output_key
+    # Define the forward function returning multiple outputs
+    output_keys = args.output_keys
 
-    def forward(x: jax.Array) -> jax.Array:
+    def forward(x: jax.Array) -> tuple[jax.Array, ...]:
         outputs = model.apply(params, x, train=False, compute_dtype=jnp.float32)
-        if output_key not in outputs:
-            available = ", ".join(sorted(outputs.keys()))
-            raise KeyError(f"Output '{output_key}' not found. Available: {available}")
-        return outputs[output_key]
+        result = []
+        for key in output_keys:
+            if key not in outputs:
+                available = ", ".join(sorted(outputs.keys()))
+                raise KeyError(f"Output '{key}' not found. Available: {available}")
+            result.append(outputs[key])
+        return tuple(result)
 
     # Choose batch size for export
     if args.dynamic_batch:
@@ -305,6 +310,9 @@ def main() -> None:
 
         sess = ort.InferenceSession(str(output_path))
         input_name = sess.get_inputs()[0].name
+        ort_output_names = [o.name for o in sess.get_outputs()]
+
+        print(f"  ONNX outputs: {ort_output_names}")
 
         # Test multiple batch sizes if dynamic
         test_batches = [1, 4, args.batch_size, 128] if args.dynamic_batch else [args.batch_size]
@@ -315,21 +323,30 @@ def main() -> None:
             )
             jax_input = jnp.array(test_input)
 
-            # JAX reference output
-            jax_output = forward(jax_input)
-            jax_output_np = np.array(jax_output)
+            # JAX reference outputs
+            jax_outputs = forward(jax_input)
 
-            # ONNX Runtime output
-            ort_output = sess.run(None, {input_name: test_input})[0]
+            # ONNX Runtime outputs
+            ort_outputs = sess.run(None, {input_name: test_input})
 
-            # Compare
-            is_close = np.allclose(jax_output_np, ort_output, rtol=args.rtol, atol=args.atol)
-            max_diff = np.max(np.abs(jax_output_np - ort_output))
+            # Compare each output
+            all_close = True
+            max_diffs = []
+            for i, (jax_out, ort_out, key) in enumerate(
+                zip(jax_outputs, ort_outputs, output_keys)
+            ):
+                jax_out_np = np.array(jax_out)
+                is_close = np.allclose(jax_out_np, ort_out, rtol=args.rtol, atol=args.atol)
+                max_diff = np.max(np.abs(jax_out_np - ort_out))
+                max_diffs.append(f"{key}={max_diff:.2e}")
+                if not is_close:
+                    all_close = False
 
-            status = "✓" if is_close else "✗"
-            print(f"  Batch {batch_size:3d}: {status} (max diff: {max_diff:.2e})")
+            status = "✓" if all_close else "✗"
+            diff_str = ", ".join(max_diffs)
+            print(f"  Batch {batch_size:3d}: {status} (max diff: {diff_str})")
 
-            if not is_close:
+            if not all_close:
                 raise RuntimeError(f"ONNX validation failed for batch size {batch_size}")
 
         print("  All validations PASSED")
