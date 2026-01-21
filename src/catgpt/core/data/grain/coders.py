@@ -29,32 +29,16 @@ import msgpack
 import numpy as np
 from apache_beam import coders
 
-from catgpt.core.utils import TokenizerConfig, flip_square, parse_square, tokenizer
-
-# Policy target dimensions
-# 64 normal destination squares + 9 underpromotion targets
-# Underpromotions: 3 pieces (knight, bishop, rook) x 3 directions (left, straight, right)
-POLICY_TO_DIM = 73
-POLICY_SHAPE = (64, POLICY_TO_DIM)  # (from_square, to_square)
-
-# Underpromotion piece type to index offset
-_UNDERPROMO_PIECE_OFFSET = {"n": 0, "b": 1, "r": 2}
-
-
-def parse_uci_move(uci: str) -> tuple[str, str, str | None]:
-    """Parse a UCI move string into (from_square, to_square, promotion).
-
-    Args:
-        uci: UCI move string (e.g., "e2e4", "e7e8q", "a7a8n").
-
-    Returns:
-        Tuple of (from_square, to_square, promotion_piece or None).
-        promotion_piece is lowercase: 'q', 'r', 'b', 'n'.
-    """
-    from_sq = uci[:2]
-    to_sq = uci[2:4]
-    promo = uci[4].lower() if len(uci) > 4 else None
-    return from_sq, to_sq, promo
+from catgpt.core.utils import (
+    POLICY_SHAPE,
+    POLICY_TO_DIM,
+    TokenizerConfig,
+    encode_policy_target,
+    flip_square,
+    parse_square,
+    parse_uci_move,
+    tokenizer,
+)
 
 
 def square_to_index(square_name: str | None, flip: bool = False) -> int:
@@ -72,53 +56,6 @@ def square_to_index(square_name: str | None, flip: bool = False) -> int:
     if flip:
         square_name = flip_square(square_name)
     return parse_square(square_name)
-
-
-def encode_policy_target(
-    legal_moves: list[tuple[str, float]],
-    flip: bool = False,
-) -> np.ndarray:
-    """Convert legal moves with policy to (64, 73) target tensor.
-
-    The policy target encodes the move distribution over a (from_square, to_square)
-    tensor. Normal moves use to_square indices 0-63. Underpromotions (non-queen
-    promotions) use indices 64-72:
-        64-66: knight promotions (left capture, straight, right capture)
-        67-69: bishop promotions (left capture, straight, right capture)
-        70-72: rook promotions (left capture, straight, right capture)
-
-    Queen promotions use the normal destination square (0-63).
-
-    Args:
-        legal_moves: List of (uci_move, probability) tuples.
-        flip: Whether to flip squares (for black to move, to match tokenizer).
-
-    Returns:
-        Shape (64, 73) array with policy probabilities.
-    """
-    target = np.zeros(POLICY_SHAPE, dtype=np.float32)
-
-    for uci_move, prob in legal_moves:
-        from_sq, to_sq, promo = parse_uci_move(uci_move)
-
-        if flip:
-            from_sq = flip_square(from_sq)
-            to_sq = flip_square(to_sq)
-
-        from_idx = parse_square(from_sq)
-
-        if promo and promo != "q":
-            # Underpromotion: map to indices 64-72
-            # file_diff: -1 (capture left), 0 (straight), +1 (capture right)
-            file_diff = ord(to_sq[0]) - ord(from_sq[0])
-            to_idx = 64 + _UNDERPROMO_PIECE_OFFSET[promo] * 3 + (file_diff + 1)
-        else:
-            # Normal move or queen promotion: use destination square
-            to_idx = parse_square(to_sq)
-
-        target[from_idx, to_idx] = prob
-
-    return target
 
 
 def convert_old_win_prob_to_new(old_win_prob: float) -> float:

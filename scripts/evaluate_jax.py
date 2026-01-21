@@ -19,6 +19,15 @@ Usage:
 
     # Compare multiple checkpoints
     uv run python scripts/evaluate_jax.py checkpoints_jax/epoch_50 checkpoints_jax/epoch_100 checkpoints_jax/best
+
+    # Use highest matmul precision (for ONNX/TensorRT comparison)
+    uv run python scripts/evaluate_jax.py checkpoints_jax/best --matmul-precision highest
+
+    # Use bfloat16 compute dtype (faster on TPU/Ampere+)
+    uv run python scripts/evaluate_jax.py checkpoints_jax/best --compute-dtype bfloat16
+
+    # Evaluate with policy engine (argmax policy move) instead of value engine
+    uv run python scripts/evaluate_jax.py evaluate checkpoints_jax/best --engine policy
 """
 
 from pathlib import Path
@@ -72,7 +81,7 @@ def evaluate(
     max_puzzles: Annotated[
         int | None,
         typer.Option("--max-puzzles", "-n", help="Limit number of puzzles per benchmark"),
-    ] = None,
+    ] = 10000,
     wandb: Annotated[
         bool,
         typer.Option("--wandb/--no-wandb", help="Log results to Weights & Biases"),
@@ -89,6 +98,27 @@ def evaluate(
         int,
         typer.Option("--batch-size", help="Batch size for model evaluation"),
     ] = 256,
+    matmul_precision: Annotated[
+        str,
+        typer.Option(
+            "--matmul-precision",
+            help="JAX matmul precision: 'high' (TF32 on Ampere+) or 'highest' (full float32)",
+        ),
+    ] = "high",
+    compute_dtype: Annotated[
+        str,
+        typer.Option(
+            "--compute-dtype",
+            help="Compute dtype for model inference (float32, float16, bfloat16)",
+        ),
+    ] = "bfloat16",
+    engine_type: Annotated[
+        str,
+        typer.Option(
+            "--engine",
+            help="Engine type: 'value' (1-move lookahead) or 'policy' (argmax policy)",
+        ),
+    ] = "value",
     verbose: Annotated[
         bool,
         typer.Option("--verbose", "-v", help="Enable verbose logging"),
@@ -96,10 +126,51 @@ def evaluate(
 ) -> None:
     """Evaluate checkpoint(s) on chess benchmarks.
 
-    Loads trained JAX models, wraps them in a ValueEngine (1-move lookahead),
-    and evaluates on puzzle benchmarks.
+    Loads trained JAX models, wraps them in an engine, and evaluates on puzzle benchmarks.
+
+    Engine types:
+    - value: 1-move lookahead using value head (picks move that minimizes opponent's win prob)
+    - policy: Argmax policy move (picks move with highest policy logit)
     """
     setup_logging(verbose)
+
+    # Validate matmul precision
+    valid_matmul_precisions = ("high", "highest")
+    if matmul_precision not in valid_matmul_precisions:
+        logger.error(f"Invalid matmul precision: {matmul_precision}")
+        logger.info(f"Valid options: {valid_matmul_precisions}")
+        raise typer.Exit(1)
+
+    # Validate compute dtype
+    valid_dtypes = ("float32", "float16", "bfloat16")
+    if compute_dtype not in valid_dtypes:
+        logger.error(f"Invalid compute dtype: {compute_dtype}")
+        logger.info(f"Valid options: {valid_dtypes}")
+        raise typer.Exit(1)
+
+    # Validate engine type
+    valid_engines = ("value", "policy")
+    if engine_type not in valid_engines:
+        logger.error(f"Invalid engine type: {engine_type}")
+        logger.info(f"Valid options: {valid_engines}")
+        raise typer.Exit(1)
+
+    # Set JAX matmul precision BEFORE any JAX imports/computation
+    # This must happen early to affect all subsequent JAX operations
+    import jax
+    import jax.numpy as jnp
+
+    jax.config.update("jax_default_matmul_precision", matmul_precision)
+    logger.info(f"JAX matmul precision: {matmul_precision}")
+
+    # Map dtype string to jax dtype
+    dtype_map = {
+        "float32": jnp.float32,
+        "float16": jnp.float16,
+        "bfloat16": jnp.bfloat16,
+    }
+    compute_dtype_jax = dtype_map[compute_dtype]
+    logger.info(f"Compute dtype: {compute_dtype}")
 
     # Validate checkpoints exist
     for checkpoint in checkpoints:
@@ -125,7 +196,10 @@ def evaluate(
 
     # Import here to avoid slow startup for --help
     from catgpt.jax.evaluation.benchmarks.puzzles import PuzzleBenchmark
+    from catgpt.jax.evaluation.engines.policy_engine import PolicyEngine
     from catgpt.jax.evaluation.engines.value_engine import ValueEngine
+
+    logger.info(f"Engine type: {engine_type}")
 
     # Initialize W&B if requested
     wandb_run = None
@@ -144,6 +218,9 @@ def evaluate(
                     "checkpoints": [str(c) for c in checkpoints],
                     "benchmarks": benchmark_names,
                     "max_puzzles": max_puzzles,
+                    "matmul_precision": matmul_precision,
+                    "compute_dtype": compute_dtype,
+                    "engine_type": engine_type,
                 },
             )
             logger.info(f"W&B initialized: {wb.run.url}")
@@ -175,7 +252,18 @@ def evaluate(
 
         # Load engine
         try:
-            engine = ValueEngine.from_checkpoint(checkpoint_path, batch_size=batch_size)
+            if engine_type == "value":
+                engine = ValueEngine.from_checkpoint(
+                    checkpoint_path,
+                    batch_size=batch_size,
+                    compute_dtype=compute_dtype_jax,
+                )
+            else:  # engine_type == "policy"
+                engine = PolicyEngine.from_checkpoint(
+                    checkpoint_path,
+                    batch_size=batch_size,
+                    compute_dtype=compute_dtype_jax,
+                )
         except Exception as e:
             logger.error(f"Failed to load checkpoint: {e}")
             continue
