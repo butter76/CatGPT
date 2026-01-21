@@ -13,6 +13,8 @@ from catgpt.core.utils.tokenizer import TokenizerConfig, tokenize
 from catgpt.jax.evaluation.checkpoint import LoadedCheckpoint, load_checkpoint
 
 if TYPE_CHECKING:
+    from jax.typing import DTypeLike
+
     from catgpt.jax.configs import JaxTokenizerConfig
     from catgpt.jax.models.transformer import BidirectionalTransformer
 
@@ -42,6 +44,7 @@ class ValueEngine:
         tokenizer_config: "JaxTokenizerConfig",
         *,
         batch_size: int = 64,
+        compute_dtype: "DTypeLike | None" = None,
     ) -> None:
         """Initialize the ValueEngine.
 
@@ -51,6 +54,8 @@ class ValueEngine:
             tokenizer_config: Configuration for FEN tokenization.
             batch_size: Fixed batch size for evaluation. All batches are padded
                 to this size to avoid JIT recompilation.
+            compute_dtype: Dtype for intermediate computations (e.g., jnp.float32,
+                jnp.bfloat16, jnp.float16). Defaults to jnp.float32.
         """
         self.model = model
         self.params = params
@@ -58,9 +63,14 @@ class ValueEngine:
         self.batch_size = batch_size
         self._seq_length = tokenizer_config.sequence_length
 
+        # Resolve compute dtype
+        if compute_dtype is None:
+            compute_dtype = jnp.float32
+        self.compute_dtype = compute_dtype
+
         # JIT compile the model application
         self._apply_fn = jax.jit(
-            lambda params, x: model.apply(params, x, train=False)
+            lambda params, x: model.apply(params, x, train=False, compute_dtype=compute_dtype)
         )
 
         # Create tokenizer config
@@ -76,7 +86,7 @@ class ValueEngine:
         # Block until compilation is done
         jax.block_until_ready(_)
 
-        logger.debug(f"ValueEngine initialized with batch_size={batch_size}")
+        logger.debug(f"ValueEngine initialized with batch_size={batch_size}, compute_dtype={compute_dtype}")
 
     @property
     def name(self) -> str:
@@ -89,12 +99,15 @@ class ValueEngine:
         checkpoint_path: Path | str,
         *,
         batch_size: int = 64,
+        compute_dtype: "DTypeLike | None" = None,
     ) -> "ValueEngine":
         """Create a ValueEngine from a checkpoint directory.
 
         Args:
             checkpoint_path: Path to the checkpoint directory.
             batch_size: Fixed batch size for evaluation (padded for JIT efficiency).
+            compute_dtype: Dtype for intermediate computations (e.g., jnp.float32,
+                jnp.bfloat16, jnp.float16). Defaults to jnp.float32.
 
         Returns:
             Initialized ValueEngine.
@@ -105,6 +118,7 @@ class ValueEngine:
             params=loaded.params,
             tokenizer_config=loaded.tokenizer_config,
             batch_size=batch_size,
+            compute_dtype=compute_dtype,
         )
 
     @classmethod
@@ -113,12 +127,15 @@ class ValueEngine:
         checkpoint: LoadedCheckpoint,
         *,
         batch_size: int = 64,
+        compute_dtype: "DTypeLike | None" = None,
     ) -> "ValueEngine":
         """Create a ValueEngine from an already-loaded checkpoint.
 
         Args:
             checkpoint: Loaded checkpoint containing model and params.
             batch_size: Fixed batch size for evaluation (padded for JIT efficiency).
+            compute_dtype: Dtype for intermediate computations (e.g., jnp.float32,
+                jnp.bfloat16, jnp.float16). Defaults to jnp.float32.
 
         Returns:
             Initialized ValueEngine.
@@ -128,6 +145,7 @@ class ValueEngine:
             params=checkpoint.params,
             tokenizer_config=checkpoint.tokenizer_config,
             batch_size=batch_size,
+            compute_dtype=compute_dtype,
         )
 
     def reset(self) -> None:

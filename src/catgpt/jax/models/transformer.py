@@ -204,7 +204,7 @@ class Smolgen(nn.Module):
 
         # 3. Dense1 → GELU → LayerNorm
         hidden = nn.Dense(self.hidden_size, dtype=self.dtype, name="dense1")(compressed)
-        hidden = nn.gelu(hidden)
+        hidden = nn.gelu(hidden, approximate=True)  # tanh approximation for ONNX compat
         hidden = nn.LayerNorm(dtype=jnp.float32, name="ln1")(
             hidden.astype(jnp.float32)
         ).astype(self.dtype)
@@ -213,7 +213,7 @@ class Smolgen(nn.Module):
         gen_from = nn.Dense(
             self.num_heads * self.gen_size, dtype=self.dtype, name="dense2"
         )(hidden)
-        gen_from = nn.gelu(gen_from)
+        gen_from = nn.gelu(gen_from, approximate=True)  # tanh approximation for ONNX compat
         gen_from = nn.LayerNorm(dtype=jnp.float32, name="ln2")(
             gen_from.astype(jnp.float32)
         ).astype(self.dtype)
@@ -246,7 +246,7 @@ class TransformerBlock(nn.Module):
     def _get_activation(self) -> callable:
         """Get activation function by name."""
         activations = {
-            "gelu": nn.gelu,
+            "gelu": lambda x: nn.gelu(x, approximate=True),  # tanh approximation for ONNX compat
             "relu": nn.relu,
             "silu": nn.silu,
             "tanh": jnp.tanh,

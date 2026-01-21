@@ -32,6 +32,7 @@ dependencies = [
     "apache-beam>=2.70.0",
     "grain>=0.2.0",
     "google-crc32c>=1.8.0",
+    "polygraphy>=0.49.26",
 ]
 
 [project.optional-dependencies]
