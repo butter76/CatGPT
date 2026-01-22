@@ -4,7 +4,8 @@
  * Loads a TensorRT engine and benchmarks inference at various batch sizes.
  * The model expects:
  *   - Input: int32 tensor of shape (batch, 64) - chess position tokens
- *   - Output: float32 tensor of shape (batch,) - win probability
+ *   - Output "value": float32 tensor of shape (batch,) - win probability
+ *   - Output "policy_logit": float32 tensor of shape (batch, 4672) - policy logits
  */
 
 #include <NvInfer.h>
@@ -284,11 +285,18 @@ private:
     cudaEvent_t event_ = nullptr;
 };
 
+// Inference result containing both value and policy outputs
+struct InferenceResult {
+    std::vector<float> values;          // (batch,) - win probabilities
+    std::vector<float> policy_logits;   // (batch * POLICY_SIZE) - policy logits
+};
+
 // TensorRT Engine wrapper with CUDA Graph caching and double buffering
 class TrtEngine {
 public:
     static constexpr int32_t SEQ_LENGTH = 64;
-    static constexpr int32_t VOCAB_SIZE = 28;
+    static constexpr int32_t VOCAB_SIZE = 26;  // Must match catgpt::VOCAB_SIZE
+    static constexpr int32_t POLICY_SIZE = 4672;  // 64 * 73 (from_sq * to_sq)
     static constexpr int NUM_BUFFERS = 2;  // Double buffering
 
     // Batch sizes to cache CUDA graphs for
@@ -305,8 +313,8 @@ public:
 
     // Run inference on a batch of chess positions
     // Input: vector of int32 tokens, size = batch_size * SEQ_LENGTH
-    // Output: vector of float32 win probabilities, size = batch_size
-    std::vector<float> infer(std::span<const int32_t> input_tokens, int32_t batch_size) {
+    // Output: InferenceResult with values and policy logits
+    InferenceResult infer(std::span<const int32_t> input_tokens, int32_t batch_size) {
         if (static_cast<size_t>(batch_size * SEQ_LENGTH) != input_tokens.size()) {
             throw std::runtime_error("Input size mismatch");
         }
@@ -325,22 +333,26 @@ private:
     // Per-batch-size cached resources
     struct CachedBatchResources {
         CudaBuffer<int32_t> input_buffer;
-        CudaBuffer<float> output_buffer;
+        CudaBuffer<float> value_buffer;
+        CudaBuffer<float> policy_buffer;
         PinnedBuffer<int32_t> pinned_input;
-        PinnedBuffer<float> pinned_output;
+        PinnedBuffer<float> pinned_value;
+        PinnedBuffer<float> pinned_policy;
         CudaGraphExec graph_exec;
 
         CachedBatchResources(int32_t batch_size)
             : input_buffer(batch_size * SEQ_LENGTH),
-              output_buffer(batch_size),
+              value_buffer(batch_size),
+              policy_buffer(batch_size * POLICY_SIZE),
               pinned_input(batch_size * SEQ_LENGTH),
-              pinned_output(batch_size) {}
+              pinned_value(batch_size),
+              pinned_policy(batch_size * POLICY_SIZE) {}
     };
 
     // Inference using cached CUDA graph
-    std::vector<float> infer_with_graph(std::span<const int32_t> input_tokens,
-                                         int32_t batch_size,
-                                         CachedBatchResources& res) {
+    InferenceResult infer_with_graph(std::span<const int32_t> input_tokens,
+                                     int32_t batch_size,
+                                     CachedBatchResources& res) {
         // Copy input to pinned buffer (CPU-side, not part of graph)
         res.pinned_input.copy_from(input_tokens.data(), input_tokens.size());
 
@@ -353,18 +365,23 @@ private:
         res.graph_exec.launch(stream_.get());
         stream_.synchronize();
 
-        // Copy from pinned output buffer (CPU-side, not part of graph)
-        std::vector<float> output(batch_size);
-        std::memcpy(output.data(), res.pinned_output.get(), batch_size * sizeof(float));
+        // Copy from pinned output buffers (CPU-side, not part of graph)
+        InferenceResult result;
+        result.values.resize(batch_size);
+        result.policy_logits.resize(batch_size * POLICY_SIZE);
+        std::memcpy(result.values.data(), res.pinned_value.get(), batch_size * sizeof(float));
+        std::memcpy(result.policy_logits.data(), res.pinned_policy.get(),
+                    batch_size * POLICY_SIZE * sizeof(float));
 
-        return output;
+        return result;
     }
 
     // Capture CUDA graph for a batch size
     void capture_graph(int32_t batch_size, CachedBatchResources& res) {
         // Set up tensor addresses and shapes before capture
         context_->setTensorAddress(input_name_.c_str(), res.input_buffer.get());
-        context_->setTensorAddress(output_name_.c_str(), res.output_buffer.get());
+        context_->setTensorAddress(value_output_name_.c_str(), res.value_buffer.get());
+        context_->setTensorAddress(policy_output_name_.c_str(), res.policy_buffer.get());
 
         nvinfer1::Dims input_dims;
         input_dims.nbDims = 2;
@@ -373,6 +390,7 @@ private:
         context_->setInputShape(input_name_.c_str(), input_dims);
 
         size_t input_count = batch_size * SEQ_LENGTH;
+        size_t policy_count = batch_size * POLICY_SIZE;
 
         // Begin graph capture
         stream_.begin_capture();
@@ -388,7 +406,8 @@ private:
         }
 
         // D2H transfer (async, captured)
-        res.output_buffer.copy_to_host_async(res.pinned_output.get(), batch_size, stream_.get());
+        res.value_buffer.copy_to_host_async(res.pinned_value.get(), batch_size, stream_.get());
+        res.policy_buffer.copy_to_host_async(res.pinned_policy.get(), policy_count, stream_.get());
 
         // End capture and instantiate
         cudaGraph_t graph = stream_.end_capture();
@@ -398,7 +417,7 @@ private:
     }
 
     // Fallback inference without graph (for uncached batch sizes)
-    std::vector<float> infer_no_graph(std::span<const int32_t> input_tokens, int32_t batch_size) {
+    InferenceResult infer_no_graph(std::span<const int32_t> input_tokens, int32_t batch_size) {
         // Resize GPU and pinned buffers if needed
         ensure_fallback_buffers(batch_size);
 
@@ -409,7 +428,8 @@ private:
 
         // Set tensor addresses
         context_->setTensorAddress(input_name_.c_str(), fallback_input_buffer_.get());
-        context_->setTensorAddress(output_name_.c_str(), fallback_output_buffer_.get());
+        context_->setTensorAddress(value_output_name_.c_str(), fallback_value_buffer_.get());
+        context_->setTensorAddress(policy_output_name_.c_str(), fallback_policy_buffer_.get());
 
         // Set input shape (dynamic batch)
         nvinfer1::Dims input_dims;
@@ -424,15 +444,22 @@ private:
         }
 
         // Async D2H transfer, then synchronize
-        fallback_output_buffer_.copy_to_host_async(
-            fallback_pinned_output_.get(), batch_size, stream_.get());
+        size_t policy_count = batch_size * POLICY_SIZE;
+        fallback_value_buffer_.copy_to_host_async(
+            fallback_pinned_value_.get(), batch_size, stream_.get());
+        fallback_policy_buffer_.copy_to_host_async(
+            fallback_pinned_policy_.get(), policy_count, stream_.get());
         stream_.synchronize();
 
-        // Copy from pinned buffer to output vector
-        std::vector<float> output(batch_size);
-        std::memcpy(output.data(), fallback_pinned_output_.get(), batch_size * sizeof(float));
+        // Copy from pinned buffers to output
+        InferenceResult result;
+        result.values.resize(batch_size);
+        result.policy_logits.resize(policy_count);
+        std::memcpy(result.values.data(), fallback_pinned_value_.get(), batch_size * sizeof(float));
+        std::memcpy(result.policy_logits.data(), fallback_pinned_policy_.get(),
+                    policy_count * sizeof(float));
 
-        return output;
+        return result;
     }
 
 public:
@@ -486,12 +513,14 @@ public:
     }
 
     const std::string& input_name() const { return input_name_; }
-    const std::string& output_name() const { return output_name_; }
+    const std::string& value_output_name() const { return value_output_name_; }
+    const std::string& policy_output_name() const { return policy_output_name_; }
 
     // Process multiple batches with double buffering for maximum throughput
     // Returns all outputs concatenated
-    std::vector<float> infer_pipelined(const std::vector<std::span<const int32_t>>& batches,
-                                        int32_t batch_size) {
+    std::pair<std::vector<float>, std::vector<float>> infer_pipelined(
+        const std::vector<std::span<const int32_t>>& batches,
+        int32_t batch_size) {
         if (batches.empty()) return {};
 
         auto it = double_buffer_resources_.find(batch_size);
@@ -500,10 +529,13 @@ public:
         }
 
         auto& db = it->second;
-        std::vector<float> all_outputs;
-        all_outputs.reserve(batches.size() * batch_size);
+        std::vector<float> all_values;
+        std::vector<float> all_policies;
+        all_values.reserve(batches.size() * batch_size);
+        all_policies.reserve(batches.size() * batch_size * POLICY_SIZE);
 
         const size_t input_count = batch_size * SEQ_LENGTH;
+        const size_t policy_count = batch_size * POLICY_SIZE;
 
         // Process batches with double buffering
         for (size_t i = 0; i < batches.size(); ++i) {
@@ -517,9 +549,12 @@ public:
                 size_t out_idx = i - NUM_BUFFERS;
                 int out_slot = out_idx % NUM_BUFFERS;
                 auto& out_buf = db.buffers[out_slot];
-                all_outputs.insert(all_outputs.end(),
-                                   out_buf.pinned_output.get(),
-                                   out_buf.pinned_output.get() + batch_size);
+                all_values.insert(all_values.end(),
+                                  out_buf.pinned_value.get(),
+                                  out_buf.pinned_value.get() + batch_size);
+                all_policies.insert(all_policies.end(),
+                                    out_buf.pinned_policy.get(),
+                                    out_buf.pinned_policy.get() + policy_count);
             }
 
             // Copy input to pinned buffer
@@ -548,12 +583,15 @@ public:
             int slot = i % NUM_BUFFERS;
             auto& buf = db.buffers[slot];
             buf.done_event.synchronize();
-            all_outputs.insert(all_outputs.end(),
-                               buf.pinned_output.get(),
-                               buf.pinned_output.get() + batch_size);
+            all_values.insert(all_values.end(),
+                              buf.pinned_value.get(),
+                              buf.pinned_value.get() + batch_size);
+            all_policies.insert(all_policies.end(),
+                                buf.pinned_policy.get(),
+                                buf.pinned_policy.get() + policy_count);
         }
 
-        return all_outputs;
+        return {std::move(all_values), std::move(all_policies)};
     }
 
     // Benchmark pipelined inference (sustained throughput)
@@ -605,15 +643,19 @@ private:
         CudaStream stream;
         CudaEvent done_event;
         CudaBuffer<int32_t> input_buffer;
-        CudaBuffer<float> output_buffer;
+        CudaBuffer<float> value_buffer;
+        CudaBuffer<float> policy_buffer;
         PinnedBuffer<int32_t> pinned_input;
-        PinnedBuffer<float> pinned_output;
+        PinnedBuffer<float> pinned_value;
+        PinnedBuffer<float> pinned_policy;
 
         DoubleBufferSlot(int32_t batch_size)
             : input_buffer(batch_size * SEQ_LENGTH),
-              output_buffer(batch_size),
+              value_buffer(batch_size),
+              policy_buffer(batch_size * POLICY_SIZE),
               pinned_input(batch_size * SEQ_LENGTH),
-              pinned_output(batch_size) {}
+              pinned_value(batch_size),
+              pinned_policy(batch_size * POLICY_SIZE) {}
     };
 
     struct DoubleBufferResources {
@@ -638,13 +680,15 @@ private:
 
     void execute_pipeline_step(int32_t batch_size, DoubleBufferSlot& buf) {
         size_t input_count = batch_size * SEQ_LENGTH;
+        size_t policy_count = batch_size * POLICY_SIZE;
 
         // H2D transfer
         buf.input_buffer.copy_from_host_async(buf.pinned_input.get(), input_count, buf.stream.get());
 
         // Set tensor addresses
         context_->setTensorAddress(input_name_.c_str(), buf.input_buffer.get());
-        context_->setTensorAddress(output_name_.c_str(), buf.output_buffer.get());
+        context_->setTensorAddress(value_output_name_.c_str(), buf.value_buffer.get());
+        context_->setTensorAddress(policy_output_name_.c_str(), buf.policy_buffer.get());
 
         // Set input shape
         nvinfer1::Dims input_dims;
@@ -657,7 +701,8 @@ private:
         context_->enqueueV3(buf.stream.get());
 
         // D2H transfer
-        buf.output_buffer.copy_to_host_async(buf.pinned_output.get(), batch_size, buf.stream.get());
+        buf.value_buffer.copy_to_host_async(buf.pinned_value.get(), batch_size, buf.stream.get());
+        buf.policy_buffer.copy_to_host_async(buf.pinned_policy.get(), policy_count, buf.stream.get());
     }
 
     void capture_double_buffer_graph(int32_t batch_size, DoubleBufferResources& db) {
@@ -737,34 +782,72 @@ private:
                 input_name_ = name;
                 std::println("  Input '{}': {} {}", name, dims_str, dtype_str);
             } else {
-                output_name_ = name;
+                // Determine output type by name or order
+                std::string name_str(name);
                 std::println("  Output '{}': {} {}", name, dims_str, dtype_str);
+
+                // Match output names - check for "value" or "policy" in the name
+                if (name_str.find("value") != std::string::npos ||
+                    name_str.find("Value") != std::string::npos) {
+                    value_output_name_ = name;
+                } else if (name_str.find("policy") != std::string::npos ||
+                           name_str.find("Policy") != std::string::npos) {
+                    policy_output_name_ = name;
+                } else {
+                    // Fallback: assign by shape (value has 1D, policy has 2D output)
+                    if (dims.nbDims == 1 || (dims.nbDims == 2 && dims.d[1] == 1)) {
+                        if (value_output_name_.empty()) {
+                            value_output_name_ = name;
+                        }
+                    } else {
+                        if (policy_output_name_.empty()) {
+                            policy_output_name_ = name;
+                        }
+                    }
+                }
             }
         }
 
-        if (input_name_.empty() || output_name_.empty()) {
-            throw std::runtime_error("Could not find input/output tensors");
+        if (input_name_.empty()) {
+            throw std::runtime_error("Could not find input tensor");
         }
+        if (value_output_name_.empty()) {
+            throw std::runtime_error("Could not find value output tensor");
+        }
+        if (policy_output_name_.empty()) {
+            throw std::runtime_error("Could not find policy output tensor");
+        }
+
+        std::println("  -> Input: '{}'", input_name_);
+        std::println("  -> Value output: '{}'", value_output_name_);
+        std::println("  -> Policy output: '{}'", policy_output_name_);
     }
 
     void ensure_fallback_buffers(int32_t batch_size) {
         size_t input_count = batch_size * SEQ_LENGTH;
-        size_t output_count = batch_size;
+        size_t value_count = batch_size;
+        size_t policy_count = batch_size * POLICY_SIZE;
 
         // GPU buffers
         if (fallback_input_buffer_.count() < input_count) {
             fallback_input_buffer_ = CudaBuffer<int32_t>(input_count);
         }
-        if (fallback_output_buffer_.count() < output_count) {
-            fallback_output_buffer_ = CudaBuffer<float>(output_count);
+        if (fallback_value_buffer_.count() < value_count) {
+            fallback_value_buffer_ = CudaBuffer<float>(value_count);
+        }
+        if (fallback_policy_buffer_.count() < policy_count) {
+            fallback_policy_buffer_ = CudaBuffer<float>(policy_count);
         }
 
         // Pinned host buffers (for async transfers)
         if (fallback_pinned_input_.count() < input_count) {
             fallback_pinned_input_ = PinnedBuffer<int32_t>(input_count);
         }
-        if (fallback_pinned_output_.count() < output_count) {
-            fallback_pinned_output_ = PinnedBuffer<float>(output_count);
+        if (fallback_pinned_value_.count() < value_count) {
+            fallback_pinned_value_ = PinnedBuffer<float>(value_count);
+        }
+        if (fallback_pinned_policy_.count() < policy_count) {
+            fallback_pinned_policy_ = PinnedBuffer<float>(policy_count);
         }
     }
 
@@ -774,7 +857,8 @@ private:
     std::unique_ptr<nvinfer1::IExecutionContext> context_;
 
     std::string input_name_;
-    std::string output_name_;
+    std::string value_output_name_;
+    std::string policy_output_name_;
 
     CudaStream stream_;  // Dedicated CUDA stream for inference
 
@@ -786,9 +870,11 @@ private:
 
     // Fallback buffers for uncached batch sizes (no graph)
     CudaBuffer<int32_t> fallback_input_buffer_;
-    CudaBuffer<float> fallback_output_buffer_;
+    CudaBuffer<float> fallback_value_buffer_;
+    CudaBuffer<float> fallback_policy_buffer_;
     PinnedBuffer<int32_t> fallback_pinned_input_;
-    PinnedBuffer<float> fallback_pinned_output_;
+    PinnedBuffer<float> fallback_pinned_value_;
+    PinnedBuffer<float> fallback_pinned_policy_;
 };
 
 void print_header() {
@@ -837,8 +923,27 @@ int main(int argc, char* argv[]) {
         std::println("\n┌─ Inference Test ──────────────────────────────────────────────┐");
         {
             std::vector<int32_t> test_input(TrtEngine::SEQ_LENGTH, 1);  // Simple test input
-            auto output = engine.infer(test_input, 1);
-            std::println("│ Single inference test: value = {:.6f}", output[0]);
+            auto result = engine.infer(test_input, 1);
+            std::println("│ Single inference test:");
+            std::println("│   Value (win prob): {:.6f}", result.values[0]);
+
+            // Show top-5 policy logits (argmax)
+            auto& policy = result.policy_logits;
+            std::vector<std::pair<int, float>> indexed_logits;
+            indexed_logits.reserve(policy.size());
+            for (size_t i = 0; i < policy.size(); ++i) {
+                indexed_logits.emplace_back(static_cast<int>(i), policy[i]);
+            }
+            std::partial_sort(indexed_logits.begin(), indexed_logits.begin() + 5, indexed_logits.end(),
+                              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+            std::println("│   Top-5 policy logits:");
+            for (int i = 0; i < 5; ++i) {
+                int from_sq = indexed_logits[i].first / 73;
+                int to_sq = indexed_logits[i].first % 73;
+                std::println("│     [{}] from={}, to={}: {:.4f}",
+                             i + 1, from_sq, to_sq, indexed_logits[i].second);
+            }
         }
         std::println("└───────────────────────────────────────────────────────────────┘");
 

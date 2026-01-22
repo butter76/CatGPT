@@ -1,0 +1,7 @@
+---
+alwaysApply: true
+---
+
+This repo uses a third-party library from https://github.com/Disservin/chess-library to handle all lower-level chessboard manipulation. You can view most of the relevant details from ./cpp/external/chess-library/include/chess.hpp.
+
+One notable "gotcha". When making a move, you must use template "true" in board.makeMove<true>(m). This prevents en passants from showing up in the FEN when they are not legal (e.g. the en passant would place yourself in check). This is required to match the network's training environment.

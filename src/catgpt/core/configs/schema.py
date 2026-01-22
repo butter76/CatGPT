@@ -18,7 +18,7 @@ class ModelConfig:
     num_layers: int = 6
     num_heads: int = 8
     ff_dim: int | None = None  # Defaults to 4 * hidden_size if None
-    vocab_size: int = 28  # From tokenizer.VOCAB_SIZE
+    vocab_size: int = 26  # From tokenizer.VOCAB_SIZE
     seq_length: int = 64
     activation: str = "gelu"
 
