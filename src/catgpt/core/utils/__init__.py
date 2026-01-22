@@ -1,5 +1,6 @@
 """Shared utilities for CatGPT."""
 
+from catgpt.core.utils import tokenizer
 from catgpt.core.utils.logging import setup_logging
 from catgpt.core.utils.policy import (
     POLICY_SHAPE,
@@ -32,4 +33,5 @@ __all__ = [
     "parse_uci_move",
     "setup_logging",
     "tokenize",
+    "tokenizer",
 ]
