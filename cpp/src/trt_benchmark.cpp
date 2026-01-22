@@ -295,7 +295,7 @@ struct InferenceResult {
 class TrtEngine {
 public:
     static constexpr int32_t SEQ_LENGTH = 64;
-    static constexpr int32_t VOCAB_SIZE = 28;
+    static constexpr int32_t VOCAB_SIZE = 26;  // Must match catgpt::VOCAB_SIZE
     static constexpr int32_t POLICY_SIZE = 4672;  // 64 * 73 (from_sq * to_sq)
     static constexpr int NUM_BUFFERS = 2;  // Double buffering
 

@@ -127,7 +127,7 @@ def _load_model_config(path: Path) -> JaxModelConfig:
         num_layers=config_dict["num_layers"],
         num_heads=config_dict["num_heads"],
         ff_dim=config_dict.get("ff_dim"),
-        vocab_size=config_dict.get("vocab_size", 28),
+        vocab_size=config_dict.get("vocab_size", 26),
         seq_length=config_dict.get("seq_length", 64),
         activation=config_dict.get("activation", "gelu"),
         output_heads=output_heads,
