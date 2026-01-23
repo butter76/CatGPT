@@ -157,8 +157,8 @@ class Smolgen(nn.Module):
     Architecture:
     1. Compress: (batch, seq_len, hidden) → (batch, seq_len, hidden_channels)
     2. Flatten: → (batch, seq_len * hidden_channels)
-    3. Dense1 → GELU → LayerNorm: → (batch, hidden_size)
-    4. Dense2 → GELU → LayerNorm: → (batch, num_heads * gen_size)
+    3. Dense1 → LayerNorm: → (batch, hidden_size)
+    4. Dense2 → LayerNorm: → (batch, num_heads * gen_size)
     5. Reshape: → (batch, num_heads, gen_size)
     6. Shared weight_gen (external): → (batch, num_heads, seq_len * seq_len)
     7. Reshape: → (batch, num_heads, seq_len, seq_len)
@@ -202,18 +202,16 @@ class Smolgen(nn.Module):
         # 2. Flatten: → (batch, seq_len * hidden_channels)
         compressed = compressed.reshape(batch_size, -1)
 
-        # 3. Dense1 → GELU → LayerNorm
+        # 3. Dense1 → LayerNorm
         hidden = nn.Dense(self.hidden_size, dtype=self.dtype, name="dense1")(compressed)
-        hidden = nn.gelu(hidden, approximate=True)  # tanh approximation for ONNX compat
         hidden = nn.LayerNorm(dtype=jnp.float32, name="ln1")(
             hidden.astype(jnp.float32)
         ).astype(self.dtype)
 
-        # 4. Dense2 → GELU → LayerNorm → reshape to (batch, num_heads, gen_size)
+        # 4. Dense2 → LayerNorm → reshape to (batch, num_heads, gen_size)
         gen_from = nn.Dense(
             self.num_heads * self.gen_size, dtype=self.dtype, name="dense2"
         )(hidden)
-        gen_from = nn.gelu(gen_from, approximate=True)  # tanh approximation for ONNX compat
         gen_from = nn.LayerNorm(dtype=jnp.float32, name="ln2")(
             gen_from.astype(jnp.float32)
         ).astype(self.dtype)
