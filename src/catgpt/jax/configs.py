@@ -316,6 +316,7 @@ class JaxEvalEngineConfig:
 
     type: str = "value"  # "value", "policy", or "mcts"
     batch_size: int = 256
+    num_workers: int = 1  # Number of parallel workers (each loads own engine)
     mcts: JaxMCTSConfig = field(default_factory=JaxMCTSConfig)
 
     def __post_init__(self) -> None:

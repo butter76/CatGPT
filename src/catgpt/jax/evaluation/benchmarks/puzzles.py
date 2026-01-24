@@ -1,9 +1,10 @@
 """Chess puzzle benchmark for evaluating engines."""
 
 import csv
+import multiprocessing as mp
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import chess
 from loguru import logger
@@ -11,6 +12,13 @@ from tqdm import tqdm
 
 from catgpt.jax.evaluation.benchmarks.base import BenchmarkResult
 from catgpt.jax.evaluation.engines.base import Engine
+
+if TYPE_CHECKING:
+    from catgpt.jax.configs import JaxEvalConfig
+
+
+# Module-level variables for worker processes
+_worker_engine: Engine | None = None
 
 
 @dataclass
@@ -321,6 +329,315 @@ class PuzzleBenchmark:
             metrics[f"{bucket_name}_count"] = float(stats["puzzles"])
 
         return metrics
+
+    def run_parallel(
+        self,
+        eval_config: "JaxEvalConfig",
+        *,
+        show_progress: bool = True,
+    ) -> BenchmarkResult:
+        """Run the benchmark in parallel across multiple workers.
+
+        Each worker loads its own engine instance and processes puzzles independently.
+        This is useful for expensive engines like MCTS where parallelism can significantly
+        speed up evaluation.
+
+        Args:
+            eval_config: Full evaluation config containing checkpoint path and engine settings.
+            show_progress: Whether to show a progress bar.
+
+        Returns:
+            BenchmarkResult with accuracy metrics and per-puzzle details.
+        """
+        num_workers = eval_config.engine.num_workers
+
+        if num_workers <= 1:
+            # Fall back to single-threaded for 1 worker
+            # Need to create engine here
+            engine = _create_engine_from_config(eval_config)
+            return self.run(engine, show_progress=show_progress)
+
+        logger.info(f"Running parallel evaluation with {num_workers} workers")
+
+        # Prepare puzzle data for workers (convert to dicts for pickling)
+        puzzle_data = [
+            {
+                "id": p.id,
+                "rating": p.rating,
+                "fen": p.fen,
+                "moves": p.moves,
+            }
+            for p in self.puzzles
+        ]
+
+        # Prepare config dict for workers (dataclasses aren't always picklable)
+        config_dict = _eval_config_to_dict(eval_config)
+
+        # Use spawn context for JAX compatibility
+        ctx = mp.get_context("spawn")
+
+        results: list[PuzzleResult] = []
+        total_solved = 0
+        total_moves_correct = 0
+        total_moves = 0
+
+        with ctx.Pool(
+            processes=num_workers,
+            initializer=_worker_init,
+            initargs=(config_dict,),
+        ) as pool:
+            # Use imap_unordered for better progress updates
+            work_items = puzzle_data
+
+            if show_progress:
+                pbar = tqdm(
+                    total=len(puzzle_data),
+                    desc=f"Evaluating {self.name}",
+                    unit="puzzle",
+                )
+            else:
+                pbar = None
+
+            for result_dict in pool.imap_unordered(_worker_evaluate_puzzle, work_items):
+                result = PuzzleResult(**result_dict)
+                results.append(result)
+
+                # Update running stats
+                if result.solved:
+                    total_solved += 1
+                total_moves_correct += result.moves_correct
+                total_moves += result.moves_total
+
+                # Update progress bar
+                if pbar is not None:
+                    pbar.update(1)
+                    n_puzzles = len(results)
+                    solve_rate = total_solved / n_puzzles if n_puzzles > 0 else 0.0
+                    accuracy = total_moves_correct / total_moves if total_moves > 0 else 0.0
+                    pbar.set_postfix(
+                        acc=f"{accuracy:.1%}",
+                        solve=f"{solve_rate:.1%}",
+                        solved=f"{total_solved}/{n_puzzles}",
+                    )
+
+            if pbar is not None:
+                pbar.close()
+
+        # Compute aggregate metrics
+        metrics = self._compute_metrics(results)
+
+        # Add rating bucket metrics
+        bucket_metrics = self._compute_rating_buckets(results)
+        metrics.update(bucket_metrics)
+
+        return BenchmarkResult(
+            name=self.name,
+            metrics=metrics,
+            details=[asdict(r) for r in results],
+            metadata={
+                "csv_path": str(self.csv_path),
+                "num_puzzles": len(results),
+                "num_workers": num_workers,
+            },
+        )
+
+
+def _eval_config_to_dict(config: "JaxEvalConfig") -> dict[str, Any]:
+    """Convert eval config to a picklable dict for multiprocessing."""
+    return {
+        "checkpoint": config.checkpoint,
+        "engine": {
+            "type": config.engine.type,
+            "batch_size": config.engine.batch_size,
+            "mcts": {
+                "num_simulations": config.engine.mcts.num_simulations,
+                "c_puct": config.engine.mcts.c_puct,
+                "fpu_value": config.engine.mcts.fpu_value,
+            },
+        },
+        "compute": {
+            "matmul_precision": config.compute.matmul_precision,
+            "compute_dtype": config.compute.compute_dtype,
+        },
+    }
+
+
+def _worker_init(config_dict: dict[str, Any]) -> None:
+    """Initialize worker process with engine.
+
+    Called once per worker process at startup.
+    """
+    global _worker_engine
+
+    # Set JAX configuration before any JAX imports
+    import jax
+    import jax.numpy as jnp
+
+    jax.config.update(
+        "jax_default_matmul_precision",
+        config_dict["compute"]["matmul_precision"],
+    )
+
+    # Import engines here (after JAX config)
+    from catgpt.jax.evaluation.engines.mcts import MCTSConfig, MCTSEngine
+    from catgpt.jax.evaluation.engines.policy_engine import PolicyEngine
+    from catgpt.jax.evaluation.engines.value_engine import ValueEngine
+
+    # Map dtype string to jax dtype
+    dtype_map = {
+        "float32": jnp.float32,
+        "float16": jnp.float16,
+        "bfloat16": jnp.bfloat16,
+    }
+    compute_dtype = dtype_map[config_dict["compute"]["compute_dtype"]]
+
+    checkpoint_path = Path(config_dict["checkpoint"])
+    engine_type = config_dict["engine"]["type"]
+    batch_size = config_dict["engine"]["batch_size"]
+
+    if engine_type == "value":
+        _worker_engine = ValueEngine.from_checkpoint(
+            checkpoint_path,
+            batch_size=batch_size,
+            compute_dtype=compute_dtype,
+        )
+    elif engine_type == "policy":
+        _worker_engine = PolicyEngine.from_checkpoint(
+            checkpoint_path,
+            batch_size=batch_size,
+            compute_dtype=compute_dtype,
+        )
+    else:  # mcts
+        mcts_cfg = config_dict["engine"]["mcts"]
+        mcts_config = MCTSConfig(
+            num_simulations=mcts_cfg["num_simulations"],
+            c_puct=mcts_cfg["c_puct"],
+            fpu_value=mcts_cfg["fpu_value"],
+        )
+        _worker_engine = MCTSEngine.from_checkpoint(
+            checkpoint_path,
+            config=mcts_config,
+            batch_size=1,
+            compute_dtype=compute_dtype,
+        )
+
+    logger.debug(f"Worker initialized with {engine_type} engine")
+
+
+def _worker_evaluate_puzzle(puzzle_dict: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate a single puzzle in a worker process.
+
+    Args:
+        puzzle_dict: Dictionary with puzzle data.
+
+    Returns:
+        Dictionary with PuzzleResult fields.
+    """
+    global _worker_engine
+
+    if _worker_engine is None:
+        raise RuntimeError("Worker engine not initialized")
+
+    puzzle = Puzzle(
+        id=puzzle_dict["id"],
+        rating=puzzle_dict["rating"],
+        fen=puzzle_dict["fen"],
+        moves=puzzle_dict["moves"],
+    )
+
+    board = chess.Board(puzzle.fen)
+
+    moves_correct = 0
+    moves_total = 0
+    predicted_moves: list[str] = []
+    expected_moves: list[str] = []
+
+    for i, uci_move in enumerate(puzzle.moves):
+        if i % 2 == 0:
+            # Opponent's move - just apply it
+            try:
+                board.push_uci(uci_move)
+            except ValueError:
+                break
+        else:
+            # Engine must find this move
+            moves_total += 1
+            expected_moves.append(uci_move)
+
+            # Get engine's move
+            predicted = _worker_engine.select_move(board)
+
+            if predicted is not None:
+                predicted_uci = predicted.uci()
+                predicted_moves.append(predicted_uci)
+
+                if predicted_uci == uci_move:
+                    moves_correct += 1
+            else:
+                predicted_moves.append("")
+
+            # Apply the correct move to continue the puzzle
+            try:
+                board.push_uci(uci_move)
+            except ValueError:
+                break
+
+    return {
+        "puzzle_id": puzzle.id,
+        "rating": puzzle.rating,
+        "solved": (moves_correct == moves_total and moves_total > 0),
+        "moves_correct": moves_correct,
+        "moves_total": moves_total,
+        "predicted_moves": predicted_moves,
+        "expected_moves": expected_moves,
+    }
+
+
+def _create_engine_from_config(config: "JaxEvalConfig") -> Engine:
+    """Create an engine from eval config (for single-threaded fallback)."""
+    import jax
+    import jax.numpy as jnp
+
+    from catgpt.jax.evaluation.engines.mcts import MCTSConfig, MCTSEngine
+    from catgpt.jax.evaluation.engines.policy_engine import PolicyEngine
+    from catgpt.jax.evaluation.engines.value_engine import ValueEngine
+
+    # Map dtype string to jax dtype
+    dtype_map = {
+        "float32": jnp.float32,
+        "float16": jnp.float16,
+        "bfloat16": jnp.bfloat16,
+    }
+    compute_dtype = dtype_map[config.compute.compute_dtype]
+
+    checkpoint_path = Path(config.checkpoint)
+    engine_type = config.engine.type
+    batch_size = config.engine.batch_size
+
+    if engine_type == "value":
+        return ValueEngine.from_checkpoint(
+            checkpoint_path,
+            batch_size=batch_size,
+            compute_dtype=compute_dtype,
+        )
+    elif engine_type == "policy":
+        return PolicyEngine.from_checkpoint(
+            checkpoint_path,
+            batch_size=batch_size,
+            compute_dtype=compute_dtype,
+        )
+    else:  # mcts
+        mcts_config = MCTSConfig(
+            num_simulations=config.engine.mcts.num_simulations,
+            c_puct=config.engine.mcts.c_puct,
+            fpu_value=config.engine.mcts.fpu_value,
+        )
+        return MCTSEngine.from_checkpoint(
+            checkpoint_path,
+            config=mcts_config,
+            batch_size=1,
+            compute_dtype=compute_dtype,
+        )
 
 
 def load_puzzle_benchmarks(

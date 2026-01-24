@@ -23,6 +23,9 @@ Usage:
     # Use highest matmul precision (for ONNX/TensorRT comparison)
     uv run python scripts/evaluate_jax.py compute.matmul_precision=highest
 
+    # Parallel evaluation with 4 workers (each loads own engine)
+    uv run python scripts/evaluate_jax.py engine.num_workers=4
+
     # Disable W&B logging
     uv run python scripts/evaluate_jax.py wandb.enabled=false
 """
@@ -205,6 +208,10 @@ def main(cfg: DictConfig) -> None:
             f"c_puct: {eval_cfg.engine.mcts.c_puct}"
         )
 
+    num_workers = eval_cfg.engine.num_workers
+    use_parallel = num_workers > 1
+    logger.info(f"Workers: {num_workers}" + (" (parallel)" if use_parallel else ""))
+
     # Initialize W&B if requested
     wandb_run = None
     if eval_cfg.wandb.enabled:
@@ -224,6 +231,7 @@ def main(cfg: DictConfig) -> None:
                     "compute_dtype": eval_cfg.compute.compute_dtype,
                     "engine_type": eval_cfg.engine.type,
                     "engine_batch_size": eval_cfg.engine.batch_size,
+                    "num_workers": num_workers,
                     "mcts_simulations": eval_cfg.engine.mcts.num_simulations,
                     "mcts_c_puct": eval_cfg.engine.mcts.c_puct,
                 },
@@ -246,40 +254,43 @@ def main(cfg: DictConfig) -> None:
             max_puzzles=eval_cfg.benchmark.max_puzzles,
         )
 
-    # Load engine
     checkpoint_name = checkpoint_path.name
     logger.info(f"\n{'=' * 60}")
     logger.info(f"Evaluating checkpoint: {checkpoint_path}")
     logger.info(f"{'=' * 60}")
 
-    try:
-        if eval_cfg.engine.type == "value":
-            engine = ValueEngine.from_checkpoint(
-                checkpoint_path,
-                batch_size=eval_cfg.engine.batch_size,
-                compute_dtype=compute_dtype_jax,
-            )
-        elif eval_cfg.engine.type == "policy":
-            engine = PolicyEngine.from_checkpoint(
-                checkpoint_path,
-                batch_size=eval_cfg.engine.batch_size,
-                compute_dtype=compute_dtype_jax,
-            )
-        else:  # engine_type == "mcts"
-            mcts_config = MCTSConfig(
-                num_simulations=eval_cfg.engine.mcts.num_simulations,
-                c_puct=eval_cfg.engine.mcts.c_puct,
-                fpu_value=eval_cfg.engine.mcts.fpu_value,
-            )
-            engine = MCTSEngine.from_checkpoint(
-                checkpoint_path,
-                config=mcts_config,
-                batch_size=1,  # MCTS evaluates one position at a time
-                compute_dtype=compute_dtype_jax,
-            )
-    except Exception as e:
-        logger.error(f"Failed to load checkpoint: {e}")
-        raise SystemExit(1)
+    # Load engine only if not using parallel mode
+    # (parallel mode creates engines in worker processes)
+    engine = None
+    if not use_parallel:
+        try:
+            if eval_cfg.engine.type == "value":
+                engine = ValueEngine.from_checkpoint(
+                    checkpoint_path,
+                    batch_size=eval_cfg.engine.batch_size,
+                    compute_dtype=compute_dtype_jax,
+                )
+            elif eval_cfg.engine.type == "policy":
+                engine = PolicyEngine.from_checkpoint(
+                    checkpoint_path,
+                    batch_size=eval_cfg.engine.batch_size,
+                    compute_dtype=compute_dtype_jax,
+                )
+            else:  # engine_type == "mcts"
+                mcts_config = MCTSConfig(
+                    num_simulations=eval_cfg.engine.mcts.num_simulations,
+                    c_puct=eval_cfg.engine.mcts.c_puct,
+                    fpu_value=eval_cfg.engine.mcts.fpu_value,
+                )
+                engine = MCTSEngine.from_checkpoint(
+                    checkpoint_path,
+                    config=mcts_config,
+                    batch_size=1,  # MCTS evaluates one position at a time
+                    compute_dtype=compute_dtype_jax,
+                )
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            raise SystemExit(1)
 
     # Run evaluation
     all_results: dict[str, dict[str, any]] = {}
@@ -288,7 +299,10 @@ def main(cfg: DictConfig) -> None:
     for bench_name, bench in benchmarks.items():
         logger.info(f"\nRunning {bench_name} ({len(bench.puzzles)} puzzles)...")
 
-        result = bench.run(engine, show_progress=True)
+        if use_parallel:
+            result = bench.run_parallel(eval_cfg, show_progress=True)
+        else:
+            result = bench.run(engine, show_progress=True)
         checkpoint_results[bench_name] = result
 
         # Log to console

@@ -25,6 +25,11 @@ engine:
   type: "mcts"  # Options: "value", "policy", "mcts"
   batch_size: 1
 
+  # Parallel workers: each worker loads its own engine and processes puzzles independently.
+  # Useful for MCTS where evaluation is CPU-bound. Set to number of CPU cores for max throughput.
+  # Note: GPU memory usage scales with num_workers (each worker loads model into GPU).
+  num_workers: 2
+
   # MCTS-specific settings (only used when type=mcts)
   mcts:
     num_simulations: 400
@@ -34,7 +39,7 @@ engine:
 # Benchmark configuration
 benchmark:
   names:
-    - "puzzles"  # Default benchmark
+    - "high_rated_puzzles"  # Default benchmark
   # Available benchmarks: "puzzles", "high_rated_puzzles"
   # Use names: ["puzzles", "high_rated_puzzles"] for all
   max_puzzles: 10000  # null for unlimited
