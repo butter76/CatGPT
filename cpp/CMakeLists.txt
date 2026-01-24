@@ -131,6 +131,28 @@ set_target_properties(catgpt_uci PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR}"
 )
 
+# === CatGPT MCTS UCI Engine (with TensorRT) ===
+add_executable(catgpt_mcts
+    src/mcts_uci_main.cpp
+)
+
+target_include_directories(catgpt_mcts PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+)
+
+target_link_libraries(catgpt_mcts PRIVATE
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    pthread
+)
+
+set_target_properties(catgpt_mcts PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+)
+
 # Enable colored output
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)
@@ -138,4 +160,5 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_lib_tests PRIVATE -fdiagnostics-color=always)
     target_compile_options(dummy_search PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_uci PRIVATE -fdiagnostics-color=always)
+    target_compile_options(catgpt_mcts PRIVATE -fdiagnostics-color=always)
 endif()
