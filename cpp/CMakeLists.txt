@@ -113,10 +113,29 @@ set_target_properties(dummy_search PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR}"
 )
 
+# === CatGPT UCI Engine ===
+add_executable(catgpt_uci
+    src/uci_main.cpp
+)
+
+target_include_directories(catgpt_uci PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+)
+
+target_link_libraries(catgpt_uci PRIVATE
+    pthread
+)
+
+set_target_properties(catgpt_uci PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR}"
+)
+
 # Enable colored output
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)
     target_compile_options(trt_benchmark PRIVATE -fdiagnostics-color=always)
     target_compile_options(chess_lib_tests PRIVATE -fdiagnostics-color=always)
     target_compile_options(dummy_search PRIVATE -fdiagnostics-color=always)
+    target_compile_options(catgpt_uci PRIVATE -fdiagnostics-color=always)
 endif()
