@@ -122,12 +122,14 @@ private:
         std::println("id author {}", ENGINE_AUTHOR);
         // TODO: Add UCI options here when needed
         std::println("uciok");
+        std::cout.flush();
     }
 
     void handle_isready() {
         // Ensure any pending operations complete
         stop_search();
         std::println("readyok");
+        std::cout.flush();
     }
 
     void handle_ucinewgame() {
@@ -196,6 +198,7 @@ private:
     void handle_debug() {
         std::cout << search_algo_->board() << '\n';
         std::println("FEN: {}", search_algo_->board().getFen());
+        std::cout.flush();
     }
 
     void stop_search() {
@@ -239,11 +242,13 @@ private:
         if (!result.has_move()) {
             // No legal move (shouldn't happen in normal play)
             std::println("bestmove 0000");
+            std::cout.flush();
             return;
         }
 
         std::string bestmove_str = chess::uci::moveToUci(result.best_move);
         std::println("bestmove {}", bestmove_str);
+        std::cout.flush();
     }
 
     static std::vector<std::string> tokenize(std::string_view line) {
