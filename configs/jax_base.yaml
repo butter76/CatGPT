@@ -4,9 +4,9 @@
 # Model architecture
 model:
   name: "transformer"
-  hidden_size: 512
-  num_layers: 16
-  num_heads: 32
+  hidden_size: 1024
+  num_layers: 15
+  num_heads: 64
   ff_dim: 1536  # Defaults to 4 * hidden_size
   vocab_size: 26  # From tokenizer (don't change unless tokenizer changes)
   seq_length: 64  # Will be overridden by tokenizer.sequence_length
@@ -16,7 +16,7 @@ model:
   # Generates position-dependent attention biases conditioned on input
   # See: https://lczero.org/blog/2024/02/transformer-progress/
   smolgen:
-    enabled: false
+    enabled: true
     hidden_channels: 32  # Compression dimension
     hidden_size: 256     # Hidden layer size
     gen_size: 256        # Per-head generation dimension

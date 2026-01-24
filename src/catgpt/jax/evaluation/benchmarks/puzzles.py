@@ -141,13 +141,41 @@ class PuzzleBenchmark:
         """
         results: list[PuzzleResult] = []
 
-        iterator = self.puzzles
+        # Running stats for progress bar
+        total_solved = 0
+        total_moves_correct = 0
+        total_moves = 0
+
+        pbar = None
         if show_progress:
-            iterator = tqdm(iterator, desc=f"Evaluating {self.name}", unit="puzzle")
+            pbar = tqdm(self.puzzles, desc=f"Evaluating {self.name}", unit="puzzle")
+            iterator = pbar
+        else:
+            iterator = self.puzzles
 
         for puzzle in iterator:
             result = self._evaluate_puzzle(puzzle, engine)
             results.append(result)
+
+            # Update running stats
+            if result.solved:
+                total_solved += 1
+            total_moves_correct += result.moves_correct
+            total_moves += result.moves_total
+
+            # Update progress bar with running stats
+            if pbar is not None:
+                n_puzzles = len(results)
+                solve_rate = total_solved / n_puzzles if n_puzzles > 0 else 0.0
+                accuracy = total_moves_correct / total_moves if total_moves > 0 else 0.0
+                pbar.set_postfix(
+                    acc=f"{accuracy:.1%}",
+                    solve=f"{solve_rate:.1%}",
+                    solved=f"{total_solved}/{n_puzzles}",
+                )
+
+        if pbar is not None:
+            pbar.close()
 
         # Compute aggregate metrics
         metrics = self._compute_metrics(results)

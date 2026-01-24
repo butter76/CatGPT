@@ -294,3 +294,104 @@ def jax_config_to_dict(config: JaxExperimentConfig) -> dict[str, Any]:
     # Convert Path objects to strings for YAML serialization
     result["checkpoint"]["dir"] = str(result["checkpoint"]["dir"])
     return result
+
+
+# =============================================================================
+# Evaluation Configuration
+# =============================================================================
+
+
+@dataclass
+class JaxMCTSConfig:
+    """Configuration for MCTS search."""
+
+    num_simulations: int = 800
+    c_puct: float = 1.75
+    fpu_value: float = -1.0
+
+
+@dataclass
+class JaxEvalEngineConfig:
+    """Configuration for evaluation engine."""
+
+    type: str = "value"  # "value", "policy", or "mcts"
+    batch_size: int = 256
+    mcts: JaxMCTSConfig = field(default_factory=JaxMCTSConfig)
+
+    def __post_init__(self) -> None:
+        """Convert dict to dataclass if needed."""
+        if isinstance(self.mcts, dict):
+            self.mcts = JaxMCTSConfig(**self.mcts)
+
+
+@dataclass
+class JaxEvalBenchmarkConfig:
+    """Configuration for evaluation benchmarks."""
+
+    names: list[str] = field(default_factory=lambda: ["puzzles"])
+    max_puzzles: int | None = 10000
+    puzzles_path: str = "puzzles/puzzles.csv"
+    high_rated_puzzles_path: str = "puzzles/high_rated_puzzles.csv"
+
+
+@dataclass
+class JaxEvalComputeConfig:
+    """Configuration for evaluation compute settings."""
+
+    matmul_precision: str = "high"  # "high" or "highest"
+    compute_dtype: str = "bfloat16"  # "float32", "float16", "bfloat16"
+
+
+@dataclass
+class JaxEvalWandbConfig:
+    """Configuration for evaluation W&B logging."""
+
+    enabled: bool = True
+    project: str = "catgpt-puzzles"
+    entity: str | None = None
+    tags: list[str] = field(default_factory=lambda: ["eval"])
+
+
+@dataclass
+class JaxEvalConfig:
+    """Top-level configuration for JAX model evaluation."""
+
+    # Checkpoint path(s) - can be a single path or list
+    checkpoint: str = "checkpoints_jax/best"
+
+    engine: JaxEvalEngineConfig = field(default_factory=JaxEvalEngineConfig)
+    benchmark: JaxEvalBenchmarkConfig = field(default_factory=JaxEvalBenchmarkConfig)
+    compute: JaxEvalComputeConfig = field(default_factory=JaxEvalComputeConfig)
+    wandb: JaxEvalWandbConfig = field(default_factory=JaxEvalWandbConfig)
+
+    verbose: bool = False
+
+    def __post_init__(self) -> None:
+        """Convert dicts to dataclasses if needed."""
+        if isinstance(self.engine, dict):
+            self.engine = JaxEvalEngineConfig(**self.engine)
+        if isinstance(self.benchmark, dict):
+            self.benchmark = JaxEvalBenchmarkConfig(**self.benchmark)
+        if isinstance(self.compute, dict):
+            self.compute = JaxEvalComputeConfig(**self.compute)
+        if isinstance(self.wandb, dict):
+            self.wandb = JaxEvalWandbConfig(**self.wandb)
+
+
+def jax_eval_config_from_dict(data: dict[str, Any]) -> JaxEvalConfig:
+    """Create JaxEvalConfig from a dictionary.
+
+    Args:
+        data: Dictionary with configuration values.
+
+    Returns:
+        JaxEvalConfig instance.
+    """
+    return JaxEvalConfig(
+        checkpoint=data.get("checkpoint", "checkpoints_jax/best"),
+        engine=JaxEvalEngineConfig(**data.get("engine", {})),
+        benchmark=JaxEvalBenchmarkConfig(**data.get("benchmark", {})),
+        compute=JaxEvalComputeConfig(**data.get("compute", {})),
+        wandb=JaxEvalWandbConfig(**data.get("wandb", {})),
+        verbose=data.get("verbose", False),
+    )

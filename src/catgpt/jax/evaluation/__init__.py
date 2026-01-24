@@ -2,17 +2,17 @@
 
 This module provides:
 - Checkpoint loading utilities
-- Chess engines (ValueEngine for 1-move lookahead)
+- Chess engines (ValueEngine, PolicyEngine, MCTSEngine)
 - Evaluation benchmarks (puzzle benchmarks)
 
 Usage:
-    from catgpt.jax.evaluation import ValueEngine, PuzzleBenchmark, load_checkpoint
+    from catgpt.jax.evaluation import MCTSEngine, PuzzleBenchmark, load_checkpoint
 
     # Load a trained checkpoint
     checkpoint = load_checkpoint("checkpoints_jax/best")
 
     # Create an engine
-    engine = ValueEngine.from_loaded_checkpoint(checkpoint)
+    engine = MCTSEngine.from_loaded_checkpoint(checkpoint)
 
     # Run a benchmark
     benchmark = PuzzleBenchmark("puzzles/puzzles.csv")
@@ -27,7 +27,13 @@ from catgpt.jax.evaluation.benchmarks import (
     PuzzleResult,
 )
 from catgpt.jax.evaluation.checkpoint import LoadedCheckpoint, load_checkpoint
-from catgpt.jax.evaluation.engines import Engine, ValueEngine
+from catgpt.jax.evaluation.engines import (
+    Engine,
+    MCTSConfig,
+    MCTSEngine,
+    PolicyEngine,
+    ValueEngine,
+)
 
 __all__ = [
     # Checkpoint loading
@@ -35,6 +41,9 @@ __all__ = [
     "load_checkpoint",
     # Engines
     "Engine",
+    "MCTSConfig",
+    "MCTSEngine",
+    "PolicyEngine",
     "ValueEngine",
     # Benchmarks
     "Benchmark",

@@ -119,7 +119,7 @@ puzzles/
 *.trt
 
 # C++ Build Artifacts
-engine/build/
+cpp/build/
 *.o
 *.obj
 *.a
