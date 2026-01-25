@@ -22,13 +22,18 @@ Usage:
     # Quick test with fewer puzzles
     uv run python scripts/evaluate_cpp.py benchmark.max_puzzles=100
 
+    # Parallel evaluation with 4 workers (each loads own engine)
+    uv run python scripts/evaluate_cpp.py engine.num_workers=4
+
     # Disable W&B logging
     uv run python scripts/evaluate_cpp.py wandb.enabled=false
 """
 
 import csv
+import multiprocessing as mp
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import chess
 import hydra
@@ -45,6 +50,9 @@ PUZZLE_BENCHMARKS = {
     "puzzles": "puzzles_path",
     "high_rated_puzzles": "high_rated_puzzles_path",
 }
+
+# Module-level variable for worker processes
+_worker_engine = None
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -257,6 +265,129 @@ def compute_rating_buckets(results: list[PuzzleResult]) -> dict[str, float]:
     return metrics
 
 
+def _config_to_dict(cfg: DictConfig, project_root: Path) -> dict[str, Any]:
+    """Convert config to a picklable dict for multiprocessing."""
+    return {
+        "cpp_build_dir": str(project_root / cfg.cpp_build_dir),
+        "trt_engine": str(project_root / cfg.trt_engine),
+        "engine": {
+            "type": cfg.engine.type,
+            "timeout": cfg.engine.timeout,
+            "mcts": {
+                "num_simulations": cfg.engine.mcts.num_simulations,
+            },
+        },
+    }
+
+
+def _worker_init(config_dict: dict[str, Any]) -> None:
+    """Initialize worker process with UCI engine.
+
+    Called once per worker process at startup.
+    """
+    global _worker_engine
+
+    from catgpt.cpp.uci_engine import MCTSEngine, PolicyEngine, ValueEngine
+
+    engine_type = config_dict["engine"]["type"]
+    cpp_build_dir = Path(config_dict["cpp_build_dir"])
+    trt_engine = Path(config_dict["trt_engine"])
+    timeout = config_dict["engine"]["timeout"]
+
+    # Map engine type to binary name
+    binary_map = {
+        "mcts": "catgpt_mcts",
+        "value": "catgpt_value",
+        "policy": "catgpt_policy",
+    }
+
+    binary_path = cpp_build_dir / binary_map[engine_type]
+
+    if engine_type == "mcts":
+        num_simulations = config_dict["engine"]["mcts"]["num_simulations"]
+        _worker_engine = MCTSEngine(
+            binary_path,
+            trt_engine,
+            num_simulations=num_simulations,
+            timeout=timeout,
+        )
+    elif engine_type == "value":
+        _worker_engine = ValueEngine(binary_path, trt_engine, timeout=timeout)
+    else:  # policy
+        _worker_engine = PolicyEngine(binary_path, trt_engine, timeout=timeout)
+
+    logger.debug(f"Worker initialized with {engine_type} engine")
+
+
+def _worker_evaluate_puzzle(puzzle_dict: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate a single puzzle in a worker process.
+
+    Args:
+        puzzle_dict: Dictionary with puzzle data.
+
+    Returns:
+        Dictionary with PuzzleResult fields.
+    """
+    global _worker_engine
+
+    if _worker_engine is None:
+        raise RuntimeError("Worker engine not initialized")
+
+    puzzle = Puzzle(
+        id=puzzle_dict["id"],
+        rating=puzzle_dict["rating"],
+        fen=puzzle_dict["fen"],
+        moves=puzzle_dict["moves"],
+    )
+
+    board = chess.Board(puzzle.fen)
+
+    moves_correct = 0
+    moves_total = 0
+    predicted_moves: list[str] = []
+    expected_moves: list[str] = []
+
+    for i, uci_move in enumerate(puzzle.moves):
+        if i % 2 == 0:
+            # Opponent's move - just apply it
+            try:
+                board.push_uci(uci_move)
+            except ValueError:
+                break
+        else:
+            # Engine must find this move
+            moves_total += 1
+            expected_moves.append(uci_move)
+
+            # Get engine's move
+            predicted = _worker_engine.select_move(board)
+
+            if predicted is not None:
+                predicted_uci = predicted.uci()
+                predicted_moves.append(predicted_uci)
+
+                if predicted_uci == uci_move:
+                    moves_correct += 1
+            else:
+                predicted_moves.append("")
+
+            # Apply the correct move to continue the puzzle
+            try:
+                board.push_uci(uci_move)
+            except ValueError:
+                break
+
+    return {
+        "puzzle_id": puzzle.id,
+        "rating": puzzle.rating,
+        "solved": (moves_correct == moves_total and moves_total > 0),
+        "moves_correct": moves_correct,
+        "moves_total": moves_total,
+        "predicted_moves": predicted_moves,
+        "expected_moves": expected_moves,
+    }
+
+
 def run_benchmark(
     engine,
     puzzles: list[Puzzle],
@@ -325,6 +456,113 @@ def run_benchmark(
         metrics=metrics,
         details=[asdict(r) for r in results],
         metadata={"num_puzzles": len(results)},
+    )
+
+
+def run_benchmark_parallel(
+    cfg: DictConfig,
+    project_root: Path,
+    puzzles: list[Puzzle],
+    name: str,
+    *,
+    num_workers: int,
+    show_progress: bool = True,
+) -> BenchmarkResult:
+    """Run the benchmark in parallel across multiple workers.
+
+    Each worker loads its own UCI engine instance and processes puzzles independently.
+    This is useful for expensive engines like MCTS where parallelism can significantly
+    speed up evaluation.
+
+    Args:
+        cfg: Hydra configuration.
+        project_root: Path to the project root directory.
+        puzzles: List of puzzles to evaluate.
+        name: Benchmark name.
+        num_workers: Number of parallel workers.
+        show_progress: Whether to show a progress bar.
+
+    Returns:
+        BenchmarkResult with accuracy metrics and per-puzzle details.
+    """
+    logger.info(f"Running parallel evaluation with {num_workers} workers")
+
+    # Prepare puzzle data for workers (convert to dicts for pickling)
+    puzzle_data = [
+        {
+            "id": p.id,
+            "rating": p.rating,
+            "fen": p.fen,
+            "moves": p.moves,
+        }
+        for p in puzzles
+    ]
+
+    # Prepare config dict for workers
+    config_dict = _config_to_dict(cfg, project_root)
+
+    # Use spawn context for subprocess isolation
+    ctx = mp.get_context("spawn")
+
+    results: list[PuzzleResult] = []
+    total_solved = 0
+    total_moves_correct = 0
+    total_moves = 0
+
+    with ctx.Pool(
+        processes=num_workers,
+        initializer=_worker_init,
+        initargs=(config_dict,),
+    ) as pool:
+        # Use imap_unordered for better progress updates
+        work_items = puzzle_data
+
+        if show_progress:
+            pbar = tqdm(
+                total=len(puzzle_data),
+                desc=f"Evaluating {name}",
+                unit="puzzle",
+            )
+        else:
+            pbar = None
+
+        for result_dict in pool.imap_unordered(_worker_evaluate_puzzle, work_items):
+            result = PuzzleResult(**result_dict)
+            results.append(result)
+
+            # Update running stats
+            if result.solved:
+                total_solved += 1
+            total_moves_correct += result.moves_correct
+            total_moves += result.moves_total
+
+            # Update progress bar
+            if pbar is not None:
+                pbar.update(1)
+                n_puzzles = len(results)
+                solve_rate = total_solved / n_puzzles if n_puzzles > 0 else 0.0
+                accuracy = total_moves_correct / total_moves if total_moves > 0 else 0.0
+                pbar.set_postfix(
+                    acc=f"{accuracy:.1%}",
+                    solve=f"{solve_rate:.1%}",
+                    solved=f"{total_solved}/{n_puzzles}",
+                )
+
+        if pbar is not None:
+            pbar.close()
+
+    # Compute aggregate metrics
+    metrics = compute_metrics(results)
+
+    # Add rating bucket metrics
+    bucket_metrics = compute_rating_buckets(results)
+    metrics.update(bucket_metrics)
+
+    return BenchmarkResult(
+        name=name,
+        metrics=metrics,
+        details=[asdict(r) for r in results],
+        metadata={"num_puzzles": len(results), "num_workers": num_workers},
     )
 
 
@@ -464,6 +702,10 @@ def main(cfg: DictConfig) -> None:
     if cfg.engine.type == "mcts":
         logger.info(f"MCTS simulations: {cfg.engine.mcts.num_simulations}")
 
+    num_workers = cfg.engine.num_workers
+    use_parallel = num_workers > 1
+    logger.info(f"Workers: {num_workers}" + (" (parallel)" if use_parallel else ""))
+
     # Initialize W&B if requested
     wandb_run = None
     if cfg.wandb.enabled:
@@ -481,6 +723,7 @@ def main(cfg: DictConfig) -> None:
                     "max_puzzles": cfg.benchmark.max_puzzles,
                     "engine_type": cfg.engine.type,
                     "mcts_simulations": cfg.engine.mcts.num_simulations if cfg.engine.type == "mcts" else None,
+                    "num_workers": num_workers,
                 },
             )
             logger.info(f"W&B initialized: {wb.run.url}")
@@ -499,15 +742,25 @@ def main(cfg: DictConfig) -> None:
         benchmarks[name] = puzzles
         logger.info(f"Loaded {len(puzzles)} puzzles for {name}")
 
-    # Create engine (starts the subprocess)
-    try:
-        engine = create_engine(cfg, project_root)
-    except Exception as e:
-        logger.error(f"Failed to create engine: {e}")
-        raise SystemExit(1)
+    # Create engine only for single-worker mode
+    # (parallel mode creates engines in worker processes)
+    engine = None
+    if not use_parallel:
+        try:
+            engine = create_engine(cfg, project_root)
+        except Exception as e:
+            logger.error(f"Failed to create engine: {e}")
+            raise SystemExit(1)
 
     try:
-        engine_name = engine.name
+        # Determine engine name for display
+        if use_parallel:
+            engine_name = f"{cfg.engine.type.upper()}(workers={num_workers})"
+            if cfg.engine.type == "mcts":
+                engine_name = f"MCTS(nodes={cfg.engine.mcts.num_simulations}, workers={num_workers})"
+        else:
+            engine_name = engine.name
+
         logger.info(f"\n{'=' * 60}")
         logger.info(f"Evaluating engine: {engine_name}")
         logger.info(f"{'=' * 60}")
@@ -519,7 +772,17 @@ def main(cfg: DictConfig) -> None:
         for bench_name, puzzles in benchmarks.items():
             logger.info(f"\nRunning {bench_name} ({len(puzzles)} puzzles)...")
 
-            result = run_benchmark(engine, puzzles, bench_name, show_progress=True)
+            if use_parallel:
+                result = run_benchmark_parallel(
+                    cfg,
+                    project_root,
+                    puzzles,
+                    bench_name,
+                    num_workers=num_workers,
+                    show_progress=True,
+                )
+            else:
+                result = run_benchmark(engine, puzzles, bench_name, show_progress=True)
             engine_results[bench_name] = result
 
             # Log to console
@@ -562,9 +825,10 @@ def main(cfg: DictConfig) -> None:
         _print_summary(all_results, benchmark_names)
 
     finally:
-        # Always close the engine
-        engine.close()
-        logger.info("Engine closed")
+        # Close the engine if we created one
+        if engine is not None:
+            engine.close()
+            logger.info("Engine closed")
 
     # Finish W&B run
     if cfg.wandb.enabled and wandb_run:

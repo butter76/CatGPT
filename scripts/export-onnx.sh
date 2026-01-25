@@ -12,8 +12,7 @@ set -e
 CHECKPOINT_PATH="${1:-checkpoints_jax/sample}"
 
 uv run python scripts/export_onnx.py \
-    --checkpoint checkpoints_jax/best/best \
-    --output-path sample.onnx \
+    --output-path catgpt.onnx \
+    --output-keys value \
     --dynamic-batch \
-    --opset 20 \
-    --validate
+    --opset 20

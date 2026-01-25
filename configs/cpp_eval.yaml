@@ -22,7 +22,7 @@ cpp_build_dir: "cpp/build/bin"
 
 # Engine configuration
 engine:
-  type: "policy"  # Options: "value", "policy", "mcts"
+  type: "mcts"  # Options: "value", "policy", "mcts"
 
   # MCTS-specific settings (only used when type=mcts)
   mcts:
@@ -31,10 +31,13 @@ engine:
   # UCI timeout in seconds
   timeout: 120.0
 
+  # Parallel workers (each loads own engine instance)
+  num_workers: 2  # Use >1 for parallel evaluation
+
 # Benchmark configuration
 benchmark:
   names:
-    - "puzzles"  # Default benchmark
+    - "high_rated_puzzles"  # Default benchmark
   # Available benchmarks: "puzzles", "high_rated_puzzles"
   # Use names: ["puzzles", "high_rated_puzzles"] for all
   max_puzzles: 10000  # null for unlimited
