@@ -240,6 +240,38 @@ class MCTSEngine(UCIEngine):
         return f"MCTS(nodes={self._num_simulations})"
 
 
+class FractionalMCTSEngine(UCIEngine):
+    """UCI engine wrapper for Fractional MCTS with iterative deepening."""
+
+    def __init__(
+        self,
+        binary_path: str | Path,
+        engine_path: str | Path | None = None,
+        *,
+        min_total_evals: int = 400,
+        timeout: float = 120.0,
+    ) -> None:
+        """Initialize Fractional MCTS engine.
+
+        Args:
+            binary_path: Path to the catgpt_fractional_mcts binary.
+            engine_path: Path to the TensorRT engine file.
+            min_total_evals: Minimum total GPU evaluations (passed as nodes).
+            timeout: Timeout in seconds for UCI responses.
+        """
+        super().__init__(
+            binary_path,
+            engine_path,
+            timeout=timeout,
+            go_options={"nodes": min_total_evals},
+        )
+        self._min_total_evals = min_total_evals
+
+    @property
+    def name(self) -> str:
+        return f"FractionalMCTS(evals={self._min_total_evals})"
+
+
 class ValueEngine(UCIEngine):
     """UCI engine wrapper for value-based search."""
 

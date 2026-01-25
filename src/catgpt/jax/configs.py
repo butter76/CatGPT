@@ -311,18 +311,32 @@ class JaxMCTSConfig:
 
 
 @dataclass
+class JaxFractionalMCTSConfig:
+    """Configuration for Fractional MCTS search with iterative deepening."""
+
+    c_puct: float = 1.75
+    policy_coverage_threshold: float = 0.80
+    min_total_evals: int = 400
+    initial_budget: float = 1.0
+    budget_multiplier: float = 1.2
+
+
+@dataclass
 class JaxEvalEngineConfig:
     """Configuration for evaluation engine."""
 
-    type: str = "value"  # "value", "policy", or "mcts"
+    type: str = "value"  # "value", "policy", "mcts", or "fractional_mcts"
     batch_size: int = 256
     num_workers: int = 1  # Number of parallel workers (each loads own engine)
     mcts: JaxMCTSConfig = field(default_factory=JaxMCTSConfig)
+    fractional_mcts: JaxFractionalMCTSConfig = field(default_factory=JaxFractionalMCTSConfig)
 
     def __post_init__(self) -> None:
         """Convert dict to dataclass if needed."""
         if isinstance(self.mcts, dict):
             self.mcts = JaxMCTSConfig(**self.mcts)
+        if isinstance(self.fractional_mcts, dict):
+            self.fractional_mcts = JaxFractionalMCTSConfig(**self.fractional_mcts)
 
 
 @dataclass

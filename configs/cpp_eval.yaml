@@ -22,11 +22,19 @@ cpp_build_dir: "cpp/build/bin"
 
 # Engine configuration
 engine:
-  type: "mcts"  # Options: "value", "policy", "mcts"
+  type: "fractional_mcts"  # Options: "value", "policy", "mcts", "fractional_mcts"
 
   # MCTS-specific settings (only used when type=mcts)
   mcts:
     num_simulations: 400
+
+  # Fractional MCTS settings (only used when type=fractional_mcts)
+  fractional_mcts:
+    c_puct: 1.75
+    policy_coverage_threshold: 0.80
+    min_total_evals: 400
+    initial_budget: 1.0
+    budget_multiplier: 1.2
 
   # UCI timeout in seconds
   timeout: 120.0

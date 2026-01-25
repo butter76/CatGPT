@@ -276,6 +276,9 @@ def _config_to_dict(cfg: DictConfig, project_root: Path) -> dict[str, Any]:
             "mcts": {
                 "num_simulations": cfg.engine.mcts.num_simulations,
             },
+            "fractional_mcts": {
+                "min_total_evals": cfg.engine.fractional_mcts.min_total_evals,
+            },
         },
     }
 
@@ -297,6 +300,7 @@ def _worker_init(config_dict: dict[str, Any]) -> None:
     # Map engine type to binary name
     binary_map = {
         "mcts": "catgpt_mcts",
+        "fractional_mcts": "catgpt_fractional_mcts",
         "value": "catgpt_value",
         "policy": "catgpt_policy",
     }
@@ -309,6 +313,15 @@ def _worker_init(config_dict: dict[str, Any]) -> None:
             binary_path,
             trt_engine,
             num_simulations=num_simulations,
+            timeout=timeout,
+        )
+    elif engine_type == "fractional_mcts":
+        from catgpt.cpp.uci_engine import FractionalMCTSEngine
+        min_total_evals = config_dict["engine"]["fractional_mcts"]["min_total_evals"]
+        _worker_engine = FractionalMCTSEngine(
+            binary_path,
+            trt_engine,
+            min_total_evals=min_total_evals,
             timeout=timeout,
         )
     elif engine_type == "value":
@@ -615,7 +628,12 @@ def create_engine(cfg: DictConfig, project_root: Path):
     Returns:
         UCI engine instance.
     """
-    from catgpt.cpp.uci_engine import MCTSEngine, PolicyEngine, ValueEngine
+    from catgpt.cpp.uci_engine import (
+        FractionalMCTSEngine,
+        MCTSEngine,
+        PolicyEngine,
+        ValueEngine,
+    )
 
     engine_type = cfg.engine.type
     cpp_build_dir = project_root / cfg.cpp_build_dir
@@ -625,6 +643,7 @@ def create_engine(cfg: DictConfig, project_root: Path):
     # Map engine type to binary name
     binary_map = {
         "mcts": "catgpt_mcts",
+        "fractional_mcts": "catgpt_fractional_mcts",
         "value": "catgpt_value",
         "policy": "catgpt_policy",
     }
@@ -650,6 +669,15 @@ def create_engine(cfg: DictConfig, project_root: Path):
             binary_path,
             trt_engine,
             num_simulations=num_simulations,
+            timeout=timeout,
+        )
+    elif engine_type == "fractional_mcts":
+        min_total_evals = cfg.engine.fractional_mcts.min_total_evals
+        logger.info(f"Creating Fractional MCTS engine with {min_total_evals} min evals")
+        return FractionalMCTSEngine(
+            binary_path,
+            trt_engine,
+            min_total_evals=min_total_evals,
             timeout=timeout,
         )
     elif engine_type == "value":
@@ -680,7 +708,7 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
 
     # Validate engine type
-    valid_engines = ("value", "policy", "mcts")
+    valid_engines = ("value", "policy", "mcts", "fractional_mcts")
     if cfg.engine.type not in valid_engines:
         logger.error(f"Invalid engine type: {cfg.engine.type}")
         logger.info(f"Valid options: {valid_engines}")
@@ -701,6 +729,8 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Engine type: {cfg.engine.type}")
     if cfg.engine.type == "mcts":
         logger.info(f"MCTS simulations: {cfg.engine.mcts.num_simulations}")
+    elif cfg.engine.type == "fractional_mcts":
+        logger.info(f"Fractional MCTS min_evals: {cfg.engine.fractional_mcts.min_total_evals}")
 
     num_workers = cfg.engine.num_workers
     use_parallel = num_workers > 1
@@ -723,6 +753,7 @@ def main(cfg: DictConfig) -> None:
                     "max_puzzles": cfg.benchmark.max_puzzles,
                     "engine_type": cfg.engine.type,
                     "mcts_simulations": cfg.engine.mcts.num_simulations if cfg.engine.type == "mcts" else None,
+                    "fractional_mcts_min_evals": cfg.engine.fractional_mcts.min_total_evals if cfg.engine.type == "fractional_mcts" else None,
                     "num_workers": num_workers,
                 },
             )
@@ -758,6 +789,8 @@ def main(cfg: DictConfig) -> None:
             engine_name = f"{cfg.engine.type.upper()}(workers={num_workers})"
             if cfg.engine.type == "mcts":
                 engine_name = f"MCTS(nodes={cfg.engine.mcts.num_simulations}, workers={num_workers})"
+            elif cfg.engine.type == "fractional_mcts":
+                engine_name = f"FractionalMCTS(evals={cfg.engine.fractional_mcts.min_total_evals}, workers={num_workers})"
         else:
             engine_name = engine.name
 

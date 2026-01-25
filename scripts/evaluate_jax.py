@@ -14,6 +14,9 @@ Usage:
     # Use MCTS engine with custom simulations
     uv run python scripts/evaluate_jax.py engine.type=mcts engine.mcts.num_simulations=1600
 
+    # Use Fractional MCTS engine
+    uv run python scripts/evaluate_jax.py engine.type=fractional_mcts engine.fractional_mcts.min_total_evals=800
+
     # Run on all benchmarks
     uv run python scripts/evaluate_jax.py benchmark.names=[puzzles,high_rated_puzzles]
 
@@ -158,7 +161,7 @@ def main(cfg: DictConfig) -> None:
         raise SystemExit(1)
 
     # Validate engine type
-    valid_engines = ("value", "policy", "mcts")
+    valid_engines = ("value", "policy", "mcts", "fractional_mcts")
     if eval_cfg.engine.type not in valid_engines:
         logger.error(f"Invalid engine type: {eval_cfg.engine.type}")
         logger.info(f"Valid options: {valid_engines}")
@@ -197,6 +200,10 @@ def main(cfg: DictConfig) -> None:
 
     # Import here to avoid slow startup for --help
     from catgpt.jax.evaluation.benchmarks.puzzles import PuzzleBenchmark
+    from catgpt.jax.evaluation.engines.fractional_mcts import (
+        FractionalMCTSConfig,
+        FractionalMCTSEngine,
+    )
     from catgpt.jax.evaluation.engines.mcts import MCTSConfig, MCTSEngine
     from catgpt.jax.evaluation.engines.policy_engine import PolicyEngine
     from catgpt.jax.evaluation.engines.value_engine import ValueEngine
@@ -206,6 +213,11 @@ def main(cfg: DictConfig) -> None:
         logger.info(
             f"MCTS simulations: {eval_cfg.engine.mcts.num_simulations}, "
             f"c_puct: {eval_cfg.engine.mcts.c_puct}"
+        )
+    elif eval_cfg.engine.type == "fractional_mcts":
+        logger.info(
+            f"Fractional MCTS min_evals: {eval_cfg.engine.fractional_mcts.min_total_evals}, "
+            f"c_puct: {eval_cfg.engine.fractional_mcts.c_puct}"
         )
 
     num_workers = eval_cfg.engine.num_workers
@@ -218,23 +230,35 @@ def main(cfg: DictConfig) -> None:
         try:
             import wandb as wb
 
+            wandb_config = {
+                "checkpoint": str(checkpoint_path),
+                "benchmarks": benchmark_names,
+                "max_puzzles": eval_cfg.benchmark.max_puzzles,
+                "matmul_precision": eval_cfg.compute.matmul_precision,
+                "compute_dtype": eval_cfg.compute.compute_dtype,
+                "engine_type": eval_cfg.engine.type,
+                "engine_batch_size": eval_cfg.engine.batch_size,
+                "num_workers": num_workers,
+            }
+            if eval_cfg.engine.type == "mcts":
+                wandb_config.update({
+                    "mcts_simulations": eval_cfg.engine.mcts.num_simulations,
+                    "mcts_c_puct": eval_cfg.engine.mcts.c_puct,
+                })
+            elif eval_cfg.engine.type == "fractional_mcts":
+                wandb_config.update({
+                    "fractional_mcts_min_evals": eval_cfg.engine.fractional_mcts.min_total_evals,
+                    "fractional_mcts_c_puct": eval_cfg.engine.fractional_mcts.c_puct,
+                    "fractional_mcts_coverage": eval_cfg.engine.fractional_mcts.policy_coverage_threshold,
+                    "fractional_mcts_initial_budget": eval_cfg.engine.fractional_mcts.initial_budget,
+                    "fractional_mcts_multiplier": eval_cfg.engine.fractional_mcts.budget_multiplier,
+                })
             wandb_run = wb.init(
                 project=eval_cfg.wandb.project,
                 entity=eval_cfg.wandb.entity,
                 name=run_name,
                 tags=eval_cfg.wandb.tags,
-                config={
-                    "checkpoint": str(checkpoint_path),
-                    "benchmarks": benchmark_names,
-                    "max_puzzles": eval_cfg.benchmark.max_puzzles,
-                    "matmul_precision": eval_cfg.compute.matmul_precision,
-                    "compute_dtype": eval_cfg.compute.compute_dtype,
-                    "engine_type": eval_cfg.engine.type,
-                    "engine_batch_size": eval_cfg.engine.batch_size,
-                    "num_workers": num_workers,
-                    "mcts_simulations": eval_cfg.engine.mcts.num_simulations,
-                    "mcts_c_puct": eval_cfg.engine.mcts.c_puct,
-                },
+                config=wandb_config,
             )
             logger.info(f"W&B initialized: {wb.run.url}")
         except ImportError:
@@ -276,7 +300,7 @@ def main(cfg: DictConfig) -> None:
                     batch_size=eval_cfg.engine.batch_size,
                     compute_dtype=compute_dtype_jax,
                 )
-            else:  # engine_type == "mcts"
+            elif eval_cfg.engine.type == "mcts":
                 mcts_config = MCTSConfig(
                     num_simulations=eval_cfg.engine.mcts.num_simulations,
                     c_puct=eval_cfg.engine.mcts.c_puct,
@@ -286,6 +310,20 @@ def main(cfg: DictConfig) -> None:
                     checkpoint_path,
                     config=mcts_config,
                     batch_size=1,  # MCTS evaluates one position at a time
+                    compute_dtype=compute_dtype_jax,
+                )
+            else:  # engine_type == "fractional_mcts"
+                fractional_config = FractionalMCTSConfig(
+                    c_puct=eval_cfg.engine.fractional_mcts.c_puct,
+                    policy_coverage_threshold=eval_cfg.engine.fractional_mcts.policy_coverage_threshold,
+                    min_total_evals=eval_cfg.engine.fractional_mcts.min_total_evals,
+                    initial_budget=eval_cfg.engine.fractional_mcts.initial_budget,
+                    budget_multiplier=eval_cfg.engine.fractional_mcts.budget_multiplier,
+                )
+                engine = FractionalMCTSEngine.from_checkpoint(
+                    checkpoint_path,
+                    config=fractional_config,
+                    batch_size=1,  # Fractional MCTS evaluates one position at a time
                     compute_dtype=compute_dtype_jax,
                 )
         except Exception as e:
