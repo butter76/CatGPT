@@ -8,6 +8,7 @@ model:
   num_layers: 16
   num_heads: 32
   ff_dim: 1536  # Defaults to 4 * hidden_size
+  attention_dim: null  # Expanded attention dim (null = hidden_size). E.g., 768 with 48 heads for 50% more attention capacity
   vocab_size: 26  # From tokenizer (don't change unless tokenizer changes)
   seq_length: 64  # Will be overridden by tokenizer.sequence_length
   activation: "gelu"
@@ -16,7 +17,7 @@ model:
   # Generates position-dependent attention biases conditioned on input
   # See: https://lczero.org/blog/2024/02/transformer-progress/
   smolgen:
-    enabled: false
+    enabled: true
     hidden_channels: 32  # Compression dimension
     hidden_size: 256     # Hidden layer size
     gen_size: 256        # Per-head generation dimension
@@ -68,9 +69,9 @@ scheduler:
 # Training loop configuration
 # Training is step-based with "pseudo-epochs" for validation/checkpointing
 training:
-  max_steps: 300000  # Total training steps
-  steps_per_epoch: 3000  # Steps per pseudo-epoch (validation interval)
-  batch_size: 2048
+  max_steps: 600000  # Total training steps
+  steps_per_epoch: 6000  # Steps per pseudo-epoch (validation interval)
+  batch_size: 1024
   gradient_clip: 1.0
   gradient_accumulation_steps: 1
   max_eval_steps: 200  # Max validation steps (prevents infinite loop)

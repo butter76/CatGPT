@@ -25,6 +25,7 @@ class TransformerConfig:
     num_layers: int = 6
     num_heads: int = 8
     ff_dim: int | None = None  # Defaults to 4 * hidden_size
+    attention_dim: int | None = None  # Expanded attention dimension (None = hidden_size)
     vocab_size: int = 26  # From tokenizer.VOCAB_SIZE
     seq_length: int = 64
     activation: str = "gelu"
@@ -40,8 +41,13 @@ class TransformerConfig:
         if self.ff_dim is None:
             object.__setattr__(self, "ff_dim", 4 * self.hidden_size)
 
-        if self.hidden_size % self.num_heads != 0:
-            msg = f"hidden_size ({self.hidden_size}) must be divisible by num_heads ({self.num_heads})"
+        # Expanded attention: QKV projects to attention_dim, allowing more heads
+        # with the same head_dim. Output projects back to hidden_size.
+        if self.attention_dim is None:
+            object.__setattr__(self, "attention_dim", self.hidden_size)
+
+        if self.attention_dim % self.num_heads != 0:
+            msg = f"attention_dim ({self.attention_dim}) must be divisible by num_heads ({self.num_heads})"
             raise ValueError(msg)
 
         # Convert dict to dataclass if needed
@@ -58,10 +64,14 @@ class QKVNormMultiHeadAttention(nn.Module):
         attn_QKV(Q, K, V) = softmax(Norm(Q) * Norm(K)^T / sqrt(d_k)) * Norm(V)
 
     Normalization is applied per-head (not along the full hidden dimension).
+
+    Supports expanded attention where qkv_features > output_features, allowing
+    more attention heads while keeping the residual stream dimension smaller.
     """
 
     num_heads: int
     qkv_features: int
+    output_features: int | None = None  # Output projection dim (None = qkv_features)
     deterministic: bool = True
     dtype: Dtype = jnp.float32
 
@@ -141,8 +151,9 @@ class QKVNormMultiHeadAttention(nn.Module):
         # Reshape to (batch, seq_len, qkv_features)
         attn_output = attn_output.reshape(batch_size, seq_len, self.qkv_features)
 
-        # Final output projection
-        output = nn.Dense(self.qkv_features, dtype=self.dtype, name="out")(attn_output)
+        # Final output projection (to output_features, supporting expanded attention)
+        out_features = self.output_features if self.output_features is not None else self.qkv_features
+        output = nn.Dense(out_features, dtype=self.dtype, name="out")(attn_output)
 
         return output
 
@@ -234,6 +245,7 @@ class TransformerBlock(nn.Module):
     hidden_size: int
     num_heads: int
     ff_dim: int
+    attention_dim: int | None = None  # Expanded attention dimension (None = hidden_size)
     seq_length: int = 64
     activation: str = "gelu"
     dtype: Dtype = jnp.float32  # Compute dtype for mixed precision
@@ -302,9 +314,12 @@ class TransformerBlock(nn.Module):
         # Self-attention with Peri-LN and QKV-Norm (NO causal mask = bidirectional)
         # Input norm: LayerNorm in float32 for numerical stability, then cast back
         normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
+        # Expanded attention: QKV projects to attention_dim, output projects back to hidden_size
+        attn_dim = self.attention_dim if self.attention_dim is not None else self.hidden_size
         attn_out = QKVNormMultiHeadAttention(
             num_heads=self.num_heads,
-            qkv_features=self.hidden_size,
+            qkv_features=attn_dim,
+            output_features=self.hidden_size,
             deterministic=not train,
             dtype=self.dtype,
         )(normed, normed, smolgen_bias=smolgen_bias)
@@ -421,6 +436,7 @@ class BidirectionalTransformer(nn.Module):
                 hidden_size=self.config.hidden_size,
                 num_heads=self.config.num_heads,
                 ff_dim=self.config.ff_dim or (4 * self.config.hidden_size),
+                attention_dim=self.config.attention_dim,
                 seq_length=self.config.seq_length,
                 activation=self.config.activation,
                 dtype=compute_dtype,
@@ -542,6 +558,7 @@ class BidirectionalTransformer(nn.Module):
             num_layers=config.num_layers,
             num_heads=config.num_heads,
             ff_dim=config.ff_dim,
+            attention_dim=config.attention_dim,
             vocab_size=config.vocab_size,
             seq_length=config.seq_length,
             activation=config.activation,

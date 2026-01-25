@@ -100,6 +100,7 @@ class JaxModelConfig:
     num_layers: int = 6
     num_heads: int = 8
     ff_dim: int | None = None  # Defaults to 4 * hidden_size if None
+    attention_dim: int | None = None  # Expanded attention dimension (None = hidden_size)
     vocab_size: int = 26  # From tokenizer.VOCAB_SIZE
     seq_length: int = 64
     activation: str = "gelu"
@@ -115,8 +116,13 @@ class JaxModelConfig:
         if self.ff_dim is None:
             self.ff_dim = 4 * self.hidden_size
 
-        if self.hidden_size % self.num_heads != 0:
-            msg = f"hidden_size ({self.hidden_size}) must be divisible by num_heads ({self.num_heads})"
+        # Expanded attention: QKV projects to attention_dim, allowing more heads
+        # with the same head_dim. Output projects back to hidden_size.
+        if self.attention_dim is None:
+            self.attention_dim = self.hidden_size
+
+        if self.attention_dim % self.num_heads != 0:
+            msg = f"attention_dim ({self.attention_dim}) must be divisible by num_heads ({self.num_heads})"
             raise ValueError(msg)
 
         # Convert dict to dataclass if needed (for YAML loading)
