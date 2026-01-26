@@ -19,6 +19,19 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
+# === vcpkg / libcoro ===
+# vcpkg doesn't provide a CMake config for libcoro, so we set paths manually
+set(VCPKG_ROOT "$ENV{HOME}/vcpkg" CACHE PATH "vcpkg installation root")
+set(VCPKG_INSTALLED_DIR "${VCPKG_ROOT}/installed/x64-linux")
+
+set(LIBCORO_INCLUDE_DIR "${VCPKG_INSTALLED_DIR}/include")
+set(LIBCORO_LIB_DIR "${VCPKG_INSTALLED_DIR}/lib")
+find_library(LIBCORO_LIB coro PATHS ${LIBCORO_LIB_DIR} REQUIRED)
+
+message(STATUS "vcpkg root: ${VCPKG_ROOT}")
+message(STATUS "libcoro include: ${LIBCORO_INCLUDE_DIR}")
+message(STATUS "libcoro library: ${LIBCORO_LIB}")
+
 # === Chess Library (header-only) ===
 set(CHESS_LIBRARY_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/external/chess-library/include")
 message(STATUS "Chess library include: ${CHESS_LIBRARY_INCLUDE_DIR}")
@@ -80,9 +93,141 @@ set_target_properties(trt_benchmark PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
 
+# === Dummy Search POC executable ===
+add_executable(dummy_search
+    src/dummy_search/main.cpp
+)
+
+target_include_directories(dummy_search PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${LIBCORO_INCLUDE_DIR}
+)
+
+target_link_libraries(dummy_search PRIVATE
+    ${LIBCORO_LIB}
+    pthread  # Required for libcoro thread_pool
+)
+
+set_target_properties(dummy_search PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR}"
+)
+
+# === CatGPT UCI Engine ===
+add_executable(catgpt_uci
+    src/uci_main.cpp
+)
+
+target_include_directories(catgpt_uci PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+)
+
+target_link_libraries(catgpt_uci PRIVATE
+    pthread
+)
+
+set_target_properties(catgpt_uci PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR}"
+)
+
+# === CatGPT MCTS UCI Engine (with TensorRT) ===
+add_executable(catgpt_mcts
+    src/mcts_uci_main.cpp
+)
+
+target_include_directories(catgpt_mcts PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+)
+
+target_link_libraries(catgpt_mcts PRIVATE
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    pthread
+)
+
+set_target_properties(catgpt_mcts PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+)
+
+# === CatGPT Fractional MCTS UCI Engine (with TensorRT) ===
+add_executable(catgpt_fractional_mcts
+    src/fractional_mcts_uci_main.cpp
+)
+
+target_include_directories(catgpt_fractional_mcts PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+)
+
+target_link_libraries(catgpt_fractional_mcts PRIVATE
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    pthread
+)
+
+set_target_properties(catgpt_fractional_mcts PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+)
+
+# === CatGPT Value UCI Engine (with TensorRT) ===
+add_executable(catgpt_value
+    src/value_uci_main.cpp
+)
+
+target_include_directories(catgpt_value PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+)
+
+target_link_libraries(catgpt_value PRIVATE
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    pthread
+)
+
+set_target_properties(catgpt_value PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+)
+
+# === CatGPT Policy UCI Engine (with TensorRT) ===
+add_executable(catgpt_policy
+    src/policy_uci_main.cpp
+)
+
+target_include_directories(catgpt_policy PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+)
+
+target_link_libraries(catgpt_policy PRIVATE
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    pthread
+)
+
+set_target_properties(catgpt_policy PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+)
+
 # Enable colored output
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)
     target_compile_options(trt_benchmark PRIVATE -fdiagnostics-color=always)
     target_compile_options(chess_lib_tests PRIVATE -fdiagnostics-color=always)
+    target_compile_options(dummy_search PRIVATE -fdiagnostics-color=always)
+    target_compile_options(catgpt_uci PRIVATE -fdiagnostics-color=always)
+    target_compile_options(catgpt_mcts PRIVATE -fdiagnostics-color=always)
+    target_compile_options(catgpt_fractional_mcts PRIVATE -fdiagnostics-color=always)
+    target_compile_options(catgpt_value PRIVATE -fdiagnostics-color=always)
+    target_compile_options(catgpt_policy PRIVATE -fdiagnostics-color=always)
 endif()

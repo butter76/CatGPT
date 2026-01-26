@@ -1,0 +1,71 @@
+# JAX evaluation configuration for CatGPT
+# Override values via CLI: uv run python scripts/evaluate_jax.py compute.matmul_precision=highest
+#
+# Usage:
+#   # Run with defaults
+#   uv run python scripts/evaluate_jax.py
+#
+#   # Override checkpoint path
+#   uv run python scripts/evaluate_jax.py checkpoint=checkpoints_jax/epoch_50
+#
+#   # Use MCTS engine with custom simulations
+#   uv run python scripts/evaluate_jax.py engine.type=mcts engine.mcts.num_simulations=1600
+#
+#   # Run on all benchmarks
+#   uv run python scripts/evaluate_jax.py benchmark.names=[puzzles,high_rated_puzzles]
+#
+#   # Quick test with fewer puzzles
+#   uv run python scripts/evaluate_jax.py benchmark.max_puzzles=100
+
+# Checkpoint to evaluate
+checkpoint: "checkpoints_jax/best/best"
+
+# Engine configuration
+engine:
+  type: "fractional_mcts"  # Options: "value", "policy", "mcts", "fractional_mcts"
+  batch_size: 1
+
+  # Parallel workers: each worker loads its own engine and processes puzzles independently.
+  # Useful for MCTS where evaluation is CPU-bound. Set to number of CPU cores for max throughput.
+  # Note: GPU memory usage scales with num_workers (each worker loads model into GPU).
+  num_workers: 2
+
+  # MCTS-specific settings (only used when type=mcts)
+  mcts:
+    num_simulations: 400
+    c_puct: 1.75
+    fpu_value: -1.0  # First play urgency (-1 = assume loss for unvisited)
+
+  # Fractional MCTS settings (only used when type=fractional_mcts)
+  fractional_mcts:
+    c_puct: 1.75
+    policy_coverage_threshold: 0.80  # Fraction of policy mass for "limit" calculation
+    min_total_evals: 400             # Stop after this many total GPU evaluations
+    initial_budget: 1.0              # Starting N for iterative deepening
+    budget_multiplier: 1.2           # N grows by 20% each iteration
+
+# Benchmark configuration
+benchmark:
+  names:
+    - "high_rated_puzzles"  # Default benchmark
+  # Available benchmarks: "puzzles", "high_rated_puzzles"
+  # Use names: ["puzzles", "high_rated_puzzles"] for all
+  max_puzzles: 10000  # null for unlimited
+  puzzles_path: "puzzles/puzzles.csv"
+  high_rated_puzzles_path: "puzzles/high_rated_puzzles.csv"
+
+# Compute configuration
+compute:
+  matmul_precision: "high"  # Options: "high" (TF32 on Ampere+), "highest" (full float32)
+  compute_dtype: "bfloat16"  # Options: "float32", "float16", "bfloat16"
+
+# Weights & Biases logging
+wandb:
+  enabled: true
+  project: "catgpt-puzzles"
+  entity: null  # Your W&B username or team
+  tags:
+    - "eval"
+
+# Logging
+verbose: false

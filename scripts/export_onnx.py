@@ -296,6 +296,12 @@ def _parse_args() -> argparse.Namespace:
         help="Path to checkpoint directory. If provided, loads model config and params from checkpoint.",
     )
     parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/jax_base.yaml"),
+        help="Path to config YAML file. Used when --checkpoint is not provided (default: configs/jax_base.yaml).",
+    )
+    parser.add_argument(
         "--use-ema",
         action="store_true",
         default=True,
@@ -363,10 +369,6 @@ def main() -> None:
     output_path = args.output_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Require checkpoint
-    if args.checkpoint is None:
-        raise ValueError("--checkpoint is required. Provide path to a checkpoint directory.")
-
     # Remove existing files
     data_path = output_path.with_suffix(".onnx.data")
     for p in [output_path, data_path]:
@@ -375,21 +377,45 @@ def main() -> None:
 
     # Import heavy dependencies after arg parsing
     from jax2onnx import to_onnx
+    from omegaconf import OmegaConf
 
+    from catgpt.jax.configs import jax_config_from_dict
     from catgpt.jax.evaluation.checkpoint import load_checkpoint
+    from catgpt.jax.models.transformer import BidirectionalTransformer
 
     print("=" * 60)
     print("JAX → ONNX Export (via jax2onnx)")
     print("=" * 60)
 
-    # Load checkpoint
-    print(f"\n[Checkpoint] Loading from: {args.checkpoint}")
-    print(f"  Use EMA params: {args.use_ema}")
+    if args.checkpoint is not None:
+        # Load checkpoint
+        print(f"\n[Checkpoint] Loading from: {args.checkpoint}")
+        print(f"  Use EMA params: {args.use_ema}")
 
-    ckpt = load_checkpoint(args.checkpoint, evaluation=args.use_ema)
-    model = ckpt.model
-    params = ckpt.params
-    model_config = ckpt.model_config
+        ckpt = load_checkpoint(args.checkpoint, evaluation=args.use_ema)
+        model = ckpt.model
+        params = ckpt.params
+        model_config = ckpt.model_config
+    else:
+        # Create fresh model from config
+        print(f"\n[Config] Creating new model from: {args.config}")
+
+        if not args.config.exists():
+            raise FileNotFoundError(f"Config file not found: {args.config}")
+
+        config_dict = OmegaConf.to_container(OmegaConf.load(args.config), resolve=True)
+        experiment_config = jax_config_from_dict(config_dict)  # type: ignore[arg-type]
+        model_config = experiment_config.model
+
+        # Override seq_length from tokenizer config if specified
+        model_config.seq_length = experiment_config.tokenizer.sequence_length
+
+        # Create and initialize model with random parameters
+        rng = jax.random.PRNGKey(experiment_config.seed)
+        model, params = BidirectionalTransformer.create_and_init(
+            model_config, rng, compute_dtype=jnp.float32
+        )
+        print("  Created model with random initialization")
 
     print(f"\nModel config:")
     print(f"  hidden_size: {model_config.hidden_size}")

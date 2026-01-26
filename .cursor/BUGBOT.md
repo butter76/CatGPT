@@ -45,5 +45,9 @@ Flag these as HIGH priority:
 - Missing type annotations on public functions
 - Potential memory leaks (especially in training loops)
 - Race conditions in data loading
-- Hardcoded paths or credentials
 - Missing .detach() on tensors used for logging
+
+## Non-issues
+
+Don't flag these as issues:
+- Hardcoded paths

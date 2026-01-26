@@ -1,0 +1,65 @@
+# C++ engine evaluation configuration for CatGPT
+# Override values via CLI: uv run python scripts/evaluate_cpp.py engine.type=mcts
+#
+# Usage:
+#   # Run with defaults
+#   uv run python scripts/evaluate_cpp.py
+#
+#   # Use MCTS engine with custom simulations
+#   uv run python scripts/evaluate_cpp.py engine.type=mcts engine.mcts.num_simulations=1600
+#
+#   # Run on all benchmarks
+#   uv run python scripts/evaluate_cpp.py benchmark.names=[puzzles,high_rated_puzzles]
+#
+#   # Quick test with fewer puzzles
+#   uv run python scripts/evaluate_cpp.py benchmark.max_puzzles=100
+
+# TensorRT engine path
+trt_engine: "sample.trt"
+
+# C++ binary paths (relative to cpp/build/bin/)
+cpp_build_dir: "cpp/build/bin"
+
+# Engine configuration
+engine:
+  type: "fractional_mcts"  # Options: "value", "policy", "mcts", "fractional_mcts"
+
+  # MCTS-specific settings (only used when type=mcts)
+  mcts:
+    num_simulations: 400
+
+  # Fractional MCTS settings (only used when type=fractional_mcts)
+  fractional_mcts:
+    c_puct: 1.75
+    policy_coverage_threshold: 0.80
+    min_total_evals: 400
+    initial_budget: 1.0
+    budget_multiplier: 1.2
+
+  # UCI timeout in seconds
+  timeout: 120.0
+
+  # Parallel workers (each loads own engine instance)
+  num_workers: 2  # Use >1 for parallel evaluation
+
+# Benchmark configuration
+benchmark:
+  names:
+    - "high_rated_puzzles"  # Default benchmark
+  # Available benchmarks: "puzzles", "high_rated_puzzles"
+  # Use names: ["puzzles", "high_rated_puzzles"] for all
+  max_puzzles: 10000  # null for unlimited
+  puzzles_path: "puzzles/puzzles.csv"
+  high_rated_puzzles_path: "puzzles/high_rated_puzzles.csv"
+
+# Weights & Biases logging
+wandb:
+  enabled: true
+  project: "catgpt-puzzles"
+  entity: null  # Your W&B username or team
+  tags:
+    - "eval"
+    - "cpp"
+
+# Logging
+verbose: false

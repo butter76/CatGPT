@@ -5,49 +5,52 @@ This script loads trained checkpoints, wraps them in engines, and evaluates
 them on various benchmarks (primarily chess puzzles).
 
 Usage:
-    # Evaluate on default puzzles benchmark
-    uv run python scripts/evaluate_jax.py checkpoints_jax/best
+    # Evaluate with defaults (prompts for run name)
+    uv run python scripts/evaluate_jax.py
 
-    # Evaluate on specific benchmarks
-    uv run python scripts/evaluate_jax.py checkpoints_jax/best -b puzzles -b high_rated_puzzles
+    # Override checkpoint path
+    uv run python scripts/evaluate_jax.py checkpoint=checkpoints_jax/epoch_50
 
-    # Evaluate with W&B logging
-    uv run python scripts/evaluate_jax.py checkpoints_jax/best --wandb
+    # Use MCTS engine with custom simulations
+    uv run python scripts/evaluate_jax.py engine.type=mcts engine.mcts.num_simulations=1600
 
-    # Quick test with limited puzzles
-    uv run python scripts/evaluate_jax.py checkpoints_jax/best --max-puzzles 100
+    # Use Fractional MCTS engine
+    uv run python scripts/evaluate_jax.py engine.type=fractional_mcts engine.fractional_mcts.min_total_evals=800
 
-    # Compare multiple checkpoints
-    uv run python scripts/evaluate_jax.py checkpoints_jax/epoch_50 checkpoints_jax/epoch_100 checkpoints_jax/best
+    # Run on all benchmarks
+    uv run python scripts/evaluate_jax.py benchmark.names=[puzzles,high_rated_puzzles]
+
+    # Quick test with fewer puzzles
+    uv run python scripts/evaluate_jax.py benchmark.max_puzzles=100
 
     # Use highest matmul precision (for ONNX/TensorRT comparison)
-    uv run python scripts/evaluate_jax.py checkpoints_jax/best --matmul-precision highest
+    uv run python scripts/evaluate_jax.py compute.matmul_precision=highest
 
-    # Use bfloat16 compute dtype (faster on TPU/Ampere+)
-    uv run python scripts/evaluate_jax.py checkpoints_jax/best --compute-dtype bfloat16
+    # Parallel evaluation with 4 workers (each loads own engine)
+    uv run python scripts/evaluate_jax.py engine.num_workers=4
 
-    # Evaluate with policy engine (argmax policy move) instead of value engine
-    uv run python scripts/evaluate_jax.py evaluate checkpoints_jax/best --engine policy
+    # Disable W&B logging
+    uv run python scripts/evaluate_jax.py wandb.enabled=false
 """
 
 from pathlib import Path
-from typing import Annotated
 
-import typer
+import hydra
+import jax
+import jax.numpy as jnp
 from loguru import logger
+from omegaconf import DictConfig, OmegaConf
 from rich.console import Console
 from rich.table import Table
 
-app = typer.Typer(
-    help="Evaluate JAX chess models on benchmarks.",
-    add_completion=False,
-)
+from catgpt.jax.configs import JaxEvalConfig, jax_eval_config_from_dict
+
 console = Console()
 
 # Default benchmark paths
 PUZZLE_BENCHMARKS = {
-    "puzzles": Path("puzzles/puzzles.csv"),
-    "high_rated_puzzles": Path("puzzles/high_rated_puzzles.csv"),
+    "puzzles": "puzzles_path",
+    "high_rated_puzzles": "high_rated_puzzles_path",
 }
 
 
@@ -64,266 +67,34 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
-@app.command()
-def evaluate(
-    checkpoints: Annotated[
-        list[Path],
-        typer.Argument(help="Path(s) to checkpoint directory(ies)"),
-    ],
-    benchmark: Annotated[
-        list[str],
-        typer.Option(
-            "--benchmark",
-            "-b",
-            help="Benchmark(s) to run (puzzles, high_rated_puzzles, all)",
-        ),
-    ] = ["puzzles"],
-    max_puzzles: Annotated[
-        int | None,
-        typer.Option("--max-puzzles", "-n", help="Limit number of puzzles per benchmark"),
-    ] = 10000,
-    wandb: Annotated[
-        bool,
-        typer.Option("--wandb/--no-wandb", help="Log results to Weights & Biases"),
-    ] = True,
-    wandb_project: Annotated[
-        str,
-        typer.Option("--wandb-project", help="W&B project name"),
-    ] = "catgpt-puzzles",
-    wandb_run_name: Annotated[
-        str | None,
-        typer.Option("--name", help="W&B run name (default: checkpoint name)"),
-    ] = None,
-    batch_size: Annotated[
-        int,
-        typer.Option("--batch-size", help="Batch size for model evaluation"),
-    ] = 256,
-    matmul_precision: Annotated[
-        str,
-        typer.Option(
-            "--matmul-precision",
-            help="JAX matmul precision: 'high' (TF32 on Ampere+) or 'highest' (full float32)",
-        ),
-    ] = "high",
-    compute_dtype: Annotated[
-        str,
-        typer.Option(
-            "--compute-dtype",
-            help="Compute dtype for model inference (float32, float16, bfloat16)",
-        ),
-    ] = "bfloat16",
-    engine_type: Annotated[
-        str,
-        typer.Option(
-            "--engine",
-            help="Engine type: 'value' (1-move lookahead) or 'policy' (argmax policy)",
-        ),
-    ] = "value",
-    verbose: Annotated[
-        bool,
-        typer.Option("--verbose", "-v", help="Enable verbose logging"),
-    ] = False,
-) -> None:
-    """Evaluate checkpoint(s) on chess benchmarks.
+def prompt_run_name() -> str:
+    """Prompt user for a run name to organize W&B runs.
 
-    Loads trained JAX models, wraps them in an engine, and evaluates on puzzle benchmarks.
-
-    Engine types:
-    - value: 1-move lookahead using value head (picks move that minimizes opponent's win prob)
-    - policy: Argmax policy move (picks move with highest policy logit)
+    Returns:
+        The run name entered by the user.
     """
-    setup_logging(verbose)
+    print("\n" + "=" * 50)
+    print("CatGPT JAX Evaluation")
+    print("=" * 50)
+    run_name = input("Enter run name (for W&B): ").strip()
+    if not run_name:
+        raise ValueError("Run name cannot be empty")
+    # Sanitize: replace spaces with underscores, remove problematic chars
+    run_name = run_name.replace(" ", "_")
+    run_name = "".join(c for c in run_name if c.isalnum() or c in "_-")
+    print(f"W&B run name: {run_name}")
+    print("=" * 50 + "\n")
+    return run_name
 
-    # Validate matmul precision
-    valid_matmul_precisions = ("high", "highest")
-    if matmul_precision not in valid_matmul_precisions:
-        logger.error(f"Invalid matmul precision: {matmul_precision}")
-        logger.info(f"Valid options: {valid_matmul_precisions}")
-        raise typer.Exit(1)
 
-    # Validate compute dtype
-    valid_dtypes = ("float32", "float16", "bfloat16")
-    if compute_dtype not in valid_dtypes:
-        logger.error(f"Invalid compute dtype: {compute_dtype}")
-        logger.info(f"Valid options: {valid_dtypes}")
-        raise typer.Exit(1)
-
-    # Validate engine type
-    valid_engines = ("value", "policy")
-    if engine_type not in valid_engines:
-        logger.error(f"Invalid engine type: {engine_type}")
-        logger.info(f"Valid options: {valid_engines}")
-        raise typer.Exit(1)
-
-    # Set JAX matmul precision BEFORE any JAX imports/computation
-    # This must happen early to affect all subsequent JAX operations
-    import jax
-    import jax.numpy as jnp
-
-    jax.config.update("jax_default_matmul_precision", matmul_precision)
-    logger.info(f"JAX matmul precision: {matmul_precision}")
-
-    # Map dtype string to jax dtype
-    dtype_map = {
-        "float32": jnp.float32,
-        "float16": jnp.float16,
-        "bfloat16": jnp.bfloat16,
-    }
-    compute_dtype_jax = dtype_map[compute_dtype]
-    logger.info(f"Compute dtype: {compute_dtype}")
-
-    # Validate checkpoints exist
-    for checkpoint in checkpoints:
-        if not checkpoint.exists():
-            logger.error(f"Checkpoint not found: {checkpoint}")
-            raise typer.Exit(1)
-
-    # Determine which benchmarks to run
-    if "all" in benchmark:
-        benchmark_names = list(PUZZLE_BENCHMARKS.keys())
+def _get_benchmark_path(cfg: JaxEvalConfig, name: str) -> Path:
+    """Get the file path for a benchmark by name."""
+    if name == "puzzles":
+        return Path(cfg.benchmark.puzzles_path)
+    elif name == "high_rated_puzzles":
+        return Path(cfg.benchmark.high_rated_puzzles_path)
     else:
-        benchmark_names = benchmark
-
-    # Validate benchmark names
-    for name in benchmark_names:
-        if name not in PUZZLE_BENCHMARKS:
-            logger.error(f"Unknown benchmark: {name}")
-            logger.info(f"Available benchmarks: {list(PUZZLE_BENCHMARKS.keys())}")
-            raise typer.Exit(1)
-        if not PUZZLE_BENCHMARKS[name].exists():
-            logger.error(f"Benchmark file not found: {PUZZLE_BENCHMARKS[name]}")
-            raise typer.Exit(1)
-
-    # Import here to avoid slow startup for --help
-    from catgpt.jax.evaluation.benchmarks.puzzles import PuzzleBenchmark
-    from catgpt.jax.evaluation.engines.policy_engine import PolicyEngine
-    from catgpt.jax.evaluation.engines.value_engine import ValueEngine
-
-    logger.info(f"Engine type: {engine_type}")
-
-    # Initialize W&B if requested
-    wandb_run = None
-    if wandb:
-        try:
-            import wandb as wb
-
-            run_name = wandb_run_name
-            if run_name is None and len(checkpoints) == 1:
-                run_name = checkpoints[0].name
-
-            wandb_run = wb.init(
-                project=wandb_project,
-                name=run_name,
-                config={
-                    "checkpoints": [str(c) for c in checkpoints],
-                    "benchmarks": benchmark_names,
-                    "max_puzzles": max_puzzles,
-                    "matmul_precision": matmul_precision,
-                    "compute_dtype": compute_dtype,
-                    "engine_type": engine_type,
-                },
-            )
-            logger.info(f"W&B initialized: {wb.run.url}")
-        except ImportError:
-            logger.warning("wandb not installed, skipping W&B logging")
-            wandb = False
-        except Exception as e:
-            logger.warning(f"Failed to initialize W&B: {e}")
-            wandb = False
-
-    # Load benchmarks
-    benchmarks = {}
-    for name in benchmark_names:
-        csv_path = PUZZLE_BENCHMARKS[name]
-        benchmarks[name] = PuzzleBenchmark(
-            csv_path,
-            name=name,
-            max_puzzles=max_puzzles,
-        )
-
-    # Run evaluation for each checkpoint
-    all_results: dict[str, dict[str, any]] = {}
-
-    for checkpoint_path in checkpoints:
-        checkpoint_name = checkpoint_path.name
-        logger.info(f"\n{'=' * 60}")
-        logger.info(f"Evaluating checkpoint: {checkpoint_path}")
-        logger.info(f"{'=' * 60}")
-
-        # Load engine
-        try:
-            if engine_type == "value":
-                engine = ValueEngine.from_checkpoint(
-                    checkpoint_path,
-                    batch_size=batch_size,
-                    compute_dtype=compute_dtype_jax,
-                )
-            else:  # engine_type == "policy"
-                engine = PolicyEngine.from_checkpoint(
-                    checkpoint_path,
-                    batch_size=batch_size,
-                    compute_dtype=compute_dtype_jax,
-                )
-        except Exception as e:
-            logger.error(f"Failed to load checkpoint: {e}")
-            continue
-
-        checkpoint_results = {}
-
-        for bench_name, bench in benchmarks.items():
-            logger.info(f"\nRunning {bench_name} ({len(bench.puzzles)} puzzles)...")
-
-            result = bench.run(engine, show_progress=True)
-            checkpoint_results[bench_name] = result
-
-            # Log to console
-            console.print(f"\n[bold cyan]{bench_name}[/bold cyan] Results:")
-            console.print(f"  Move Accuracy: {result.metrics['move_accuracy']:.2%}")
-            console.print(f"  Solve Rate: {result.metrics['solve_rate']:.2%}")
-            console.print(f"  Puzzles: {int(result.metrics['num_puzzles'])}")
-
-            # Log to W&B
-            if wandb and wandb_run:
-                import wandb as wb
-
-                prefix = f"{checkpoint_name}/{bench_name}" if len(checkpoints) > 1 else bench_name
-
-                for key, value in result.metrics.items():
-                    wb.log({f"{prefix}/{key}": value})
-
-                # Log detailed table
-                if result.details:
-                    table = wb.Table(
-                        columns=[
-                            "puzzle_id",
-                            "rating",
-                            "solved",
-                            "moves_correct",
-                            "moves_total",
-                        ]
-                    )
-                    for detail in result.details:
-                        table.add_data(
-                            detail["puzzle_id"],
-                            detail["rating"],
-                            detail["solved"],
-                            detail["moves_correct"],
-                            detail["moves_total"],
-                        )
-                    wb.log({f"{prefix}/details": table})
-
-        all_results[checkpoint_name] = checkpoint_results
-
-    # Print summary table
-    _print_summary(all_results, benchmark_names)
-
-    # Finish W&B run
-    if wandb and wandb_run:
-        import wandb as wb
-
-        wb.finish()
-
-    console.print("\n[bold green]Evaluation complete![/bold green]")
+        raise ValueError(f"Unknown benchmark: {name}")
 
 
 def _print_summary(
@@ -355,60 +126,270 @@ def _print_summary(
     console.print(table)
 
 
-@app.command()
-def list_benchmarks() -> None:
-    """List available benchmarks."""
-    console.print("[bold]Available Benchmarks[/bold]\n")
+@hydra.main(version_base=None, config_path="../configs", config_name="jax_eval")
+def main(cfg: DictConfig) -> None:
+    """Main evaluation entry point.
 
-    for name, path in PUZZLE_BENCHMARKS.items():
-        exists = "✓" if path.exists() else "✗"
-        status = "[green]found[/green]" if path.exists() else "[red]not found[/red]"
-        console.print(f"  {exists} {name}: {path} ({status})")
+    Args:
+        cfg: Hydra configuration.
+    """
+    # Prompt for run name first (before any logging setup)
+    run_name = prompt_run_name()
 
+    # Convert OmegaConf to typed config
+    config_dict = OmegaConf.to_container(cfg, resolve=True)
+    eval_cfg = jax_eval_config_from_dict(config_dict)  # type: ignore[arg-type]
 
-@app.command()
-def inspect(
-    checkpoint: Annotated[
-        Path,
-        typer.Argument(help="Path to checkpoint directory"),
-    ],
-) -> None:
-    """Inspect a checkpoint without running evaluation."""
-    setup_logging()
+    # Setup logging
+    setup_logging(eval_cfg.verbose)
+    logger.info("Starting CatGPT JAX evaluation")
+    logger.info(f"Run name: {run_name}")
+    logger.info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
 
-    if not checkpoint.exists():
-        logger.error(f"Checkpoint not found: {checkpoint}")
-        raise typer.Exit(1)
+    # Validate matmul precision
+    valid_matmul_precisions = ("high", "highest")
+    if eval_cfg.compute.matmul_precision not in valid_matmul_precisions:
+        logger.error(f"Invalid matmul precision: {eval_cfg.compute.matmul_precision}")
+        logger.info(f"Valid options: {valid_matmul_precisions}")
+        raise SystemExit(1)
 
-    from catgpt.jax.evaluation.checkpoint import load_checkpoint
+    # Validate compute dtype
+    valid_dtypes = ("float32", "float16", "bfloat16")
+    if eval_cfg.compute.compute_dtype not in valid_dtypes:
+        logger.error(f"Invalid compute dtype: {eval_cfg.compute.compute_dtype}")
+        logger.info(f"Valid options: {valid_dtypes}")
+        raise SystemExit(1)
 
-    try:
-        loaded = load_checkpoint(checkpoint)
-    except Exception as e:
-        logger.error(f"Failed to load checkpoint: {e}")
-        raise typer.Exit(1)
+    # Validate engine type
+    valid_engines = ("value", "policy", "mcts", "fractional_mcts")
+    if eval_cfg.engine.type not in valid_engines:
+        logger.error(f"Invalid engine type: {eval_cfg.engine.type}")
+        logger.info(f"Valid options: {valid_engines}")
+        raise SystemExit(1)
 
-    console.print(f"\n[bold]Checkpoint: {checkpoint}[/bold]\n")
+    # Set JAX matmul precision BEFORE any JAX computation
+    jax.config.update("jax_default_matmul_precision", eval_cfg.compute.matmul_precision)
+    logger.info(f"JAX matmul precision: {eval_cfg.compute.matmul_precision}")
 
-    console.print("[cyan]Model Config:[/cyan]")
-    console.print(f"  Name: {loaded.model_config.name}")
-    console.print(f"  Hidden Size: {loaded.model_config.hidden_size}")
-    console.print(f"  Num Layers: {loaded.model_config.num_layers}")
-    console.print(f"  Num Heads: {loaded.model_config.num_heads}")
-    console.print(f"  FF Dim: {loaded.model_config.ff_dim}")
-    console.print(f"  Vocab Size: {loaded.model_config.vocab_size}")
-    console.print(f"  Seq Length: {loaded.model_config.seq_length}")
+    # Map dtype string to jax dtype
+    dtype_map = {
+        "float32": jnp.float32,
+        "float16": jnp.float16,
+        "bfloat16": jnp.bfloat16,
+    }
+    compute_dtype_jax = dtype_map[eval_cfg.compute.compute_dtype]
+    logger.info(f"Compute dtype: {eval_cfg.compute.compute_dtype}")
 
-    console.print("\n[cyan]Tokenizer Config:[/cyan]")
-    console.print(f"  Sequence Length: {loaded.tokenizer_config.sequence_length}")
-    console.print(f"  Include Halfmove: {loaded.tokenizer_config.include_halfmove}")
+    # Get checkpoint path
+    checkpoint_path = Path(eval_cfg.checkpoint)
+    if not checkpoint_path.exists():
+        logger.error(f"Checkpoint not found: {checkpoint_path}")
+        raise SystemExit(1)
 
-    # Count parameters
-    import jax
+    # Validate benchmark names
+    benchmark_names = eval_cfg.benchmark.names
+    for name in benchmark_names:
+        if name not in PUZZLE_BENCHMARKS:
+            logger.error(f"Unknown benchmark: {name}")
+            logger.info(f"Available benchmarks: {list(PUZZLE_BENCHMARKS.keys())}")
+            raise SystemExit(1)
+        bench_path = _get_benchmark_path(eval_cfg, name)
+        if not bench_path.exists():
+            logger.error(f"Benchmark file not found: {bench_path}")
+            raise SystemExit(1)
 
-    param_count = sum(p.size for p in jax.tree_util.tree_leaves(loaded.params))
-    console.print(f"\n[cyan]Parameters:[/cyan] {param_count:,}")
+    # Import here to avoid slow startup for --help
+    from catgpt.jax.evaluation.benchmarks.puzzles import PuzzleBenchmark
+    from catgpt.jax.evaluation.engines.fractional_mcts import (
+        FractionalMCTSConfig,
+        FractionalMCTSEngine,
+    )
+    from catgpt.jax.evaluation.engines.mcts import MCTSConfig, MCTSEngine
+    from catgpt.jax.evaluation.engines.policy_engine import PolicyEngine
+    from catgpt.jax.evaluation.engines.value_engine import ValueEngine
+
+    logger.info(f"Engine type: {eval_cfg.engine.type}")
+    if eval_cfg.engine.type == "mcts":
+        logger.info(
+            f"MCTS simulations: {eval_cfg.engine.mcts.num_simulations}, "
+            f"c_puct: {eval_cfg.engine.mcts.c_puct}"
+        )
+    elif eval_cfg.engine.type == "fractional_mcts":
+        logger.info(
+            f"Fractional MCTS min_evals: {eval_cfg.engine.fractional_mcts.min_total_evals}, "
+            f"c_puct: {eval_cfg.engine.fractional_mcts.c_puct}"
+        )
+
+    num_workers = eval_cfg.engine.num_workers
+    use_parallel = num_workers > 1
+    logger.info(f"Workers: {num_workers}" + (" (parallel)" if use_parallel else ""))
+
+    # Initialize W&B if requested
+    wandb_run = None
+    if eval_cfg.wandb.enabled:
+        try:
+            import wandb as wb
+
+            wandb_config = {
+                "checkpoint": str(checkpoint_path),
+                "benchmarks": benchmark_names,
+                "max_puzzles": eval_cfg.benchmark.max_puzzles,
+                "matmul_precision": eval_cfg.compute.matmul_precision,
+                "compute_dtype": eval_cfg.compute.compute_dtype,
+                "engine_type": eval_cfg.engine.type,
+                "engine_batch_size": eval_cfg.engine.batch_size,
+                "num_workers": num_workers,
+            }
+            if eval_cfg.engine.type == "mcts":
+                wandb_config.update({
+                    "mcts_simulations": eval_cfg.engine.mcts.num_simulations,
+                    "mcts_c_puct": eval_cfg.engine.mcts.c_puct,
+                })
+            elif eval_cfg.engine.type == "fractional_mcts":
+                wandb_config.update({
+                    "fractional_mcts_min_evals": eval_cfg.engine.fractional_mcts.min_total_evals,
+                    "fractional_mcts_c_puct": eval_cfg.engine.fractional_mcts.c_puct,
+                    "fractional_mcts_coverage": eval_cfg.engine.fractional_mcts.policy_coverage_threshold,
+                    "fractional_mcts_initial_budget": eval_cfg.engine.fractional_mcts.initial_budget,
+                    "fractional_mcts_multiplier": eval_cfg.engine.fractional_mcts.budget_multiplier,
+                })
+            wandb_run = wb.init(
+                project=eval_cfg.wandb.project,
+                entity=eval_cfg.wandb.entity,
+                name=run_name,
+                tags=eval_cfg.wandb.tags,
+                config=wandb_config,
+            )
+            logger.info(f"W&B initialized: {wb.run.url}")
+        except ImportError:
+            logger.warning("wandb not installed, skipping W&B logging")
+            eval_cfg.wandb.enabled = False
+        except Exception as e:
+            logger.warning(f"Failed to initialize W&B: {e}")
+            eval_cfg.wandb.enabled = False
+
+    # Load benchmarks
+    benchmarks = {}
+    for name in benchmark_names:
+        csv_path = _get_benchmark_path(eval_cfg, name)
+        benchmarks[name] = PuzzleBenchmark(
+            csv_path,
+            name=name,
+            max_puzzles=eval_cfg.benchmark.max_puzzles,
+        )
+
+    checkpoint_name = checkpoint_path.name
+    logger.info(f"\n{'=' * 60}")
+    logger.info(f"Evaluating checkpoint: {checkpoint_path}")
+    logger.info(f"{'=' * 60}")
+
+    # Load engine only if not using parallel mode
+    # (parallel mode creates engines in worker processes)
+    engine = None
+    if not use_parallel:
+        try:
+            if eval_cfg.engine.type == "value":
+                engine = ValueEngine.from_checkpoint(
+                    checkpoint_path,
+                    batch_size=eval_cfg.engine.batch_size,
+                    compute_dtype=compute_dtype_jax,
+                )
+            elif eval_cfg.engine.type == "policy":
+                engine = PolicyEngine.from_checkpoint(
+                    checkpoint_path,
+                    batch_size=eval_cfg.engine.batch_size,
+                    compute_dtype=compute_dtype_jax,
+                )
+            elif eval_cfg.engine.type == "mcts":
+                mcts_config = MCTSConfig(
+                    num_simulations=eval_cfg.engine.mcts.num_simulations,
+                    c_puct=eval_cfg.engine.mcts.c_puct,
+                    fpu_value=eval_cfg.engine.mcts.fpu_value,
+                )
+                engine = MCTSEngine.from_checkpoint(
+                    checkpoint_path,
+                    config=mcts_config,
+                    batch_size=1,  # MCTS evaluates one position at a time
+                    compute_dtype=compute_dtype_jax,
+                )
+            else:  # engine_type == "fractional_mcts"
+                fractional_config = FractionalMCTSConfig(
+                    c_puct=eval_cfg.engine.fractional_mcts.c_puct,
+                    policy_coverage_threshold=eval_cfg.engine.fractional_mcts.policy_coverage_threshold,
+                    min_total_evals=eval_cfg.engine.fractional_mcts.min_total_evals,
+                    initial_budget=eval_cfg.engine.fractional_mcts.initial_budget,
+                    budget_multiplier=eval_cfg.engine.fractional_mcts.budget_multiplier,
+                )
+                engine = FractionalMCTSEngine.from_checkpoint(
+                    checkpoint_path,
+                    config=fractional_config,
+                    batch_size=1,  # Fractional MCTS evaluates one position at a time
+                    compute_dtype=compute_dtype_jax,
+                )
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            raise SystemExit(1)
+
+    # Run evaluation
+    all_results: dict[str, dict[str, any]] = {}
+    checkpoint_results = {}
+
+    for bench_name, bench in benchmarks.items():
+        logger.info(f"\nRunning {bench_name} ({len(bench.puzzles)} puzzles)...")
+
+        if use_parallel:
+            result = bench.run_parallel(eval_cfg, show_progress=True)
+        else:
+            result = bench.run(engine, show_progress=True)
+        checkpoint_results[bench_name] = result
+
+        # Log to console
+        console.print(f"\n[bold cyan]{bench_name}[/bold cyan] Results:")
+        console.print(f"  Move Accuracy: {result.metrics['move_accuracy']:.2%}")
+        console.print(f"  Solve Rate: {result.metrics['solve_rate']:.2%}")
+        console.print(f"  Puzzles: {int(result.metrics['num_puzzles'])}")
+
+        # Log to W&B
+        if eval_cfg.wandb.enabled and wandb_run:
+            import wandb as wb
+
+            for key, value in result.metrics.items():
+                wb.log({f"{bench_name}/{key}": value})
+
+            # Log detailed table
+            if result.details:
+                table = wb.Table(
+                    columns=[
+                        "puzzle_id",
+                        "rating",
+                        "solved",
+                        "moves_correct",
+                        "moves_total",
+                    ]
+                )
+                for detail in result.details:
+                    table.add_data(
+                        detail["puzzle_id"],
+                        detail["rating"],
+                        detail["solved"],
+                        detail["moves_correct"],
+                        detail["moves_total"],
+                    )
+                wb.log({f"{bench_name}/details": table})
+
+    all_results[checkpoint_name] = checkpoint_results
+
+    # Print summary table
+    _print_summary(all_results, benchmark_names)
+
+    # Finish W&B run
+    if eval_cfg.wandb.enabled and wandb_run:
+        import wandb as wb
+
+        wb.finish()
+
+    console.print("\n[bold green]Evaluation complete![/bold green]")
 
 
 if __name__ == "__main__":
-    app()
+    main()
