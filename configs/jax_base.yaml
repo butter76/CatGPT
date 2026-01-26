@@ -4,9 +4,9 @@
 # Model architecture
 model:
   name: "transformer"
-  hidden_size: 1024
-  num_layers: 15
-  num_heads: 64
+  hidden_size: 512
+  num_layers: 16
+  num_heads: 32
   ff_dim: 1536  # Defaults to 4 * hidden_size
   attention_dim: null  # Expanded attention dim (null = hidden_size). E.g., 768 with 48 heads for 50% more attention capacity
   vocab_size: 26  # From tokenizer (don't change unless tokenizer changes)
@@ -33,6 +33,9 @@ model:
     soft_policy_head: false  # Enable soft policy
     soft_policy_temperature: 4.0  # KataGo default
     soft_policy_weight: 8.0  # KataGo default (compensates for smaller gradients)
+    hard_policy_head: true  # Enable hard policy (sharpened target)
+    hard_policy_temperature: 0.25  # p^4 sharpening
+    hard_policy_weight: 0.1  # Small weight (harder targets are noisier)
     # Square prediction heads (noisy auxiliary targets)
     next_capture_head: false  # Predict square of piece to be captured next
     next_capture_weight: 0.2  # Small weight for noisy auxiliary target

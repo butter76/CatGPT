@@ -49,6 +49,13 @@ class JaxOutputHeadConfig:
     soft_policy_temperature: float = 4.0  # Temperature for softening (higher = more uniform)
     soft_policy_weight: float = 8.0  # Loss weight (compensates for smaller gradients)
 
+    # Hard policy auxiliary target
+    # Applies low temperature to sharpen the policy target, focusing training on
+    # getting the absolute best move right. T=0.25 means p^(1/0.25) = p^4.
+    hard_policy_head: bool = False  # Enable auxiliary hard policy head
+    hard_policy_temperature: float = 0.25  # Temperature for sharpening (lower = more peaked)
+    hard_policy_weight: float = 0.1  # Small weight since harder targets are noisier
+
     # Square prediction heads (noisy auxiliary targets)
     # Predict which square has the piece that will be captured next / pawn that will move next
     # These are 64-way classification tasks with masking for positions without valid targets

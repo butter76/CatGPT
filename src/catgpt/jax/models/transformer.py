@@ -517,6 +517,22 @@ class BidirectionalTransformer(nn.Module):
 
             outputs["soft_policy_logit"] = soft_policy_logits_flat
 
+        # Hard policy head: auxiliary head for sharpened policy target
+        # Uses temperature < 1 (e.g., 0.25) to sharpen the distribution, focusing
+        # training on getting the absolute best move right (p^4 for T=0.25).
+        if head_config.hard_policy_head:
+            # Same architecture as policy head but separate parameters
+            hard_policy_logits = nn.Dense(
+                _POLICY_TO_DIM,
+                dtype=jnp.float32,
+                name="hard_policy_head",
+            )(hidden)  # (batch, 64, 73)
+
+            # Flatten for cross-entropy loss: (batch, 64*73) = (batch, 4672)
+            hard_policy_logits_flat = hard_policy_logits.reshape(batch_size, -1)
+
+            outputs["hard_policy_logit"] = hard_policy_logits_flat
+
         # Next capture head: predict which square has the piece to be captured next
         # This is a noisy auxiliary target - many games have no future captures
         if head_config.next_capture_head:

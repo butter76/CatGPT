@@ -280,6 +280,22 @@ class Trainer:
                 weight = head_config.soft_policy_weight if head_config else 8.0
                 losses["soft_policy"] = soft_policy_loss * weight
 
+            # Hard policy head: auxiliary head for sharpened policy target
+            # Applies low temperature to sharpen the distribution, focusing on the best move.
+            if "hard_policy_logit" in outputs and "policy_target" in batch:
+                # Compute hard target: p^(1/T) where T=0.25 → p^4 then renormalize
+                temp = head_config.hard_policy_temperature if head_config else 0.25
+                # Add small epsilon for numerical stability before taking power
+                hard_target = jnp.pow(batch["policy_target"] + 1e-10, 1.0 / temp)
+                hard_target = hard_target / jnp.sum(hard_target, axis=-1, keepdims=True)
+
+                hard_policy_loss = optax.softmax_cross_entropy(
+                    outputs["hard_policy_logit"].astype(jnp.float32),
+                    hard_target.astype(jnp.float32),
+                ).mean()
+                weight = head_config.hard_policy_weight if head_config else 0.1
+                losses["hard_policy"] = hard_policy_loss * weight
+
             # Next capture head: cross-entropy with masking for None values
             # Target is -1 for positions without future captures
             if "next_capture_logit" in outputs and "next_capture_target" in batch:
