@@ -454,6 +454,13 @@ def _eval_config_to_dict(config: "JaxEvalConfig") -> dict[str, Any]:
                 "c_puct": config.engine.mcts.c_puct,
                 "fpu_value": config.engine.mcts.fpu_value,
             },
+            "fractional_mcts": {
+                "c_puct": config.engine.fractional_mcts.c_puct,
+                "policy_coverage_threshold": config.engine.fractional_mcts.policy_coverage_threshold,
+                "min_total_evals": config.engine.fractional_mcts.min_total_evals,
+                "initial_budget": config.engine.fractional_mcts.initial_budget,
+                "budget_multiplier": config.engine.fractional_mcts.budget_multiplier,
+            },
         },
         "compute": {
             "matmul_precision": config.compute.matmul_precision,
@@ -479,6 +486,10 @@ def _worker_init(config_dict: dict[str, Any]) -> None:
     )
 
     # Import engines here (after JAX config)
+    from catgpt.jax.evaluation.engines.fractional_mcts import (
+        FractionalMCTSConfig,
+        FractionalMCTSEngine,
+    )
     from catgpt.jax.evaluation.engines.mcts import MCTSConfig, MCTSEngine
     from catgpt.jax.evaluation.engines.policy_engine import PolicyEngine
     from catgpt.jax.evaluation.engines.value_engine import ValueEngine
@@ -507,7 +518,7 @@ def _worker_init(config_dict: dict[str, Any]) -> None:
             batch_size=batch_size,
             compute_dtype=compute_dtype,
         )
-    else:  # mcts
+    elif engine_type == "mcts":
         mcts_cfg = config_dict["engine"]["mcts"]
         mcts_config = MCTSConfig(
             num_simulations=mcts_cfg["num_simulations"],
@@ -519,6 +530,26 @@ def _worker_init(config_dict: dict[str, Any]) -> None:
             config=mcts_config,
             batch_size=1,
             compute_dtype=compute_dtype,
+        )
+    elif engine_type == "fractional_mcts":
+        fmcts_cfg = config_dict["engine"]["fractional_mcts"]
+        fmcts_config = FractionalMCTSConfig(
+            c_puct=fmcts_cfg["c_puct"],
+            policy_coverage_threshold=fmcts_cfg["policy_coverage_threshold"],
+            min_total_evals=fmcts_cfg["min_total_evals"],
+            initial_budget=fmcts_cfg["initial_budget"],
+            budget_multiplier=fmcts_cfg["budget_multiplier"],
+        )
+        _worker_engine = FractionalMCTSEngine.from_checkpoint(
+            checkpoint_path,
+            config=fmcts_config,
+            batch_size=1,
+            compute_dtype=compute_dtype,
+        )
+    else:
+        raise ValueError(
+            f"Unknown engine type: {engine_type!r}. "
+            f"Valid types: 'value', 'policy', 'mcts', 'fractional_mcts'"
         )
 
     logger.debug(f"Worker initialized with {engine_type} engine")
@@ -598,6 +629,10 @@ def _create_engine_from_config(config: "JaxEvalConfig") -> Engine:
     import jax
     import jax.numpy as jnp
 
+    from catgpt.jax.evaluation.engines.fractional_mcts import (
+        FractionalMCTSConfig,
+        FractionalMCTSEngine,
+    )
     from catgpt.jax.evaluation.engines.mcts import MCTSConfig, MCTSEngine
     from catgpt.jax.evaluation.engines.policy_engine import PolicyEngine
     from catgpt.jax.evaluation.engines.value_engine import ValueEngine
@@ -626,7 +661,7 @@ def _create_engine_from_config(config: "JaxEvalConfig") -> Engine:
             batch_size=batch_size,
             compute_dtype=compute_dtype,
         )
-    else:  # mcts
+    elif engine_type == "mcts":
         mcts_config = MCTSConfig(
             num_simulations=config.engine.mcts.num_simulations,
             c_puct=config.engine.mcts.c_puct,
@@ -637,6 +672,25 @@ def _create_engine_from_config(config: "JaxEvalConfig") -> Engine:
             config=mcts_config,
             batch_size=1,
             compute_dtype=compute_dtype,
+        )
+    elif engine_type == "fractional_mcts":
+        fmcts_config = FractionalMCTSConfig(
+            c_puct=config.engine.fractional_mcts.c_puct,
+            policy_coverage_threshold=config.engine.fractional_mcts.policy_coverage_threshold,
+            min_total_evals=config.engine.fractional_mcts.min_total_evals,
+            initial_budget=config.engine.fractional_mcts.initial_budget,
+            budget_multiplier=config.engine.fractional_mcts.budget_multiplier,
+        )
+        return FractionalMCTSEngine.from_checkpoint(
+            checkpoint_path,
+            config=fmcts_config,
+            batch_size=1,
+            compute_dtype=compute_dtype,
+        )
+    else:
+        raise ValueError(
+            f"Unknown engine type: {engine_type!r}. "
+            f"Valid types: 'value', 'policy', 'mcts', 'fractional_mcts'"
         )
 
 
