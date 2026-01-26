@@ -219,6 +219,28 @@ set_target_properties(catgpt_policy PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
 
+# === CatGPT FEN Analyzer (with TensorRT) ===
+add_executable(catgpt_analyze
+    src/analyze_fen_main.cpp
+)
+
+target_include_directories(catgpt_analyze PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+)
+
+target_link_libraries(catgpt_analyze PRIVATE
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    pthread
+)
+
+set_target_properties(catgpt_analyze PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+)
+
 # Enable colored output
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)
@@ -230,4 +252,5 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(catgpt_fractional_mcts PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_value PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_policy PRIVATE -fdiagnostics-color=always)
+    target_compile_options(catgpt_analyze PRIVATE -fdiagnostics-color=always)
 endif()
