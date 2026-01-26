@@ -18,12 +18,12 @@
 #   uv run python scripts/evaluate_jax.py benchmark.max_puzzles=100
 
 # Checkpoint to evaluate
-checkpoint: "checkpoints_jax/best/best"
+checkpoint: "checkpoints_jax/best"
 
 # Engine configuration
 engine:
-  type: "fractional_mcts"  # Options: "value", "policy", "mcts", "fractional_mcts"
-  batch_size: 1
+  type: "value"  # Options: "value", "policy", "mcts", "fractional_mcts"
+  batch_size: 256
 
   # Parallel workers: each worker loads its own engine and processes puzzles independently.
   # Useful for MCTS where evaluation is CPU-bound. Set to number of CPU cores for max throughput.

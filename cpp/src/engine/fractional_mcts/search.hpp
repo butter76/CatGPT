@@ -118,7 +118,7 @@ public:
         float N = config_.initial_budget;
         int iteration = 0;
 
-        while (total_gpu_evals_ < target_evals) {
+        while (total_gpu_evals_ < target_evals && iteration < 50) {
             if (stop_flag_.load(std::memory_order_relaxed)) {
                 break;
             }
@@ -262,13 +262,15 @@ private:
             return;
         }
 
-        // Compute limit: how many children cover 80% of policy
-        int limit = node->get_limit(config_.policy_coverage_threshold);
+        if (node->children.empty()) {
+            // Compute limit: how many children cover 80% of policy
+            int limit = node->get_limit(config_.policy_coverage_threshold);
 
-        // Base case: N < limit, don't expand further
-        // Q is already set from prior evaluation
-        if (N < static_cast<float>(limit)) {
-            return;
+            // Base case: N < limit, don't expand further
+            // Q is already set from prior evaluation
+            if (N < static_cast<float>(limit)) {
+                return;
+            }
         }
 
         // Expansion case: expand children with P >= 1/N
@@ -294,13 +296,16 @@ private:
             }
         }
 
+        // Recompute allocations
+        auto second_allocations = compute_allocations(node, N);
+
         // Update Q as weighted average of children's Q values
         // Note: negate child.Q because it's from opponent's perspective
         float weighted_sum = 0.0f;
         float total_weight = 0.0f;
         for (auto& [move, child] : node->children) {
-            auto it = allocations.find(move);
-            if (it != allocations.end() && it->second > 0.0f) {
+            auto it = second_allocations.find(move);
+            if (it != second_allocations.end() && it->second > 0.0f) {
                 float N_i = it->second;
                 weighted_sum += (-child.Q) * N_i;
                 total_weight += N_i;
