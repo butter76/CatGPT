@@ -76,15 +76,23 @@ openings:
 game:
   # Draw adjudication: declare draw if position is "dead"
   adjudicate_draw_moves: 200       # Max moves before forced draw
-  adjudicate_draw_score: 10        # Score threshold in centipawns
+  adjudicate_draw_score: 20        # Score threshold in centipawns
   adjudicate_draw_count: 10        # Consecutive moves with |score| < threshold
 
   # Resignation: engine loses if score is hopeless
   adjudicate_resign_score: 1000    # Score threshold in centipawns (10 pawns)
   adjudicate_resign_count: 5       # Consecutive moves with score < -threshold
 
-  # Tablebase adjudication (future)
-  use_tablebases: false
+  # Syzygy tablebase adjudication
+  # Uses python-chess syzygy module to adjudicate endgames
+  # WDL: 2=win, 1=cursed win, 0=draw, -1=blessed loss, -2=loss
+  syzygy:
+    enabled: true                   # Enable Syzygy adjudication
+    path: "/ephemeral/syzygy/syzygy_tables/3-4-5"                   # Path to tablebase files (3-4-5 and 6-piece)
+    adjudicate_draw: true            # Adjudicate WDL=0 positions as draw
+    adjudicate_win: true             # Adjudicate WDL=±2 positions as win/loss
+    # Note: Cursed wins (WDL=1) and blessed losses (WDL=-1) are NOT adjudicated
+    # as they can be drawn via the 50-move rule
 
 # Weights & Biases logging
 wandb:

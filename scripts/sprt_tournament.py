@@ -50,7 +50,12 @@ from catgpt.cpp.uci_engine import (
     UCIEngine,
     ValueEngine,
 )
-from catgpt.tournament.game_runner import GameConfig, GameResult, GameRunner
+from catgpt.tournament.game_runner import (
+    GameConfig,
+    GameResult,
+    GameRunner,
+    GameTermination,
+)
 from catgpt.tournament.openings import load_openings
 from catgpt.tournament.sprt import SPRTCalculator, SPRTResult, SPRTStatus
 
@@ -201,23 +206,56 @@ def create_status_table(
     return table
 
 
-def save_pgn(
-    games: list[GameResult],
-    path: Path,
-    engine_a_name: str,
-    engine_b_name: str,
-) -> None:
-    """Save all games to a PGN file."""
-    with path.open("w") as f:
-        for i, game in enumerate(games, 1):
-            pgn = game.to_pgn(
-                engine_a_name=engine_a_name,
-                engine_b_name=engine_b_name,
-                round_num=i,
-            )
-            f.write(pgn)
-            f.write("\n")
-    logger.info(f"Saved {len(games)} games to {path}")
+class PGNWriter:
+    """Incremental PGN writer that flushes games as they complete."""
+
+    def __init__(
+        self,
+        path: Path,
+        engine_a_name: str,
+        engine_b_name: str,
+        event: str = "SPRT Tournament",
+    ):
+        self.path = path
+        self.engine_a_name = engine_a_name
+        self.engine_b_name = engine_b_name
+        self.event = event
+        self.game_count = 0
+        self._file = None
+
+    def open(self) -> None:
+        """Open the PGN file for writing."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.path.open("w")
+        logger.info(f"PGN output: {self.path}")
+
+    def write_game(self, game: GameResult) -> None:
+        """Write a single game to the PGN file and flush."""
+        if self._file is None:
+            return
+
+        self.game_count += 1
+        pgn = game.to_pgn(
+            engine_a_name=self.engine_a_name,
+            engine_b_name=self.engine_b_name,
+            event=self.event,
+            round_num=self.game_count,
+        )
+        self._file.write(pgn)
+        self._file.write("\n")
+        self._file.flush()  # Flush immediately so games are saved as they finish
+
+    def write_games(self, games: list[GameResult]) -> None:
+        """Write multiple games."""
+        for game in games:
+            self.write_game(game)
+
+    def close(self) -> None:
+        """Close the PGN file."""
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+            logger.info(f"Saved {self.game_count} games to {self.path}")
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="sprt_tournament")
@@ -298,18 +336,51 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Estimated games: ~{sprt.games_estimate()}")
 
     # Create game runner
+    # Resolve Syzygy path if enabled
+    syzygy_path = None
+    if cfg.game.syzygy.enabled:
+        syzygy_path_cfg = Path(cfg.game.syzygy.path)
+        # Use absolute path as-is, otherwise resolve relative to project root
+        if syzygy_path_cfg.is_absolute():
+            syzygy_path = str(syzygy_path_cfg)
+        else:
+            syzygy_path = str(project_root / syzygy_path_cfg)
+        logger.info(f"Syzygy tablebases enabled: {syzygy_path}")
+
     game_config = GameConfig(
         adjudicate_draw_moves=cfg.game.adjudicate_draw_moves,
         adjudicate_draw_score=cfg.game.adjudicate_draw_score,
         adjudicate_draw_count=cfg.game.adjudicate_draw_count,
         adjudicate_resign_score=cfg.game.adjudicate_resign_score,
         adjudicate_resign_count=cfg.game.adjudicate_resign_count,
+        syzygy_enabled=cfg.game.syzygy.enabled,
+        syzygy_path=syzygy_path,
+        syzygy_adjudicate_draw=cfg.game.syzygy.adjudicate_draw,
+        syzygy_adjudicate_win=cfg.game.syzygy.adjudicate_win,
     )
     runner = GameRunner(game_config)
 
     # Track results
     wins, losses, draws = 0, 0, 0
+    syzygy_adjudications = 0
     all_games: list[GameResult] = []
+
+    # Setup PGN writer (writes games incrementally as they finish)
+    pgn_writer: PGNWriter | None = None
+    if cfg.output.save_pgn:
+        if cfg.output.pgn_path:
+            pgn_path = project_root / cfg.output.pgn_path
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            pgn_path = project_root / f"outputs/sprt_{run_name}_{timestamp}.pgn"
+
+        pgn_writer = PGNWriter(
+            pgn_path,
+            engine_a_name=engine_a_name,
+            engine_b_name=engine_b_name,
+            event=f"SPRT: {run_name}",
+        )
+        pgn_writer.open()
 
     # Main tournament loop
     max_rounds = cfg.sprt.max_games // 2  # 2 games per round (color swap)
@@ -329,6 +400,10 @@ def main(cfg: DictConfig) -> None:
             game1, game2 = runner.play_game_pair(engine_a, engine_b, opening_fen)
             all_games.extend([game1, game2])
 
+            # Write games to PGN immediately (flushed to disk)
+            if pgn_writer is not None:
+                pgn_writer.write_games([game1, game2])
+
             # Update statistics
             for game in [game1, game2]:
                 if game.result_value == 1.0:
@@ -337,6 +412,10 @@ def main(cfg: DictConfig) -> None:
                     losses += 1
                 else:
                     draws += 1
+
+                # Track Syzygy adjudications
+                if game.termination == GameTermination.SYZYGY_ADJUDICATED:
+                    syzygy_adjudications += 1
 
             # Update SPRT
             sprt_result = sprt.update(wins, losses, draws)
@@ -370,6 +449,7 @@ def main(cfg: DictConfig) -> None:
                         "win_rate": sprt_result.win_rate,
                         "draw_rate": sprt_result.draw_rate,
                         "loss_rate": sprt_result.loss_rate,
+                        "syzygy_adjudications": syzygy_adjudications,
                     }
                 )
 
@@ -429,28 +509,26 @@ def main(cfg: DictConfig) -> None:
             wb.summary["final_wins"] = wins
             wb.summary["final_losses"] = losses
             wb.summary["final_draws"] = draws
+            wb.summary["final_syzygy_adjudications"] = syzygy_adjudications
 
-        # Save PGN
-        if cfg.output.save_pgn:
-            if cfg.output.pgn_path:
-                pgn_path = project_root / cfg.output.pgn_path
-            else:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                pgn_path = project_root / f"outputs/sprt_{run_name}_{timestamp}.pgn"
+        # Upload PGN to W&B if enabled
+        if pgn_writer is not None and wandb_run:
+            import wandb as wb
 
-            pgn_path.parent.mkdir(parents=True, exist_ok=True)
-            save_pgn(all_games, pgn_path, engine_a_name, engine_b_name)
-
-            if wandb_run:
-                import wandb as wb
-
-                wb.save(str(pgn_path))
+            wb.save(str(pgn_writer.path))
 
     finally:
         # Cleanup
         logger.info("Closing engines...")
         engine_a.close()
         engine_b.close()
+
+        # Close game runner (releases tablebase file handles)
+        runner.close()
+
+        # Close PGN writer
+        if pgn_writer is not None:
+            pgn_writer.close()
 
         if wandb_run:
             import wandb as wb

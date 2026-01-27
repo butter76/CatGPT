@@ -7,8 +7,10 @@ move adjudication and game termination.
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 
 import chess
+import chess.syzygy
 from loguru import logger
 
 from catgpt.cpp.uci_engine import UCIEngine
@@ -24,6 +26,7 @@ class GameTermination(Enum):
     THREEFOLD = "threefold_repetition"
     DRAW_ADJUDICATED = "draw_adjudicated"
     RESIGN_ADJUDICATED = "resign_adjudicated"
+    SYZYGY_ADJUDICATED = "syzygy_adjudicated"
     MAX_MOVES = "max_moves"
     ENGINE_ERROR = "engine_error"
 
@@ -42,6 +45,12 @@ class GameConfig:
     # Resignation: if score < -threshold for N consecutive moves
     adjudicate_resign_score: int = 1000  # Centipawns (10 pawns)
     adjudicate_resign_count: int = 5  # Consecutive moves
+
+    # Syzygy tablebase adjudication
+    syzygy_enabled: bool = False
+    syzygy_path: str | None = None  # Path to tablebase files
+    syzygy_adjudicate_draw: bool = True  # Adjudicate WDL=0 as draw
+    syzygy_adjudicate_win: bool = True  # Adjudicate WDL=±2 as win/loss
 
 
 @dataclass
@@ -133,6 +142,129 @@ class GameRunner:
             config: Game adjudication configuration.
         """
         self.config = config or GameConfig()
+        self._tablebase: chess.syzygy.Tablebase | None = None
+
+        # Initialize Syzygy tablebases if enabled
+        if self.config.syzygy_enabled and self.config.syzygy_path:
+            self._init_tablebases()
+
+    def _init_tablebases(self) -> None:
+        """Initialize Syzygy tablebase probing."""
+        path = Path(self.config.syzygy_path)
+        if not path.exists():
+            logger.warning(f"Syzygy path not found: {path}")
+            return
+
+        try:
+            self._tablebase = chess.syzygy.open_tablebase(str(path))
+            logger.info(f"Loaded Syzygy tablebases from {path}")
+
+            # Try to add subdirectories (common layout: 3-4-5/, 6/)
+            for subdir in path.iterdir():
+                if subdir.is_dir():
+                    try:
+                        count = self._tablebase.add_directory(str(subdir))
+                        if count > 0:
+                            logger.debug(f"Added {count} tables from {subdir}")
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            logger.warning(f"Failed to load Syzygy tablebases: {e}")
+            self._tablebase = None
+
+    def _probe_syzygy(self, board: chess.Board) -> tuple[int | None, int | None]:
+        """Probe Syzygy tablebases for WDL and DTZ.
+
+        Args:
+            board: Current board position.
+
+        Returns:
+            Tuple of (wdl, dtz) where:
+            - wdl: 2=win, 1=cursed win, 0=draw, -1=blessed loss, -2=loss (or None)
+            - dtz: Distance to zeroing move (or None)
+        """
+        if self._tablebase is None:
+            return None, None
+
+        # Skip positions with castling rights (not in tablebases)
+        if board.has_castling_rights(chess.WHITE) or board.has_castling_rights(
+            chess.BLACK
+        ):
+            return None, None
+
+        # Count pieces (tablebases typically support up to 6-7 pieces)
+        piece_count = chess.popcount(board.occupied)
+        if piece_count > 7:  # Most common tablebase limit
+            return None, None
+
+        try:
+            wdl = self._tablebase.probe_wdl(board)
+            dtz = self._tablebase.probe_dtz(board)
+            return wdl, dtz
+        except KeyError:
+            # Position not in tablebase
+            return None, None
+        except Exception as e:
+            logger.debug(f"Syzygy probe error: {e}")
+            return None, None
+
+    def _check_syzygy_adjudication(
+        self, board: chess.Board, engine_a_white: bool
+    ) -> tuple[GameTermination, str] | None:
+        """Check if position can be adjudicated via Syzygy tablebases.
+
+        Args:
+            board: Current board position.
+            engine_a_white: Whether Engine A is playing White.
+
+        Returns:
+            Tuple of (termination, result) if adjudicated, None otherwise.
+        """
+        if not self.config.syzygy_enabled or self._tablebase is None:
+            return None
+
+        wdl, dtz = self._probe_syzygy(board)
+        if wdl is None:
+            return None
+
+        # WDL values from side-to-move perspective:
+        # 2 = winning, 1 = cursed win, 0 = draw, -1 = blessed loss, -2 = losing
+
+        # Adjudicate clear wins/losses (WDL = ±2)
+        if self.config.syzygy_adjudicate_win and abs(wdl) == 2:
+            if wdl == 2:
+                # Side to move is winning
+                if board.turn == chess.WHITE:
+                    result = "1-0"
+                else:
+                    result = "0-1"
+            else:  # wdl == -2
+                # Side to move is losing
+                if board.turn == chess.WHITE:
+                    result = "0-1"
+                else:
+                    result = "1-0"
+
+            logger.debug(
+                f"Syzygy adjudication: WDL={wdl}, DTZ={dtz}, result={result}"
+            )
+            return GameTermination.SYZYGY_ADJUDICATED, result
+
+        # Adjudicate draws (WDL = 0)
+        if self.config.syzygy_adjudicate_draw and wdl == 0:
+            logger.debug(f"Syzygy adjudication: WDL={wdl} (draw)")
+            return GameTermination.SYZYGY_ADJUDICATED, "1/2-1/2"
+
+        # Don't adjudicate cursed wins (WDL = 1) or blessed losses (WDL = -1)
+        # as these can be drawn with the 50-move rule
+        return None
+
+    def close(self) -> None:
+        """Close resources (tablebase files)."""
+        if self._tablebase is not None:
+            self._tablebase.close()
+            self._tablebase = None
 
     def play_game(
         self,
@@ -175,6 +307,12 @@ class GameRunner:
             if len(moves) >= self.config.adjudicate_draw_moves:
                 termination = GameTermination.MAX_MOVES
                 result = "1/2-1/2"
+                break
+
+            # Check Syzygy tablebase adjudication
+            syzygy_result = self._check_syzygy_adjudication(board, engine_a_white)
+            if syzygy_result is not None:
+                termination, result = syzygy_result
                 break
 
             # Get current engine
