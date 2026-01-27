@@ -263,8 +263,9 @@ private:
         }
 
         if (node->children.empty()) {
-            // Compute limit: how many children cover 80% of policy
-            int limit = node->get_limit(config_.policy_coverage_threshold);
+            // Compute limit: how many children cover policy threshold
+            int limit = node->get_limit(config_.policy_coverage_threshold,
+                                        config_.single_node_coverage_threshold);
 
             // Base case: N < limit, don't expand further
             // Q is already set from prior evaluation
@@ -334,7 +335,8 @@ private:
                   [](const auto& a, const auto& b) { return a.second > b.second; });
 
         // Get limit (number of children covering policy coverage threshold)
-        int limit = node->get_limit(config_.policy_coverage_threshold);
+        int limit = node->get_limit(config_.policy_coverage_threshold,
+                                    config_.single_node_coverage_threshold);
 
         for (size_t i = 0; i < sorted_priors.size(); ++i) {
             const auto& [move, prior] = sorted_priors[i];
