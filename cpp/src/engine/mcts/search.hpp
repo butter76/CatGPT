@@ -59,11 +59,13 @@ public:
         , config_(config)
         , board_(STARTPOS_FEN)
         , stop_flag_(false)
+        , total_gpu_evals_(0)
     {}
 
     void reset(std::string_view fen = STARTPOS_FEN) override {
         board_ = chess::Board(fen);
         root_.reset();
+        total_gpu_evals_ = 0;
     }
 
     void makemove(const chess::Move& move) override {
@@ -103,16 +105,17 @@ public:
 
         // Initialize root node
         root_ = std::make_unique<MCTSNode>();
+        total_gpu_evals_ = 0;
 
-        // Determine number of simulations
-        int num_simulations = config_.num_simulations;
+        // Determine target number of GPU evaluations
+        int target_evals = config_.min_total_evals;
         if (limits.nodes.has_value()) {
-            num_simulations = std::min(num_simulations, static_cast<int>(limits.nodes.value()));
+            target_evals = std::min(target_evals, static_cast<int>(limits.nodes.value()));
         }
 
-        // Run simulations
+        // Run simulations until we reach the minimum GPU evaluations
         std::int64_t total_nodes = 0;
-        for (int sim = 0; sim < num_simulations; ++sim) {
+        while (total_gpu_evals_ < target_evals) {
             if (stop_flag_.load(std::memory_order_relaxed)) {
                 break;
             }
@@ -209,9 +212,22 @@ private:
 
     /**
      * Select child with highest PUCT score.
+     *
+     * Uses Leela-style FPU where unvisited nodes get:
+     *     fpu = parent.Q - fpu_reduction * sqrt(visited_policy)
      */
     std::pair<chess::Move, MCTSNode*> select_child(MCTSNode* node) {
         float sqrt_n_parent = node->N > 0 ? std::sqrt(static_cast<float>(node->N)) : 1.0f;
+
+        // Compute Leela-style FPU for unvisited nodes
+        // visited_policy = sum of P for children with N > 0
+        float visited_policy = 0.0f;
+        for (const auto& [move, child] : node->children) {
+            if (child.N > 0) {
+                visited_policy += child.P;
+            }
+        }
+        float fpu = node->Q() - config_.fpu_reduction * std::sqrt(visited_policy);
 
         float best_score = -std::numeric_limits<float>::infinity();
         chess::Move best_move = chess::Move::NO_MOVE;
@@ -225,7 +241,8 @@ private:
             if (child.is_terminal) {
                 q = -child.terminal_value.value();
             } else if (child.N == 0) {
-                q = config_.fpu_value;
+                // Leela-style FPU for unvisited nodes
+                q = fpu;
             } else {
                 q = -child.Q();
             }
@@ -292,6 +309,8 @@ private:
      */
     std::pair<std::unordered_map<chess::Move, float, MoveHash>, float>
     evaluate_position(const chess::Board& pos) {
+        ++total_gpu_evals_;
+
         std::string fen = pos.getFen();
 
         // Tokenize
@@ -359,6 +378,7 @@ private:
     chess::Board board_;
     std::unique_ptr<MCTSNode> root_;
     std::atomic<bool> stop_flag_;
+    int total_gpu_evals_;
 };
 
 }  // namespace catgpt

@@ -23,17 +23,19 @@ struct MCTSConfig {
     float c_puct = 1.75f;
 
     /**
-     * Number of MCTS simulations to run per move.
-     * More simulations = stronger play but slower.
+     * Minimum total GPU evaluations before stopping search.
+     * Search continues until this many neural network evaluations are done.
      */
-    int num_simulations = 800;
+    int min_total_evals = 800;
 
     /**
-     * First Play Urgency - the Q value assigned to unvisited nodes.
-     * -1.0 (default) means unvisited nodes are treated as losses,
-     * encouraging exploration of all moves before deep exploitation.
+     * First Play Urgency reduction (Leela-style). For unvisited nodes,
+     * the Q value is computed as:
+     *     parent.Q - fpu_reduction * sqrt(visited_policy)
+     * where visited_policy is the fraction of policy mass of visited children.
+     * Default 0.330 matches Leela Chess Zero.
      */
-    float fpu_value = -1.0f;
+    float fpu_reduction = 0.330f;
 };
 
 }  // namespace catgpt
