@@ -28,8 +28,8 @@ model:
     value_head: true     # Win probability prediction (primary task)
     policy_head: true    # Policy prediction (primary task)
     self_weight: 0.1     # Loss weight for self head
-    value_weight: 1.0    # Loss weight for value head
-    policy_weight: 1.0    # Loss weight for policy head
+    value_weight: 0.7    # Loss weight for value head
+    policy_weight: 1.5    # Loss weight for policy head
     soft_policy_head: false  # Enable soft policy
     soft_policy_temperature: 4.0  # KataGo default
     soft_policy_weight: 8.0  # KataGo default (compensates for smaller gradients)

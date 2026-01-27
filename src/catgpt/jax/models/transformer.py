@@ -110,17 +110,17 @@ class QKVNormMultiHeadAttention(nn.Module):
         key = key.reshape(batch_size, seq_len, self.num_heads, head_dim)
         value = value.reshape(batch_size, seq_len, self.num_heads, head_dim)
 
-        # Apply per-head LayerNorm along head_dim (last axis)
-        # Normalize in float32 for stability, then cast back
-        query = nn.LayerNorm(dtype=jnp.float32, name="query_norm")(
-            query.astype(jnp.float32)
-        ).astype(self.dtype)
-        key = nn.LayerNorm(dtype=jnp.float32, name="key_norm")(
-            key.astype(jnp.float32)
-        ).astype(self.dtype)
-        value = nn.LayerNorm(dtype=jnp.float32, name="value_norm")(
-            value.astype(jnp.float32)
-        ).astype(self.dtype)
+        # # Apply per-head LayerNorm along head_dim (last axis)
+        # # Normalize in float32 for stability, then cast back
+        # query = nn.LayerNorm(dtype=jnp.float32, name="query_norm")(
+        #     query.astype(jnp.float32)
+        # ).astype(self.dtype)
+        # key = nn.LayerNorm(dtype=jnp.float32, name="key_norm")(
+        #     key.astype(jnp.float32)
+        # ).astype(self.dtype)
+        # value = nn.LayerNorm(dtype=jnp.float32, name="value_norm")(
+        #     value.astype(jnp.float32)
+        # ).astype(self.dtype)
 
         # Transpose to (batch, num_heads, seq_len, head_dim) for attention computation
         query = jnp.transpose(query, (0, 2, 1, 3))
