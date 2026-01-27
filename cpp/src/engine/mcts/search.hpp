@@ -140,8 +140,8 @@ public:
 
             // Q from root's perspective (negate child's Q since it's opponent's view)
             float q = -best->second->Q();
-            // Convert Q from [-1, 1] to centipawns (rough approximation)
-            int cp = static_cast<int>(q * 100.0f);
+            // Convert Q from [-1, 1] to centipawns using tangent scaling
+            int cp = static_cast<int>(90.0f * std::tan(q * 1.5637541897f));
             result.score = Score::cp(cp);
         } else {
             // Fallback (shouldn't happen)

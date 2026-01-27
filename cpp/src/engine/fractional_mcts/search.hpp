@@ -157,8 +157,8 @@ public:
             // Get Q for score reporting from the chosen child
             auto& chosen_child = root_->children.at(best_move);
             float q = -chosen_child.Q;
-            // Convert Q from [-1, 1] to centipawns
-            int cp = static_cast<int>(q * 100.0f);
+            // Convert Q from [-1, 1] to centipawns using tangent scaling
+            int cp = static_cast<int>(90.0f * std::tan(q * 1.5637541897f));
             result.score = Score::cp(cp);
         } else {
             // Fallback (shouldn't happen)
