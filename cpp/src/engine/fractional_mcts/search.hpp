@@ -116,6 +116,7 @@ public:
 
         // Run iterative deepening
         float N = config_.initial_budget;
+        float last_used_N = N;
         int iteration = 0;
 
         while (total_gpu_evals_ < target_evals && iteration < 50) {
@@ -132,18 +133,30 @@ public:
                 }
             }
 
+            last_used_N = N;
             recursive_search(root_.get(), board_, N);
             N *= config_.budget_multiplier;
             ++iteration;
         }
 
-        // Select best move by Q value (negated since children are opponent's perspective)
-        auto best = root_->best_child_by_q();
-        if (best.has_value()) {
-            result.best_move = best->first;
+        // Select best move by allocation (using the last N that was actually used)
+        auto final_allocations = compute_allocations(root_.get(), last_used_N);
 
-            // Q from root's perspective (negate child's Q)
-            float q = -best->second->Q;
+        chess::Move best_move = chess::Move::NO_MOVE;
+        float best_allocation = -1.0f;
+        for (const auto& [move, alloc] : final_allocations) {
+            if (alloc > best_allocation) {
+                best_allocation = alloc;
+                best_move = move;
+            }
+        }
+
+        if (best_move != chess::Move::NO_MOVE) {
+            result.best_move = best_move;
+
+            // Get Q for score reporting from the chosen child
+            auto& chosen_child = root_->children.at(best_move);
+            float q = -chosen_child.Q;
             // Convert Q from [-1, 1] to centipawns
             int cp = static_cast<int>(q * 100.0f);
             result.score = Score::cp(cp);
