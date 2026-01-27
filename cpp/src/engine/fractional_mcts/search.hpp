@@ -283,6 +283,7 @@ private:
         }
 
         // Compute budget allocations via binary search
+        // TODO: Could be replaced later with a cached value
         auto allocations = compute_allocations(node, N);
 
         // Recurse into children
@@ -319,11 +320,33 @@ private:
 
     /**
      * Expand children with prior probability >= threshold.
+     * Children in the first 'limit' positions (by descending prior) are always
+     * expanded regardless of threshold.
      */
     void expand_children(FractionalNode* node, chess::Board& scratch_board, float threshold) {
+        // Sort policy priors by descending prior
+        std::vector<std::pair<chess::Move, float>> sorted_priors;
+        sorted_priors.reserve(node->policy_priors.size());
         for (const auto& [move, prior] : node->policy_priors) {
-            // Skip if already expanded or below threshold
-            if (prior < threshold || node->children.count(move) > 0) {
+            sorted_priors.emplace_back(move, prior);
+        }
+        std::sort(sorted_priors.begin(), sorted_priors.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+
+        // Get limit (number of children covering policy coverage threshold)
+        int limit = node->get_limit(config_.policy_coverage_threshold);
+
+        for (size_t i = 0; i < sorted_priors.size(); ++i) {
+            const auto& [move, prior] = sorted_priors[i];
+
+            // Skip if already expanded
+            if (node->children.count(move) > 0) {
+                continue;
+            }
+
+            // Skip if below threshold AND not in first 'limit' nodes
+            bool in_limit = static_cast<int>(i) < limit;
+            if (prior < threshold && !in_limit) {
                 continue;
             }
 
