@@ -116,6 +116,7 @@ public:
 
         // Run iterative deepening
         float N = config_.initial_budget;
+        float last_used_N = N;
         int iteration = 0;
 
         while (total_gpu_evals_ < target_evals && iteration < 50) {
@@ -132,20 +133,32 @@ public:
                 }
             }
 
+            last_used_N = N;
             recursive_search(root_.get(), board_, N);
             N *= config_.budget_multiplier;
             ++iteration;
         }
 
-        // Select best move by Q value (negated since children are opponent's perspective)
-        auto best = root_->best_child_by_q();
-        if (best.has_value()) {
-            result.best_move = best->first;
+        // Select best move by allocation (using the last N that was actually used)
+        auto final_allocations = compute_allocations(root_.get(), last_used_N);
 
-            // Q from root's perspective (negate child's Q)
-            float q = -best->second->Q;
-            // Convert Q from [-1, 1] to centipawns
-            int cp = static_cast<int>(q * 100.0f);
+        chess::Move best_move = chess::Move::NO_MOVE;
+        float best_allocation = -1.0f;
+        for (const auto& [move, alloc] : final_allocations) {
+            if (alloc > best_allocation) {
+                best_allocation = alloc;
+                best_move = move;
+            }
+        }
+
+        if (best_move != chess::Move::NO_MOVE) {
+            result.best_move = best_move;
+
+            // Get Q for score reporting from the chosen child
+            auto& chosen_child = root_->children.at(best_move);
+            float q = -chosen_child.Q;
+            // Convert Q from [-1, 1] to centipawns using tangent scaling
+            int cp = static_cast<int>(90.0f * std::tan(q * 1.5637541897f));
             result.score = Score::cp(cp);
         } else {
             // Fallback (shouldn't happen)
@@ -263,8 +276,9 @@ private:
         }
 
         if (node->children.empty()) {
-            // Compute limit: how many children cover 80% of policy
-            int limit = node->get_limit(config_.policy_coverage_threshold);
+            // Compute limit: how many children cover policy threshold
+            int limit = node->get_limit(config_.policy_coverage_threshold,
+                                        config_.single_node_coverage_threshold);
 
             // Base case: N < limit, don't expand further
             // Q is already set from prior evaluation
@@ -283,6 +297,7 @@ private:
         }
 
         // Compute budget allocations via binary search
+        // TODO: Could be replaced later with a cached value
         auto allocations = compute_allocations(node, N);
 
         // Recurse into children
@@ -319,11 +334,34 @@ private:
 
     /**
      * Expand children with prior probability >= threshold.
+     * Children in the first 'limit' positions (by descending prior) are always
+     * expanded regardless of threshold.
      */
     void expand_children(FractionalNode* node, chess::Board& scratch_board, float threshold) {
+        // Sort policy priors by descending prior
+        std::vector<std::pair<chess::Move, float>> sorted_priors;
+        sorted_priors.reserve(node->policy_priors.size());
         for (const auto& [move, prior] : node->policy_priors) {
-            // Skip if already expanded or below threshold
-            if (prior < threshold || node->children.count(move) > 0) {
+            sorted_priors.emplace_back(move, prior);
+        }
+        std::sort(sorted_priors.begin(), sorted_priors.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+
+        // Get limit (number of children covering policy coverage threshold)
+        int limit = node->get_limit(config_.policy_coverage_threshold,
+                                    config_.single_node_coverage_threshold);
+
+        for (size_t i = 0; i < sorted_priors.size(); ++i) {
+            const auto& [move, prior] = sorted_priors[i];
+
+            // Skip if already expanded
+            if (node->children.count(move) > 0) {
+                continue;
+            }
+
+            // Skip if below threshold AND not in first 'limit' nodes
+            bool in_limit = static_cast<int>(i) < limit;
+            if (prior < threshold && !in_limit) {
                 continue;
             }
 

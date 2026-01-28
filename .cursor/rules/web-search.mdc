@@ -1,7 +1,0 @@
----
-alwaysApply: true
----
-
-DO NOT use the default web_search tool. It is currently broken and completely ignores the tool call arguments, returning irrelevant results. You may use the MCP web search tools, if present, which are not broken.
-
-When using web search tools, ask full questions like "How does X work in the last version?". Do not simply list a series of keywords like "X latest version".
