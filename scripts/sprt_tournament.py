@@ -117,7 +117,16 @@ def create_engine(
     if engine_type not in binary_map:
         raise ValueError(f"Unknown engine type: {engine_type}")
 
-    binary_path = cpp_build_dir / binary_map[engine_type]
+    # Use custom binary_path if provided, otherwise auto-derive from type
+    if engine_cfg.get("binary_path") is not None:
+        custom_path = Path(engine_cfg.binary_path)
+        # Resolve relative paths against project root
+        if custom_path.is_absolute():
+            binary_path = custom_path
+        else:
+            binary_path = project_root / custom_path
+    else:
+        binary_path = cpp_build_dir / binary_map[engine_type]
 
     if not binary_path.exists():
         raise FileNotFoundError(

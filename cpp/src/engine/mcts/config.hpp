@@ -36,6 +36,12 @@ struct MCTSConfig {
      * Default 0.330 matches Leela Chess Zero.
      */
     float fpu_reduction = 0.330f;
+
+    /**
+     * Maximum number of simulations to run regardless of GPU eval count.
+     * Prevents infinite loops when repeatedly hitting terminal nodes.
+     */
+    int max_simulations = 10000;
 };
 
 }  // namespace catgpt

@@ -33,7 +33,7 @@ engine_a:
 
   # MCTS-specific settings (only used when type=mcts)
   mcts:
-    num_simulations: 440
+    num_simulations: 400
 
   # Fractional MCTS settings (only used when type=fractional_mcts)
   fractional_mcts:
@@ -44,11 +44,12 @@ engine_a:
 
 # Engine B configuration (the "baseline" engine)
 engine_b:
+  binary_path: null  # Custom binary path (null = auto-derive from cpp_build_dir + type)
   trt_engine: "sample.trt"
   type: "mcts"
 
   mcts:
-    num_simulations: 440
+    num_simulations: 400
 
   fractional_mcts:
     min_total_evals: 400

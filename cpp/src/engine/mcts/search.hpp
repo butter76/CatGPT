@@ -115,7 +115,7 @@ public:
 
         // Run simulations until we reach the minimum GPU evaluations
         std::int64_t total_nodes = 0;
-        while (total_gpu_evals_ < target_evals) {
+        while (total_gpu_evals_ < target_evals && total_nodes < config_.max_simulations) {
             if (stop_flag_.load(std::memory_order_relaxed)) {
                 break;
             }
