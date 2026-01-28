@@ -115,6 +115,7 @@ lczero-training/
 stockfish/
 puzzles/
 openings/
+engines/
 *.onnx
 *.data
 *.trt

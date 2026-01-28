@@ -208,6 +208,9 @@ private:
 
         // BACKPROPAGATE
         backpropagate(path, value);
+
+        // Update Q values using allocation-weighted averaging
+        update_q_recursive(root_.get());
     }
 
     /**
@@ -267,6 +270,10 @@ private:
         // Get policy and value from neural network
         auto [policy_priors, value] = evaluate_position(scratch_board);
 
+        // Store origQ for this node (the NN evaluation)
+        node->origQ = value;
+        node->cachedQ = value;  // Initialize cachedQ as well
+
         // Create children for all legal moves
         chess::Movelist moves;
         chess::movegen::legalmoves(moves, scratch_board);
@@ -290,9 +297,13 @@ private:
                     // The side to move at this position is checkmated (they lost)
                     child.is_terminal = true;
                     child.terminal_value = -1.0f;
+                    child.origQ = -1.0f;
+                    child.cachedQ = -1.0f;
                 } else if (game_result == chess::GameResult::DRAW) {
                     child.is_terminal = true;
                     child.terminal_value = 0.0f;
+                    child.origQ = 0.0f;
+                    child.cachedQ = 0.0f;
                 }
             }
 
@@ -371,6 +382,142 @@ private:
             // Flip perspective for parent (opponent's view)
             value = -value;
         }
+    }
+
+    /**
+     * Compute budget allocations for children via binary search.
+     *
+     * Finds K such that for all children i:
+     *   N_i = c_puct * P_i * sqrt(N) / (K - Q_i)
+     * and sum(N_i) = N.
+     */
+    std::unordered_map<chess::Move, float, MoveHash>
+    compute_allocations(MCTSNode* node, float N) {
+        std::unordered_map<chess::Move, float, MoveHash> allocations;
+
+        if (node->children.empty() || N <= 0.0f) {
+            return allocations;
+        }
+
+        float c_puct = config_.c_puct;
+        float sqrt_N = std::sqrt(N);
+
+        // Collect children with valid Q values:
+        // - Visited children (N > 0) have cachedQ from recursive search
+        // - Terminal children have cachedQ set from their known terminal value
+        // - Unvisited non-terminal children have garbage cachedQ (0.0f default)
+        std::vector<std::pair<chess::Move, MCTSNode*>> children_vec;
+        children_vec.reserve(node->children.size());
+        for (auto& [move, child] : node->children) {
+            if (child.N > 0 || child.is_terminal) {
+                children_vec.emplace_back(move, &child);
+            }
+        }
+
+        // If no children have valid Q values, return empty allocations
+        if (children_vec.empty()) {
+            return allocations;
+        }
+
+        // Lambda to compute allocation for a child given K
+        auto compute_allocation = [c_puct, sqrt_N](MCTSNode* child, float K) -> float {
+            // N_i = c_puct * P_i * sqrt(N) / (K - Q_i)
+            // Q_i is from parent's perspective, so we use -child.cachedQ
+            float denominator = K - (-child->cachedQ);
+            if (denominator <= 0.0f) {
+                return std::numeric_limits<float>::infinity();
+            }
+            return c_puct * child->P * sqrt_N / denominator;
+        };
+
+        // Lambda to compute sum of allocations for a given K
+        auto sum_allocations = [&children_vec, &compute_allocation](float K) -> float {
+            float total = 0.0f;
+            for (const auto& [move, child] : children_vec) {
+                float alloc = compute_allocation(child, K);
+                if (std::isinf(alloc)) {
+                    return std::numeric_limits<float>::infinity();
+                }
+                total += alloc;
+            }
+            return total;
+        };
+
+        // Find K bounds
+        // K must be > max(-child.cachedQ) = max(Q from parent's perspective)
+        float max_q = -std::numeric_limits<float>::infinity();
+        for (const auto& [move, child] : children_vec) {
+            max_q = std::max(max_q, -child->cachedQ);
+        }
+        float K_low = max_q + 1e-9f;
+        float K_high = K_low + 10.0f;
+
+        // Expand K_high until sum < N
+        for (int i = 0; i < 100; ++i) {
+            float s = sum_allocations(K_high);
+            if (s <= N) {
+                break;
+            }
+            K_high *= 2.0f;
+        }
+
+        // Binary search for K
+        for (int i = 0; i < 64; ++i) {
+            float K_mid = (K_low + K_high) / 2.0f;
+            float s = sum_allocations(K_mid);
+            if (s > N) {
+                K_low = K_mid;
+            } else {
+                K_high = K_mid;
+            }
+        }
+
+        float K = (K_low + K_high) / 2.0f;
+
+        // Compute final allocations
+        for (const auto& [move, child] : children_vec) {
+            allocations[move] = compute_allocation(child, K);
+        }
+
+        return allocations;
+    }
+
+    /**
+     * Recursively update Q values using allocation-weighted averaging.
+     *
+     * Q = (origQ + Σ(allocation × (-child.Q))) / N
+     *
+     * where allocations are computed with budget = N - 1.
+     */
+    void update_q_recursive(MCTSNode* node) {
+        // Base case: terminal node
+        if (node->is_terminal) {
+            node->cachedQ = node->origQ;
+            return;
+        }
+
+        // Base case: unexpanded or single visit (only have own NN eval)
+        if (node->children.empty() || node->N <= 1) {
+            node->cachedQ = node->origQ;
+            return;
+        }
+
+        // First, recursively update all children
+        for (auto& [move, child] : node->children) {
+            update_q_recursive(&child);
+        }
+
+        // Compute allocations with budget = N - 1
+        auto allocations = compute_allocations(node, static_cast<float>(node->N - 1));
+
+        // Q = (origQ + Σ(allocation × (-child.Q))) / N
+        float children_contribution = 0.0f;
+        for (const auto& [move, alloc] : allocations) {
+            auto& child = node->children.at(move);
+            children_contribution += alloc * (-child.cachedQ);
+        }
+
+        node->cachedQ = (node->origQ + children_contribution) / static_cast<float>(node->N);
     }
 
     std::shared_ptr<TrtEvaluator> evaluator_;

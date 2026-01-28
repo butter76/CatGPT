@@ -42,10 +42,10 @@ public:
 
     /**
      * Mean value (expected outcome from this position).
-     * Returns 0.0 for unvisited nodes.
+     * Returns cachedQ which is computed via allocation-weighted averaging.
      */
     [[nodiscard]] float Q() const noexcept {
-        return N > 0 ? W / static_cast<float>(N) : 0.0f;
+        return cachedQ;
     }
 
     /**
@@ -129,9 +129,11 @@ public:
     }
 
     // Statistics
-    int N = 0;       // Visit count
-    float W = 0.0f;  // Total value sum
-    float P = 0.0f;  // Prior probability
+    int N = 0;         // Visit count
+    float W = 0.0f;    // Total value sum (legacy, used for backprop tracking)
+    float P = 0.0f;    // Prior probability
+    float origQ = 0.0f;    // Original NN evaluation (or terminal value)
+    float cachedQ = 0.0f;  // Cached Q value (computed via allocations)
 
     // Terminal state info
     bool is_terminal = false;
