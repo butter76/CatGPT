@@ -3,11 +3,15 @@
  *
  * Monte Carlo Tree Search using PUCT selection (AlphaZero/Leela Chess Zero style).
  *
- * The search proceeds in four phases:
+ * The search proceeds in five phases:
  *   1. SELECT: Traverse tree using PUCT until reaching a leaf
  *   2. EXPAND: Create children for the leaf with priors from policy network
- *   3. EVALUATE: Get value estimate from value network
- *   4. BACKPROPAGATE: Update N, W along path from leaf to root
+ *   3. EVALUATE: Get value estimate (origQ) from value network
+ *   4. BACKPROPAGATE: Update N (visit count) along path from leaf to root
+ *   5. CALC Q: Recursively recompute Q values for the tree
+ *
+ * Q values are computed as:
+ *   Q(node) = (origQ * 1 + sum(-child.Q * child.N)) / N
  *
  * After search, the move with highest visit count is selected.
  */
@@ -197,17 +201,17 @@ private:
         }
 
         // EXPAND & EVALUATE
-        float value;
-        if (node->is_terminal) {
-            // Terminal node - use stored value
-            value = node->terminal_value.value();
-        } else {
-            // Expand the leaf and get value
-            value = expand_and_evaluate(node, scratch_board);
+        if (!node->is_terminal) {
+            // Expand the leaf (this sets node->origQ)
+            expand_and_evaluate(node, scratch_board);
         }
+        // Terminal nodes already have origQ set when created
 
-        // BACKPROPAGATE
-        backpropagate(path, value);
+        // BACKPROPAGATE: update visit counts
+        backpropagate(path);
+
+        // CALC Q: recursively recompute Q values for entire tree
+        calcQ(root_.get());
     }
 
     /**
@@ -290,9 +294,11 @@ private:
                     // The side to move at this position is checkmated (they lost)
                     child.is_terminal = true;
                     child.terminal_value = -1.0f;
+                    child.origQ = -1.0f;
                 } else if (game_result == chess::GameResult::DRAW) {
                     child.is_terminal = true;
                     child.terminal_value = 0.0f;
+                    child.origQ = 0.0f;
                 }
             }
 
@@ -304,6 +310,9 @@ private:
         // Sort children by decreasing policy (highest P first)
         std::sort(node->children.begin(), node->children.end(),
                   [](const auto& a, const auto& b) { return a.second.P > b.second.P; });
+
+        // Store original NN evaluation for recursive Q calculation
+        node->origQ = value;
 
         return value;
     }
@@ -364,17 +373,46 @@ private:
     }
 
     /**
-     * Update statistics along the path from leaf to root.
+     * Update visit counts along the path from leaf to root.
      */
-    void backpropagate(std::vector<MCTSNode*>& path, float value) {
-        // Walk back from leaf to root
-        for (auto it = path.rbegin(); it != path.rend(); ++it) {
-            MCTSNode* node = *it;
+    void backpropagate(std::vector<MCTSNode*>& path) {
+        for (MCTSNode* node : path) {
             node->N += 1;
-            node->W += value;
-            // Flip perspective for parent (opponent's view)
-            value = -value;
         }
+    }
+
+    /**
+     * Recursively compute Q values for the entire tree.
+     *
+     * Q(node) = (origQ * 1 + sum(-child.Q * child.N)) / N
+     *
+     * This is called after each simulation to update cached_Q values.
+     */
+    void calcQ(MCTSNode* node) {
+        // Terminal nodes: Q is just the terminal value
+        if (node->is_terminal) {
+            node->cached_Q = node->terminal_value.value();
+            return;
+        }
+
+        // Unexpanded leaf: Q is just origQ (shouldn't happen after backprop)
+        if (!node->is_expanded()) {
+            node->cached_Q = node->origQ;
+            return;
+        }
+
+        // Recursively compute Q for all children first
+        for (auto& [move, child] : node->children) {
+            calcQ(&child);
+        }
+
+        // Compute weighted average:
+        // Q = (origQ * 1 + sum(-child.Q * child.N)) / N
+        float sum = node->origQ;  // Weight 1 for own evaluation
+        for (const auto& [move, child] : node->children) {
+            sum += -child.cached_Q * static_cast<float>(child.N);
+        }
+        node->cached_Q = sum / static_cast<float>(node->N);
     }
 
     std::shared_ptr<TrtEvaluator> evaluator_;
