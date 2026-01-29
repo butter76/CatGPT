@@ -1,0 +1,113 @@
+# SPRT Tournament configuration for CatGPT
+# Run engine-vs-engine matches with Sequential Probability Ratio Test
+#
+# Usage:
+#   # Run with defaults (prompts for run name)
+#   uv run python scripts/sprt_tournament.py
+#
+#   # Compare MCTS 400 vs MCTS 800 simulations
+#   uv run python scripts/sprt_tournament.py \
+#     engine_a.mcts.num_simulations=400 \
+#     engine_b.mcts.num_simulations=800
+#
+#   # Compare different engine types
+#   uv run python scripts/sprt_tournament.py \
+#     engine_a.type=fractional_mcts \
+#     engine_b.type=mcts
+#
+#   # Use tighter SPRT bounds (more games, more precision)
+#   uv run python scripts/sprt_tournament.py sprt.elo1=5
+#
+#   # Use different TensorRT models
+#   uv run python scripts/sprt_tournament.py \
+#     engine_a.trt_engine=catgpt_v1.trt \
+#     engine_b.trt_engine=catgpt_v2.trt
+
+# C++ binary paths (relative to project root)
+cpp_build_dir: "cpp/build/bin"
+
+# Engine A configuration (the "new" or "test" engine)
+engine_a:
+  trt_engine: "sample.trt"
+  type: "fractional_mcts"  # Options: "value", "policy", "mcts", "fractional_mcts"
+
+  # MCTS-specific settings (only used when type=mcts)
+  mcts:
+    num_simulations: 400
+
+  # Fractional MCTS settings (only used when type=fractional_mcts)
+  fractional_mcts:
+    min_total_evals: 400
+
+  # UCI timeout in seconds
+  timeout: 120.0
+
+# Engine B configuration (the "baseline" engine)
+engine_b:
+  binary_path: null  # Custom binary path (null = auto-derive from cpp_build_dir + type)
+  trt_engine: "sample.trt"
+  type: "mcts"
+
+  mcts:
+    num_simulations: 400
+
+  fractional_mcts:
+    min_total_evals: 400
+
+  timeout: 120.0
+
+# SPRT parameters
+# H0: Engine A is elo0 Elo stronger than Engine B
+# H1: Engine A is elo1 Elo stronger than Engine B
+# Test continues until we can accept H0 or H1 with confidence (1-alpha)(1-beta)
+sprt:
+  elo0: 0          # Null hypothesis: engines are equal strength
+  elo1: 10         # Alt hypothesis: Engine A is 10 Elo stronger
+  alpha: 0.05      # Type I error rate (false positive) - accept H1 when H0 is true
+  beta: 0.05       # Type II error rate (false negative) - accept H0 when H1 is true
+  max_games: 10000 # Safety limit to prevent infinite runs
+
+# Opening book configuration
+openings:
+  path: "openings/UHO_2024/UHO_2024_+100_+109/UHO_2024_6mvs_+100_+109.epd"  # EPD file with starting positions
+  shuffle: true                   # Randomize opening order
+  seed: null                      # Random seed (null for random)
+
+# Game adjudication settings
+game:
+  # Draw adjudication: declare draw if position is "dead"
+  adjudicate_draw_moves: 200       # Max moves before forced draw
+  adjudicate_draw_score: 20        # Score threshold in centipawns
+  adjudicate_draw_count: 10        # Consecutive moves with |score| < threshold
+
+  # Resignation: engine loses if score is hopeless
+  adjudicate_resign_score: 1000    # Score threshold in centipawns (10 pawns)
+  adjudicate_resign_count: 5       # Consecutive moves with score < -threshold
+
+  # Syzygy tablebase adjudication
+  # Uses python-chess syzygy module to adjudicate endgames
+  # WDL: 2=win, 1=cursed win, 0=draw, -1=blessed loss, -2=loss
+  syzygy:
+    enabled: true                   # Enable Syzygy adjudication
+    path: "/ephemeral/syzygy/syzygy_tables/3-4-5"                   # Path to tablebase files (3-4-5 and 6-piece)
+    adjudicate_draw: true            # Adjudicate WDL=0 positions as draw
+    adjudicate_win: true             # Adjudicate WDL=±2 positions as win/loss
+    # Note: Cursed wins (WDL=1) and blessed losses (WDL=-1) are NOT adjudicated
+    # as they can be drawn via the 50-move rule
+
+# Weights & Biases logging
+wandb:
+  enabled: true
+  project: "catgpt-sprt"
+  entity: null  # Your W&B username or team
+  tags:
+    - "sprt"
+    - "tournament"
+
+# Output settings
+output:
+  save_pgn: true                   # Save games to PGN file
+  pgn_path: null                   # null = auto-generate based on run name
+
+# Logging
+verbose: false

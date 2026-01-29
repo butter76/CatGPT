@@ -3,11 +3,15 @@
  *
  * Monte Carlo Tree Search using PUCT selection (AlphaZero/Leela Chess Zero style).
  *
- * The search proceeds in four phases:
+ * The search proceeds in five phases:
  *   1. SELECT: Traverse tree using PUCT until reaching a leaf
  *   2. EXPAND: Create children for the leaf with priors from policy network
- *   3. EVALUATE: Get value estimate from value network
- *   4. BACKPROPAGATE: Update N, W along path from leaf to root
+ *   3. EVALUATE: Get value estimate (origQ) from value network
+ *   4. BACKPROPAGATE: Update N (visit count) along path from leaf to root
+ *   5. CALC Q: Recursively recompute Q values for the tree
+ *
+ * Q values are computed as:
+ *   Q(node) = (origQ * 1 + sum(-child.Q * child.N)) / N
  *
  * After search, the move with highest visit count is selected.
  */
@@ -43,7 +47,7 @@ namespace catgpt {
  *   - Q(s,a): Mean value of taking action a from state s
  *   - P(s,a): Prior probability from policy network
  *   - N(s,a): Visit count for this action
- *   - N_parent: Total visits to parent node
+ *   - N_parent: Total visits to parent node, not including itself
  *   - c_puct: Exploration constant
  */
 class MCTSSearch : public SearchAlgo {
@@ -59,11 +63,13 @@ public:
         , config_(config)
         , board_(STARTPOS_FEN)
         , stop_flag_(false)
+        , total_gpu_evals_(0)
     {}
 
     void reset(std::string_view fen = STARTPOS_FEN) override {
         board_ = chess::Board(fen);
         root_.reset();
+        total_gpu_evals_ = 0;
     }
 
     void makemove(const chess::Move& move) override {
@@ -103,16 +109,17 @@ public:
 
         // Initialize root node
         root_ = std::make_unique<MCTSNode>();
+        total_gpu_evals_ = 0;
 
-        // Determine number of simulations
-        int num_simulations = config_.num_simulations;
+        // Determine target number of GPU evaluations
+        int target_evals = config_.min_total_evals;
         if (limits.nodes.has_value()) {
-            num_simulations = std::min(num_simulations, static_cast<int>(limits.nodes.value()));
+            target_evals = std::min(target_evals, static_cast<int>(limits.nodes.value()));
         }
 
-        // Run simulations
+        // Run simulations until we reach the minimum GPU evaluations
         std::int64_t total_nodes = 0;
-        for (int sim = 0; sim < num_simulations; ++sim) {
+        while (total_gpu_evals_ < target_evals && total_nodes < config_.max_simulations) {
             if (stop_flag_.load(std::memory_order_relaxed)) {
                 break;
             }
@@ -137,8 +144,8 @@ public:
 
             // Q from root's perspective (negate child's Q since it's opponent's view)
             float q = -best->second->Q();
-            // Convert Q from [-1, 1] to centipawns (rough approximation)
-            int cp = static_cast<int>(q * 100.0f);
+            // Convert Q from [-1, 1] to centipawns using tangent scaling
+            int cp = static_cast<int>(90.0f * std::tan(q * 1.5637541897f));
             result.score = Score::cp(cp);
         } else {
             // Fallback (shouldn't happen)
@@ -194,28 +201,35 @@ private:
         }
 
         // EXPAND & EVALUATE
-        float value;
-        if (node->is_terminal) {
-            // Terminal node - use stored value
-            value = node->terminal_value.value();
-        } else {
-            // Expand the leaf and get value
-            value = expand_and_evaluate(node, scratch_board);
+        if (!node->is_terminal) {
+            // Expand the leaf (this sets node->origQ)
+            expand_and_evaluate(node, scratch_board);
         }
+        // Terminal nodes already have origQ set when created
 
-        // BACKPROPAGATE
-        backpropagate(path, value);
+        // BACKPROPAGATE: update visit counts
+        backpropagate(path);
+
+        // CALC Q: recursively recompute Q values for entire tree
+        calcQ(root_.get());
     }
 
     /**
      * Select child with highest PUCT score.
+     *
+     * Uses Leela-style FPU where unvisited nodes get:
+     *     fpu = parent.Q - fpu_reduction * sqrt(visited_policy)
      */
     std::pair<chess::Move, MCTSNode*> select_child(MCTSNode* node) {
-        float sqrt_n_parent = node->N > 0 ? std::sqrt(static_cast<float>(node->N)) : 1.0f;
+        // Use N-1 since current visit is in progress; safe to be 0 due to FPU
+        float sqrt_n_parent = node->N > 1 ? std::sqrt(static_cast<float>(node->N - 1)) : 0.0f;
 
         float best_score = -std::numeric_limits<float>::infinity();
         chess::Move best_move = chess::Move::NO_MOVE;
         MCTSNode* best_child = nullptr;
+
+        // Cumulative policy of children before current child (in decreasing P order)
+        float cumulative_policy = 0.0f;
 
         for (auto& [move, child] : node->children) {
             // Determine Q value from parent's perspective
@@ -225,7 +239,9 @@ private:
             if (child.is_terminal) {
                 q = -child.terminal_value.value();
             } else if (child.N == 0) {
-                q = config_.fpu_value;
+                // Per-child FPU: based on policy of higher-ranked siblings
+                float fpu = node->Q() - config_.fpu_reduction * std::sqrt(cumulative_policy);
+                q = fpu;
             } else {
                 q = -child.Q();
             }
@@ -238,6 +254,9 @@ private:
                 best_move = move;
                 best_child = &child;
             }
+
+            // Add this child's policy to cumulative sum for next iteration
+            cumulative_policy += child.P;
         }
 
         return {best_move, best_child};
@@ -253,6 +272,8 @@ private:
         // Create children for all legal moves
         chess::Movelist moves;
         chess::movegen::legalmoves(moves, scratch_board);
+
+        node->children.reserve(moves.size());
 
         for (const auto& move : moves) {
             float prior = 0.0f;
@@ -273,16 +294,25 @@ private:
                     // The side to move at this position is checkmated (they lost)
                     child.is_terminal = true;
                     child.terminal_value = -1.0f;
+                    child.origQ = -1.0f;
                 } else if (game_result == chess::GameResult::DRAW) {
                     child.is_terminal = true;
                     child.terminal_value = 0.0f;
+                    child.origQ = 0.0f;
                 }
             }
 
             scratch_board.unmakeMove(move);
 
-            node->children[move] = std::move(child);
+            node->children.emplace_back(move, std::move(child));
         }
+
+        // Sort children by decreasing policy (highest P first)
+        std::sort(node->children.begin(), node->children.end(),
+                  [](const auto& a, const auto& b) { return a.second.P > b.second.P; });
+
+        // Store original NN evaluation for recursive Q calculation
+        node->origQ = value;
 
         return value;
     }
@@ -292,6 +322,8 @@ private:
      */
     std::pair<std::unordered_map<chess::Move, float, MoveHash>, float>
     evaluate_position(const chess::Board& pos) {
+        ++total_gpu_evals_;
+
         std::string fen = pos.getFen();
 
         // Tokenize
@@ -341,17 +373,46 @@ private:
     }
 
     /**
-     * Update statistics along the path from leaf to root.
+     * Update visit counts along the path from leaf to root.
      */
-    void backpropagate(std::vector<MCTSNode*>& path, float value) {
-        // Walk back from leaf to root
-        for (auto it = path.rbegin(); it != path.rend(); ++it) {
-            MCTSNode* node = *it;
+    void backpropagate(std::vector<MCTSNode*>& path) {
+        for (MCTSNode* node : path) {
             node->N += 1;
-            node->W += value;
-            // Flip perspective for parent (opponent's view)
-            value = -value;
         }
+    }
+
+    /**
+     * Recursively compute Q values for the entire tree.
+     *
+     * Q(node) = (origQ * 1 + sum(-child.Q * child.N)) / N
+     *
+     * This is called after each simulation to update cached_Q values.
+     */
+    void calcQ(MCTSNode* node) {
+        // Terminal nodes: Q is just the terminal value
+        if (node->is_terminal) {
+            node->cached_Q = node->terminal_value.value();
+            return;
+        }
+
+        // Unexpanded leaf: Q is just origQ (shouldn't happen after backprop)
+        if (!node->is_expanded()) {
+            node->cached_Q = node->origQ;
+            return;
+        }
+
+        // Recursively compute Q for all children first
+        for (auto& [move, child] : node->children) {
+            calcQ(&child);
+        }
+
+        // Compute weighted average:
+        // Q = (origQ * 1 + sum(-child.Q * child.N)) / N
+        float sum = node->origQ;  // Weight 1 for own evaluation
+        for (const auto& [move, child] : node->children) {
+            sum += -child.cached_Q * static_cast<float>(child.N);
+        }
+        node->cached_Q = sum / static_cast<float>(node->N);
     }
 
     std::shared_ptr<TrtEvaluator> evaluator_;
@@ -359,6 +420,7 @@ private:
     chess::Board board_;
     std::unique_ptr<MCTSNode> root_;
     std::atomic<bool> stop_flag_;
+    int total_gpu_evals_;
 };
 
 }  // namespace catgpt
