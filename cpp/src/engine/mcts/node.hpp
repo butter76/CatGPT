@@ -137,8 +137,8 @@ public:
     bool is_terminal = false;
     std::optional<float> terminal_value;  // -1=loss, 0=draw, 1=win (from this node's side-to-move)
 
-    // Children indexed by move
-    std::unordered_map<chess::Move, MCTSNode, MoveHash> children;
+    // Children ordered by decreasing policy (highest P first)
+    std::vector<std::pair<chess::Move, MCTSNode>> children;
 };
 
 }  // namespace catgpt

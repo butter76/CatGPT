@@ -43,7 +43,7 @@ namespace catgpt {
  *   - Q(s,a): Mean value of taking action a from state s
  *   - P(s,a): Prior probability from policy network
  *   - N(s,a): Visit count for this action
- *   - N_parent: Total visits to parent node
+ *   - N_parent: Total visits to parent node, not including itself
  *   - c_puct: Exploration constant
  */
 class MCTSSearch : public SearchAlgo {
@@ -217,21 +217,15 @@ private:
      *     fpu = parent.Q - fpu_reduction * sqrt(visited_policy)
      */
     std::pair<chess::Move, MCTSNode*> select_child(MCTSNode* node) {
-        float sqrt_n_parent = node->N > 0 ? std::sqrt(static_cast<float>(node->N)) : 1.0f;
-
-        // Compute Leela-style FPU for unvisited nodes
-        // visited_policy = sum of P for children with N > 0
-        float visited_policy = 0.0f;
-        for (const auto& [move, child] : node->children) {
-            if (child.N > 0) {
-                visited_policy += child.P;
-            }
-        }
-        float fpu = node->Q() - config_.fpu_reduction * std::sqrt(visited_policy);
+        // Use N-1 since current visit is in progress; safe to be 0 due to FPU
+        float sqrt_n_parent = node->N > 1 ? std::sqrt(static_cast<float>(node->N - 1)) : 0.0f;
 
         float best_score = -std::numeric_limits<float>::infinity();
         chess::Move best_move = chess::Move::NO_MOVE;
         MCTSNode* best_child = nullptr;
+
+        // Cumulative policy of children before current child (in decreasing P order)
+        float cumulative_policy = 0.0f;
 
         for (auto& [move, child] : node->children) {
             // Determine Q value from parent's perspective
@@ -241,7 +235,8 @@ private:
             if (child.is_terminal) {
                 q = -child.terminal_value.value();
             } else if (child.N == 0) {
-                // Leela-style FPU for unvisited nodes
+                // Per-child FPU: based on policy of higher-ranked siblings
+                float fpu = node->Q() - config_.fpu_reduction * std::sqrt(cumulative_policy);
                 q = fpu;
             } else {
                 q = -child.Q();
@@ -255,6 +250,9 @@ private:
                 best_move = move;
                 best_child = &child;
             }
+
+            // Add this child's policy to cumulative sum for next iteration
+            cumulative_policy += child.P;
         }
 
         return {best_move, best_child};
@@ -270,6 +268,8 @@ private:
         // Create children for all legal moves
         chess::Movelist moves;
         chess::movegen::legalmoves(moves, scratch_board);
+
+        node->children.reserve(moves.size());
 
         for (const auto& move : moves) {
             float prior = 0.0f;
@@ -298,8 +298,12 @@ private:
 
             scratch_board.unmakeMove(move);
 
-            node->children[move] = std::move(child);
+            node->children.emplace_back(move, std::move(child));
         }
+
+        // Sort children by decreasing policy (highest P first)
+        std::sort(node->children.begin(), node->children.end(),
+                  [](const auto& a, const auto& b) { return a.second.P > b.second.P; });
 
         return value;
     }
