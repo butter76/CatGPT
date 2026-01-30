@@ -487,13 +487,36 @@ class BidirectionalTransformer(nn.Module):
 
         # Policy head: per-token projection to (64, 73) move distribution
         if head_config.policy_head:
-            # Project each of the 64 token representations to 73 dimensions
-            # hidden: (batch, 64, hidden_size) -> (batch, 64, 73)
-            policy_logits = nn.Dense(
-                _POLICY_TO_DIM,
-                dtype=jnp.float32,
-                name="policy_head",
-            )(hidden)  # (batch, 64, 73)
+            if head_config.policy_attention_head:
+                # LC0-style attention policy head
+                # Uses Q·K^T for 64x64 main move logits, separate projection for underpromotions
+                # See: https://lczero.org/blog/2024/02/transformer-progress/
+                qk_dim = head_config.policy_qk_dim
+
+                # Project to Q and K representations
+                query = nn.Dense(qk_dim, dtype=jnp.float32, name="policy_query")(hidden)
+                key = nn.Dense(qk_dim, dtype=jnp.float32, name="policy_key")(hidden)
+                # query, key: (batch, 64, qk_dim)
+
+                # Compute Q·K^T to get 64x64 move logits (no softmax, no V, no output projection)
+                # (batch, 64, qk_dim) @ (batch, qk_dim, 64) -> (batch, 64, 64)
+                main_logits = jnp.matmul(query, jnp.transpose(key, (0, 2, 1)))
+
+                # Underpromotion logits: separate projection scaled up to match Q·K^T magnitude
+                # Q·K^T has magnitude ~sqrt(qk_dim), so we scale underpromo logits to match
+                underpromo_logits = nn.Dense(9, dtype=jnp.float32, name="policy_underpromo")(hidden)
+                underpromo_logits = underpromo_logits * jnp.sqrt(qk_dim).astype(jnp.float32)
+
+                # Concatenate: (batch, 64, 64) + (batch, 64, 9) -> (batch, 64, 73)
+                policy_logits = jnp.concatenate([main_logits, underpromo_logits], axis=-1)
+            else:
+                # Simple policy head: direct projection to 73 dimensions per square
+                # hidden: (batch, 64, hidden_size) -> (batch, 64, 73)
+                policy_logits = nn.Dense(
+                    _POLICY_TO_DIM,
+                    dtype=jnp.float32,
+                    name="policy_head",
+                )(hidden)  # (batch, 64, 73)
 
             # Flatten for cross-entropy loss: (batch, 64*73) = (batch, 4672)
             policy_logits_flat = policy_logits.reshape(batch_size, -1)

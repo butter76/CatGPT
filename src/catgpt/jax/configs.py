@@ -65,6 +65,13 @@ class JaxOutputHeadConfig:
     next_pawn_move_head: bool = False
     next_pawn_move_weight: float = 0.1  # Small weight for noisy auxiliary target
 
+    # Attention-based policy head (LC0-style)
+    # Instead of a simple Dense(73) projection, uses Q·K^T attention for 64x64 main
+    # move logits, with a separate projection scaled up for underpromotions.
+    # See: https://lczero.org/blog/2024/02/transformer-progress/
+    policy_attention_head: bool = True  # Use Q·K^T attention for 64x64 logits
+    policy_qk_dim: int = 32  # Dimension for Q/K projections
+
     # HL-Gauss configuration for value head
     # Converts scalar win probability (0-1) to categorical distribution
     value_num_bins: int = 81  # Number of bins for value distribution

@@ -30,6 +30,9 @@ model:
     self_weight: 0.1     # Loss weight for self head
     value_weight: 0.7    # Loss weight for value head
     policy_weight: 1.5    # Loss weight for policy head
+    # LC0-style attention policy head: uses Q·K^T for 64x64 move logits
+    policy_attention_head: true  # Use attention-based policy (vs simple Dense)
+    policy_qk_dim: 32     # Q/K projection dimension
     soft_policy_head: false  # Enable soft policy
     soft_policy_temperature: 4.0  # KataGo default
     soft_policy_weight: 8.0  # KataGo default (compensates for smaller gradients)
