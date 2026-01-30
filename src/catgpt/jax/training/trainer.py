@@ -30,11 +30,52 @@ if TYPE_CHECKING:
     from catgpt.jax.configs import (
         JaxCheckpointConfig,
         JaxExperimentConfig,
+        JaxMetricsConfig,
         JaxModelConfig,
         JaxTokenizerConfig,
         JaxTrainingConfig,
         JaxWandbConfig,
     )
+
+
+def compute_layer_grad_norms(grads: dict) -> dict[str, jax.Array]:
+    """Compute L2 norms of gradients per layer/component.
+
+    Traverses the gradient pytree and computes global norms for:
+    - Overall gradients (grad_norm/global)
+    - Each transformer block (grad_norm/block_N)
+    - Embedding layers (grad_norm/Embed_N)
+    - Output heads (grad_norm/X_head)
+
+    Args:
+        grads: Gradient pytree from jax.grad.
+
+    Returns:
+        Dictionary mapping metric names to gradient norms.
+    """
+    norms = {}
+
+    # Global gradient norm (useful for monitoring clipping)
+    norms["grad_norm/global"] = optax.global_norm(grads)
+
+    # Navigate to params dict (may or may not have 'params' wrapper)
+    params = grads.get("params", grads)
+
+    for key, subtree in params.items():
+        if key.startswith("block_"):
+            # Per transformer block: block_0, block_1, ...
+            norms[f"grad_norm/{key}"] = optax.global_norm(subtree)
+        elif key.startswith("Embed"):
+            # Embeddings: Embed_0 (token), Embed_1 (position)
+            norms[f"grad_norm/{key}"] = optax.global_norm(subtree)
+        elif key.endswith("_head"):
+            # Output heads: value_head, self_head, policy_head, etc.
+            norms[f"grad_norm/{key}"] = optax.global_norm(subtree)
+        elif key == "smolgen_weight_gen":
+            # Shared smolgen weight generation kernel
+            norms["grad_norm/smolgen_weight_gen"] = optax.global_norm(subtree)
+
+    return norms
 
 
 class TrainState(train_state.TrainState):
@@ -99,6 +140,13 @@ class Trainer:
         self.tokenizer_config = tokenizer_config
         self.full_config = full_config
         self.lr_schedule = lr_schedule
+
+        # Extract metrics config (with defaults if not provided)
+        if full_config is not None and hasattr(full_config, "metrics"):
+            self.metrics_config = full_config.metrics
+        else:
+            from catgpt.jax.configs import JaxMetricsConfig
+            self.metrics_config = JaxMetricsConfig()
 
         # Check if using SPlus optimizer (requires different eval params)
         self.use_splus = (
@@ -207,7 +255,7 @@ class Trainer:
         self,
         state: TrainState,
         batch: dict[str, jax.Array],
-    ) -> tuple[TrainState, dict[str, jax.Array]]:
+    ) -> tuple[TrainState, dict[str, jax.Array], dict[str, jax.Array]]:
         """Perform a single training step (implementation).
 
         Args:
@@ -215,7 +263,7 @@ class Trainer:
             batch: Batch with 'input' (tokens) and 'target' (HL-Gauss distribution).
 
         Returns:
-            Tuple of (new state, metrics dict).
+            Tuple of (new state, metrics dict, per-head losses dict).
         """
         compute_dtype = self.compute_dtype
         head_config = self.model_config.output_heads if self.model_config else None
@@ -401,7 +449,119 @@ class Trainer:
             # Also track fraction of valid samples
             metrics["next_pawn_move_valid_frac"] = jnp.mean(mask.astype(jnp.float32))
 
-        return state, metrics
+        # Layer gradient norms (computed unconditionally, filtering done at logging time)
+        layer_grad_norms = compute_layer_grad_norms(grads)
+        metrics.update(layer_grad_norms)
+
+        return state, metrics, losses
+
+    def _compute_head_grad_norms(
+        self,
+        batch: dict[str, jax.Array],
+        head_losses: dict[str, jax.Array],
+    ) -> dict[str, jax.Array]:
+        """Compute gradient norms contributed by each head's loss.
+
+        This requires a separate backward pass for each head, which is expensive.
+        Should only be called at reduced frequency (e.g., every 100 steps).
+
+        Args:
+            batch: The input batch (needed for forward pass).
+            head_losses: Dictionary of per-head loss values from training step.
+
+        Returns:
+            Dictionary mapping head names to their gradient norms.
+        """
+        compute_dtype = self.compute_dtype
+        head_config = self.model_config.output_heads if self.model_config else None
+        head_grad_norms = {}
+
+        for head_name in head_losses.keys():
+            # Create a loss function that computes only this head's loss
+            def single_head_loss_fn(params, _head_name=head_name):
+                outputs = self.state.apply_fn(
+                    params,
+                    batch["input"],
+                    train=True,
+                    compute_dtype=compute_dtype,
+                )
+
+                # Recompute just this head's loss
+                if _head_name == "self" and "self" in outputs:
+                    loss = optax.softmax_cross_entropy_with_integer_labels(
+                        outputs["self"], batch["input"]
+                    ).mean()
+                    weight = head_config.self_weight if head_config else 0.1
+                    return loss * weight
+
+                elif _head_name == "value" and "value_logit" in outputs:
+                    loss = optax.softmax_cross_entropy(
+                        outputs["value_logit"].astype(jnp.float32),
+                        batch["target"].astype(jnp.float32),
+                    ).mean()
+                    weight = head_config.value_weight if head_config else 1.0
+                    return loss * weight
+
+                elif _head_name == "policy" and "policy_logit" in outputs and "policy_target" in batch:
+                    loss = optax.softmax_cross_entropy(
+                        outputs["policy_logit"].astype(jnp.float32),
+                        batch["policy_target"].astype(jnp.float32),
+                    ).mean()
+                    weight = head_config.policy_weight if head_config else 1.0
+                    return loss * weight
+
+                elif _head_name == "soft_policy" and "soft_policy_logit" in outputs and "policy_target" in batch:
+                    temp = head_config.soft_policy_temperature if head_config else 4.0
+                    soft_target = jnp.pow(batch["policy_target"] + 1e-10, 1.0 / temp)
+                    soft_target = soft_target / jnp.sum(soft_target, axis=-1, keepdims=True)
+                    loss = optax.softmax_cross_entropy(
+                        outputs["soft_policy_logit"].astype(jnp.float32),
+                        soft_target.astype(jnp.float32),
+                    ).mean()
+                    weight = head_config.soft_policy_weight if head_config else 8.0
+                    return loss * weight
+
+                elif _head_name == "hard_policy" and "hard_policy_logit" in outputs and "policy_target" in batch:
+                    temp = head_config.hard_policy_temperature if head_config else 0.25
+                    hard_target = jnp.pow(batch["policy_target"] + 1e-10, 1.0 / temp)
+                    hard_target = hard_target / jnp.sum(hard_target, axis=-1, keepdims=True)
+                    loss = optax.softmax_cross_entropy(
+                        outputs["hard_policy_logit"].astype(jnp.float32),
+                        hard_target.astype(jnp.float32),
+                    ).mean()
+                    weight = head_config.hard_policy_weight if head_config else 0.1
+                    return loss * weight
+
+                elif _head_name == "next_capture" and "next_capture_logit" in outputs and "next_capture_target" in batch:
+                    target = batch["next_capture_target"]
+                    mask = (target >= 0).astype(jnp.float32)
+                    safe_target = jnp.maximum(target, 0)
+                    per_sample = optax.softmax_cross_entropy_with_integer_labels(
+                        outputs["next_capture_logit"].astype(jnp.float32), safe_target
+                    )
+                    loss = jnp.sum(per_sample * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+                    weight = head_config.next_capture_weight if head_config else 0.1
+                    return loss * weight
+
+                elif _head_name == "next_pawn_move" and "next_pawn_move_logit" in outputs and "next_pawn_move_target" in batch:
+                    target = batch["next_pawn_move_target"]
+                    mask = (target >= 0).astype(jnp.float32)
+                    safe_target = jnp.maximum(target, 0)
+                    per_sample = optax.softmax_cross_entropy_with_integer_labels(
+                        outputs["next_pawn_move_logit"].astype(jnp.float32), safe_target
+                    )
+                    loss = jnp.sum(per_sample * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+                    weight = head_config.next_pawn_move_weight if head_config else 0.1
+                    return loss * weight
+
+                # Fallback: return zero loss for unknown heads
+                return jnp.array(0.0)
+
+            # Compute gradient for this single head's loss
+            head_grads = jax.grad(single_head_loss_fn)(self.state.params)
+            head_grad_norms[f"head_grad_norm/{head_name}"] = optax.global_norm(head_grads)
+
+        return head_grad_norms
 
     def _eval_step_impl(
         self,
@@ -542,6 +702,15 @@ class Trainer:
             policy_accuracy = (pred_moves == target_moves).mean()
             metrics["policy_accuracy"] = policy_accuracy
 
+            # Policy perplexity: exp(cross_entropy)
+            # Measures prediction uncertainty; lower = more confident/accurate
+            # Note: With 4672 move classes (64×73), uniform perplexity would be ~4672
+            policy_ce = optax.softmax_cross_entropy(
+                outputs["policy_logit"].astype(jnp.float32),
+                batch["policy_target"].astype(jnp.float32),
+            ).mean()
+            metrics["policy_perplexity"] = jnp.exp(policy_ce)
+
         # Next capture head metrics (accuracy on valid samples only)
         if "next_capture_logit" in outputs and "next_capture_target" in batch:
             target = batch["next_capture_target"]
@@ -609,7 +778,7 @@ class Trainer:
             batch = {k: jnp.array(v) for k, v in batch.items()}
 
             # Training step
-            self.state, metrics = self._train_step(self.state, batch)
+            self.state, metrics, head_losses = self._train_step(self.state, batch)
 
             loss = float(metrics["loss"])
             epoch_loss += loss
@@ -620,6 +789,14 @@ class Trainer:
             if accumulation_count >= accumulation_steps:
                 self.global_step += 1
                 accumulation_count = 0
+
+                # Compute per-head gradient norms if enabled (expensive, done at lower frequency)
+                if (
+                    self.metrics_config.log_head_grad_norms
+                    and self.global_step % self.metrics_config.head_grad_norm_every_steps == 0
+                ):
+                    head_grad_norms = self._compute_head_grad_norms(batch, head_losses)
+                    metrics.update(head_grad_norms)
 
                 # Update progress bar with key metrics
                 epoch_pbar.update(1)
@@ -872,6 +1049,18 @@ class Trainer:
                 log_dict["train/next_pawn_move_accuracy"] = float(metrics["next_pawn_move_accuracy"])
             if "next_pawn_move_valid_frac" in metrics:
                 log_dict["train/next_pawn_move_valid_frac"] = float(metrics["next_pawn_move_valid_frac"])
+
+            # Add gradient norms (layer-wise) if enabled
+            if self.metrics_config.log_layer_grad_norms:
+                for key, value in metrics.items():
+                    if key.startswith("grad_norm/"):
+                        log_dict[f"train/{key}"] = float(value)
+
+            # Add per-head gradient norms if present (computed at lower frequency)
+            if self.metrics_config.log_head_grad_norms:
+                for key, value in metrics.items():
+                    if key.startswith("head_grad_norm/"):
+                        log_dict[f"train/{key}"] = float(value)
 
             wandb.log(log_dict, step=self.global_step)
 

@@ -112,6 +112,15 @@ wandb:
   tags: ["jax"]
   log_every_steps: 10
 
+# Training metrics configuration
+metrics:
+  # Layer gradient norms: L2 norm per transformer block, embeddings, output heads
+  log_layer_grad_norms: true
+  # Per-head gradient norms: L2 norm of gradients from each loss head
+  # Requires extra backward passes - expensive but useful for debugging
+  log_head_grad_norms: false
+  head_grad_norm_every_steps: 100  # Compute every N steps to reduce overhead
+
 # Distributed training (JAX-specific)
 distributed:
   enabled: false

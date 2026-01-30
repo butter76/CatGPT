@@ -244,6 +244,24 @@ class JaxWandbConfig:
 
 
 @dataclass
+class JaxMetricsConfig:
+    """Configuration for training metrics collection.
+
+    Controls which additional metrics are computed and logged during training.
+    Some metrics (like per-head gradient norms) require extra backward passes
+    and can be expensive, so they're computed at a lower frequency.
+    """
+
+    # Layer gradient norms: L2 norm of gradients per transformer block/embedding/head
+    log_layer_grad_norms: bool = True
+
+    # Head gradient norms: L2 norm of gradients contributed by each loss head
+    # Requires separate backward pass per head - expensive but informative
+    log_head_grad_norms: bool = True
+    head_grad_norm_every_steps: int = 100  # Only compute every N steps to reduce overhead
+
+
+@dataclass
 class JaxDistributedConfig:
     """Configuration for JAX distributed training."""
 
@@ -264,9 +282,15 @@ class JaxExperimentConfig:
     data: JaxDataConfig = field(default_factory=JaxDataConfig)
     checkpoint: JaxCheckpointConfig = field(default_factory=JaxCheckpointConfig)
     wandb: JaxWandbConfig = field(default_factory=JaxWandbConfig)
+    metrics: JaxMetricsConfig = field(default_factory=JaxMetricsConfig)
     distributed: JaxDistributedConfig = field(default_factory=JaxDistributedConfig)
 
     seed: int = 42
+
+    def __post_init__(self) -> None:
+        """Convert dicts to dataclasses if needed."""
+        if isinstance(self.metrics, dict):
+            self.metrics = JaxMetricsConfig(**self.metrics)
 
 
 def jax_config_from_dict(data: dict[str, Any]) -> JaxExperimentConfig:
@@ -287,6 +311,7 @@ def jax_config_from_dict(data: dict[str, Any]) -> JaxExperimentConfig:
         data=JaxDataConfig(**data.get("data", {})),
         checkpoint=JaxCheckpointConfig(**data.get("checkpoint", {})),
         wandb=JaxWandbConfig(**data.get("wandb", {})),
+        metrics=JaxMetricsConfig(**data.get("metrics", {})),
         distributed=JaxDistributedConfig(**data.get("distributed", {})),
         seed=data.get("seed", 42),
     )
