@@ -1,5 +1,5 @@
 /**
- * MCTS Search Algorithm.
+ * MCTS Search Algorithm with Soft-Minimax Q Calculation.
  *
  * Monte Carlo Tree Search using PUCT selection (AlphaZero/Leela Chess Zero style).
  *
@@ -8,10 +8,15 @@
  *   2. EXPAND: Create children for the leaf with priors from policy network
  *   3. EVALUATE: Get value estimate (origQ) from value network
  *   4. BACKPROPAGATE: Update N (visit count) along path from leaf to root
- *   5. CALC Q: Recursively recompute Q values for the tree
+ *   5. CALC Q: Recursively recompute Q values using soft-minimax
  *
- * Q values are computed as:
- *   Q(node) = (origQ * 1 + sum(-child.Q * child.N)) / N
+ * Soft-minimax Q calculation:
+ *   - Sort children by descending N (most visited first)
+ *   - Track running max of -child.Q as we iterate
+ *   - Q(node) = (origQ * 1 + sum(max_neg_child_q * child.N)) / N
+ *
+ * This propagates good scores from well-explored children to less-explored
+ * siblings, creating a blend between standard MCTS averaging and minimax.
  *
  * After search, the move with highest visit count is selected.
  */
@@ -24,6 +29,7 @@
 #include <chrono>
 #include <cmath>
 #include <memory>
+#include <numeric>
 #include <print>
 #include <vector>
 
@@ -382,9 +388,13 @@ private:
     }
 
     /**
-     * Recursively compute Q values for the entire tree.
+     * Recursively compute Q values for the entire tree using soft-minimax.
      *
-     * Q(node) = (origQ * 1 + sum(-child.Q * child.N)) / N
+     * Q(node) = (origQ * 1 + sum(max_neg_child_q * child.N)) / N
+     *
+     * Where max_neg_child_q is the running maximum of -child.Q as we iterate
+     * through children sorted by descending visit count. This propagates good
+     * scores from well-explored children to less-explored siblings.
      *
      * This is called after each simulation to update cached_Q values.
      */
@@ -406,12 +416,25 @@ private:
             calcQ(&child);
         }
 
-        // Compute weighted average:
-        // Q = (origQ * 1 + sum(-child.Q * child.N)) / N
+        // Create indices sorted by descending N (most visited first)
+        std::vector<std::size_t> indices(node->children.size());
+        std::iota(indices.begin(), indices.end(), 0);
+        std::sort(indices.begin(), indices.end(), [&](std::size_t a, std::size_t b) {
+            return node->children[a].second.N > node->children[b].second.N;
+        });
+
+        // Soft-minimax weighted average:
+        // Track running max of -child.Q as we go through by descending N
         float sum = node->origQ;  // Weight 1 for own evaluation
-        for (const auto& [move, child] : node->children) {
-            sum += -child.cached_Q * static_cast<float>(child.N);
+        float max_neg_child_q = -std::numeric_limits<float>::infinity();
+
+        for (std::size_t idx : indices) {
+            const auto& child = node->children[idx].second;
+            float neg_child_q = -child.cached_Q;
+            max_neg_child_q = std::max(max_neg_child_q, neg_child_q);
+            sum += max_neg_child_q * static_cast<float>(child.N);
         }
+
         node->cached_Q = sum / static_cast<float>(node->N);
     }
 
