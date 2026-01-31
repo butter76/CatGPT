@@ -267,7 +267,7 @@ private:
      */
     float expand_and_evaluate(MCTSNode* node, chess::Board& scratch_board) {
         // Get policy and value from neural network
-        auto [policy_priors, value] = evaluate_position(scratch_board);
+        auto eval = evaluate_position(scratch_board);
 
         // Create children for all legal moves
         chess::Movelist moves;
@@ -277,8 +277,8 @@ private:
 
         for (const auto& move : moves) {
             float prior = 0.0f;
-            auto it = policy_priors.find(move);
-            if (it != policy_priors.end()) {
+            auto it = eval.policy_priors.find(move);
+            if (it != eval.policy_priors.end()) {
                 prior = it->second;
             }
 
@@ -312,16 +312,25 @@ private:
                   [](const auto& a, const auto& b) { return a.second.P > b.second.P; });
 
         // Store original NN evaluation for recursive Q calculation
-        node->origQ = value;
+        node->origQ = eval.value;
+        node->value_probs = eval.value_probs;
 
-        return value;
+        return eval.value;
     }
+
+    /**
+     * Result of neural network evaluation.
+     */
+    struct EvalResult {
+        std::unordered_map<chess::Move, float, MoveHash> policy_priors;
+        float value;  // [-1, 1]
+        std::array<float, VALUE_NUM_BINS> value_probs;
+    };
 
     /**
      * Evaluate a position with the neural network.
      */
-    std::pair<std::unordered_map<chess::Move, float, MoveHash>, float>
-    evaluate_position(const chess::Board& pos) {
+    EvalResult evaluate_position(const chess::Board& pos) {
         ++total_gpu_evals_;
 
         std::string fen = pos.getFen();
@@ -369,7 +378,7 @@ private:
             policy_priors[move] = exp_logit / sum_exp;
         }
 
-        return {policy_priors, value};
+        return {std::move(policy_priors), value, nn_output.value_probs};
     }
 
     /**

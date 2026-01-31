@@ -8,12 +8,14 @@
 #ifndef CATGPT_ENGINE_MCTS_NODE_HPP
 #define CATGPT_ENGINE_MCTS_NODE_HPP
 
+#include <array>
 #include <memory>
 #include <optional>
 #include <unordered_map>
 #include <vector>
 
 #include "../../../external/chess-library/include/chess.hpp"
+#include "../trt_evaluator.hpp"
 
 namespace catgpt {
 
@@ -135,6 +137,9 @@ public:
     float origQ = 0.0f;   // Original NN evaluation or terminal value
     float cached_Q = 0.0f; // Computed Q from recursive formula
     float P = 0.0f;       // Prior probability
+
+    // Value distribution from HL-Gauss head (81 bins over [0, 1])
+    std::array<float, VALUE_NUM_BINS> value_probs{};
 
     // Terminal state info
     bool is_terminal = false;
