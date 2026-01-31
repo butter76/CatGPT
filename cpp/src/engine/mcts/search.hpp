@@ -396,7 +396,7 @@ private:
         }
 
         // Unexpanded leaf: Q is just origQ (shouldn't happen after backprop)
-        if (!node->is_expanded()) {
+        if (!node->is_expanded() || node->N <= 1) {
             node->cached_Q = node->origQ;
             return;
         }
@@ -406,13 +406,26 @@ private:
             calcQ(&child);
         }
 
-        // Compute weighted average:
-        // Q = (origQ * 1 + sum(-child.Q * child.N)) / N
-        float sum = node->origQ;  // Weight 1 for own evaluation
-        for (const auto& [move, child] : node->children) {
-            sum += -child.cached_Q * static_cast<float>(child.N);
+        if (node->N > 5) {
+
+            // Compute weighted average:
+            // Q = (sum(-child.Q * child.N)) / (N - 1)
+            float sum = 0.0f;  // Weight 1 for own evaluation
+            for (const auto& [move, child] : node->children) {
+                sum += -child.cached_Q * static_cast<float>(child.N);
+            }
+            node->cached_Q = sum / static_cast<float>(node->N - 1);
+
+        } else {
+
+            // Compute weighted average:
+            // Q = (origQ * 1 + sum(-child.Q * child.N)) / N
+            float sum = 0.0f;  // Weight 1 for own evaluation
+            for (const auto& [move, child] : node->children) {
+                sum += -child.cached_Q * static_cast<float>(child.N);
+            }
+            node->cached_Q = (node->origQ + sum) / static_cast<float>(node->N);
         }
-        node->cached_Q = sum / static_cast<float>(node->N);
     }
 
     std::shared_ptr<TrtEvaluator> evaluator_;
