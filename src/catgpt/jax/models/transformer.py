@@ -30,6 +30,9 @@ class TransformerConfig:
     seq_length: int = 64
     activation: str = "gelu"
 
+    # Position embedding type: "absolute" (learnable per-position) or "magating" (mult/add gates)
+    position_embedding: str = "magating"
+
     # Output head configuration
     output_heads: JaxOutputHeadConfig = field(default_factory=JaxOutputHeadConfig)
 
@@ -409,16 +412,36 @@ class BidirectionalTransformer(nn.Module):
             dtype=jnp.float32,  # Embeddings always in float32
         )(x)  # (batch, seq, hidden)
 
-        # Learnable absolute positional embedding
-        positions = jnp.arange(seq_len)
-        pos_emb = nn.Embed(
-            num_embeddings=self.config.seq_length,
-            features=self.config.hidden_size,
-            dtype=jnp.float32,  # Embeddings always in float32
-        )(positions)  # (seq, hidden)
+        # Position encoding: either absolute (learnable) or MaGating (mult/add gates)
+        if self.config.position_embedding == "absolute":
+            # Learnable absolute positional embedding
+            positions = jnp.arange(seq_len)
+            pos_emb = nn.Embed(
+                num_embeddings=self.config.seq_length,
+                features=self.config.hidden_size,
+                dtype=jnp.float32,  # Embeddings always in float32
+                name="position_embedding",
+            )(positions)  # (seq, hidden)
 
-        # Combine embeddings and cast to compute dtype
-        hidden = (token_emb + pos_emb).astype(compute_dtype)
+            # Combine embeddings and cast to compute dtype
+            hidden = (token_emb + pos_emb).astype(compute_dtype)
+        elif self.config.position_embedding == "magating":
+            # MaGating: learnable multiplicative and additive gates after embedding
+            mult_gate = self.param(
+                "ma_mult_gate",
+                nn.initializers.ones,
+                (self.config.seq_length, self.config.hidden_size),
+            )
+            add_gate = self.param(
+                "ma_add_gate",
+                nn.initializers.zeros,
+                (self.config.seq_length, self.config.hidden_size),
+            )
+            hidden = token_emb * mult_gate + add_gate
+            hidden = hidden.astype(compute_dtype)
+        else:
+            msg = f"Unknown position_embedding type: {self.config.position_embedding}. Choose 'absolute' or 'magating'."
+            raise ValueError(msg)
 
         # Create shared Smolgen weight generation kernel if enabled
         # This kernel is shared across ALL transformer blocks
@@ -601,6 +624,7 @@ class BidirectionalTransformer(nn.Module):
             vocab_size=config.vocab_size,
             seq_length=config.seq_length,
             activation=config.activation,
+            position_embedding=config.position_embedding,
             output_heads=config.output_heads,
             smolgen=config.smolgen,
         )

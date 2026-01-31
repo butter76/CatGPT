@@ -119,6 +119,10 @@ class JaxModelConfig:
     seq_length: int = 64
     activation: str = "gelu"
 
+    # Position embedding type: "absolute" (learnable per-position) or "magating" (mult/add gates)
+    # MaGating uses learnable multiplicative and additive gates instead of additive positional embedding.
+    position_embedding: str = "magating"
+
     # Output head configuration
     output_heads: JaxOutputHeadConfig = field(default_factory=JaxOutputHeadConfig)
 

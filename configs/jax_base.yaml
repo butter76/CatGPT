@@ -12,6 +12,8 @@ model:
   vocab_size: 26  # From tokenizer (don't change unless tokenizer changes)
   seq_length: 64  # Will be overridden by tokenizer.sequence_length
   activation: "gelu"
+  # Position embedding type: "absolute" (learnable) or "magating" (multiplicative + additive gates)
+  position_embedding: "magating"
 
   # Smolgen: dynamic attention bias generation
   # Generates position-dependent attention biases conditioned on input

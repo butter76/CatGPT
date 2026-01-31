@@ -131,6 +131,7 @@ def _load_model_config(path: Path) -> JaxModelConfig:
         vocab_size=config_dict.get("vocab_size", 26),
         seq_length=config_dict.get("seq_length", 64),
         activation=config_dict.get("activation", "gelu"),
+        position_embedding=config_dict.get("position_embedding", "magating"),
         output_heads=output_heads,
         smolgen=smolgen,
     )
