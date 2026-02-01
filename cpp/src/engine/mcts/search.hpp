@@ -305,9 +305,9 @@ private:
 
                 // Update remainingUpside for next iteration
                 if (at_least) {
-                    remainingUpside *= (1.0f - child.cached_upside);
+                    remainingUpside = std::min(1.0f - child.cached_upside, remainingUpside);
                 } else {
-                    remainingUpside *= child.cached_upside;
+                    remainingUpside = std::min(child.cached_upside, remainingUpside);
                 }
             } else {
                 // Unexpanded node: use policy
