@@ -30,7 +30,6 @@ Usage:
     uv run python scripts/sprt_tournament.py wandb.enabled=false
 """
 
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 

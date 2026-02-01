@@ -291,16 +291,22 @@ class GameRunner:
         white_engine = engine_a if engine_a_white else engine_b
         black_engine = engine_b if engine_a_white else engine_a
 
-        # Track scores for adjudication (not yet implemented in UCI wrapper)
-        # For now, we just play until natural termination or move limit
-
-        consecutive_low_score = 0
-        consecutive_losing = 0
-
         while True:
-            # Check for game over
+            # Check for game over (checkmate, stalemate, insufficient material, etc.)
             if board.is_game_over():
                 termination, result = self._get_natural_termination(board)
+                break
+
+            # Check for claimable draws (threefold repetition, fifty-move rule)
+            # These are not auto-detected by is_game_over() without claim_draw=True
+            if board.is_repetition(3):
+                termination = GameTermination.THREEFOLD
+                result = "1/2-1/2"
+                break
+
+            if board.is_fifty_moves():
+                termination = GameTermination.FIFTY_MOVE
+                result = "1/2-1/2"
                 break
 
             # Check move limit
@@ -318,9 +324,9 @@ class GameRunner:
             # Get current engine
             current_engine = white_engine if board.turn == chess.WHITE else black_engine
 
-            # Get move from engine
+            # Get move from engine (pass move history for repetition detection)
             try:
-                move = current_engine.select_move(board)
+                move = current_engine.select_move(board, opening_fen=opening_fen, moves=moves)
             except Exception as e:
                 logger.error(f"Engine error: {e}")
                 termination = GameTermination.ENGINE_ERROR
