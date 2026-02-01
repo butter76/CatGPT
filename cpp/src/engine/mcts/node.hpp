@@ -136,6 +136,7 @@ public:
     int N = 0;            // Visit count
     float origQ = 0.0f;   // Original NN evaluation or terminal value
     float cached_Q = 0.0f; // Computed Q from recursive formula
+    float cached_upside = 0.0f;  // P(value >= root's cachedQ) from root's perspective
     float P = 0.0f;       // Prior probability
 
     // Value distribution from HL-Gauss head (81 bins over [0, 1])

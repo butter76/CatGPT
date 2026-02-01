@@ -70,7 +70,13 @@ public:
         , board_(STARTPOS_FEN)
         , stop_flag_(false)
         , total_gpu_evals_(0)
+        , debug_(false)
     {}
+
+    /**
+     * Enable or disable debug output.
+     */
+    void set_debug(bool enabled) { debug_ = enabled; }
 
     void reset(std::string_view fen = STARTPOS_FEN) override {
         board_ = chess::Board(fen);
@@ -197,13 +203,15 @@ private:
         MCTSNode* node = root_.get();
         std::vector<MCTSNode*> path = {node};
         chess::Board scratch_board = board_;
+        bool at_least = true;  // Root's children selection is "at least"
 
-        // SELECT: traverse tree using PUCT until we reach a leaf
+        // SELECT: traverse tree using upside-based selection until we reach a leaf
         while (node->is_expanded() && !node->is_terminal) {
-            auto [move, child] = select_child(node);
+            auto [move, child] = select_child(node, at_least);
             scratch_board.makeMove<true>(move);
             node = child;
             path.push_back(node);
+            at_least = !at_least;  // Flip perspective each level
         }
 
         // EXPAND & EVALUATE
@@ -218,51 +226,108 @@ private:
 
         // CALC Q: recursively recompute Q values for entire tree
         calcQ(root_.get());
+
+        // CALC UPSIDE: probability of being at least as good as current estimate
+        float upside_threshold = std::min(root_->cached_Q + 2.0f / 81.0f, 0.999f);
+        calcUpside(root_.get(), upside_threshold);
+
+        // Debug: show all visited children at root
+        if (debug_) {
+            std::print("  POST-CALC (root.N={}, root.Q={:.4f}, upside_threshold={:.4f}):\n",
+                       root_->N, root_->cached_Q, upside_threshold);
+            std::print("    {:6} {:>5} {:>8} {:>8} {:>8} {:>8}\n",
+                       "move", "N", "P", "Q", "-Q", "upside");
+            for (const auto& [move, child] : root_->children) {
+                if (child.N > 0) {
+                    std::print("    {:6} {:5} {:8.4f} {:8.4f} {:8.4f} {:8.4f}\n",
+                               chess::uci::moveToUci(move), child.N, child.P,
+                               child.cached_Q, -child.cached_Q, child.cached_upside);
+                }
+            }
+            std::print("\n");
+        }
     }
 
     /**
-     * Select child with highest PUCT score.
+     * Select child with highest exploration score based on upside.
      *
-     * Uses Leela-style FPU where unvisited nodes get:
-     *     fpu = parent.Q - fpu_reduction * sqrt(visited_policy)
+     * Children are sorted by (N desc, P desc). For each child:
+     * - Expanded (N > 0): U = remainingUpside * upside_factor * n_parent / (N + 1)
+     * - Unexpanded (N == 0): U = remainingUpside * P / (N + 1)
+     *
+     * For "at least" nodes: upside_factor = cached_upside
+     * For "at most" nodes: upside_factor = 1 - cached_upside
+     *
+     * remainingUpside decays as we iterate through expanded children,
+     * giving more exploration budget to higher-visited children.
+     *
+     * @param node The parent node to select from
+     * @param at_least True if selecting from root's perspective, false for opponent
      */
-    std::pair<chess::Move, MCTSNode*> select_child(MCTSNode* node) {
-        // Use N-1 since current visit is in progress; safe to be 0 due to FPU
-        float sqrt_n_parent = node->N > 1 ? std::sqrt(static_cast<float>(node->N - 1)) : 0.0f;
+    std::pair<chess::Move, MCTSNode*> select_child(MCTSNode* node, bool at_least) {
+        // n_parent = N - 1 (current visit in progress)
+        int n_parent = node->N > 1 ? node->N - 1 : 0;
+
+        // Create indices sorted by (N desc, P desc)
+        std::vector<std::size_t> indices(node->children.size());
+        std::iota(indices.begin(), indices.end(), 0);
+        std::sort(indices.begin(), indices.end(), [&](std::size_t a, std::size_t b) {
+            const auto& ca = node->children[a].second;
+            const auto& cb = node->children[b].second;
+            if (ca.N != cb.N) return ca.N > cb.N;  // Decreasing N
+            return ca.P > cb.P;  // Decreasing P (tie-breaker)
+        });
 
         float best_score = -std::numeric_limits<float>::infinity();
         chess::Move best_move = chess::Move::NO_MOVE;
         MCTSNode* best_child = nullptr;
 
-        // Cumulative policy of children before current child (in decreasing P order)
-        float cumulative_policy = 0.0f;
+        float remainingUpside = 1.0f;
 
-        for (auto& [move, child] : node->children) {
-            // Determine Q value from parent's perspective
-            // Child's Q/terminal_value is from child's side-to-move (our opponent)
-            // So we negate to get our perspective
-            float q;
-            if (child.is_terminal) {
-                q = -child.terminal_value.value();
-            } else if (child.N == 0) {
-                // Per-child FPU: based on policy of higher-ranked siblings
-                float fpu = node->Q() - config_.fpu_reduction * std::sqrt(cumulative_policy);
-                q = fpu;
+        if (debug_) {
+            std::print("  SELECT (at_least={}, n_parent={}):\n", at_least, n_parent);
+        }
+
+        for (std::size_t idx : indices) {
+            auto& [move, child] = node->children[idx];
+
+            float U;
+            if (child.N > 0) {
+                // Expanded node: use upside
+                float upside_factor = at_least ? child.cached_upside : (1.0f - child.cached_upside);
+                U = remainingUpside * upside_factor / (child.N + 1);
+
+                if (debug_) {
+                    std::print("    {} N={} upside={:.4f} upside_factor={:.4f} remainingUp={:.4f} => U={:.4f}\n",
+                               chess::uci::moveToUci(move), child.N, child.cached_upside,
+                               upside_factor, remainingUpside, U);
+                }
+
+                // Update remainingUpside for next iteration
+                if (at_least) {
+                    remainingUpside *= (1.0f - child.cached_upside);
+                } else {
+                    remainingUpside *= child.cached_upside;
+                }
             } else {
-                q = -child.Q();
+                // Unexpanded node: use policy
+                U = remainingUpside * child.P;  // N=0, so denominator is 1
+
+                if (debug_) {
+                    std::print("    {} N=0 P={:.4f} remainingUp={:.4f} => U={:.4f}\n",
+                               chess::uci::moveToUci(move), child.P, remainingUpside, U);
+                }
             }
 
-            // PUCT formula
-            float u = q + config_.c_puct * child.P * sqrt_n_parent / (1.0f + child.N);
-
-            if (u > best_score) {
-                best_score = u;
+            if (U > best_score) {
+                best_score = U;
                 best_move = move;
                 best_child = &child;
             }
+        }
 
-            // Add this child's policy to cumulative sum for next iteration
-            cumulative_policy += child.P;
+        if (debug_) {
+            std::print("    => selected: {} (U={:.4f})\n", chess::uci::moveToUci(best_move), best_score);
         }
 
         return {best_move, best_child};
@@ -397,6 +462,36 @@ private:
     }
 
     /**
+     * Compute upside probability from value distribution.
+     *
+     * @param probs Value distribution (81 bins uniformly over [-1, 1])
+     * @param threshold The Q value threshold to compare against
+     * @param at_least If true, compute P(value >= threshold); if false, P(value <= threshold)
+     * @return Probability mass meeting the condition
+     */
+    static float compute_upside_from_probs(
+        const std::array<float, VALUE_NUM_BINS>& probs,
+        float threshold,
+        bool at_least
+    ) {
+        float sum = 0.0f;
+        for (int i = 0; i < VALUE_NUM_BINS; ++i) {
+            // Bucket i center: uniformly spaced in [-1, 1]
+            float bucket_center = -1.0f + (2.0f * i + 1.0f) / VALUE_NUM_BINS;
+            bool include;
+            if (at_least) {
+                // Include if bucket_center >= threshold, OR last bucket (captures values up to +1)
+                include = (bucket_center >= threshold) || (i == VALUE_NUM_BINS - 1);
+            } else {
+                // Include if bucket_center <= threshold, OR first bucket (captures values down to -1)
+                include = (bucket_center <= threshold) || (i == 0);
+            }
+            if (include) sum += probs[i];
+        }
+        return sum;
+    }
+
+    /**
      * Recursively compute Q values for the entire tree using soft-minimax.
      *
      * Q(node) = (origQ * 1 + sum(max_neg_child_q * child.N)) / N
@@ -447,12 +542,69 @@ private:
         node->cached_Q = sum / static_cast<float>(node->N);
     }
 
+    /**
+     * Recursively compute upside values for the entire tree.
+     *
+     * Upside represents the probability that a node's true value (from root's
+     * perspective) is at least as good as the root's current estimate.
+     *
+     * For leaf nodes: upside = P(value >= threshold) using value_probs distribution
+     * For non-leaf nodes: soft-max weighted average similar to calcQ
+     *
+     * @param node The node to compute upside for
+     * @param threshold The Q value threshold (root's cachedQ)
+     * @param at_least If true, compute P(value >= threshold); flips on each level
+     */
+    void calcUpside(MCTSNode* node, float threshold, bool at_least = true) {
+        // Terminal nodes: deterministic 0 or 1
+        if (node->is_terminal) {
+            float val = node->terminal_value.value();
+            bool meets_condition = at_least ? (val >= threshold) : (val <= threshold);
+            node->cached_upside = meets_condition ? 1.0f : 0.0f;
+            return;
+        }
+
+        // Unexpanded leaf: use value_probs directly
+        if (!node->is_expanded()) {
+            node->cached_upside = compute_upside_from_probs(node->value_probs, threshold, at_least);
+            return;
+        }
+
+        // Recursively compute for children (flip perspective!)
+        for (auto& [move, child] : node->children) {
+            calcUpside(&child, -threshold, !at_least);
+        }
+
+        // Own upside contribution (weight 1)
+        float own_upside = compute_upside_from_probs(node->value_probs, threshold, at_least);
+
+        // Sort children by descending N (most visited first) - same as calcQ
+        std::vector<std::size_t> indices(node->children.size());
+        std::iota(indices.begin(), indices.end(), 0);
+        std::sort(indices.begin(), indices.end(), [&](std::size_t a, std::size_t b) {
+            return node->children[a].second.N > node->children[b].second.N;
+        });
+
+        // Soft-max weighted average (similar to calcQ)
+        float sum = own_upside;
+        float max_upside = 0.0f;  // Running max (upside is [0,1] so start at 0)
+
+        for (std::size_t idx : indices) {
+            const auto& child = node->children[idx].second;
+            max_upside = child.cached_upside;
+            sum += max_upside * static_cast<float>(child.N);
+        }
+
+        node->cached_upside = sum / static_cast<float>(node->N);
+    }
+
     std::shared_ptr<TrtEvaluator> evaluator_;
     MCTSConfig config_;
     chess::Board board_;
     std::unique_ptr<MCTSNode> root_;
     std::atomic<bool> stop_flag_;
     int total_gpu_evals_;
+    bool debug_;
 };
 
 }  // namespace catgpt
