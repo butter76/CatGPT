@@ -99,6 +99,19 @@ std::string interpret_value(float value) {
 }
 
 /**
+ * Convert win probability [0, 1] to centipawns using tangent scaling.
+ * This is the same formula used by Leela Chess Zero / MCTS.
+ */
+int win_prob_to_centipawns(float win_prob) {
+    // Convert win probability [0, 1] to Q in [-1, 1]
+    float q = win_prob * 2.0f - 1.0f;
+    // Clamp to avoid numerical issues near extremes
+    q = std::clamp(q, -0.9999f, 0.9999f);
+    // Tangent scaling: 90 * tan(q * (π/2))
+    return static_cast<int>(90.0f * std::tan(q * 1.5637541897f));
+}
+
+/**
  * Print a visual bar representation of probability.
  */
 void print_prob_bar(float prob, int width = 20) {
@@ -238,14 +251,70 @@ int main(int argc, char* argv[]) {
         std::cout << "───────────────────────────────────────────────────────────────\n\n";
 
         float win_prob = output.value;
+        int centipawns = win_prob_to_centipawns(win_prob);
+
         std::cout << "Win probability (for side to move): ";
         std::cout << std::fixed << std::setprecision(1) << (win_prob * 100.0f) << "%\n";
+
+        std::cout << "Centipawns: " << std::showpos << centipawns << std::noshowpos << " cp\n";
 
         std::cout << "\n";
         print_prob_bar(win_prob, 40);
         std::cout << "\n";
 
         std::cout << "\nInterpretation: " << interpret_value(win_prob) << "\n\n";
+
+        // === Value Distribution ===
+        std::cout << "───────────────────────────────────────────────────────────────\n";
+        std::cout << "                      VALUE DISTRIBUTION\n";
+        std::cout << "───────────────────────────────────────────────────────────────\n\n";
+
+        std::cout << "Distribution over " << catgpt::VALUE_NUM_BINS << " bins (0.0 to 1.0):\n\n";
+
+        // Find max probability for scaling the display
+        float max_prob = 0.0f;
+        for (int i = 0; i < catgpt::VALUE_NUM_BINS; ++i) {
+            max_prob = std::max(max_prob, output.value_probs[i]);
+        }
+
+        // Display as a compact histogram (group bins for readability)
+        constexpr int NUM_DISPLAY_BINS = 20;
+        constexpr int BINS_PER_GROUP = catgpt::VALUE_NUM_BINS / NUM_DISPLAY_BINS;
+
+        std::cout << "  Win%  │ Prob │ Distribution\n";
+        std::cout << "  ──────┼──────┼─────────────────────────────────────────\n";
+
+        for (int g = 0; g < NUM_DISPLAY_BINS; ++g) {
+            // Calculate aggregated probability for this group
+            float group_prob = 0.0f;
+            for (int i = g * BINS_PER_GROUP; i < (g + 1) * BINS_PER_GROUP && i < catgpt::VALUE_NUM_BINS; ++i) {
+                group_prob += output.value_probs[i];
+            }
+
+            // Calculate the win probability range for this group
+            float range_start = static_cast<float>(g) / NUM_DISPLAY_BINS * 100.0f;
+            float range_end = static_cast<float>(g + 1) / NUM_DISPLAY_BINS * 100.0f;
+
+            std::cout << "  " << std::setw(2) << static_cast<int>(range_start) << "-"
+                      << std::setw(2) << static_cast<int>(range_end) << " │ ";
+            std::cout << std::setw(4) << std::fixed << std::setprecision(1)
+                      << (group_prob * 100.0f) << " │ ";
+
+            // Draw bar (scale to max)
+            int bar_width = 35;
+            float max_group_prob = max_prob * BINS_PER_GROUP;  // Rough scaling
+            int filled = (max_group_prob > 0)
+                ? static_cast<int>(group_prob / max_group_prob * bar_width + 0.5f)
+                : 0;
+            filled = std::min(filled, bar_width);
+
+            for (int i = 0; i < bar_width; ++i) {
+                std::cout << (i < filled ? "█" : "░");
+            }
+            std::cout << "\n";
+        }
+
+        std::cout << "\n";
 
         // === Policy ===
         std::cout << "───────────────────────────────────────────────────────────────\n";
