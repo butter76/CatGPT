@@ -301,12 +301,23 @@ class Trainer:
                 losses["value"] = value_loss * weight
 
             # Policy head: cross-entropy with soft policy targets
+            # Mask out illegal moves (zero probability in target) by setting logits to -inf
             if "policy_logit" in outputs and "policy_target" in batch:
                 # outputs["policy_logit"]: (batch, 64*73) logits
                 # batch["policy_target"]: (batch, 64*73) policy distribution
-                policy_loss = optax.softmax_cross_entropy(
+                policy_target = batch["policy_target"].astype(jnp.float32)
+
+                # Mask illegal moves: set logits to -1e9 where target probability is 0
+                legal_mask = policy_target > 0  # (batch, 64*73)
+                masked_logits = jnp.where(
+                    legal_mask,
                     outputs["policy_logit"].astype(jnp.float32),
-                    batch["policy_target"].astype(jnp.float32),
+                    jnp.float32(-1e9),
+                )
+
+                policy_loss = optax.softmax_cross_entropy(
+                    masked_logits,
+                    policy_target,
                 ).mean()
                 weight = head_config.policy_weight if head_config else 1.0
                 losses["policy"] = policy_loss * weight
@@ -315,15 +326,25 @@ class Trainer:
             # Applies temperature to soften the policy target, forcing the model to learn
             # relative rankings of lower-probability moves, not just the top 1-2.
             if "soft_policy_logit" in outputs and "policy_target" in batch:
+                policy_target = batch["policy_target"].astype(jnp.float32)
+
+                # Mask illegal moves
+                legal_mask = policy_target > 0
+                masked_logits = jnp.where(
+                    legal_mask,
+                    outputs["soft_policy_logit"].astype(jnp.float32),
+                    jnp.float32(-1e9),
+                )
+
                 # Compute soft target: p^(1/T) then renormalize
                 temp = head_config.soft_policy_temperature if head_config else 4.0
                 # Add small epsilon for numerical stability before taking power
-                soft_target = jnp.pow(batch["policy_target"] + 1e-10, 1.0 / temp)
+                soft_target = jnp.pow(policy_target + 1e-10, 1.0 / temp)
                 soft_target = soft_target / jnp.sum(soft_target, axis=-1, keepdims=True)
 
                 soft_policy_loss = optax.softmax_cross_entropy(
-                    outputs["soft_policy_logit"].astype(jnp.float32),
-                    soft_target.astype(jnp.float32),
+                    masked_logits,
+                    soft_target,
                 ).mean()
                 weight = head_config.soft_policy_weight if head_config else 8.0
                 losses["soft_policy"] = soft_policy_loss * weight
@@ -331,15 +352,25 @@ class Trainer:
             # Hard policy head: auxiliary head for sharpened policy target
             # Applies low temperature to sharpen the distribution, focusing on the best move.
             if "hard_policy_logit" in outputs and "policy_target" in batch:
+                policy_target = batch["policy_target"].astype(jnp.float32)
+
+                # Mask illegal moves
+                legal_mask = policy_target > 0
+                masked_logits = jnp.where(
+                    legal_mask,
+                    outputs["hard_policy_logit"].astype(jnp.float32),
+                    jnp.float32(-1e9),
+                )
+
                 # Compute hard target: p^(1/T) where T=0.25 → p^4 then renormalize
                 temp = head_config.hard_policy_temperature if head_config else 0.25
                 # Add small epsilon for numerical stability before taking power
-                hard_target = jnp.pow(batch["policy_target"] + 1e-10, 1.0 / temp)
+                hard_target = jnp.pow(policy_target + 1e-10, 1.0 / temp)
                 hard_target = hard_target / jnp.sum(hard_target, axis=-1, keepdims=True)
 
                 hard_policy_loss = optax.softmax_cross_entropy(
-                    outputs["hard_policy_logit"].astype(jnp.float32),
-                    hard_target.astype(jnp.float32),
+                    masked_logits,
+                    hard_target,
                 ).mean()
                 weight = head_config.hard_policy_weight if head_config else 0.1
                 losses["hard_policy"] = hard_policy_loss * weight
@@ -421,9 +452,19 @@ class Trainer:
 
         # Policy head metrics
         if "policy_logit" in outputs and "policy_target" in batch:
+            policy_target = batch["policy_target"].astype(jnp.float32)
+
+            # Mask illegal moves for accuracy computation
+            legal_mask = policy_target > 0
+            masked_logits = jnp.where(
+                legal_mask,
+                outputs["policy_logit"].astype(jnp.float32),
+                jnp.float32(-1e9),
+            )
+
             # Top-1 accuracy: compare argmax of prediction vs argmax of target
-            pred_moves = jnp.argmax(outputs["policy_logit"], axis=-1)  # (batch,)
-            target_moves = jnp.argmax(batch["policy_target"], axis=-1)  # (batch,)
+            pred_moves = jnp.argmax(masked_logits, axis=-1)  # (batch,)
+            target_moves = jnp.argmax(policy_target, axis=-1)  # (batch,)
             policy_accuracy = (pred_moves == target_moves).mean()
             metrics["policy_accuracy"] = policy_accuracy
 
@@ -609,26 +650,47 @@ class Trainer:
             losses["value"] = value_loss * weight
 
         # Policy head: cross-entropy with soft policy targets
+        # Mask out illegal moves (zero probability in target) by setting logits to -inf
         if "policy_logit" in outputs and "policy_target" in batch:
             # outputs["policy_logit"]: (batch, 64*73) logits
             # batch["policy_target"]: (batch, 64*73) policy distribution
-            policy_loss = optax.softmax_cross_entropy(
+            policy_target = batch["policy_target"].astype(jnp.float32)
+
+            # Mask illegal moves: set logits to -1e9 where target probability is 0
+            legal_mask = policy_target > 0  # (batch, 64*73)
+            masked_logits = jnp.where(
+                legal_mask,
                 outputs["policy_logit"].astype(jnp.float32),
-                batch["policy_target"].astype(jnp.float32),
+                jnp.float32(-1e9),
+            )
+
+            policy_loss = optax.softmax_cross_entropy(
+                masked_logits,
+                policy_target,
             ).mean()
             weight = head_config.policy_weight if head_config else 1.0
             losses["policy"] = policy_loss * weight
 
         # Soft policy head: auxiliary head for softened policy target (KataGo method)
         if "soft_policy_logit" in outputs and "policy_target" in batch:
+            policy_target = batch["policy_target"].astype(jnp.float32)
+
+            # Mask illegal moves
+            legal_mask = policy_target > 0
+            masked_logits = jnp.where(
+                legal_mask,
+                outputs["soft_policy_logit"].astype(jnp.float32),
+                jnp.float32(-1e9),
+            )
+
             # Compute soft target: p^(1/T) then renormalize
             temp = head_config.soft_policy_temperature if head_config else 4.0
-            soft_target = jnp.pow(batch["policy_target"] + 1e-10, 1.0 / temp)
+            soft_target = jnp.pow(policy_target + 1e-10, 1.0 / temp)
             soft_target = soft_target / jnp.sum(soft_target, axis=-1, keepdims=True)
 
             soft_policy_loss = optax.softmax_cross_entropy(
-                outputs["soft_policy_logit"].astype(jnp.float32),
-                soft_target.astype(jnp.float32),
+                masked_logits,
+                soft_target,
             ).mean()
             weight = head_config.soft_policy_weight if head_config else 8.0
             losses["soft_policy"] = soft_policy_loss * weight
@@ -696,9 +758,19 @@ class Trainer:
 
         # Policy head metrics
         if "policy_logit" in outputs and "policy_target" in batch:
+            policy_target = batch["policy_target"].astype(jnp.float32)
+
+            # Mask illegal moves for metrics computation
+            legal_mask = policy_target > 0
+            masked_logits = jnp.where(
+                legal_mask,
+                outputs["policy_logit"].astype(jnp.float32),
+                jnp.float32(-1e9),
+            )
+
             # Top-1 accuracy: compare argmax of prediction vs argmax of target
-            pred_moves = jnp.argmax(outputs["policy_logit"], axis=-1)  # (batch,)
-            target_moves = jnp.argmax(batch["policy_target"], axis=-1)  # (batch,)
+            pred_moves = jnp.argmax(masked_logits, axis=-1)  # (batch,)
+            target_moves = jnp.argmax(policy_target, axis=-1)  # (batch,)
             policy_accuracy = (pred_moves == target_moves).mean()
             metrics["policy_accuracy"] = policy_accuracy
 
@@ -706,14 +778,14 @@ class Trainer:
             # Measures prediction uncertainty; lower = more confident/accurate
             # Note: With 4672 move classes (64×73), uniform perplexity would be ~4672
             policy_ce = optax.softmax_cross_entropy(
-                outputs["policy_logit"].astype(jnp.float32),
-                batch["policy_target"].astype(jnp.float32),
+                masked_logits,
+                policy_target,
             ).mean()
             metrics["policy_perplexity"] = jnp.exp(policy_ce)
 
             # Hard policy perplexity: cross-entropy against hard label (argmax of target)
             hard_policy_ce = optax.softmax_cross_entropy_with_integer_labels(
-                outputs["policy_logit"].astype(jnp.float32),
+                masked_logits,
                 target_moves,
             ).mean()
             metrics["hard_policy_perplexity"] = jnp.exp(hard_policy_ce)
