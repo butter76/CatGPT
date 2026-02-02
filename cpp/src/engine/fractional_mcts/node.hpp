@@ -39,10 +39,12 @@ public:
     /**
      * Compute how many children cover the given fraction of policy mass.
      *
-     * @param coverage_threshold Fraction of policy mass to cover (e.g., 0.80).
+     * @param coverage_threshold Fraction of policy mass to cover (e.g., 0.75).
+     * @param single_node_threshold Minimum prior for limit=1 (e.g., 0.90).
+     *        If the top child's prior is below this, limit is forced to >= 2.
      * @return Number of children needed to cover that fraction.
      */
-    [[nodiscard]] int get_limit(float coverage_threshold = 0.80f) const {
+    [[nodiscard]] int get_limit(float coverage_threshold, float single_node_threshold) const {
         if (policy_priors.empty()) {
             return 0;
         }
@@ -56,14 +58,21 @@ public:
         std::sort(priors.begin(), priors.end(), std::greater<float>());
 
         float cumsum = 0.0f;
+        int limit = static_cast<int>(priors.size());
         for (size_t i = 0; i < priors.size(); ++i) {
             cumsum += priors[i];
             if (cumsum >= coverage_threshold) {
-                return static_cast<int>(i + 1);
+                limit = static_cast<int>(i + 1);
+                break;
             }
         }
 
-        return static_cast<int>(priors.size());
+        // Special case: limit=1 requires the top prior to exceed single_node_threshold
+        if (limit == 1 && priors[0] < single_node_threshold) {
+            return 2;
+        }
+
+        return limit;
     }
 
     /**

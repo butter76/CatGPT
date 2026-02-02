@@ -136,19 +136,40 @@ class UCIEngine:
                 return None
         return None
 
-    def select_move(self, board: chess.Board) -> chess.Move | None:
+    def select_move(
+        self,
+        board: chess.Board,
+        opening_fen: str | None = None,
+        moves: list[str] | None = None,
+    ) -> chess.Move | None:
         """Select the best move for the given position.
 
         Args:
             board: Current chess position.
+            opening_fen: Starting FEN for this game (enables repetition detection).
+            moves: List of UCI moves played since opening_fen.
 
         Returns:
             The selected move, or None if no legal moves exist.
+
+        Note:
+            For proper repetition detection, provide opening_fen and moves.
+            This sends "position fen <opening_fen> moves <move1> <move2> ..."
+            so the engine can track position history. Without this, the engine
+            only sees the current FEN and cannot detect threefold repetition.
         """
         with self._lock:
-            # Set up position
-            fen = board.fen()
-            self._send_command(f"position fen {fen}")
+            # Set up position with move history for repetition detection
+            if opening_fen is not None and moves is not None:
+                if moves:
+                    move_str = " ".join(moves)
+                    self._send_command(f"position fen {opening_fen} moves {move_str}")
+                else:
+                    self._send_command(f"position fen {opening_fen}")
+            else:
+                # Fallback: just send current FEN (no repetition detection)
+                fen = board.fen()
+                self._send_command(f"position fen {fen}")
 
             # Send go command with options
             go_parts = ["go"]

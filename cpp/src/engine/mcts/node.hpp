@@ -8,12 +8,14 @@
 #ifndef CATGPT_ENGINE_MCTS_NODE_HPP
 #define CATGPT_ENGINE_MCTS_NODE_HPP
 
+#include <array>
 #include <memory>
 #include <optional>
 #include <unordered_map>
 #include <vector>
 
 #include "../../../external/chess-library/include/chess.hpp"
+#include "../trt_evaluator.hpp"
 
 namespace catgpt {
 
@@ -29,10 +31,12 @@ struct MoveHash {
  *
  * Statistics:
  *   N: Visit count - how many times this node was visited during search.
- *   W: Total value sum - accumulated value from all visits.
+ *   origQ: Original NN evaluation or terminal value (set once when expanded).
+ *   cached_Q: Computed Q value from recursive formula.
  *   P: Prior probability - from policy network, used in PUCT formula.
  *
- * The mean value Q = W/N represents the expected outcome from this position.
+ * Q is computed recursively as:
+ *   Q = (origQ * 1 + sum(-child.Q * child.N)) / N
  */
 class MCTSNode {
 public:
@@ -42,10 +46,10 @@ public:
 
     /**
      * Mean value (expected outcome from this position).
-     * Returns 0.0 for unvisited nodes.
+     * Returns cached_Q which is computed by calcQ() after each simulation.
      */
     [[nodiscard]] float Q() const noexcept {
-        return N > 0 ? W / static_cast<float>(N) : 0.0f;
+        return cached_Q;
     }
 
     /**
@@ -129,16 +133,20 @@ public:
     }
 
     // Statistics
-    int N = 0;       // Visit count
-    float W = 0.0f;  // Total value sum
-    float P = 0.0f;  // Prior probability
+    int N = 0;            // Visit count
+    float origQ = 0.0f;   // Original NN evaluation or terminal value
+    float cached_Q = 0.0f; // Computed Q from recursive formula
+    float P = 0.0f;       // Prior probability
+
+    // Value distribution from HL-Gauss head (81 bins over [0, 1])
+    std::array<float, VALUE_NUM_BINS> value_probs{};
 
     // Terminal state info
     bool is_terminal = false;
     std::optional<float> terminal_value;  // -1=loss, 0=draw, 1=win (from this node's side-to-move)
 
-    // Children indexed by move
-    std::unordered_map<chess::Move, MCTSNode, MoveHash> children;
+    // Children ordered by decreasing policy (highest P first)
+    std::vector<std::pair<chess::Move, MCTSNode>> children;
 };
 
 }  // namespace catgpt

@@ -12,7 +12,7 @@ set -e
 uv run python scripts/export_onnx.py \
     --checkpoint ./checkpoints_jax/best \
     --output-path sample.onnx \
-    --output-keys value hard_policy_logit \
+    --output-keys value value_probs hard_policy_logit \
     --batch-size 1 \
     --opset 20 \
     --validate

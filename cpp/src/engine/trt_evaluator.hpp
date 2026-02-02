@@ -53,12 +53,16 @@ public:
     }
 };
 
+// Number of bins in the HL-Gauss value distribution
+constexpr int VALUE_NUM_BINS = 81;
+
 /**
  * Result of neural network evaluation.
  */
 struct NNOutput {
-    float value;                              // Win probability [0, 1]
-    std::array<float, POLICY_SIZE> policy;    // Policy logits (64 * 73 = 4672)
+    float value;                                    // Win probability [0, 1] (expected value)
+    std::array<float, VALUE_NUM_BINS> value_probs;  // Value distribution (81 bins over [0, 1])
+    std::array<float, POLICY_SIZE> policy;          // Policy logits (64 * 73 = 4672)
 };
 
 /**
@@ -87,9 +91,11 @@ public:
         if (stream_) cudaStreamDestroy(stream_);
         if (d_input_) cudaFree(d_input_);
         if (d_value_) cudaFree(d_value_);
+        if (d_value_probs_) cudaFree(d_value_probs_);
         if (d_policy_) cudaFree(d_policy_);
         if (h_input_) cudaFreeHost(h_input_);
         if (h_value_) cudaFreeHost(h_value_);
+        if (h_value_probs_) cudaFreeHost(h_value_probs_);
         if (h_policy_) cudaFreeHost(h_policy_);
     }
 
@@ -118,6 +124,7 @@ public:
         // Build output
         NNOutput output;
         output.value = h_value_[0];
+        std::memcpy(output.value_probs.data(), h_value_probs_, VALUE_NUM_BINS * sizeof(float));
         std::memcpy(output.policy.data(), h_policy_, POLICY_SIZE * sizeof(float));
 
         return output;
@@ -169,9 +176,12 @@ private:
             } else {
                 std::string name_str(name);
 
-                // Try to match by name first
-                if (name_str.find("value") != std::string::npos ||
-                    name_str.find("Value") != std::string::npos) {
+                // Try to match by name first (order matters: check value_probs before value)
+                if (name_str.find("value_probs") != std::string::npos ||
+                    name_str.find("ValueProbs") != std::string::npos) {
+                    value_probs_output_name_ = name;
+                } else if (name_str.find("value") != std::string::npos ||
+                           name_str.find("Value") != std::string::npos) {
                     value_output_name_ = name;
                 } else if (name_str.find("policy") != std::string::npos ||
                            name_str.find("Policy") != std::string::npos) {
@@ -179,6 +189,7 @@ private:
                 } else {
                     // Fallback: detect by shape
                     // Value output: scalar or (batch,) or (batch, 1)
+                    // Value probs output: (batch, 81)
                     // Policy output: (batch, 4672)
                     int64_t output_size = 1;
                     for (int d = 0; d < dims.nbDims; ++d) {
@@ -188,6 +199,8 @@ private:
                     if (output_size == 1 || (dims.nbDims == 1) ||
                         (dims.nbDims == 2 && dims.d[1] == 1)) {
                         value_output_name_ = name;
+                    } else if (dims.nbDims == 2 && dims.d[1] == VALUE_NUM_BINS) {
+                        value_probs_output_name_ = name;
                     } else if (output_size >= POLICY_SIZE ||
                                (dims.nbDims == 2 && dims.d[1] == POLICY_SIZE)) {
                         policy_output_name_ = name;
@@ -199,6 +212,9 @@ private:
         if (input_name_.empty() || value_output_name_.empty() || policy_output_name_.empty()) {
             throw std::runtime_error("Could not find all required I/O tensors");
         }
+        if (value_probs_output_name_.empty()) {
+            std::println(stderr, "[TRT WARNING] value_probs output not found - using zeros");
+        }
     }
 
     void allocate_buffers() {
@@ -208,11 +224,13 @@ private:
         // Allocate device buffers
         CATGPT_CUDA_CHECK(cudaMalloc(&d_input_, SEQ_LENGTH * sizeof(std::int32_t)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_value_, sizeof(float)));
+        CATGPT_CUDA_CHECK(cudaMalloc(&d_value_probs_, VALUE_NUM_BINS * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_policy_, POLICY_SIZE * sizeof(float)));
 
         // Allocate pinned host buffers for async transfers
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_input_, SEQ_LENGTH * sizeof(std::int32_t)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_value_, sizeof(float)));
+        CATGPT_CUDA_CHECK(cudaMallocHost(&h_value_probs_, VALUE_NUM_BINS * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_policy_, POLICY_SIZE * sizeof(float)));
     }
 
@@ -220,6 +238,9 @@ private:
         // Set up tensor addresses
         context_->setTensorAddress(input_name_.c_str(), d_input_);
         context_->setTensorAddress(value_output_name_.c_str(), d_value_);
+        if (!value_probs_output_name_.empty()) {
+            context_->setTensorAddress(value_probs_output_name_.c_str(), d_value_probs_);
+        }
         context_->setTensorAddress(policy_output_name_.c_str(), d_policy_);
 
         // Set input shape (batch size 1)
@@ -248,6 +269,11 @@ private:
         CATGPT_CUDA_CHECK(cudaMemcpyAsync(
             h_value_, d_value_, sizeof(float),
             cudaMemcpyDeviceToHost, stream_));
+        if (!value_probs_output_name_.empty()) {
+            CATGPT_CUDA_CHECK(cudaMemcpyAsync(
+                h_value_probs_, d_value_probs_, VALUE_NUM_BINS * sizeof(float),
+                cudaMemcpyDeviceToHost, stream_));
+        }
         CATGPT_CUDA_CHECK(cudaMemcpyAsync(
             h_policy_, d_policy_, POLICY_SIZE * sizeof(float),
             cudaMemcpyDeviceToHost, stream_));
@@ -266,6 +292,7 @@ private:
 
     std::string input_name_;
     std::string value_output_name_;
+    std::string value_probs_output_name_;
     std::string policy_output_name_;
 
     cudaStream_t stream_ = nullptr;
@@ -274,11 +301,13 @@ private:
     // Device buffers
     std::int32_t* d_input_ = nullptr;
     float* d_value_ = nullptr;
+    float* d_value_probs_ = nullptr;
     float* d_policy_ = nullptr;
 
     // Pinned host buffers
     std::int32_t* h_input_ = nullptr;
     float* h_value_ = nullptr;
+    float* h_value_probs_ = nullptr;
     float* h_policy_ = nullptr;
 };
 
