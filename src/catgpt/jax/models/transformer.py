@@ -484,17 +484,24 @@ class BidirectionalTransformer(nn.Module):
             outputs["self"] = self_logits
 
         # Value head: HL-Gauss categorical distribution from last token
+        # Uses 2-layer MLP (matching PyTorch/searchless_chess architecture)
         if head_config.value_head:
             # Use last token representation (similar to GPT-style classification)
             pooled = hidden[:, -1, :]  # (batch, hidden)
 
-            # Output logits for each bin in the HL-Gauss distribution
+            # 2-layer MLP: hidden -> hidden/2 -> num_bins (matching PyTorch)
             num_bins = head_config.value_num_bins
+            value_hidden = nn.Dense(
+                self.config.hidden_size // 2,
+                dtype=jnp.float32,
+                name="value_head_fc1",
+            )(pooled)  # (batch, hidden/2)
+            value_hidden = nn.gelu(value_hidden, approximate=True)
             value_logits = nn.Dense(
                 num_bins,
                 dtype=jnp.float32,
-                name="value_head",
-            )(pooled)  # (batch, num_bins)
+                name="value_head_fc2",
+            )(value_hidden)  # (batch, num_bins)
 
             # Softmax to get probability distribution
             value_probs = jax.nn.softmax(value_logits, axis=-1)  # (batch, num_bins)

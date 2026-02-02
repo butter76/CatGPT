@@ -476,7 +476,7 @@ class Trainer:
         head_config = self.model_config.output_heads if self.model_config else None
         head_grad_norms = {}
 
-        for head_name in head_losses.keys():
+        for head_name in head_losses:
             # Create a loss function that computes only this head's loss
             def single_head_loss_fn(params, _head_name=head_name):
                 outputs = self.state.apply_fn(
@@ -710,6 +710,13 @@ class Trainer:
                 batch["policy_target"].astype(jnp.float32),
             ).mean()
             metrics["policy_perplexity"] = jnp.exp(policy_ce)
+
+            # Hard policy perplexity: cross-entropy against hard label (argmax of target)
+            hard_policy_ce = optax.softmax_cross_entropy_with_integer_labels(
+                outputs["policy_logit"].astype(jnp.float32),
+                target_moves,
+            ).mean()
+            metrics["hard_policy_perplexity"] = jnp.exp(hard_policy_ce)
 
         # Next capture head metrics (accuracy on valid samples only)
         if "next_capture_logit" in outputs and "next_capture_target" in batch:
