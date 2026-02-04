@@ -7,6 +7,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# Re-export ResidualGateConfig for convenient import
+__all__ = ["ResidualGateConfig", "SmolgenConfig", "JaxModelConfig", "JaxExperimentConfig"]
+
 
 @dataclass
 class JaxOutputHeadConfig:
@@ -79,6 +82,30 @@ class JaxOutputHeadConfig:
 
 
 @dataclass
+class ResidualGateConfig:
+    """Configuration for learnable per-layer residual gates.
+
+    Each sublayer (attention and FFN) in each transformer block gets a learnable
+    scalar gate that scales its output before the residual connection:
+        x = x + gate * sublayer(x)
+
+    This provides several benefits:
+    - ReZero-style (init=0): Easier gradient flow at init, each layer starts as identity
+    - Identity-style (init=1): Standard residual behavior but with learnable scaling
+    - Per-sublayer gates allow attention vs FFN to scale differently
+
+    The model can learn to dynamically adjust the contribution of each sublayer,
+    potentially improving training stability and convergence.
+
+    See: https://arxiv.org/abs/2003.04887 (ReZero)
+    """
+
+    enabled: bool = False
+    init_value: float = 1.0  # Initial gate value (0 for ReZero, 1 for identity start)
+    per_dim: bool = False  # If True, use per-dimension gates instead of scalar
+
+
+@dataclass
 class SmolgenConfig:
     """Configuration for Smolgen attention bias generation.
 
@@ -129,6 +156,9 @@ class JaxModelConfig:
     # Smolgen: dynamic attention bias generation
     smolgen: SmolgenConfig = field(default_factory=SmolgenConfig)
 
+    # Learnable per-layer residual gates
+    residual_gates: ResidualGateConfig = field(default_factory=ResidualGateConfig)
+
     def __post_init__(self) -> None:
         """Set defaults and validate."""
         if self.ff_dim is None:
@@ -148,6 +178,8 @@ class JaxModelConfig:
             self.output_heads = JaxOutputHeadConfig(**self.output_heads)
         if isinstance(self.smolgen, dict):
             self.smolgen = SmolgenConfig(**self.smolgen)
+        if isinstance(self.residual_gates, dict):
+            self.residual_gates = ResidualGateConfig(**self.residual_gates)
 
 
 @dataclass

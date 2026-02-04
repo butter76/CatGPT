@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from catgpt.core.data.grain.coders import POLICY_SHAPE, POLICY_TO_DIM
-from catgpt.jax.configs import JaxModelConfig, JaxOutputHeadConfig, SmolgenConfig
+from catgpt.jax.configs import JaxModelConfig, JaxOutputHeadConfig, ResidualGateConfig, SmolgenConfig
 
 # Type alias for dtype
 Dtype = Any
@@ -39,6 +39,9 @@ class TransformerConfig:
     # Smolgen configuration
     smolgen: SmolgenConfig = field(default_factory=SmolgenConfig)
 
+    # Learnable per-layer residual gates
+    residual_gates: ResidualGateConfig = field(default_factory=ResidualGateConfig)
+
     def __post_init__(self) -> None:
         """Set defaults and validate."""
         if self.ff_dim is None:
@@ -58,6 +61,8 @@ class TransformerConfig:
             object.__setattr__(self, "output_heads", JaxOutputHeadConfig(**self.output_heads))
         if isinstance(self.smolgen, dict):
             object.__setattr__(self, "smolgen", SmolgenConfig(**self.smolgen))
+        if isinstance(self.residual_gates, dict):
+            object.__setattr__(self, "residual_gates", ResidualGateConfig(**self.residual_gates))
 
 
 class QKVNormMultiHeadAttention(nn.Module):
@@ -256,6 +261,9 @@ class TransformerBlock(nn.Module):
     # Smolgen configuration (None = disabled)
     smolgen_config: SmolgenConfig | None = None
 
+    # Residual gate configuration (None = disabled)
+    residual_gate_config: ResidualGateConfig | None = None
+
     def _get_activation(self) -> callable:
         """Get activation function by name."""
         activations = {
@@ -314,6 +322,20 @@ class TransformerBlock(nn.Module):
                 name="smolgen",
             )(x, smolgen_weight_kernel)
 
+        # Initialize residual gates if enabled
+        # Gates are learnable scalars (or per-dim vectors) that scale sublayer outputs
+        # ReZero (init=0): each layer starts as identity, easier gradient flow
+        # Identity (init=1): standard residual with learnable scaling
+        gate_config = self.residual_gate_config
+        if gate_config is not None and gate_config.enabled:
+            gate_shape = (self.hidden_size,) if gate_config.per_dim else ()
+            init_fn = nn.initializers.constant(gate_config.init_value)
+            attn_gate = self.param("attn_gate", init_fn, gate_shape)
+            ff_gate = self.param("ff_gate", init_fn, gate_shape)
+        else:
+            attn_gate = 1.0
+            ff_gate = 1.0
+
         # Self-attention with Peri-LN and QKV-Norm (NO causal mask = bidirectional)
         # Input norm: LayerNorm in float32 for numerical stability, then cast back
         normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
@@ -328,7 +350,7 @@ class TransformerBlock(nn.Module):
         )(normed, normed, smolgen_bias=smolgen_bias)
         # Output norm: normalize attention output before residual addition
         attn_out = nn.LayerNorm(dtype=jnp.float32)(attn_out.astype(jnp.float32)).astype(self.dtype)
-        x = x + attn_out
+        x = x + attn_gate * attn_out
 
         # Feed-forward with Peri-LN
         # Input norm
@@ -338,7 +360,7 @@ class TransformerBlock(nn.Module):
         ff_out = nn.Dense(self.hidden_size, dtype=self.dtype)(ff_out)
         # Output norm: normalize MLP output before residual addition
         ff_out = nn.LayerNorm(dtype=jnp.float32)(ff_out.astype(jnp.float32)).astype(self.dtype)
-        x = x + ff_out
+        x = x + ff_gate * ff_out
 
         return x
 
@@ -453,6 +475,7 @@ class BidirectionalTransformer(nn.Module):
             )
 
         # Pass through transformer blocks (in compute_dtype)
+        residual_gate_config = self.config.residual_gates
         for i in range(self.config.num_layers):
             hidden = TransformerBlock(
                 hidden_size=self.config.hidden_size,
@@ -463,6 +486,7 @@ class BidirectionalTransformer(nn.Module):
                 activation=self.config.activation,
                 dtype=compute_dtype,
                 smolgen_config=smolgen_config if smolgen_config.enabled else None,
+                residual_gate_config=residual_gate_config if residual_gate_config.enabled else None,
                 name=f"block_{i}",
             )(hidden, train=train, smolgen_weight_kernel=smolgen_weight_kernel)
 
@@ -633,6 +657,7 @@ class BidirectionalTransformer(nn.Module):
             position_embedding=config.position_embedding,
             output_heads=config.output_heads,
             smolgen=config.smolgen,
+            residual_gates=config.residual_gates,
         )
         return cls(config=transformer_config)
 

@@ -24,6 +24,14 @@ model:
     hidden_size: 256     # Hidden layer size
     gen_size: 256        # Per-head generation dimension
 
+  # Learnable per-layer residual gates
+  # Each sublayer (attention, FFN) gets a learnable scalar that scales its output
+  # See: https://arxiv.org/abs/2003.04887 (ReZero)
+  residual_gates:
+    enabled: true       # Enable learnable residual gates
+    init_value: 1.0      # Initial gate value (0.0 for ReZero, 1.0 for identity)
+    per_dim: true       # Use per-dimension gates instead of scalar
+
   # Output heads configuration
   output_heads:
     self_head: true      # Token reconstruction (auxiliary task for stability)
