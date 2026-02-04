@@ -53,6 +53,8 @@ def create_optimizer(
             inverse_every=config.splus_inverse_every,
             max_dim=config.splus_max_dim,
             weight_decay=config.weight_decay,
+            nonstandard_strings=config.splus_nonstandard_strings,
+            nonstandard_constant=config.splus_nonstandard_constant,
         )
 
     if name == "sgd":

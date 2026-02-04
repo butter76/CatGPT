@@ -177,6 +177,10 @@ class JaxOptimizerConfig:
     splus_ema_rate: float = 0.999
     splus_inverse_every: int = 100
     splus_max_dim: int = 10000
+    # Nonstandard scaling: params matching these strings get constant scaling instead of shape-based
+    # Default: embeddings and layernorm use constant scaling; dense matrices use 2/(dim0+dim1)
+    splus_nonstandard_strings: list[str] = field(default_factory=lambda: ["embed", "layernorm"])
+    splus_nonstandard_constant: float = 0.001
 
 
 @dataclass

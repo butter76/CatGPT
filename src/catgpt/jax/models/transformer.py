@@ -412,20 +412,19 @@ class BidirectionalTransformer(nn.Module):
             dtype=jnp.float32,  # Embeddings always in float32
         )(x)  # (batch, seq, hidden)
 
-        # Position encoding: either absolute (learnable) or MaGating (mult/add gates)
-        if self.config.position_embedding == "absolute":
-            # Learnable absolute positional embedding
-            positions = jnp.arange(seq_len)
-            pos_emb = nn.Embed(
-                num_embeddings=self.config.seq_length,
-                features=self.config.hidden_size,
-                dtype=jnp.float32,  # Embeddings always in float32
-                name="position_embedding",
-            )(positions)  # (seq, hidden)
+        # Learnable absolute positional embedding
+        positions = jnp.arange(seq_len)
+        pos_emb = nn.Embed(
+            num_embeddings=self.config.seq_length,
+            features=self.config.hidden_size,
+            dtype=jnp.float32,  # Embeddings always in float32
+            name="position_embedding",
+        )(positions)  # (seq, hidden)
 
-            # Combine embeddings and cast to compute dtype
-            hidden = (token_emb + pos_emb).astype(compute_dtype)
-        elif self.config.position_embedding == "magating":
+        # Combine embeddings
+        hidden = token_emb + pos_emb
+
+        if self.config.position_embedding in ["magating", "magate"]:
             # MaGating: learnable multiplicative and additive gates after embedding
             mult_gate = self.param(
                 "ma_mult_gate",
@@ -439,8 +438,8 @@ class BidirectionalTransformer(nn.Module):
             )
             hidden = token_emb * mult_gate + add_gate
             hidden = hidden.astype(compute_dtype)
-        else:
-            msg = f"Unknown position_embedding type: {self.config.position_embedding}. Choose 'absolute' or 'magating'."
+        elif self.config.position_embedding != "absolute":
+            msg = f"Unknown position embedding type: {self.config.position_embedding}. Choose 'absolute' or 'magating'."
             raise ValueError(msg)
 
         # Create shared Smolgen weight generation kernel if enabled

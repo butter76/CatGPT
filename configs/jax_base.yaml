@@ -13,7 +13,7 @@ model:
   seq_length: 64  # Will be overridden by tokenizer.sequence_length
   activation: "gelu"
   # Position embedding type: "absolute" (learnable) or "magating" (multiplicative + additive gates)
-  position_embedding: "absolute"
+  position_embedding: "magating"
 
   # Smolgen: dynamic attention bias generation
   # Generates position-dependent attention biases conditioned on input
@@ -67,6 +67,10 @@ optimizer:
   splus_ema_rate: 0.999
   splus_inverse_every: 100
   splus_max_dim: 10000
+  # Nonstandard scaling: params matching these strings (case-insensitive) get constant scaling
+  # instead of shape-based scaling (2/(dim0+dim1)). Applies to 2D matrices only.
+  splus_nonstandard_strings: ["layernorm"]
+  splus_nonstandard_constant: 0.001
 
 # Learning rate scheduler
 scheduler:
