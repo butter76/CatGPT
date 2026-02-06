@@ -6,12 +6,46 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from flax.linen import initializers as flax_initializers
 
 from catgpt.core.data.grain.coders import POLICY_SHAPE, POLICY_TO_DIM
-from catgpt.jax.configs import JaxModelConfig, JaxOutputHeadConfig, ResidualGateConfig, SmolgenConfig
+from catgpt.jax.configs import (
+    JaxModelConfig,
+    JaxOutputHeadConfig,
+    ResidualGateConfig,
+    SmolgenConfig,
+)
 
 # Type alias for dtype
 Dtype = Any
+Initializer = nn.initializers.Initializer
+
+
+def deepnorm_initializer(num_layers: int) -> Initializer:
+    """Create DeepNorm-style weight initializer for stable deep transformer training.
+
+    Uses the LC0/DeepNet initialization scheme where weights are scaled by
+    beta = (8 * num_layers)^(-0.25) to prevent variance explosion in deep networks.
+
+    This initializer should be applied to:
+    - V projection in attention (NOT Q and K)
+    - Output projection in attention
+    - Both Dense layers in FFN
+
+    See: https://arxiv.org/abs/2203.00555 (DeepNet: Scaling Transformers to 1,000 Layers)
+
+    Args:
+        num_layers: Number of transformer blocks.
+
+    Returns:
+        Flax initializer with scaled variance.
+    """
+    beta = (8.0 * num_layers) ** (-0.25)
+    return flax_initializers.variance_scaling(
+        scale=beta,
+        mode="fan_avg",
+        distribution="truncated_normal",
+    )
 
 # Policy output dimensions: (64 from_squares, 73 to_squares)
 _POLICY_FROM_DIM, _POLICY_TO_DIM = POLICY_SHAPE
@@ -75,11 +109,15 @@ class QKVNormMultiHeadAttention(nn.Module):
 
     Supports expanded attention where qkv_features > output_features, allowing
     more attention heads while keeping the residual stream dimension smaller.
+
+    Uses DeepNorm-style initialization (LC0) for V and output projections to enable
+    stable training of deep networks. Q and K use standard initialization.
     """
 
     num_heads: int
     qkv_features: int
     output_features: int | None = None  # Output projection dim (None = qkv_features)
+    kernel_init: Initializer = nn.initializers.lecun_normal()  # DeepNorm init for V and output
     deterministic: bool = True
     dtype: Dtype = jnp.float32
 
@@ -109,9 +147,12 @@ class QKVNormMultiHeadAttention(nn.Module):
             raise ValueError(msg)
 
         # Project to Q, K, V
+        # Q and K use default initialization; V uses DeepNorm init for stable deep training
         query = nn.Dense(self.qkv_features, dtype=self.dtype, name="query")(inputs_q)
         key = nn.Dense(self.qkv_features, dtype=self.dtype, name="key")(inputs_kv)
-        value = nn.Dense(self.qkv_features, dtype=self.dtype, name="value")(inputs_kv)
+        value = nn.Dense(
+            self.qkv_features, kernel_init=self.kernel_init, dtype=self.dtype, name="value"
+        )(inputs_kv)
 
         # Reshape to (batch, seq_len, num_heads, head_dim)
         query = query.reshape(batch_size, seq_len, self.num_heads, head_dim)
@@ -160,8 +201,11 @@ class QKVNormMultiHeadAttention(nn.Module):
         attn_output = attn_output.reshape(batch_size, seq_len, self.qkv_features)
 
         # Final output projection (to output_features, supporting expanded attention)
+        # Uses DeepNorm init for stable deep training
         out_features = self.output_features if self.output_features is not None else self.qkv_features
-        output = nn.Dense(out_features, dtype=self.dtype, name="out")(attn_output)
+        output = nn.Dense(
+            out_features, kernel_init=self.kernel_init, dtype=self.dtype, name="out"
+        )(attn_output)
 
         return output
 
@@ -256,6 +300,7 @@ class TransformerBlock(nn.Module):
     attention_dim: int | None = None  # Expanded attention dimension (None = hidden_size)
     seq_length: int = 64
     activation: str = "gelu"
+    kernel_init: Initializer = nn.initializers.lecun_normal()  # DeepNorm init for V, output, FFN
     dtype: Dtype = jnp.float32  # Compute dtype for mixed precision
 
     # Smolgen configuration (None = disabled)
@@ -345,6 +390,7 @@ class TransformerBlock(nn.Module):
             num_heads=self.num_heads,
             qkv_features=attn_dim,
             output_features=self.hidden_size,
+            kernel_init=self.kernel_init,
             deterministic=not train,
             dtype=self.dtype,
         )(normed, normed, smolgen_bias=smolgen_bias)
@@ -353,11 +399,12 @@ class TransformerBlock(nn.Module):
         x = x + attn_gate * attn_out
 
         # Feed-forward with Peri-LN
+        # Both FFN layers use DeepNorm init for stable deep training
         # Input norm
         normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
-        ff_out = nn.Dense(self.ff_dim, dtype=self.dtype)(normed)
+        ff_out = nn.Dense(self.ff_dim, kernel_init=self.kernel_init, dtype=self.dtype)(normed)
         ff_out = self._get_activation()(ff_out)
-        ff_out = nn.Dense(self.hidden_size, dtype=self.dtype)(ff_out)
+        ff_out = nn.Dense(self.hidden_size, kernel_init=self.kernel_init, dtype=self.dtype)(ff_out)
         # Output norm: normalize MLP output before residual addition
         ff_out = nn.LayerNorm(dtype=jnp.float32)(ff_out.astype(jnp.float32)).astype(self.dtype)
         x = x + ff_gate * ff_out
@@ -474,6 +521,10 @@ class BidirectionalTransformer(nn.Module):
                 (smolgen_config.gen_size, self.config.seq_length * self.config.seq_length),
             )
 
+        # DeepNorm-style initialization (LC0): scale weights by (8*N)^(-0.25)
+        # This prevents variance explosion in deep networks
+        kernel_init = deepnorm_initializer(self.config.num_layers)
+
         # Pass through transformer blocks (in compute_dtype)
         residual_gate_config = self.config.residual_gates
         for i in range(self.config.num_layers):
@@ -484,6 +535,7 @@ class BidirectionalTransformer(nn.Module):
                 attention_dim=self.config.attention_dim,
                 seq_length=self.config.seq_length,
                 activation=self.config.activation,
+                kernel_init=kernel_init,
                 dtype=compute_dtype,
                 smolgen_config=smolgen_config if smolgen_config.enabled else None,
                 residual_gate_config=residual_gate_config if residual_gate_config.enabled else None,
