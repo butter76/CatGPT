@@ -24,13 +24,22 @@ model:
     hidden_size: 256     # Hidden layer size
     gen_size: 256        # Per-head generation dimension
 
-  # Learnable per-layer residual gates
+  # Learnable per-layer residual gates (ignored when keel.enabled=true)
   # Each sublayer (attention, FFN) gets a learnable scalar that scales its output
   # See: https://arxiv.org/abs/2003.04887 (ReZero)
   residual_gates:
-    enabled: true       # Enable learnable residual gates
+    enabled: false       # Enable learnable residual gates
     init_value: 1.0      # Initial gate value (0.0 for ReZero, 1.0 for identity)
     per_dim: true       # Use per-dimension gates instead of scalar
+
+  # Keel: Post-LN with Highway-style connection for stable deep training
+  # x_{l+1} = LN(α · x_l + F_l(LN(x_l))), where α = 2 * num_layers
+  # First block degrades to Pre-LN for stable initialization.
+  # When enabled, supersedes residual_gates.
+  # See: https://arxiv.org/abs/2601.19895
+  keel:
+    enabled: true        # Enable Keel normalization (replaces Peri-LN)
+    alpha: 4          # Highway scaling factor. null = auto (2 * num_layers = 32)
 
   # Output heads configuration
   output_heads:

@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# Re-export ResidualGateConfig for convenient import
-__all__ = ["ResidualGateConfig", "SmolgenConfig", "JaxModelConfig", "JaxExperimentConfig"]
+# Re-export configs for convenient import
+__all__ = ["KeelConfig", "ResidualGateConfig", "SmolgenConfig", "JaxModelConfig", "JaxExperimentConfig"]
 
 
 @dataclass
@@ -31,7 +31,7 @@ class JaxOutputHeadConfig:
     The policy head outputs a (64, 73) tensor representing move probabilities
     over (from_square, to_square) pairs. The 73 "to" indices are:
     - 0-63: Normal destination squares
-    - 64-72: Underpromotion targets (3 pieces × 3 directions)
+    - 64-72: Underpromotion targets (3 pieces x 3 directions)
     """
 
     # Head enable flags
@@ -133,6 +133,31 @@ class SmolgenConfig:
 
 
 @dataclass
+class KeelConfig:
+    """Configuration for Keel normalization (Post-LN with Highway-style connection).
+
+    Keel replaces the standard residual pathway with a Highway-style connection
+    and uses Post-LN to normalize after the residual addition. This enables
+    stable training at extreme depths (1000+ layers) while maintaining the
+    expressivity advantages of Post-LN.
+
+    Forward pass per sub-layer (l-th layer):
+        x_{l+1} = LN(alpha * x_l + F_l(LN(x_l)))
+
+    Where alpha = total_sub_layers = 2 * num_layers (attention + FFN per block).
+
+    Implementation details from the paper:
+    - First block: degrades to Pre-LN (no outer LN, no alpha) for stable initialization
+    - When enabled, supersedes ResidualGateConfig (gates are not used)
+
+    See: https://arxiv.org/abs/2601.19895
+    """
+
+    enabled: bool = False
+    alpha: float | None = None  # Highway scaling factor. None = auto (2 * num_layers)
+
+
+@dataclass
 class JaxModelConfig:
     """Configuration for JAX model architecture."""
 
@@ -159,6 +184,9 @@ class JaxModelConfig:
     # Learnable per-layer residual gates
     residual_gates: ResidualGateConfig = field(default_factory=ResidualGateConfig)
 
+    # Keel: Post-LN with Highway-style connection
+    keel: KeelConfig = field(default_factory=KeelConfig)
+
     def __post_init__(self) -> None:
         """Set defaults and validate."""
         if self.ff_dim is None:
@@ -180,6 +208,8 @@ class JaxModelConfig:
             self.smolgen = SmolgenConfig(**self.smolgen)
         if isinstance(self.residual_gates, dict):
             self.residual_gates = ResidualGateConfig(**self.residual_gates)
+        if isinstance(self.keel, dict):
+            self.keel = KeelConfig(**self.keel)
 
 
 @dataclass

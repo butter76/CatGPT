@@ -8,7 +8,13 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from catgpt.core.data.grain.coders import POLICY_SHAPE, POLICY_TO_DIM
-from catgpt.jax.configs import JaxModelConfig, JaxOutputHeadConfig, ResidualGateConfig, SmolgenConfig
+from catgpt.jax.configs import (
+    JaxModelConfig,
+    JaxOutputHeadConfig,
+    KeelConfig,
+    ResidualGateConfig,
+    SmolgenConfig,
+)
 
 # Type alias for dtype
 Dtype = Any
@@ -42,6 +48,9 @@ class TransformerConfig:
     # Learnable per-layer residual gates
     residual_gates: ResidualGateConfig = field(default_factory=ResidualGateConfig)
 
+    # Keel: Post-LN with Highway-style connection
+    keel: KeelConfig = field(default_factory=KeelConfig)
+
     def __post_init__(self) -> None:
         """Set defaults and validate."""
         if self.ff_dim is None:
@@ -63,6 +72,8 @@ class TransformerConfig:
             object.__setattr__(self, "smolgen", SmolgenConfig(**self.smolgen))
         if isinstance(self.residual_gates, dict):
             object.__setattr__(self, "residual_gates", ResidualGateConfig(**self.residual_gates))
+        if isinstance(self.keel, dict):
+            object.__setattr__(self, "keel", KeelConfig(**self.keel))
 
 
 class QKVNormMultiHeadAttention(nn.Module):
@@ -248,7 +259,19 @@ class Smolgen(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Single transformer encoder block with bidirectional attention."""
+    """Single transformer encoder block with bidirectional attention.
+
+    Supports two normalization strategies:
+
+    1. **Peri-LN** (default): Norm before AND after each sublayer.
+       y = x + gate * Norm(Module(Norm(x)))
+       See: https://arxiv.org/abs/2502.02732
+
+    2. **Keel**: Post-LN with Highway-style connection.
+       x_{l+1} = LN(alpha * x_l + F_l(LN(x_l)))
+       First block degrades to Pre-LN for stable initialization.
+       See: https://arxiv.org/abs/2601.19895
+    """
 
     hidden_size: int
     num_heads: int
@@ -261,8 +284,13 @@ class TransformerBlock(nn.Module):
     # Smolgen configuration (None = disabled)
     smolgen_config: SmolgenConfig | None = None
 
-    # Residual gate configuration (None = disabled)
+    # Residual gate configuration (None = disabled, ignored when Keel is enabled)
     residual_gate_config: ResidualGateConfig | None = None
+
+    # Keel configuration
+    keel_enabled: bool = False
+    keel_alpha: float = 1.0  # Highway scaling factor (= 2 * num_layers)
+    is_first_block: bool = False  # First block uses Pre-LN (no outer LN, no alpha)
 
     def _get_activation(self) -> callable:
         """Get activation function by name."""
@@ -285,18 +313,12 @@ class TransformerBlock(nn.Module):
         train: bool = False,
         smolgen_weight_kernel: jax.Array | None = None,
     ) -> jax.Array:
-        """Forward pass with Peri-LN architecture and QKV-Norm.
+        """Forward pass through transformer block.
 
-        Peri-LN applies layer normalization peripherally around each sublayer,
-        i.e., both before (input) AND after (output) each module:
-            y = x + Norm(Module(Norm(x)))
-
-        This strikes an ideal balance in variance growth, avoiding both vanishing
-        gradients (Post-LN) and massive activations (Pre-LN).
-        See: https://arxiv.org/abs/2502.02732
-
+        Uses either Peri-LN or Keel normalization depending on configuration.
         QKV-Norm is applied within the attention mechanism per-head for improved
-        training stability. See: https://arxiv.org/abs/2503.04598
+        training stability regardless of normalization strategy.
+        See: https://arxiv.org/abs/2503.04598
 
         Args:
             x: Input tensor, shape (batch, seq_len, hidden_size).
@@ -322,10 +344,90 @@ class TransformerBlock(nn.Module):
                 name="smolgen",
             )(x, smolgen_weight_kernel)
 
+        attn_dim = self.attention_dim if self.attention_dim is not None else self.hidden_size
+
+        if self.keel_enabled:
+            x = self._forward_keel(x, attn_dim, smolgen_bias, train=train)
+        else:
+            x = self._forward_peri_ln(x, attn_dim, smolgen_bias, train=train)
+
+        return x
+
+    def _forward_keel(
+        self,
+        x: jax.Array,
+        attn_dim: int,
+        smolgen_bias: jax.Array | None,
+        *,
+        train: bool,
+    ) -> jax.Array:
+        """Keel: Post-LN with Highway-style connection.
+
+        For non-first blocks:
+            x_{l+1} = LN(alpha * x_l + F_l(LN(x_l)))
+
+        For the first block (Pre-LN degenerate, no outer LN, no alpha):
+            x_{l+1} = x_l + F_l(LN(x_l))
+
+        See: https://arxiv.org/abs/2601.19895
+        """
+        alpha = self.keel_alpha
+        use_post_ln = not self.is_first_block
+
+        # --- Attention sublayer ---
+        normed = nn.LayerNorm(dtype=jnp.float32, name="attn_in_ln")(
+            x.astype(jnp.float32)
+        ).astype(self.dtype)
+        attn_out = QKVNormMultiHeadAttention(
+            num_heads=self.num_heads,
+            qkv_features=attn_dim,
+            output_features=self.hidden_size,
+            deterministic=not train,
+            dtype=self.dtype,
+        )(normed, normed, smolgen_bias=smolgen_bias)
+
+        if use_post_ln:
+            # Keel: Post-LN on (alpha * residual + sublayer_output)
+            x = nn.LayerNorm(dtype=jnp.float32, name="attn_post_ln")(
+                (alpha * x + attn_out).astype(jnp.float32)
+            ).astype(self.dtype)
+        else:
+            # First block: simple Pre-LN residual (no alpha, no outer LN)
+            x = x + attn_out
+
+        # --- FFN sublayer ---
+        normed = nn.LayerNorm(dtype=jnp.float32, name="ff_in_ln")(
+            x.astype(jnp.float32)
+        ).astype(self.dtype)
+        ff_out = nn.Dense(self.ff_dim, dtype=self.dtype, name="ff_dense1")(normed)
+        ff_out = self._get_activation()(ff_out)
+        ff_out = nn.Dense(self.hidden_size, dtype=self.dtype, name="ff_dense2")(ff_out)
+
+        if use_post_ln:
+            # Keel: Post-LN on (alpha * residual + sublayer_output)
+            x = nn.LayerNorm(dtype=jnp.float32, name="ff_post_ln")(
+                (alpha * x + ff_out).astype(jnp.float32)
+            ).astype(self.dtype)
+        else:
+            # First block: simple Pre-LN residual (no alpha, no outer LN)
+            x = x + ff_out
+
+        return x
+
+    def _forward_peri_ln(
+        self,
+        x: jax.Array,
+        attn_dim: int,
+        smolgen_bias: jax.Array | None,
+        *,
+        train: bool,
+    ) -> jax.Array:
+        """Peri-LN: Norm before AND after each sublayer.
+
+        y = x + gate * Norm(Module(Norm(x)))
+        See: https://arxiv.org/abs/2502.02732
+        """
         # Initialize residual gates if enabled
-        # Gates are learnable scalars (or per-dim vectors) that scale sublayer outputs
-        # ReZero (init=0): each layer starts as identity, easier gradient flow
-        # Identity (init=1): standard residual with learnable scaling
         gate_config = self.residual_gate_config
         if gate_config is not None and gate_config.enabled:
             gate_shape = (self.hidden_size,) if gate_config.per_dim else ()
@@ -339,8 +441,6 @@ class TransformerBlock(nn.Module):
         # Self-attention with Peri-LN and QKV-Norm (NO causal mask = bidirectional)
         # Input norm: LayerNorm in float32 for numerical stability, then cast back
         normed = nn.LayerNorm(dtype=jnp.float32)(x.astype(jnp.float32)).astype(self.dtype)
-        # Expanded attention: QKV projects to attention_dim, output projects back to hidden_size
-        attn_dim = self.attention_dim if self.attention_dim is not None else self.hidden_size
         attn_out = QKVNormMultiHeadAttention(
             num_heads=self.num_heads,
             qkv_features=attn_dim,
@@ -374,19 +474,22 @@ class BidirectionalTransformer(nn.Module):
 
     Architecture:
     - Token embedding
-    - Absolute (learnable) positional embedding
-    - Initial embedding LayerNorm (Peri-LN)
-    - N transformer encoder blocks with Peri-LN
+    - Positional embedding (absolute or MaGating)
+    - N transformer encoder blocks
     - Final LayerNorm
-    - Mean pooling over sequence
-    - Linear projection to HL-Gauss categorical distribution
+    - Output heads (value, policy, etc.)
 
-    Normalization (Peri-LN):
-    Uses Peri-LN architecture which applies layer normalization peripherally
-    around each sublayer (both input AND output): y = x + Norm(Module(Norm(x)))
-    This provides more stable training than Pre-LN (prone to massive activations)
-    or Post-LN (prone to vanishing gradients).
-    See: https://arxiv.org/abs/2502.02732
+    Normalization strategies (configured via TransformerConfig):
+
+    **Peri-LN** (default): Norm before AND after each sublayer.
+        y = x + Norm(Module(Norm(x)))
+        See: https://arxiv.org/abs/2502.02732
+
+    **Keel**: Post-LN with Highway-style connection for stable deep training.
+        x_{l+1} = LN(alpha * x_l + F_l(LN(x_l)))
+        Where alpha = total_sub_layers (2 * num_layers). First block degrades to
+        Pre-LN for stable signal initialization from the embedding layer.
+        See: https://arxiv.org/abs/2601.19895
 
     Value Head (HL-Gauss):
     Instead of outputting a single scalar, the value head outputs logits over
@@ -476,6 +579,16 @@ class BidirectionalTransformer(nn.Module):
 
         # Pass through transformer blocks (in compute_dtype)
         residual_gate_config = self.config.residual_gates
+        keel_config = self.config.keel
+        keel_enabled = keel_config.enabled
+
+        # Keel: compute highway scaling factor alpha = total_sub_layers = 2 * num_layers
+        # Each block has 2 sub-layers (attention + FFN), so total = 2 * num_layers.
+        # For small models, alpha can be overridden as a tunable hyperparameter (> 1).
+        if keel_enabled:
+            total_sub_layers = 2 * self.config.num_layers
+            keel_alpha = float(keel_config.alpha if keel_config.alpha is not None else total_sub_layers)
+
         for i in range(self.config.num_layers):
             hidden = TransformerBlock(
                 hidden_size=self.config.hidden_size,
@@ -486,11 +599,20 @@ class BidirectionalTransformer(nn.Module):
                 activation=self.config.activation,
                 dtype=compute_dtype,
                 smolgen_config=smolgen_config if smolgen_config.enabled else None,
-                residual_gate_config=residual_gate_config if residual_gate_config.enabled else None,
+                # Residual gates are ignored when Keel is enabled
+                residual_gate_config=(
+                    residual_gate_config if residual_gate_config.enabled and not keel_enabled else None
+                ),
+                # Keel parameters
+                keel_enabled=keel_enabled,
+                keel_alpha=keel_alpha if keel_enabled else 1.0,
+                is_first_block=(i == 0),
                 name=f"block_{i}",
             )(hidden, train=train, smolgen_weight_kernel=smolgen_weight_kernel)
 
         # Final norm (float32 for stability)
+        # With Keel, the last block's Post-LN already normalizes, but we keep
+        # a final norm for consistent output regardless of normalization strategy.
         hidden = nn.LayerNorm(dtype=jnp.float32)(hidden.astype(jnp.float32))
         # hidden: (batch, seq, hidden) - per-token representations
 
@@ -658,6 +780,7 @@ class BidirectionalTransformer(nn.Module):
             output_heads=config.output_heads,
             smolgen=config.smolgen,
             residual_gates=config.residual_gates,
+            keel=config.keel,
         )
         return cls(config=transformer_config)
 
