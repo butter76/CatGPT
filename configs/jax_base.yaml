@@ -39,7 +39,7 @@ model:
   # See: https://arxiv.org/abs/2601.19895
   keel:
     enabled: true        # Enable Keel normalization (replaces Peri-LN)
-    alpha: 4          # Highway scaling factor. null = auto (2 * num_layers = 32)
+    alpha: 6          # Highway scaling factor. null = auto (2 * num_layers = 32)
 
   # Output heads configuration
   output_heads:

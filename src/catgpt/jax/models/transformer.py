@@ -375,7 +375,7 @@ class TransformerBlock(nn.Module):
         use_post_ln = not self.is_first_block
 
         # --- Attention sublayer ---
-        normed = nn.LayerNorm(dtype=jnp.float32, name="attn_in_ln")(
+        normed = nn.LayerNorm(dtype=jnp.float32, name="attn_in_ln", use_bias=False)(
             x.astype(jnp.float32)
         ).astype(self.dtype)
         attn_out = QKVNormMultiHeadAttention(
@@ -388,7 +388,7 @@ class TransformerBlock(nn.Module):
 
         if use_post_ln:
             # Keel: Post-LN on (alpha * residual + sublayer_output)
-            x = nn.LayerNorm(dtype=jnp.float32, name="attn_post_ln")(
+            x = nn.LayerNorm(dtype=jnp.float32, name="attn_post_ln", use_bias=False)(
                 (alpha * x + attn_out).astype(jnp.float32)
             ).astype(self.dtype)
         else:
@@ -396,7 +396,7 @@ class TransformerBlock(nn.Module):
             x = x + attn_out
 
         # --- FFN sublayer ---
-        normed = nn.LayerNorm(dtype=jnp.float32, name="ff_in_ln")(
+        normed = nn.LayerNorm(dtype=jnp.float32, name="ff_in_ln", use_bias=False)(
             x.astype(jnp.float32)
         ).astype(self.dtype)
         ff_out = nn.Dense(self.ff_dim, dtype=self.dtype, name="ff_dense1")(normed)
@@ -405,7 +405,7 @@ class TransformerBlock(nn.Module):
 
         if use_post_ln:
             # Keel: Post-LN on (alpha * residual + sublayer_output)
-            x = nn.LayerNorm(dtype=jnp.float32, name="ff_post_ln")(
+            x = nn.LayerNorm(dtype=jnp.float32, name="ff_post_ln", use_bias=False)(
                 (alpha * x + ff_out).astype(jnp.float32)
             ).astype(self.dtype)
         else:
