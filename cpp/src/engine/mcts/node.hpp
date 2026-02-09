@@ -36,7 +36,9 @@ struct MoveHash {
  *   P: Prior probability - from policy network, used in PUCT formula.
  *
  * Q is computed recursively as:
- *   Q = (origQ * 1 + sum(-child.Q * child.N)) / N
+ *   Q = (origQ * self_weight + sum(-child.Q * child.N)) / N
+ *
+ * N is fractional — uncertain evaluations count as less than one playout.
  */
 class MCTSNode {
 public:
@@ -70,7 +72,7 @@ public:
 
         chess::Move best_move = chess::Move::NO_MOVE;
         MCTSNode* best_child = nullptr;
-        int best_visits = -1;
+        float best_visits = -1.0f;
 
         for (auto& [move, child] : children) {
             if (child.N > best_visits) {
@@ -93,12 +95,12 @@ public:
             return dist;
         }
 
-        int total_visits = 0;
+        float total_visits = 0.0f;
         for (const auto& [move, child] : children) {
             total_visits += child.N;
         }
 
-        if (total_visits == 0) {
+        if (total_visits <= 0.0f) {
             for (const auto& [move, child] : children) {
                 dist[move] = 0.0f;
             }
@@ -106,7 +108,7 @@ public:
         }
 
         for (const auto& [move, child] : children) {
-            dist[move] = static_cast<float>(child.N) / static_cast<float>(total_visits);
+            dist[move] = child.N / total_visits;
         }
 
         return dist;
@@ -133,7 +135,8 @@ public:
     }
 
     // Statistics
-    int N = 0;            // Visit count
+    float N = 0.0f;        // Visit count (fractional: uncertain evals count < 1)
+    float self_weight = 0.0f;  // Fractional weight of this node's own evaluation
     float origQ = 0.0f;   // Original NN evaluation or terminal value
     float cached_Q = 0.0f; // Computed Q from recursive formula
     float P = 0.0f;       // Prior probability

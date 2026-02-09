@@ -42,6 +42,15 @@ struct MCTSConfig {
      * Prevents infinite loops when repeatedly hitting terminal nodes.
      */
     int max_simulations = 10000;
+
+    /**
+     * Variance threshold for fractional playout weighting.
+     * The value distribution variance (in [-1, 1] space) determines playout weight:
+     *   - variance <= threshold: weight = 1.0 (full playout)
+     *   - variance >  threshold: weight = threshold / variance (fractional)
+     * Lower threshold = more aggressive fractional weighting.
+     */
+    float fractional_n_variance_threshold = 0.04f;
 };
 
 }  // namespace catgpt

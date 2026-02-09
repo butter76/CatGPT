@@ -11,7 +11,11 @@
  *   5. CALC Q: Recursively recompute Q values for the tree
  *
  * Q values are computed as:
- *   Q(node) = (origQ * 1 + sum(-child.Q * child.N)) / N
+ *   Q(node) = (origQ * self_weight + sum(-child.Q * child.N)) / N
+ *
+ * N is fractional: uncertain NN evaluations (high variance in value
+ * distribution) count as less than one playout. self_weight captures how
+ * much this node's own evaluation should be trusted.
  *
  * After search, the move with highest visit count is selected.
  */
@@ -201,14 +205,19 @@ private:
         }
 
         // EXPAND & EVALUATE
+        float playout_weight;
         if (!node->is_terminal) {
-            // Expand the leaf (this sets node->origQ)
+            // Expand the leaf (this sets node->origQ and node->value_probs)
             expand_and_evaluate(node, scratch_board);
+            playout_weight = compute_playout_weight(node->value_probs);
+            node->self_weight = playout_weight;
+        } else {
+            // Terminal nodes are certain — full playout weight
+            playout_weight = 1.0f;
         }
-        // Terminal nodes already have origQ set when created
 
-        // BACKPROPAGATE: update visit counts
-        backpropagate(path);
+        // BACKPROPAGATE: update visit counts with fractional weight
+        backpropagate(path, playout_weight);
 
         // CALC Q: recursively recompute Q values for entire tree
         calcQ(root_.get());
@@ -221,8 +230,9 @@ private:
      *     fpu = parent.Q - fpu_reduction * sqrt(visited_policy)
      */
     std::pair<chess::Move, MCTSNode*> select_child(MCTSNode* node) {
-        // Use N-1 since current visit is in progress; safe to be 0 due to FPU
-        float sqrt_n_parent = node->N > 1 ? std::sqrt(static_cast<float>(node->N - 1)) : 0.0f;
+        // Use N - self_weight since current visit is in progress; safe to be 0 due to FPU
+        float effective_parent_n = node->N - node->self_weight;
+        float sqrt_n_parent = effective_parent_n > 0.0f ? std::sqrt(effective_parent_n) : 0.0f;
 
         float best_score = -std::numeric_limits<float>::infinity();
         chess::Move best_move = chess::Move::NO_MOVE;
@@ -238,7 +248,7 @@ private:
             float q;
             if (child.is_terminal) {
                 q = -child.terminal_value.value();
-            } else if (child.N == 0) {
+            } else if (child.N == 0.0f) {
                 // Per-child FPU: based on policy of higher-ranked siblings
                 float fpu = node->Q() - config_.fpu_reduction * std::sqrt(cumulative_policy);
                 q = fpu;
@@ -295,10 +305,12 @@ private:
                     child.is_terminal = true;
                     child.terminal_value = -1.0f;
                     child.origQ = -1.0f;
+                    child.self_weight = 1.0f;  // Terminal = certain
                 } else if (game_result == chess::GameResult::DRAW) {
                     child.is_terminal = true;
                     child.terminal_value = 0.0f;
                     child.origQ = 0.0f;
+                    child.self_weight = 1.0f;  // Terminal = certain
                 }
             }
 
@@ -316,6 +328,38 @@ private:
         node->value_probs = eval.value_probs;
 
         return eval.value;
+    }
+
+    /**
+     * Compute fractional playout weight from value distribution variance.
+     *
+     * The 81 value bins span [0, 1]; we remap to [-1, 1] for variance.
+     *   - variance <= threshold: weight = 1.0 (full playout)
+     *   - variance >  threshold: weight = threshold / variance
+     *
+     * @param value_probs Probability distribution over 81 bins.
+     * @return Playout weight in (0, 1].
+     */
+    float compute_playout_weight(const std::array<float, VALUE_NUM_BINS>& value_probs) const {
+        // Bin centers in [-1, 1] at midpoints: center_i = 2*(i+0.5)/NUM_BINS - 1
+        // For 81 bins: first center ≈ -0.988, last center ≈ +0.988
+        float mean = 0.0f;
+        float mean_sq = 0.0f;
+        for (int i = 0; i < VALUE_NUM_BINS; ++i) {
+            float center = 2.0f * (static_cast<float>(i) + 0.5f) / static_cast<float>(VALUE_NUM_BINS) - 1.0f;
+            mean += value_probs[i] * center;
+            mean_sq += value_probs[i] * center * center;
+        }
+        float variance = mean_sq - mean * mean;
+
+        // Clamp variance to non-negative (numerical safety)
+        variance = std::max(variance, 0.0f);
+
+        float threshold = config_.fractional_n_variance_threshold;
+        if (variance <= threshold) {
+            return 1.0f;
+        }
+        return threshold / variance;
     }
 
     /**
@@ -383,17 +427,23 @@ private:
 
     /**
      * Update visit counts along the path from leaf to root.
+     *
+     * @param path Nodes from root to leaf.
+     * @param weight Fractional playout weight (1.0 for confident/terminal evals).
      */
-    void backpropagate(std::vector<MCTSNode*>& path) {
+    void backpropagate(std::vector<MCTSNode*>& path, float weight) {
         for (MCTSNode* node : path) {
-            node->N += 1;
+            node->N += weight;
         }
     }
 
     /**
      * Recursively compute Q values for the entire tree.
      *
-     * Q(node) = (origQ * 1 + sum(-child.Q * child.N)) / N
+     * Q(node) = (origQ * self_weight + sum(-child.Q * child.N)) / N
+     *
+     * self_weight is the fractional playout weight from this node's own NN
+     * evaluation. Uncertain evaluations (high variance) get lower weight.
      *
      * This is called after each simulation to update cached_Q values.
      */
@@ -416,12 +466,12 @@ private:
         }
 
         // Compute weighted average:
-        // Q = (origQ * 1 + sum(-child.Q * child.N)) / N
-        float sum = node->origQ;  // Weight 1 for own evaluation
+        // Q = (origQ * self_weight + sum(-child.Q * child.N)) / N
+        float sum = node->origQ * node->self_weight;
         for (const auto& [move, child] : node->children) {
-            sum += -child.cached_Q * static_cast<float>(child.N);
+            sum += -child.cached_Q * child.N;
         }
-        node->cached_Q = sum / static_cast<float>(node->N);
+        node->cached_Q = sum / node->N;
     }
 
     std::shared_ptr<TrtEvaluator> evaluator_;
