@@ -29,7 +29,7 @@ cpp_build_dir: "cpp/build/bin"
 # Engine A configuration (the "new" or "test" engine)
 engine_a:
   trt_engine: "sample.trt"
-  type: "fractional_mcts"  # Options: "value", "policy", "mcts", "fractional_mcts"
+  type: "pvs"  # Options: "value", "policy", "mcts", "fractional_mcts", "pvs"
 
   # MCTS-specific settings (only used when type=mcts)
   mcts:
@@ -38,6 +38,10 @@ engine_a:
   # Fractional MCTS settings (only used when type=fractional_mcts)
   fractional_mcts:
     min_total_evals: 400
+
+  # PVS settings (only used when type=pvs)
+  pvs:
+    max_gpu_evals: 400
 
   # UCI timeout in seconds
   timeout: 120.0
@@ -53,6 +57,9 @@ engine_b:
 
   fractional_mcts:
     min_total_evals: 400
+
+  pvs:
+    max_gpu_evals: 400
 
   timeout: 120.0
 

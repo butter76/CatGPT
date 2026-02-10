@@ -279,6 +279,9 @@ def _config_to_dict(cfg: DictConfig, project_root: Path) -> dict[str, Any]:
             "fractional_mcts": {
                 "min_total_evals": cfg.engine.fractional_mcts.min_total_evals,
             },
+            "pvs": {
+                "max_gpu_evals": cfg.engine.pvs.max_gpu_evals,
+            },
         },
     }
 
@@ -290,7 +293,7 @@ def _worker_init(config_dict: dict[str, Any]) -> None:
     """
     global _worker_engine
 
-    from catgpt.cpp.uci_engine import MCTSEngine, PolicyEngine, ValueEngine
+    from catgpt.cpp.uci_engine import MCTSEngine, PVSEngine, PolicyEngine, ValueEngine
 
     engine_type = config_dict["engine"]["type"]
     cpp_build_dir = Path(config_dict["cpp_build_dir"])
@@ -301,6 +304,7 @@ def _worker_init(config_dict: dict[str, Any]) -> None:
     binary_map = {
         "mcts": "catgpt_mcts",
         "fractional_mcts": "catgpt_fractional_mcts",
+        "pvs": "catgpt_pvs",
         "value": "catgpt_value",
         "policy": "catgpt_policy",
     }
@@ -322,6 +326,14 @@ def _worker_init(config_dict: dict[str, Any]) -> None:
             binary_path,
             trt_engine,
             min_total_evals=min_total_evals,
+            timeout=timeout,
+        )
+    elif engine_type == "pvs":
+        max_gpu_evals = config_dict["engine"]["pvs"]["max_gpu_evals"]
+        _worker_engine = PVSEngine(
+            binary_path,
+            trt_engine,
+            max_gpu_evals=max_gpu_evals,
             timeout=timeout,
         )
     elif engine_type == "value":
@@ -631,6 +643,7 @@ def create_engine(cfg: DictConfig, project_root: Path):
     from catgpt.cpp.uci_engine import (
         FractionalMCTSEngine,
         MCTSEngine,
+        PVSEngine,
         PolicyEngine,
         ValueEngine,
     )
@@ -644,6 +657,7 @@ def create_engine(cfg: DictConfig, project_root: Path):
     binary_map = {
         "mcts": "catgpt_mcts",
         "fractional_mcts": "catgpt_fractional_mcts",
+        "pvs": "catgpt_pvs",
         "value": "catgpt_value",
         "policy": "catgpt_policy",
     }
@@ -680,6 +694,15 @@ def create_engine(cfg: DictConfig, project_root: Path):
             min_total_evals=min_total_evals,
             timeout=timeout,
         )
+    elif engine_type == "pvs":
+        max_gpu_evals = cfg.engine.pvs.max_gpu_evals
+        logger.info(f"Creating PVS engine with {max_gpu_evals} max GPU evals")
+        return PVSEngine(
+            binary_path,
+            trt_engine,
+            max_gpu_evals=max_gpu_evals,
+            timeout=timeout,
+        )
     elif engine_type == "value":
         logger.info("Creating Value engine (1-ply lookahead)")
         return ValueEngine(binary_path, trt_engine, timeout=timeout)
@@ -708,7 +731,7 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
 
     # Validate engine type
-    valid_engines = ("value", "policy", "mcts", "fractional_mcts")
+    valid_engines = ("value", "policy", "mcts", "fractional_mcts", "pvs")
     if cfg.engine.type not in valid_engines:
         logger.error(f"Invalid engine type: {cfg.engine.type}")
         logger.info(f"Valid options: {valid_engines}")
@@ -731,6 +754,8 @@ def main(cfg: DictConfig) -> None:
         logger.info(f"MCTS simulations: {cfg.engine.mcts.num_simulations}")
     elif cfg.engine.type == "fractional_mcts":
         logger.info(f"Fractional MCTS min_evals: {cfg.engine.fractional_mcts.min_total_evals}")
+    elif cfg.engine.type == "pvs":
+        logger.info(f"PVS max_gpu_evals: {cfg.engine.pvs.max_gpu_evals}")
 
     num_workers = cfg.engine.num_workers
     use_parallel = num_workers > 1
@@ -754,6 +779,7 @@ def main(cfg: DictConfig) -> None:
                     "engine_type": cfg.engine.type,
                     "mcts_simulations": cfg.engine.mcts.num_simulations if cfg.engine.type == "mcts" else None,
                     "fractional_mcts_min_evals": cfg.engine.fractional_mcts.min_total_evals if cfg.engine.type == "fractional_mcts" else None,
+                    "pvs_max_gpu_evals": cfg.engine.pvs.max_gpu_evals if cfg.engine.type == "pvs" else None,
                     "num_workers": num_workers,
                 },
             )
@@ -791,6 +817,8 @@ def main(cfg: DictConfig) -> None:
                 engine_name = f"MCTS(nodes={cfg.engine.mcts.num_simulations}, workers={num_workers})"
             elif cfg.engine.type == "fractional_mcts":
                 engine_name = f"FractionalMCTS(evals={cfg.engine.fractional_mcts.min_total_evals}, workers={num_workers})"
+            elif cfg.engine.type == "pvs":
+                engine_name = f"PVS(evals={cfg.engine.pvs.max_gpu_evals}, workers={num_workers})"
         else:
             engine_name = engine.name
 

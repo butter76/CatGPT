@@ -2,6 +2,7 @@
 
 from catgpt.cpp.uci_engine import (
     MCTSEngine,
+    PVSEngine,
     PolicyEngine,
     UCIEngine,
     UCIEngineError,
@@ -12,6 +13,7 @@ __all__ = [
     "UCIEngine",
     "UCIEngineError",
     "MCTSEngine",
+    "PVSEngine",
     "ValueEngine",
     "PolicyEngine",
 ]

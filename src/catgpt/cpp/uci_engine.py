@@ -293,6 +293,38 @@ class FractionalMCTSEngine(UCIEngine):
         return f"FractionalMCTS(evals={self._min_total_evals})"
 
 
+class PVSEngine(UCIEngine):
+    """UCI engine wrapper for PVS (Principal Variation Search)."""
+
+    def __init__(
+        self,
+        binary_path: str | Path,
+        engine_path: str | Path | None = None,
+        *,
+        max_gpu_evals: int = 400,
+        timeout: float = 120.0,
+    ) -> None:
+        """Initialize PVS engine.
+
+        Args:
+            binary_path: Path to the catgpt_pvs binary.
+            engine_path: Path to the TensorRT engine file.
+            max_gpu_evals: Maximum GPU evaluations per search (passed as nodes).
+            timeout: Timeout in seconds for UCI responses.
+        """
+        super().__init__(
+            binary_path,
+            engine_path,
+            timeout=timeout,
+            go_options={"nodes": max_gpu_evals},
+        )
+        self._max_gpu_evals = max_gpu_evals
+
+    @property
+    def name(self) -> str:
+        return f"PVS(evals={self._max_gpu_evals})"
+
+
 class ValueEngine(UCIEngine):
     """UCI engine wrapper for value-based search."""
 

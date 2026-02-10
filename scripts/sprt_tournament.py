@@ -45,6 +45,7 @@ from tqdm import tqdm
 from catgpt.cpp.uci_engine import (
     FractionalMCTSEngine,
     MCTSEngine,
+    PVSEngine,
     PolicyEngine,
     UCIEngine,
     ValueEngine,
@@ -108,6 +109,7 @@ def create_engine(
     binary_map = {
         "mcts": "catgpt_mcts",
         "fractional_mcts": "catgpt_fractional_mcts",
+        "pvs": "catgpt_pvs",
         "value": "catgpt_value",
         "policy": "catgpt_policy",
     }
@@ -147,6 +149,12 @@ def create_engine(
         logger.info(f"Creating Fractional MCTS engine ({min_evals} min evals)")
         return FractionalMCTSEngine(
             binary_path, trt_engine, min_total_evals=min_evals, timeout=timeout
+        )
+    elif engine_type == "pvs":
+        max_gpu_evals = engine_cfg.pvs.max_gpu_evals
+        logger.info(f"Creating PVS engine ({max_gpu_evals} max GPU evals)")
+        return PVSEngine(
+            binary_path, trt_engine, max_gpu_evals=max_gpu_evals, timeout=timeout
         )
     elif engine_type == "value":
         logger.info("Creating Value engine (1-ply)")

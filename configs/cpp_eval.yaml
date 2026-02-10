@@ -22,7 +22,7 @@ cpp_build_dir: "cpp/build/bin"
 
 # Engine configuration
 engine:
-  type: "fractional_mcts"  # Options: "value", "policy", "mcts", "fractional_mcts"
+  type: "pvs"  # Options: "value", "policy", "mcts", "fractional_mcts", "pvs"
 
   # MCTS-specific settings (only used when type=mcts)
   mcts:
@@ -35,6 +35,10 @@ engine:
     min_total_evals: 400
     initial_budget: 1.0
     budget_multiplier: 1.2
+
+  # PVS settings (only used when type=pvs)
+  pvs:
+    max_gpu_evals: 400
 
   # UCI timeout in seconds
   timeout: 120.0
