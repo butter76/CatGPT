@@ -562,10 +562,10 @@ class BidirectionalTransformer(nn.Module):
                 (self.config.seq_length, self.config.hidden_size),
             )
             hidden = token_emb * mult_gate + add_gate
-            hidden = hidden.astype(compute_dtype)
         elif self.config.position_embedding != "absolute":
             msg = f"Unknown position embedding type: {self.config.position_embedding}. Choose 'absolute' or 'magating'."
             raise ValueError(msg)
+        hidden = hidden.astype(compute_dtype)
 
         # Create shared Smolgen weight generation kernel if enabled
         # This kernel is shared across ALL transformer blocks
