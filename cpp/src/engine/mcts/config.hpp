@@ -35,7 +35,7 @@ struct MCTSConfig {
      * where visited_policy is the fraction of policy mass of visited children.
      * Default 0.330 matches Leela Chess Zero.
      */
-    float fpu_reduction = 0.330f;
+    float fpu_reduction = 0.003f;
 
     /**
      * Maximum number of simulations to run regardless of GPU eval count.
