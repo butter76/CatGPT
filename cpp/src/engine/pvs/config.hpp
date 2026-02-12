@@ -32,13 +32,13 @@ struct PVSConfig {
      * limit = number of children (by decreasing policy) whose cumulative
      * policy mass reaches this fraction.
      */
-    float policy_coverage = 0.75f;
+     float policy_coverage = 0.0f;
 
-    /**
-     * Minimum policy weight the top child must have for limit to be 1.
-     * If the top child's policy is below this, limit is clamped to >= 2.
-     */
-    float min_single_policy = 0.90f;
+     /**
+      * Minimum policy weight the top child must have for limit to be 1.
+      * If the top child's policy is below this, limit is clamped to >= 2.
+      */
+     float min_single_policy = 0.75f;
 };
 
 }  // namespace catgpt

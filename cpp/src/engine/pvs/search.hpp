@@ -257,8 +257,11 @@ private:
 
         float ln_limit = std::log(static_cast<float>(limit));
 
+        // Depth reduction from value uncertainty: low variance → large reduction (prune more)
+        float depth_reduction = std::log(node->U + 1e-6f);
+
         // Leaf: depth is not deep enough to justify expansion
-        if (depth <= ln_limit) {
+        if (depth + depth_reduction <= ln_limit) {
             return node->value;
         }
 
@@ -271,7 +274,7 @@ private:
         // Check for bonus children beyond limit with child_depth >= 0
         for (int i = limit; i < num_policy; ++i) {
             float child_depth = depth + std::log(node->policy[i].second);
-            if (child_depth >= 0.0f) {
+            if (child_depth + depth_reduction >= 0.0f) {
                 ++search_up_to;
             } else {
                 break;  // Policy is sorted descending, so remaining will also be < 0
@@ -437,6 +440,21 @@ private:
         // Store value: convert from NN [0, 1] to [-1, 1]
         node->value = 2.0f * nn_output.value - 1.0f;
         node->value_probs = nn_output.value_probs;
+
+        // Compute U = variance of value_probs in [-1, 1] space
+        // Bin i has center (2*i - (N-1)) / N, i.e. -80/81, -78/81, ..., 78/81, 80/81
+        {
+            constexpr float N = static_cast<float>(VALUE_NUM_BINS);
+            float mean = 0.0f;
+            float mean_sq = 0.0f;
+            for (int i = 0; i < VALUE_NUM_BINS; ++i) {
+                float center = (2.0f * static_cast<float>(i) - (N - 1.0f)) / N;
+                float p = nn_output.value_probs[i];
+                mean += p * center;
+                mean_sq += p * center * center;
+            }
+            node->U = mean_sq - mean * mean;
+        }
 
         // Extract policy priors for legal moves
         bool flip = pos.sideToMove() == chess::Color::BLACK;

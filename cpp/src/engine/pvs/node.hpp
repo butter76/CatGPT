@@ -36,6 +36,7 @@ public:
 
     // NN evaluation (populated at creation time for non-terminal nodes)
     float value = 0.0f;                                // Eval in [-1, 1] from side-to-move (-1=loss, 0=draw, 1=win)
+    float U = 0.0f;                                    // Variance of value_probs in [-1, 1] space (0 for terminal nodes)
     std::array<float, VALUE_NUM_BINS> value_probs{};   // Value distribution (81 bins)
     std::vector<std::pair<chess::Move, float>> policy;  // Legal moves with softmaxed priors (sorted by decreasing P)
 
