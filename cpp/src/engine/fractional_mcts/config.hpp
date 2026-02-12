@@ -28,14 +28,14 @@ struct FractionalMCTSConfig {
      * Fraction of policy mass that determines the "limit" for expansion.
      * If N < limit (number of children covering this fraction), we don't expand.
      */
-    float policy_coverage_threshold = 0.75f;
+    float policy_coverage_threshold = 0.0f;
 
     /**
      * Minimum policy prior required for a single node to qualify as limit=1.
      * If the top child's prior is below this threshold, limit is forced to >= 2.
      * This prevents premature pruning when no move is overwhelmingly favored.
      */
-    float single_node_coverage_threshold = 0.90f;
+    float single_node_coverage_threshold = 0.75f;
 
     /**
      * Minimum total GPU evaluations before stopping search.

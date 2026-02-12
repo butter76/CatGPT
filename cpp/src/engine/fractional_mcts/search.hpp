@@ -119,7 +119,7 @@ public:
         float last_used_N = N;
         int iteration = 0;
 
-        while (total_gpu_evals_ < target_evals && iteration < 50) {
+        while (total_gpu_evals_ < target_evals && iteration < 10000) {
             if (stop_flag_.load(std::memory_order_relaxed)) {
                 break;
             }
@@ -135,7 +135,7 @@ public:
 
             last_used_N = N;
             recursive_search(root_.get(), board_, N);
-            N *= config_.budget_multiplier;
+            N += 1.0f;
             ++iteration;
         }
 
@@ -205,21 +205,30 @@ public:
 
 private:
     /**
+     * Result of neural network evaluation.
+     */
+    struct EvalResult {
+        std::unordered_map<chess::Move, float, MoveHash> policy_priors;
+        float value;  // [-1, 1]
+        std::array<float, VALUE_NUM_BINS> value_probs;
+    };
+
+    /**
      * Evaluate a node with the neural network.
-     * Populates node->policy_priors and node->Q.
+     * Populates node->policy_priors, node->Q, and node->value_probs.
      */
     void evaluate_node(FractionalNode* node, const chess::Board& pos) {
-        auto [policy_priors, value] = run_neural_network(pos);
-        node->policy_priors = std::move(policy_priors);
-        node->Q = value;
+        auto eval = run_neural_network(pos);
+        node->policy_priors = std::move(eval.policy_priors);
+        node->Q = eval.value;
+        node->value_probs = eval.value_probs;
         ++total_gpu_evals_;
     }
 
     /**
      * Run the neural network on a position.
      */
-    std::pair<std::unordered_map<chess::Move, float, MoveHash>, float>
-    run_neural_network(const chess::Board& pos) {
+    EvalResult run_neural_network(const chess::Board& pos) {
         // Tokenize
         auto tokens = tokenize<TrtEvaluator::SEQ_LENGTH>(pos, NO_HALFMOVE_CONFIG);
 
@@ -263,7 +272,7 @@ private:
             policy_priors[move] = exp_logit / sum_exp;
         }
 
-        return {policy_priors, value};
+        return {std::move(policy_priors), value, nn_output.value_probs};
     }
 
     /**
@@ -295,6 +304,13 @@ private:
         if (node->children.empty()) {
             return;
         }
+
+        // Scale N by total policy weight of expanded children
+        float total_child_weight = 0.0f;
+        for (const auto& [move, child] : node->children) {
+            total_child_weight += child.P;
+        }
+        N *= total_child_weight;
 
         // Compute budget allocations via binary search
         // TODO: Could be replaced later with a cached value
