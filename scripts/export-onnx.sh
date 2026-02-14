@@ -11,8 +11,8 @@ set -e
 
 uv run python scripts/export_onnx.py \
     --checkpoint ./checkpoints_jax/best \
-    --output-path sample.onnx \
+    --output-path catgpt.onnx \
     --output-keys value value_probs hard_policy_logit \
-    --batch-size 1 \
+    --dynamic-batch \
     --opset 20 \
     --validate

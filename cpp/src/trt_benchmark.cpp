@@ -4,8 +4,9 @@
  * Loads a TensorRT engine and benchmarks inference at various batch sizes.
  * The model expects:
  *   - Input: int32 tensor of shape (batch, 64) - chess position tokens
- *   - Output "value": float32 tensor of shape (batch,) - win probability
- *   - Output "policy_logit": float32 tensor of shape (batch, 4672) - policy logits
+ *   - Output "value": float32 tensor of shape (batch,) - win probability [0, 1]
+ *   - Output "value_probs": float32 tensor of shape (batch, 81) - HL-Gauss value distribution
+ *   - Output "policy": float32 tensor of shape (batch, 4672) - policy logits
  */
 
 #include <NvInfer.h>
@@ -285,9 +286,13 @@ private:
     cudaEvent_t event_ = nullptr;
 };
 
-// Inference result containing both value and policy outputs
+// Number of bins in the HL-Gauss value distribution
+static constexpr int32_t VALUE_NUM_BINS = 81;
+
+// Inference result containing value, value_probs, and policy outputs
 struct InferenceResult {
-    std::vector<float> values;          // (batch,) - win probabilities
+    std::vector<float> values;          // (batch,) - win probabilities [0, 1]
+    std::vector<float> value_probs;     // (batch * VALUE_NUM_BINS) - HL-Gauss value distribution
     std::vector<float> policy_logits;   // (batch * POLICY_SIZE) - policy logits
 };
 
@@ -334,18 +339,22 @@ private:
     struct CachedBatchResources {
         CudaBuffer<int32_t> input_buffer;
         CudaBuffer<float> value_buffer;
+        CudaBuffer<float> value_probs_buffer;
         CudaBuffer<float> policy_buffer;
         PinnedBuffer<int32_t> pinned_input;
         PinnedBuffer<float> pinned_value;
+        PinnedBuffer<float> pinned_value_probs;
         PinnedBuffer<float> pinned_policy;
         CudaGraphExec graph_exec;
 
         CachedBatchResources(int32_t batch_size)
             : input_buffer(batch_size * SEQ_LENGTH),
               value_buffer(batch_size),
+              value_probs_buffer(batch_size * VALUE_NUM_BINS),
               policy_buffer(batch_size * POLICY_SIZE),
               pinned_input(batch_size * SEQ_LENGTH),
               pinned_value(batch_size),
+              pinned_value_probs(batch_size * VALUE_NUM_BINS),
               pinned_policy(batch_size * POLICY_SIZE) {}
     };
 
@@ -368,8 +377,11 @@ private:
         // Copy from pinned output buffers (CPU-side, not part of graph)
         InferenceResult result;
         result.values.resize(batch_size);
+        result.value_probs.resize(batch_size * VALUE_NUM_BINS);
         result.policy_logits.resize(batch_size * POLICY_SIZE);
         std::memcpy(result.values.data(), res.pinned_value.get(), batch_size * sizeof(float));
+        std::memcpy(result.value_probs.data(), res.pinned_value_probs.get(),
+                    batch_size * VALUE_NUM_BINS * sizeof(float));
         std::memcpy(result.policy_logits.data(), res.pinned_policy.get(),
                     batch_size * POLICY_SIZE * sizeof(float));
 
@@ -381,6 +393,9 @@ private:
         // Set up tensor addresses and shapes before capture
         context_->setTensorAddress(input_name_.c_str(), res.input_buffer.get());
         context_->setTensorAddress(value_output_name_.c_str(), res.value_buffer.get());
+        if (!value_probs_output_name_.empty()) {
+            context_->setTensorAddress(value_probs_output_name_.c_str(), res.value_probs_buffer.get());
+        }
         context_->setTensorAddress(policy_output_name_.c_str(), res.policy_buffer.get());
 
         nvinfer1::Dims input_dims;
@@ -390,6 +405,7 @@ private:
         context_->setInputShape(input_name_.c_str(), input_dims);
 
         size_t input_count = batch_size * SEQ_LENGTH;
+        size_t value_probs_count = batch_size * VALUE_NUM_BINS;
         size_t policy_count = batch_size * POLICY_SIZE;
 
         // Begin graph capture
@@ -407,6 +423,9 @@ private:
 
         // D2H transfer (async, captured)
         res.value_buffer.copy_to_host_async(res.pinned_value.get(), batch_size, stream_.get());
+        if (!value_probs_output_name_.empty()) {
+            res.value_probs_buffer.copy_to_host_async(res.pinned_value_probs.get(), value_probs_count, stream_.get());
+        }
         res.policy_buffer.copy_to_host_async(res.pinned_policy.get(), policy_count, stream_.get());
 
         // End capture and instantiate
@@ -429,6 +448,9 @@ private:
         // Set tensor addresses
         context_->setTensorAddress(input_name_.c_str(), fallback_input_buffer_.get());
         context_->setTensorAddress(value_output_name_.c_str(), fallback_value_buffer_.get());
+        if (!value_probs_output_name_.empty()) {
+            context_->setTensorAddress(value_probs_output_name_.c_str(), fallback_value_probs_buffer_.get());
+        }
         context_->setTensorAddress(policy_output_name_.c_str(), fallback_policy_buffer_.get());
 
         // Set input shape (dynamic batch)
@@ -444,9 +466,14 @@ private:
         }
 
         // Async D2H transfer, then synchronize
+        size_t value_probs_count = batch_size * VALUE_NUM_BINS;
         size_t policy_count = batch_size * POLICY_SIZE;
         fallback_value_buffer_.copy_to_host_async(
             fallback_pinned_value_.get(), batch_size, stream_.get());
+        if (!value_probs_output_name_.empty()) {
+            fallback_value_probs_buffer_.copy_to_host_async(
+                fallback_pinned_value_probs_.get(), value_probs_count, stream_.get());
+        }
         fallback_policy_buffer_.copy_to_host_async(
             fallback_pinned_policy_.get(), policy_count, stream_.get());
         stream_.synchronize();
@@ -454,8 +481,11 @@ private:
         // Copy from pinned buffers to output
         InferenceResult result;
         result.values.resize(batch_size);
+        result.value_probs.resize(value_probs_count);
         result.policy_logits.resize(policy_count);
         std::memcpy(result.values.data(), fallback_pinned_value_.get(), batch_size * sizeof(float));
+        std::memcpy(result.value_probs.data(), fallback_pinned_value_probs_.get(),
+                    value_probs_count * sizeof(float));
         std::memcpy(result.policy_logits.data(), fallback_pinned_policy_.get(),
                     policy_count * sizeof(float));
 
@@ -514,11 +544,19 @@ public:
 
     const std::string& input_name() const { return input_name_; }
     const std::string& value_output_name() const { return value_output_name_; }
+    const std::string& value_probs_output_name() const { return value_probs_output_name_; }
     const std::string& policy_output_name() const { return policy_output_name_; }
+
+    // Pipelined inference result
+    struct PipelinedResult {
+        std::vector<float> values;
+        std::vector<float> value_probs;
+        std::vector<float> policies;
+    };
 
     // Process multiple batches with double buffering for maximum throughput
     // Returns all outputs concatenated
-    std::pair<std::vector<float>, std::vector<float>> infer_pipelined(
+    PipelinedResult infer_pipelined(
         const std::vector<std::span<const int32_t>>& batches,
         int32_t batch_size) {
         if (batches.empty()) return {};
@@ -529,12 +567,13 @@ public:
         }
 
         auto& db = it->second;
-        std::vector<float> all_values;
-        std::vector<float> all_policies;
-        all_values.reserve(batches.size() * batch_size);
-        all_policies.reserve(batches.size() * batch_size * POLICY_SIZE);
+        PipelinedResult result;
+        result.values.reserve(batches.size() * batch_size);
+        result.value_probs.reserve(batches.size() * batch_size * VALUE_NUM_BINS);
+        result.policies.reserve(batches.size() * batch_size * POLICY_SIZE);
 
         const size_t input_count = batch_size * SEQ_LENGTH;
+        const size_t value_probs_count = batch_size * VALUE_NUM_BINS;
         const size_t policy_count = batch_size * POLICY_SIZE;
 
         // Process batches with double buffering
@@ -549,12 +588,15 @@ public:
                 size_t out_idx = i - NUM_BUFFERS;
                 int out_slot = out_idx % NUM_BUFFERS;
                 auto& out_buf = db.buffers[out_slot];
-                all_values.insert(all_values.end(),
-                                  out_buf.pinned_value.get(),
-                                  out_buf.pinned_value.get() + batch_size);
-                all_policies.insert(all_policies.end(),
-                                    out_buf.pinned_policy.get(),
-                                    out_buf.pinned_policy.get() + policy_count);
+                result.values.insert(result.values.end(),
+                                     out_buf.pinned_value.get(),
+                                     out_buf.pinned_value.get() + batch_size);
+                result.value_probs.insert(result.value_probs.end(),
+                                          out_buf.pinned_value_probs.get(),
+                                          out_buf.pinned_value_probs.get() + value_probs_count);
+                result.policies.insert(result.policies.end(),
+                                       out_buf.pinned_policy.get(),
+                                       out_buf.pinned_policy.get() + policy_count);
             }
 
             // Copy input to pinned buffer
@@ -583,15 +625,18 @@ public:
             int slot = i % NUM_BUFFERS;
             auto& buf = db.buffers[slot];
             buf.done_event.synchronize();
-            all_values.insert(all_values.end(),
-                              buf.pinned_value.get(),
-                              buf.pinned_value.get() + batch_size);
-            all_policies.insert(all_policies.end(),
-                                buf.pinned_policy.get(),
-                                buf.pinned_policy.get() + policy_count);
+            result.values.insert(result.values.end(),
+                                 buf.pinned_value.get(),
+                                 buf.pinned_value.get() + batch_size);
+            result.value_probs.insert(result.value_probs.end(),
+                                      buf.pinned_value_probs.get(),
+                                      buf.pinned_value_probs.get() + value_probs_count);
+            result.policies.insert(result.policies.end(),
+                                   buf.pinned_policy.get(),
+                                   buf.pinned_policy.get() + policy_count);
         }
 
-        return {std::move(all_values), std::move(all_policies)};
+        return result;
     }
 
     // Benchmark pipelined inference (sustained throughput)
@@ -644,17 +689,21 @@ private:
         CudaEvent done_event;
         CudaBuffer<int32_t> input_buffer;
         CudaBuffer<float> value_buffer;
+        CudaBuffer<float> value_probs_buffer;
         CudaBuffer<float> policy_buffer;
         PinnedBuffer<int32_t> pinned_input;
         PinnedBuffer<float> pinned_value;
+        PinnedBuffer<float> pinned_value_probs;
         PinnedBuffer<float> pinned_policy;
 
         DoubleBufferSlot(int32_t batch_size)
             : input_buffer(batch_size * SEQ_LENGTH),
               value_buffer(batch_size),
+              value_probs_buffer(batch_size * VALUE_NUM_BINS),
               policy_buffer(batch_size * POLICY_SIZE),
               pinned_input(batch_size * SEQ_LENGTH),
               pinned_value(batch_size),
+              pinned_value_probs(batch_size * VALUE_NUM_BINS),
               pinned_policy(batch_size * POLICY_SIZE) {}
     };
 
@@ -680,6 +729,7 @@ private:
 
     void execute_pipeline_step(int32_t batch_size, DoubleBufferSlot& buf) {
         size_t input_count = batch_size * SEQ_LENGTH;
+        size_t value_probs_count = batch_size * VALUE_NUM_BINS;
         size_t policy_count = batch_size * POLICY_SIZE;
 
         // H2D transfer
@@ -688,6 +738,9 @@ private:
         // Set tensor addresses
         context_->setTensorAddress(input_name_.c_str(), buf.input_buffer.get());
         context_->setTensorAddress(value_output_name_.c_str(), buf.value_buffer.get());
+        if (!value_probs_output_name_.empty()) {
+            context_->setTensorAddress(value_probs_output_name_.c_str(), buf.value_probs_buffer.get());
+        }
         context_->setTensorAddress(policy_output_name_.c_str(), buf.policy_buffer.get());
 
         // Set input shape
@@ -702,6 +755,9 @@ private:
 
         // D2H transfer
         buf.value_buffer.copy_to_host_async(buf.pinned_value.get(), batch_size, buf.stream.get());
+        if (!value_probs_output_name_.empty()) {
+            buf.value_probs_buffer.copy_to_host_async(buf.pinned_value_probs.get(), value_probs_count, buf.stream.get());
+        }
         buf.policy_buffer.copy_to_host_async(buf.pinned_policy.get(), policy_count, buf.stream.get());
     }
 
@@ -782,24 +838,33 @@ private:
                 input_name_ = name;
                 std::println("  Input '{}': {} {}", name, dims_str, dtype_str);
             } else {
-                // Determine output type by name or order
                 std::string name_str(name);
                 std::println("  Output '{}': {} {}", name, dims_str, dtype_str);
 
-                // Match output names - check for "value" or "policy" in the name
-                if (name_str.find("value") != std::string::npos ||
-                    name_str.find("Value") != std::string::npos) {
+                // Try to match by name first (check value_probs before value to avoid substring collision)
+                if (name_str.find("value_probs") != std::string::npos ||
+                    name_str.find("ValueProbs") != std::string::npos) {
+                    value_probs_output_name_ = name;
+                } else if (name_str.find("value") != std::string::npos ||
+                           name_str.find("Value") != std::string::npos) {
                     value_output_name_ = name;
                 } else if (name_str.find("policy") != std::string::npos ||
                            name_str.find("Policy") != std::string::npos) {
                     policy_output_name_ = name;
                 } else {
-                    // Fallback: assign by shape (value has 1D, policy has 2D output)
+                    // Fallback: detect by shape
+                    // Value: scalar or (batch,) or (batch, 1)
+                    // Value probs: (batch, VALUE_NUM_BINS)
+                    // Policy: (batch, POLICY_SIZE)
                     if (dims.nbDims == 1 || (dims.nbDims == 2 && dims.d[1] == 1)) {
                         if (value_output_name_.empty()) {
                             value_output_name_ = name;
                         }
-                    } else {
+                    } else if (dims.nbDims == 2 && dims.d[1] == VALUE_NUM_BINS) {
+                        if (value_probs_output_name_.empty()) {
+                            value_probs_output_name_ = name;
+                        }
+                    } else if (dims.nbDims == 2 && dims.d[1] == POLICY_SIZE) {
                         if (policy_output_name_.empty()) {
                             policy_output_name_ = name;
                         }
@@ -820,12 +885,15 @@ private:
 
         std::println("  -> Input: '{}'", input_name_);
         std::println("  -> Value output: '{}'", value_output_name_);
+        std::println("  -> Value probs output: '{}'",
+                     value_probs_output_name_.empty() ? "(not found)" : value_probs_output_name_);
         std::println("  -> Policy output: '{}'", policy_output_name_);
     }
 
     void ensure_fallback_buffers(int32_t batch_size) {
         size_t input_count = batch_size * SEQ_LENGTH;
         size_t value_count = batch_size;
+        size_t value_probs_count = batch_size * VALUE_NUM_BINS;
         size_t policy_count = batch_size * POLICY_SIZE;
 
         // GPU buffers
@@ -834,6 +902,9 @@ private:
         }
         if (fallback_value_buffer_.count() < value_count) {
             fallback_value_buffer_ = CudaBuffer<float>(value_count);
+        }
+        if (fallback_value_probs_buffer_.count() < value_probs_count) {
+            fallback_value_probs_buffer_ = CudaBuffer<float>(value_probs_count);
         }
         if (fallback_policy_buffer_.count() < policy_count) {
             fallback_policy_buffer_ = CudaBuffer<float>(policy_count);
@@ -845,6 +916,9 @@ private:
         }
         if (fallback_pinned_value_.count() < value_count) {
             fallback_pinned_value_ = PinnedBuffer<float>(value_count);
+        }
+        if (fallback_pinned_value_probs_.count() < value_probs_count) {
+            fallback_pinned_value_probs_ = PinnedBuffer<float>(value_probs_count);
         }
         if (fallback_pinned_policy_.count() < policy_count) {
             fallback_pinned_policy_ = PinnedBuffer<float>(policy_count);
@@ -858,6 +932,7 @@ private:
 
     std::string input_name_;
     std::string value_output_name_;
+    std::string value_probs_output_name_;
     std::string policy_output_name_;
 
     CudaStream stream_;  // Dedicated CUDA stream for inference
@@ -871,9 +946,11 @@ private:
     // Fallback buffers for uncached batch sizes (no graph)
     CudaBuffer<int32_t> fallback_input_buffer_;
     CudaBuffer<float> fallback_value_buffer_;
+    CudaBuffer<float> fallback_value_probs_buffer_;
     CudaBuffer<float> fallback_policy_buffer_;
     PinnedBuffer<int32_t> fallback_pinned_input_;
     PinnedBuffer<float> fallback_pinned_value_;
+    PinnedBuffer<float> fallback_pinned_value_probs_;
     PinnedBuffer<float> fallback_pinned_policy_;
 };
 
@@ -926,6 +1003,19 @@ int main(int argc, char* argv[]) {
             auto result = engine.infer(test_input, 1);
             std::println("│ Single inference test:");
             std::println("│   Value (win prob): {:.6f}", result.values[0]);
+
+            // Show value distribution summary
+            if (!result.value_probs.empty()) {
+                float max_prob = *std::max_element(result.value_probs.begin(),
+                                                   result.value_probs.begin() + VALUE_NUM_BINS);
+                int mode_bin = static_cast<int>(std::distance(
+                    result.value_probs.begin(),
+                    std::max_element(result.value_probs.begin(),
+                                     result.value_probs.begin() + VALUE_NUM_BINS)));
+                float mode_value = static_cast<float>(mode_bin) / (VALUE_NUM_BINS - 1);
+                std::println("│   Value dist: mode bin={} (v={:.3f}, p={:.4f})",
+                             mode_bin, mode_value, max_prob);
+            }
 
             // Show top-5 policy logits (argmax)
             auto& policy = result.policy_logits;
