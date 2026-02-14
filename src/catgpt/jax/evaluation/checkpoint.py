@@ -17,6 +17,8 @@ from catgpt.jax.configs import (
     JaxModelConfig,
     JaxOutputHeadConfig,
     JaxTokenizerConfig,
+    KeelConfig,
+    ResidualGateConfig,
     SmolgenConfig,
 )
 from catgpt.jax.models.transformer import BidirectionalTransformer, TransformerConfig
@@ -121,6 +123,20 @@ def _load_model_config(path: Path) -> JaxModelConfig:
     else:
         smolgen = smolgen_data
 
+    # Handle residual_gates as dict or ResidualGateConfig
+    residual_gates_data = config_dict.get("residual_gates", {})
+    if isinstance(residual_gates_data, dict):
+        residual_gates = ResidualGateConfig(**residual_gates_data)
+    else:
+        residual_gates = residual_gates_data
+
+    # Handle keel as dict or KeelConfig
+    keel_data = config_dict.get("keel", {})
+    if isinstance(keel_data, dict):
+        keel = KeelConfig(**keel_data)
+    else:
+        keel = keel_data
+
     return JaxModelConfig(
         name=config_dict.get("name", "transformer"),
         hidden_size=config_dict["hidden_size"],
@@ -134,6 +150,8 @@ def _load_model_config(path: Path) -> JaxModelConfig:
         position_embedding=config_dict.get("position_embedding", "magating"),
         output_heads=output_heads,
         smolgen=smolgen,
+        residual_gates=residual_gates,
+        keel=keel,
     )
 
 
