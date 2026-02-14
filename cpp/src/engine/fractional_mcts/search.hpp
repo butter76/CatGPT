@@ -284,6 +284,13 @@ private:
             return;
         }
 
+        // Early return: if we've already searched this node with a higher budget,
+        // its Q is already at least as refined — skip re-searching.
+        if (N <= node->max_N) {
+            return;
+        }
+        node->max_N = N;
+
         if (node->children.empty()) {
             // Compute limit: how many children cover policy threshold
             int limit = node->get_limit(config_.policy_coverage_threshold,

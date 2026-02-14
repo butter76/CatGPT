@@ -135,6 +135,9 @@ public:
     // Value distribution from HL-Gauss head (81 bins over [0, 1])
     std::array<float, VALUE_NUM_BINS> value_probs{};
 
+    // Highest budget N this node was searched with (for early-return optimization)
+    float max_N = -1.0f;
+
     // Terminal state info
     bool is_terminal = false;
 
