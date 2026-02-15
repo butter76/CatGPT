@@ -72,7 +72,7 @@ tokenizer:
 # Optimizer configuration
 optimizer:
   name: "splus"  # Options: "adamw", "splus", "sgd"
-  learning_rate: 0.095
+  learning_rate: 0.20
   weight_decay: 0.01
   # AdamW/SGD specific
   b1: 0.9
@@ -90,10 +90,15 @@ optimizer:
   splus_nonstandard_constant: 0.001
 
 # Learning rate scheduler
+# DeepSeek-V3 style: warmup → stable (constant peak) → cosine decay → cooldown (constant min)
+# See: https://arxiv.org/abs/2412.19437 Section 4.2
 scheduler:
-  name: "cosine"  # Options: "cosine", "linear", "constant"
+  name: "deepseek"  # Options: "deepseek", "cosine", "linear", "constant"
   warmup_steps: 1000
   min_lr_ratio: 0.1  # Final LR = learning_rate * min_lr_ratio
+  # DeepSeek schedule phase fractions (of post-warmup steps):
+  stable_fraction: 0.68  # 68% at constant peak LR after warmup
+  cooldown_fraction: 0.07  # 7% at constant min LR at end (remaining 25% = cosine decay)
 
 # Training loop configuration
 # Training is step-based with "pseudo-epochs" for validation/checkpointing

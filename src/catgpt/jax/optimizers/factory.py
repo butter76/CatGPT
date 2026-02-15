@@ -2,6 +2,7 @@
 
 from typing import TYPE_CHECKING
 
+import jax.numpy as jnp
 import optax
 
 from catgpt.jax.optimizers.splus import splus
@@ -105,6 +106,16 @@ def create_lr_schedule(
     warmup_steps = min(warmup_steps, total_steps)
     decay_steps = max(total_steps - warmup_steps, 1)
 
+    if name == "deepseek":
+        return _deepseek_schedule(
+            base_lr=base_lr,
+            min_lr=min_lr,
+            warmup_steps=warmup_steps,
+            total_steps=total_steps,
+            stable_fraction=scheduler_config.stable_fraction,
+            cooldown_fraction=scheduler_config.cooldown_fraction,
+        )
+
     if name == "cosine":
         return optax.warmup_cosine_decay_schedule(
             init_value=0.0,
@@ -131,8 +142,85 @@ def create_lr_schedule(
             boundaries=[warmup_steps],
         )
 
-    msg = f"Unknown scheduler: {name}. Choose from: constant, cosine, linear"
+    msg = f"Unknown scheduler: {name}. Choose from: deepseek, cosine, linear, constant"
     raise ValueError(msg)
+
+
+def _deepseek_schedule(
+    base_lr: float,
+    min_lr: float,
+    warmup_steps: int,
+    total_steps: int,
+    stable_fraction: float,
+    cooldown_fraction: float,
+) -> optax.Schedule:
+    """DeepSeek-V3 style multi-phase learning rate schedule.
+
+    Phases:
+    1. Linear warmup: 0 → base_lr over warmup_steps
+    2. Stable: constant at base_lr for stable_fraction of post-warmup steps
+    3. Cosine decay: base_lr → min_lr following cosine curve
+    4. Linear cooldown: min_lr → 0 over cooldown_fraction of post-warmup steps
+       (second-order optimizers like SPlus/Muon handle near-zero LRs gracefully)
+
+    The cosine decay phase occupies the remaining fraction:
+        1.0 - stable_fraction - cooldown_fraction
+
+    See: https://arxiv.org/abs/2412.19437 Section 4.2
+
+    Args:
+        base_lr: Peak learning rate.
+        min_lr: Minimum learning rate (for cosine decay end and cooldown).
+        warmup_steps: Number of linear warmup steps.
+        total_steps: Total number of training steps.
+        stable_fraction: Fraction of post-warmup steps at constant peak LR.
+        cooldown_fraction: Fraction of post-warmup steps at constant min LR.
+
+    Returns:
+        An optax Schedule (callable: step → lr).
+    """
+    post_warmup = max(total_steps - warmup_steps, 1)
+    stable_steps = int(post_warmup * stable_fraction)
+    cooldown_steps = int(post_warmup * cooldown_fraction)
+    cosine_steps = max(post_warmup - stable_steps - cooldown_steps, 1)
+
+    # Phase boundaries (in global step space)
+    stable_end = warmup_steps + stable_steps
+    cosine_end = stable_end + cosine_steps
+
+    def schedule_fn(step):
+        step = jnp.asarray(step, dtype=jnp.float32)
+
+        # Phase 1: Linear warmup 0 → base_lr
+        warmup_lr = base_lr * step / jnp.maximum(warmup_steps, 1)
+
+        # Phase 2: Constant at base_lr
+        stable_lr = jnp.float32(base_lr)
+
+        # Phase 3: Cosine decay base_lr → min_lr
+        cosine_progress = (step - stable_end) / jnp.maximum(cosine_steps, 1)
+        cosine_progress = jnp.clip(cosine_progress, 0.0, 1.0)
+        cosine_lr = min_lr + (base_lr - min_lr) * 0.5 * (1.0 + jnp.cos(jnp.pi * cosine_progress))
+
+        # Phase 4: Linear cooldown min_lr → 0
+        # Second-order optimizers (SPlus, Muon) handle near-zero LRs gracefully
+        cooldown_progress = (step - cosine_end) / jnp.maximum(cooldown_steps, 1)
+        cooldown_progress = jnp.clip(cooldown_progress, 0.0, 1.0)
+        cooldown_lr = min_lr * (1.0 - cooldown_progress)
+
+        # Select phase based on step
+        lr = jnp.where(
+            step < warmup_steps,
+            warmup_lr,
+            jnp.where(
+                step < stable_end,
+                stable_lr,
+                jnp.where(step < cosine_end, cosine_lr, cooldown_lr),
+            ),
+        )
+        return lr
+
+    return schedule_fn
 
 
 def create_optimizer_with_gradient_clipping(

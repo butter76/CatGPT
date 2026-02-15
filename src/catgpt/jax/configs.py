@@ -247,11 +247,25 @@ class JaxOptimizerConfig:
 
 @dataclass
 class JaxSchedulerConfig:
-    """Configuration for learning rate scheduler."""
+    """Configuration for learning rate scheduler.
 
-    name: str = "cosine"  # "cosine" | "linear" | "constant"
+    Supported schedules:
+    - "deepseek": DeepSeek-V3 style multi-phase schedule
+        warmup → stable (constant peak) → cosine decay → linear cooldown (min → 0)
+        See: https://arxiv.org/abs/2412.19437 Section 4.2
+    - "cosine": Standard warmup + cosine decay
+    - "linear": Warmup + linear decay
+    - "constant": No decay (constant learning rate)
+    """
+
+    name: str = "deepseek"  # "deepseek" | "cosine" | "linear" | "constant"
     warmup_steps: int = 1000
     min_lr_ratio: float = 0.1  # min_lr = learning_rate * min_lr_ratio
+
+    # DeepSeek schedule: fraction of post-warmup steps for each phase
+    # The cosine decay phase gets the remainder: 1 - stable_fraction - cooldown_fraction
+    stable_fraction: float = 0.68  # Fraction at constant peak LR after warmup
+    cooldown_fraction: float = 0.07  # Fraction at constant min LR at end
 
 
 @dataclass
