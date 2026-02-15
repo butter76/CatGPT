@@ -222,6 +222,7 @@ private:
         node->policy_priors = std::move(eval.policy_priors);
         node->Q = eval.value;
         node->value_probs = eval.value_probs;
+        node->compute_variance();
         ++total_gpu_evals_;
     }
 
@@ -291,20 +292,25 @@ private:
         }
         node->max_N = N;
 
+        // Depth reduction: more certain nodes (low variance) get reduced effective N,
+        // more uncertain nodes (high variance) get amplified effective N.
+        float N_reduction = node->variance * 125.0f;
+        float effective_N = N * N_reduction;
+
         if (node->children.empty()) {
             // Compute limit: how many children cover policy threshold
             int limit = node->get_limit(config_.policy_coverage_threshold,
                                         config_.single_node_coverage_threshold);
 
-            // Base case: N < limit, don't expand further
+            // Base case: effective_N < limit, don't expand further
             // Q is already set from prior evaluation
-            if (N < static_cast<float>(limit)) {
+            if (effective_N < static_cast<float>(limit)) {
                 return;
             }
         }
 
-        // Expansion case: expand children with P >= 1/N
-        float expansion_threshold = N > 0.0f ? 1.0f / N : 1.0f;
+        // Expansion case: expand children with P >= 1/effective_N
+        float expansion_threshold = effective_N > 0.0f ? 1.0f / effective_N : 1.0f;
         expand_children(node, scratch_board, expansion_threshold);
 
         // If no children were expanded, nothing to do

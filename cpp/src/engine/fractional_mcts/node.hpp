@@ -10,6 +10,7 @@
 #define CATGPT_ENGINE_FRACTIONAL_MCTS_NODE_HPP
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -102,6 +103,35 @@ public:
     }
 
     /**
+     * Compute the variance of the value distribution in [-1, 1] scale.
+     *
+     * The 81 bins from the HL-Gauss head are over [0, 1]. We map them to
+     * [-1, 1] by treating bin i's center as 2*(i+0.5)/81 - 1, then compute
+     * the variance of the distribution under value_probs.
+     */
+    void compute_variance() {
+        // Bin centers in [-1, 1]
+        constexpr float bin_width = 2.0f / VALUE_NUM_BINS;
+
+        // Mean: μ = Σ p_i * c_i
+        float mean = 0.0f;
+        for (int i = 0; i < VALUE_NUM_BINS; ++i) {
+            float center = -1.0f + (static_cast<float>(i) + 0.5f) * bin_width;
+            mean += value_probs[i] * center;
+        }
+
+        // Variance: σ² = Σ p_i * (c_i - μ)²
+        float var = 0.0f;
+        for (int i = 0; i < VALUE_NUM_BINS; ++i) {
+            float center = -1.0f + (static_cast<float>(i) + 0.5f) * bin_width;
+            float diff = center - mean;
+            var += value_probs[i] * diff * diff;
+        }
+
+        variance = var;
+    }
+
+    /**
      * Get principal variation (best path by Q from this node).
      */
     [[nodiscard]] std::vector<chess::Move> get_pv(int max_depth = 10) {
@@ -134,6 +164,9 @@ public:
 
     // Value distribution from HL-Gauss head (81 bins over [0, 1])
     std::array<float, VALUE_NUM_BINS> value_probs{};
+
+    // Variance of the value distribution in [-1, 1] scale (computed from value_probs)
+    float variance = 0.0f;
 
     // Highest budget N this node was searched with (for early-return optimization)
     float max_N = -1.0f;
