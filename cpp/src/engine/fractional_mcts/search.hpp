@@ -294,7 +294,7 @@ private:
 
         // Depth reduction: more certain nodes (low variance) get reduced effective N,
         // more uncertain nodes (high variance) get amplified effective N.
-        float N_reduction = node->variance * 125.0f;
+        float N_reduction = node->variance * 25.0f;
         float effective_N = N * N_reduction;
 
         if (node->children.empty()) {
