@@ -54,6 +54,14 @@ class GameConfig:
 
 
 @dataclass
+class MoveInfo:
+    """Per-move metadata from engine search."""
+
+    depth: int = 0
+    nodes: int = 0
+
+
+@dataclass
 class GameResult:
     """Result of a single game."""
 
@@ -66,6 +74,9 @@ class GameResult:
     engine_a_white: bool
     moves: list[str]
     termination: GameTermination
+
+    # Per-move search info (depth + nodes), aligned with self.moves
+    move_infos: list[MoveInfo] = field(default_factory=list)
 
     # GPU eval (node) counts per side
     nodes_white: int = 0
@@ -125,6 +136,12 @@ class GameResult:
             # Use SAN notation
             san = board.san(move)
             move_text_parts.append(san)
+
+            # Add per-move depth/nodes comment
+            if i < len(self.move_infos):
+                info = self.move_infos[i]
+                move_text_parts.append(f"{{d={info.depth} n={info.nodes}}}")
+
             board.push(move)
 
         move_text = " ".join(move_text_parts)
@@ -292,6 +309,7 @@ class GameRunner:
         """
         board = chess.Board(opening_fen)
         moves: list[str] = []
+        move_infos: list[MoveInfo] = []
         nodes_white = 0
         nodes_black = 0
 
@@ -358,6 +376,12 @@ class GameRunner:
             else:
                 nodes_black += current_engine.last_nodes
 
+            # Record per-move search info
+            move_infos.append(MoveInfo(
+                depth=current_engine.last_depth,
+                nodes=current_engine.last_nodes,
+            ))
+
             # Make the move
             board.push(move)
             moves.append(move.uci())
@@ -377,6 +401,7 @@ class GameRunner:
             engine_a_white=engine_a_white,
             moves=moves,
             termination=termination,
+            move_infos=move_infos,
             nodes_white=nodes_white,
             nodes_black=nodes_black,
         )
