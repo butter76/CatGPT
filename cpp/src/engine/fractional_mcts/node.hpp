@@ -165,6 +165,11 @@ public:
     // Value distribution from HL-Gauss head (81 bins over [0, 1])
     std::array<float, VALUE_NUM_BINS> value_probs{};
 
+    // Distributional Q: starts as value_probs from NN eval, then updated
+    // during search as the weighted average of children's flipped distQ.
+    // Bins are over [0, 1] from this node's perspective.
+    std::array<float, VALUE_NUM_BINS> distQ{};
+
     // Variance of the value distribution in [-1, 1] scale (computed from value_probs)
     float variance = 0.0f;
 

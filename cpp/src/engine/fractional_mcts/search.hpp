@@ -134,7 +134,9 @@ public:
             }
 
             last_used_N = N;
-            recursive_search(root_.get(), board_, N);
+            int alpha = compute_percentile_bin(root_->distQ, 0.16f);
+            int beta  = compute_percentile_bin(root_->distQ, 0.84f);
+            recursive_search(root_.get(), board_, N, alpha, beta);
             N += 1.0f;
             ++iteration;
         }
@@ -222,6 +224,7 @@ private:
         node->policy_priors = std::move(eval.policy_priors);
         node->Q = eval.value;
         node->value_probs = eval.value_probs;
+        node->distQ = eval.value_probs;  // distQ starts as value_probs
         node->compute_variance();
         ++total_gpu_evals_;
     }
@@ -277,9 +280,28 @@ private:
     }
 
     /**
-     * Recursively search from a node with budget N.
+     * Compute the percentile bin from a distQ distribution.
+     * Returns the smallest bin index where the CDF first reaches >= percentile.
      */
-    void recursive_search(FractionalNode* node, chess::Board& scratch_board, float N) {
+    [[nodiscard]] static int compute_percentile_bin(const std::array<float, VALUE_NUM_BINS>& dist, float percentile) {
+        float cumsum = 0.0f;
+        for (int i = 0; i < VALUE_NUM_BINS; ++i) {
+            cumsum += dist[i];
+            if (cumsum >= percentile) {
+                return i;
+            }
+        }
+        return VALUE_NUM_BINS - 1;
+    }
+
+    /**
+     * Recursively search from a node with budget N.
+     *
+     * @param alpha Lower bound bin index (16th percentile of root distQ, from this node's perspective).
+     * @param beta  Upper bound bin index (84th percentile of root distQ, from this node's perspective).
+     *              When recursing to children, these are negated (B -> VALUE_NUM_BINS-1-B) and swapped.
+     */
+    void recursive_search(FractionalNode* node, chess::Board& scratch_board, float N, int alpha, int beta) {
         // Terminal nodes: Q is already set
         if (node->is_terminal) {
             return;
@@ -294,7 +316,24 @@ private:
 
         // Depth reduction: more certain nodes (low variance) get reduced effective N,
         // more uncertain nodes (high variance) get amplified effective N.
-        float N_reduction = node->variance * 18.0f;
+        // Compute alt_variance: partial variance from alpha..80, ignoring the
+        // "irrelevant" tail below alpha. Scaled by 2 to compensate for partial sum.
+        constexpr float bin_width = 2.0f / VALUE_NUM_BINS;
+        float vp_mean = 0.0f;
+        for (int i = 0; i < VALUE_NUM_BINS; ++i) {
+            float center = -1.0f + (static_cast<float>(i) + 0.5f) * bin_width;
+            vp_mean += node->value_probs[i] * center;
+        }
+        float alt_variance = 0.0f;
+        for (int i = alpha; i < VALUE_NUM_BINS; ++i) {
+            float center = -1.0f + (static_cast<float>(i) + 0.5f) * bin_width;
+            float diff = center - vp_mean;
+            alt_variance += node->value_probs[i] * diff * diff;
+        }
+        alt_variance *= 2.0f;
+
+        float effective_variance = std::min(node->variance, alt_variance);
+        float N_reduction = effective_variance * 18.0f;
         float effective_N = N * N_reduction;
 
         if (node->children.empty()) {
@@ -329,13 +368,17 @@ private:
         // TODO: Could be replaced later with a cached value
         auto allocations = compute_allocations(node, N);
 
+        // Negate + swap alpha/beta for children (perspective flip)
+        int child_alpha = (VALUE_NUM_BINS - 1) - beta;
+        int child_beta  = (VALUE_NUM_BINS - 1) - alpha;
+
         // Recurse into children
         for (auto& [move, child] : node->children) {
             auto it = allocations.find(move);
             if (it != allocations.end() && it->second > 0.0f) {
                 float N_i = it->second;
                 scratch_board.makeMove<true>(move);
-                recursive_search(&child, scratch_board, N_i);
+                recursive_search(&child, scratch_board, N_i, child_alpha, child_beta);
                 scratch_board.unmakeMove(move);
             }
         }
@@ -343,21 +386,33 @@ private:
         // Recompute allocations
         auto second_allocations = compute_allocations(node, N);
 
-        // Update Q as weighted average of children's Q values
+        // Update Q and distQ as weighted average of children's values
         // Note: negate child.Q because it's from opponent's perspective
+        // Note: flip child.distQ bins (reverse) because it's from opponent's perspective
         float weighted_sum = 0.0f;
         float total_weight = 0.0f;
+        std::array<float, VALUE_NUM_BINS> weighted_distQ{};
+        weighted_distQ.fill(0.0f);
+
         for (auto& [move, child] : node->children) {
             auto it = second_allocations.find(move);
             if (it != second_allocations.end() && it->second > 0.0f) {
                 float N_i = it->second;
                 weighted_sum += (-child.Q) * N_i;
+                // Accumulate flipped distQ: child's bin j maps to parent's bin (NUM_BINS-1-j)
+                for (int j = 0; j < VALUE_NUM_BINS; ++j) {
+                    weighted_distQ[VALUE_NUM_BINS - 1 - j] += child.distQ[j] * N_i;
+                }
                 total_weight += N_i;
             }
         }
 
         if (total_weight > 0.0f) {
             node->Q = weighted_sum / total_weight;
+            float inv_weight = 1.0f / total_weight;
+            for (int j = 0; j < VALUE_NUM_BINS; ++j) {
+                node->distQ[j] = weighted_distQ[j] * inv_weight;
+            }
         }
     }
 
@@ -403,12 +458,15 @@ private:
             auto [reason, game_result] = scratch_board.isGameOver();
             if (game_result != chess::GameResult::NONE) {
                 child.is_terminal = true;
+                child.distQ.fill(0.0f);
                 if (game_result == chess::GameResult::LOSE) {
                     // Side to move is checkmated (they lost)
                     child.Q = -1.0f;
+                    child.distQ[0] = 1.0f;  // All mass at bin 0 (loss)
                 } else {
                     // Draw
                     child.Q = 0.0f;
+                    child.distQ[VALUE_NUM_BINS / 2] = 1.0f;  // All mass at center (draw)
                 }
             } else {
                 // Evaluate child position
