@@ -69,6 +69,7 @@ class UCIEngine:
         self._child: pexpect.spawn | None = None
         self._lock = threading.Lock()
         self.last_nodes: int = 0  # GPU evals from the most recent select_move call
+        self.last_depth: int = 0  # Search depth from the most recent select_move call
         self._start_engine()
 
     def _start_engine(self) -> None:
@@ -155,6 +156,24 @@ class UCIEngine:
             nodes = int(match.group(1))
         return nodes
 
+    @staticmethod
+    def _parse_info_depth(text: str) -> int:
+        """Parse the search depth from UCI info output.
+
+        Looks for the last 'info' line containing 'depth <N>' in the
+        engine output that precedes the bestmove response.
+
+        Args:
+            text: Raw engine output before the bestmove line.
+
+        Returns:
+            The depth from the last info line, or 0 if not found.
+        """
+        depth = 0
+        for match in re.finditer(r"info\b.*?\bdepth\s+(\d+)", text):
+            depth = int(match.group(1))
+        return depth
+
     def select_move(
         self,
         board: chess.Board,
@@ -208,6 +227,7 @@ class UCIEngine:
             # The text before the "bestmove" match contains info lines
             info_output = self._child.before or ""
             self.last_nodes = self._parse_info_nodes(info_output)
+            self.last_depth = self._parse_info_depth(info_output)
 
             # Read the rest of the line after "bestmove"
             self._child.expect(r"\r?\n")
