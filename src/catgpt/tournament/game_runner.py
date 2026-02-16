@@ -67,6 +67,10 @@ class GameResult:
     moves: list[str]
     termination: GameTermination
 
+    # GPU eval (node) counts per side
+    nodes_white: int = 0
+    nodes_black: int = 0
+
     # Metadata
     move_count: int = field(init=False)
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -102,6 +106,8 @@ class GameResult:
             f'[FEN "{self.opening_fen}"]',
             f'[SetUp "1"]',
             f'[Termination "{self.termination.value}"]',
+            f'[WhiteNodes "{self.nodes_white}"]',
+            f'[BlackNodes "{self.nodes_black}"]',
             "",
         ]
 
@@ -286,6 +292,8 @@ class GameRunner:
         """
         board = chess.Board(opening_fen)
         moves: list[str] = []
+        nodes_white = 0
+        nodes_black = 0
 
         # Assign colors
         white_engine = engine_a if engine_a_white else engine_b
@@ -344,6 +352,12 @@ class GameRunner:
                 result = "1/2-1/2"
                 break
 
+            # Accumulate GPU evals (nodes) per side
+            if board.turn == chess.WHITE:
+                nodes_white += current_engine.last_nodes
+            else:
+                nodes_black += current_engine.last_nodes
+
             # Make the move
             board.push(move)
             moves.append(move.uci())
@@ -363,6 +377,8 @@ class GameRunner:
             engine_a_white=engine_a_white,
             moves=moves,
             termination=termination,
+            nodes_white=nodes_white,
+            nodes_black=nodes_black,
         )
 
     def _get_natural_termination(

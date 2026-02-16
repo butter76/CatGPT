@@ -246,6 +246,39 @@ private:
             return;
         }
 
+        // Emit UCI info line with search statistics
+        std::string info = "info";
+        if (result.depth.has_value()) {
+            info += std::format(" depth {}", result.depth.value());
+        }
+        if (result.seldepth.has_value()) {
+            info += std::format(" seldepth {}", result.seldepth.value());
+        }
+        if (result.nodes.has_value()) {
+            info += std::format(" nodes {}", result.nodes.value());
+        }
+        if (result.time_ms.has_value()) {
+            info += std::format(" time {}", result.time_ms.value());
+        }
+        if (result.nps.has_value()) {
+            info += std::format(" nps {}", result.nps.value());
+        }
+        if (result.score.has_value()) {
+            const auto& s = result.score.value();
+            if (s.is_mate()) {
+                info += std::format(" score mate {}", s.value);
+            } else {
+                info += std::format(" score cp {}", s.value);
+            }
+        }
+        if (result.pv.has_value() && !result.pv->empty()) {
+            info += " pv";
+            for (const auto& m : result.pv.value()) {
+                info += " " + chess::uci::moveToUci(m);
+            }
+        }
+        std::println("{}", info);
+
         std::string bestmove_str = chess::uci::moveToUci(result.best_move);
         std::println("bestmove {}", bestmove_str);
         std::cout.flush();

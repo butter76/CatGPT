@@ -8,6 +8,7 @@ Uses pexpect for reliable interactive communication with the subprocess,
 which handles PTY allocation and buffering correctly.
 """
 
+import re
 import threading
 from pathlib import Path
 
@@ -67,6 +68,7 @@ class UCIEngine:
 
         self._child: pexpect.spawn | None = None
         self._lock = threading.Lock()
+        self.last_nodes: int = 0  # GPU evals from the most recent select_move call
         self._start_engine()
 
     def _start_engine(self) -> None:
@@ -124,7 +126,6 @@ class UCIEngine:
         """Parse the bestmove from engine output."""
         # Text contains the matched pattern and surrounding context
         # Look for "bestmove XXXX" pattern
-        import re
         match = re.search(r"bestmove\s+(\S+)", text)
         if match:
             move_uci = match.group(1)
@@ -135,6 +136,24 @@ class UCIEngine:
             except ValueError:
                 return None
         return None
+
+    @staticmethod
+    def _parse_info_nodes(text: str) -> int:
+        """Parse the node count from UCI info output.
+
+        Looks for the last 'info' line containing 'nodes <N>' in the
+        engine output that precedes the bestmove response.
+
+        Args:
+            text: Raw engine output before the bestmove line.
+
+        Returns:
+            The node count from the last info line, or 0 if not found.
+        """
+        nodes = 0
+        for match in re.finditer(r"info\b.*?\bnodes\s+(\d+)", text):
+            nodes = int(match.group(1))
+        return nodes
 
     def select_move(
         self,
@@ -178,12 +197,17 @@ class UCIEngine:
                 go_parts.append(str(value))
             self._send_command(" ".join(go_parts))
 
-            # Wait for bestmove
+            # Wait for bestmove — everything before the match (info lines) is
+            # available in self._child.before after the expect call.
             self._wait_for_response("bestmove")
 
             # Get the full line containing bestmove
             if self._child is None:
                 return None
+
+            # The text before the "bestmove" match contains info lines
+            info_output = self._child.before or ""
+            self.last_nodes = self._parse_info_nodes(info_output)
 
             # Read the rest of the line after "bestmove"
             self._child.expect(r"\r?\n")
