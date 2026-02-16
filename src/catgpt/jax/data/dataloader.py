@@ -99,19 +99,24 @@ class ConvertToJax(pygrain.MapTransform):
             self._include_policy = output_heads_config.policy_head
             self._include_next_capture = output_heads_config.next_capture_head
             self._include_next_pawn_move = output_heads_config.next_pawn_move_head
+            self._include_move_values = output_heads_config.move_value_head
+            self._include_move_variances = output_heads_config.move_variance_head
         else:
             self._num_bins = 81
             self._sigma_ratio = 0.75
             self._include_policy = False
             self._include_next_capture = False
             self._include_next_pawn_move = False
+            self._include_move_values = False
+            self._include_move_variances = False
 
     def map(self, element):
         """Convert a batched element to JAX-compatible arrays.
 
         Args:
-            element: Tuple of (inputs, targets, [policy_targets], [next_capture], [next_pawn])
-                as numpy arrays. Optional elements depend on head configuration.
+            element: Tuple of (inputs, targets, [policy_targets], [next_capture],
+                [next_pawn], [move_values], [move_variances]) as numpy arrays.
+                Optional elements depend on head configuration.
 
         Returns:
             Dictionary with 'input', 'target', and optional targets as numpy arrays.
@@ -120,6 +125,8 @@ class ConvertToJax(pygrain.MapTransform):
             - 'policy_target': Flattened policy distribution, shape (batch, 64*73)
             - 'next_capture_target': Square indices, shape (batch,), -1 = invalid
             - 'next_pawn_move_target': Square indices, shape (batch,), -1 = invalid
+            - 'move_value_target': Per-move values, shape (batch, 64*73)
+            - 'move_variance_target': Per-move variances, shape (batch, 64*73)
         """
         # Unpack tuple based on configuration
         element = list(element)
@@ -129,6 +136,8 @@ class ConvertToJax(pygrain.MapTransform):
         policy_targets = None
         next_capture_targets = None
         next_pawn_move_targets = None
+        move_value_targets = None
+        move_variance_targets = None
 
         if self._include_policy:
             policy_targets = element.pop(0)
@@ -136,6 +145,10 @@ class ConvertToJax(pygrain.MapTransform):
             next_capture_targets = element.pop(0)
         if self._include_next_pawn_move:
             next_pawn_move_targets = element.pop(0)
+        if self._include_move_values:
+            move_value_targets = element.pop(0)
+        if self._include_move_variances:
+            move_variance_targets = element.pop(0)
 
         # Keep as numpy - JAX will convert when needed
         # This avoids unnecessary device transfers during data loading
@@ -175,6 +188,20 @@ class ConvertToJax(pygrain.MapTransform):
             result["next_pawn_move_target"] = np.asarray(
                 next_pawn_move_targets, dtype=np.int32
             )
+
+        # Add per-move value target if enabled
+        if self._include_move_values and move_value_targets is not None:
+            # move_value_targets: (batch, 64, 73) -> flatten to (batch, 64*73)
+            mv_array = np.asarray(move_value_targets, dtype=np.float32)
+            mv_array = mv_array.reshape(mv_array.shape[0], -1)
+            result["move_value_target"] = mv_array
+
+        # Add per-move variance target if enabled
+        if self._include_move_variances and move_variance_targets is not None:
+            # move_variance_targets: (batch, 64, 73) -> flatten to (batch, 64*73)
+            mvar_array = np.asarray(move_variance_targets, dtype=np.float32)
+            mvar_array = mvar_array.reshape(mvar_array.shape[0], -1)
+            result["move_variance_target"] = mvar_array
 
         return result
 
@@ -257,6 +284,12 @@ def create_grain_dataloader(
     include_next_pawn_move = (
         output_heads_config is not None and output_heads_config.next_pawn_move_head
     )
+    include_move_values = (
+        output_heads_config is not None and output_heads_config.move_value_head
+    )
+    include_move_variances = (
+        output_heads_config is not None and output_heads_config.move_variance_head
+    )
 
     # Define transformations pipeline
     transformations = (
@@ -265,7 +298,9 @@ def create_grain_dataloader(
             include_policy=include_policy,
             include_next_capture=include_next_capture,
             include_next_pawn_move=include_next_pawn_move,
-        ),  # bytes -> (state, win_prob, [policy], [next_capture], [next_pawn])
+            include_move_values=include_move_values,
+            include_move_variances=include_move_variances,
+        ),  # bytes -> (state, win_prob, [policy], [next_capture], [next_pawn], [move_val], [move_var])
         pygrain.Batch(batch_size=batch_size, drop_remainder=split == "train"),
         ConvertToJax(output_heads_config),  # numpy -> jax-compatible arrays with HL-Gauss
     )
@@ -289,7 +324,8 @@ def create_grain_dataloader(
         f"shuffle={shuffle}, workers={config.num_workers}, "
         f"hl_gauss(bins={num_bins}, sigma_ratio={sigma_ratio}), "
         f"policy={include_policy}, next_capture={include_next_capture}, "
-        f"next_pawn_move={include_next_pawn_move}"
+        f"next_pawn_move={include_next_pawn_move}, "
+        f"move_values={include_move_values}, move_variances={include_move_variances}"
     )
 
     return dataloader

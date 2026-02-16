@@ -75,6 +75,18 @@ class JaxOutputHeadConfig:
     policy_attention_head: bool = True  # Use Q·K^T attention for 64x64 logits
     policy_qk_dim: int = 32  # Dimension for Q/K projections
 
+    # Per-move value head: predict teacher's win probability for each legal move's
+    # resulting position. Shape (64, 73) with values in [0, 1], sparse (only legal moves).
+    # Requires enriched .bag data from generate_move_values.py.
+    move_value_head: bool = False
+    move_value_weight: float = 1.0
+
+    # Per-move variance head: predict teacher's prediction variance (uncertainty)
+    # for each legal move's resulting position. Shape (64, 73) with values in [0, 0.25].
+    # Requires enriched .bag data from generate_move_values.py.
+    move_variance_head: bool = False
+    move_variance_weight: float = 0.5
+
     # HL-Gauss configuration for value head
     # Converts scalar win probability (0-1) to categorical distribution
     value_num_bins: int = 81  # Number of bins for value distribution

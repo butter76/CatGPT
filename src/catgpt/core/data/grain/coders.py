@@ -114,6 +114,46 @@ class ConvertStateValueDataToSequence(ConvertToSequence):
     return state, np.array([win_prob])
 
 
+def encode_move_scalar_target(
+    move_scalars: list[tuple[str, float]],
+    flip: bool = False,
+) -> np.ndarray:
+    """Convert per-move scalar values to a (64, 73) target tensor.
+
+    Same layout as encode_policy_target but with arbitrary scalar values
+    (e.g., win probabilities or variances) instead of policy probabilities.
+    Non-legal-move slots are left as zero.
+
+    Args:
+        move_scalars: List of (uci_move, scalar_value) tuples.
+        flip: Whether to flip squares (for black to move, to match tokenizer).
+
+    Returns:
+        Shape (64, 73) array with scalar values at legal move positions.
+    """
+    target = np.zeros(POLICY_SHAPE, dtype=np.float32)
+
+    for uci_move, value in move_scalars:
+        from_sq, to_sq, promo = parse_uci_move(uci_move)
+
+        if flip:
+            from_sq = flip_square(from_sq)
+            to_sq = flip_square(to_sq)
+
+        from_idx = parse_square(from_sq)
+
+        if promo and promo != "q":
+            # Underpromotion: map to indices 64-72
+            file_diff = ord(to_sq[0]) - ord(from_sq[0])
+            to_idx = 64 + {"n": 0, "b": 1, "r": 2}[promo] * 3 + (file_diff + 1)
+        else:
+            to_idx = parse_square(to_sq)
+
+        target[from_idx, to_idx] = value
+
+    return target
+
+
 class ConvertTrainingBagDataToSequence(ConvertToSequence):
   """Converts training .bag data (from bagz_to_bag.py) to a sequence of integers.
 
@@ -126,11 +166,8 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
   - legal_moves: converted to policy target (64, 73) tensor
   - next_capture_square: square index of piece to be captured (auxiliary target)
   - next_pawn_move_square: square index of pawn that will move (auxiliary target)
-
-  Future versions can leverage additional fields like:
-  - game_result: final game outcome
-  - piece_will_move_to: next move predictions
-  - square_will_be_occupied_from: forward board state
+  - move_values: per-move win probability from teacher (64, 73) tensor
+  - move_variances: per-move prediction variance from teacher (64, 73) tensor
   """
 
   def __init__(
@@ -140,6 +177,8 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
       include_policy: bool = True,
       include_next_capture: bool = False,
       include_next_pawn_move: bool = False,
+      include_move_values: bool = False,
+      include_move_variances: bool = False,
   ) -> None:
     """Initialize with tokenizer configuration.
 
@@ -148,12 +187,16 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
       include_policy: Whether to include policy target in output.
       include_next_capture: Whether to include next_capture_square target.
       include_next_pawn_move: Whether to include next_pawn_move_square target.
+      include_move_values: Whether to include per-move value target.
+      include_move_variances: Whether to include per-move variance target.
     """
     super().__init__()
     self.tokenizer_config = tokenizer_config or TokenizerConfig()
     self.include_policy = include_policy
     self.include_next_capture = include_next_capture
     self.include_next_pawn_move = include_next_pawn_move
+    self.include_move_values = include_move_values
+    self.include_move_variances = include_move_variances
 
   def map(self, element: bytes):
     """Map a training position to (state_tokens, win_prob, ...).
@@ -168,6 +211,8 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
         - policy_target: np.ndarray of shape (64, 73) (if include_policy)
         - next_capture_idx: int in [-1, 63] (if include_next_capture)
         - next_pawn_move_idx: int in [-1, 63] (if include_next_pawn_move)
+        - move_value_target: np.ndarray of shape (64, 73) (if include_move_values)
+        - move_variance_target: np.ndarray of shape (64, 73) (if include_move_variances)
     """
     # Decode msgpack data
     data = msgpack.unpackb(element, raw=False)
@@ -217,6 +262,26 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
       else:
         next_pawn_idx = -1  # Masked out
       result.append(next_pawn_idx)
+
+    if self.include_move_values:
+      # Per-move value target: (64, 73) with teacher win_prob at legal move slots
+      raw_move_values = data.get("move_values")
+      if raw_move_values is not None:
+        move_value_target = encode_move_scalar_target(raw_move_values, flip=flip)
+      else:
+        # Data not enriched yet — return zeros (will be masked out during loss)
+        move_value_target = np.zeros(POLICY_SHAPE, dtype=np.float32)
+      result.append(move_value_target)
+
+    if self.include_move_variances:
+      # Per-move variance target: (64, 73) with teacher variance at legal move slots
+      raw_move_variances = data.get("move_variances")
+      if raw_move_variances is not None:
+        move_variance_target = encode_move_scalar_target(raw_move_variances, flip=flip)
+      else:
+        # Data not enriched yet — return zeros (will be masked out during loss)
+        move_variance_target = np.zeros(POLICY_SHAPE, dtype=np.float32)
+      result.append(move_variance_target)
 
     return tuple(result)
 

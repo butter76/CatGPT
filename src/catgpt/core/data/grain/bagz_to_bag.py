@@ -31,7 +31,7 @@ import chess
 import msgpack
 
 from catgpt.core.data.grain.bagz import BagReader, BagWriter
-from catgpt.core.data.grain.coders import decode_game, LeelaPositionData
+from catgpt.core.data.grain.coders import LeelaPositionData, decode_game
 
 # Standard starting position (first 4 parts of FEN, ignoring move counters)
 STANDARD_STARTING_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -"
@@ -208,8 +208,7 @@ def compute_meta_features(positions: list[LeelaPositionData]) -> list[MetaFeatur
                     chess.square_rank(move.from_square),
                 )
                 captured_sq_name = chess.square_name(captured_sq)
-                if captured_sq_name in will_move_to:
-                    del will_move_to[captured_sq_name]
+                will_move_to.pop(captured_sq_name, None)
             elif to_sq_name in will_move_to:
                 # Normal capture: captured piece is on destination square
                 del will_move_to[to_sq_name]
@@ -358,6 +357,14 @@ class TrainingPositionData:
     next_capture_square: str | None  # current square of piece that will be captured next
     next_pawn_move_square: str | None  # square of pawn that will move next
 
+    # Per-move teacher evaluations (from generate_move_values.py)
+    # Each is a list of (move_uci, value) pairs, one per legal move.
+    # move_values: teacher's predicted win probability from parent's perspective after each move
+    # move_variances: variance of the teacher's HL-Gauss distribution for each resulting position
+    # These are None if the enrichment step has not been run.
+    move_values: list[tuple[str, float]] | None = None
+    move_variances: list[tuple[str, float]] | None = None
+
 
 def encode_training_position(position: TrainingPositionData) -> bytes:
     """Encode a training position to bytes."""
@@ -375,12 +382,26 @@ def encode_training_position(position: TrainingPositionData) -> bytes:
         "next_capture_square": position.next_capture_square,
         "next_pawn_move_square": position.next_pawn_move_square,
     }
+    # Per-move teacher evaluations (optional, from generate_move_values.py)
+    if position.move_values is not None:
+        data["move_values"] = position.move_values
+    if position.move_variances is not None:
+        data["move_variances"] = position.move_variances
     return msgpack.packb(data, use_bin_type=True)
 
 
 def decode_training_position(encoded: bytes) -> TrainingPositionData:
     """Decode bytes to a training position."""
     data = msgpack.unpackb(encoded, raw=False)
+
+    # Per-move teacher evaluations (optional)
+    move_values = data.get("move_values")
+    if move_values is not None:
+        move_values = [(m, v) for m, v in move_values]
+    move_variances = data.get("move_variances")
+    if move_variances is not None:
+        move_variances = [(m, v) for m, v in move_variances]
+
     return TrainingPositionData(
         fen=data["fen"],
         legal_moves=[(m, p) for m, p in data["legal_moves"]],
@@ -394,6 +415,8 @@ def decode_training_position(encoded: bytes) -> TrainingPositionData:
         square_will_be_occupied_by_piece_on=data["square_will_be_occupied_by_piece_on"],
         next_capture_square=data["next_capture_square"],
         next_pawn_move_square=data["next_pawn_move_square"],
+        move_values=move_values,
+        move_variances=move_variances,
     )
 
 

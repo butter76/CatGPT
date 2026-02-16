@@ -58,6 +58,11 @@ model:
     hard_policy_head: true  # Enable hard policy (sharpened target)
     hard_policy_temperature: 0.25  # p^4 sharpening
     hard_policy_weight: 0.1  # Small weight (harder targets are noisier)
+    # Per-move teacher evaluation heads (requires enriched .bag data from generate_move_values.py)
+    move_value_head: true    # Predict teacher's win probability for each legal move's result
+    move_value_weight: 1.0    # Loss weight for move value head
+    move_variance_head: true # Predict teacher's prediction variance for each legal move
+    move_variance_weight: 0.5 # Loss weight for move variance head
     # Square prediction heads (noisy auxiliary targets)
     next_capture_head: false  # Predict square of piece to be captured next
     next_capture_weight: 0.2  # Small weight for noisy auxiliary target
@@ -115,8 +120,8 @@ training:
 
 # Data loading
 data:
-  train_path: "~/training_bag/training-run1-test80-202507*.bag"
-  val_path: "~/training_bag/training-run1-test80-202508*.bag"
+  train_path: "~/parent_bag/*.bag"
+  val_path: "~/parent_val_bag/*.bag"
   num_workers: 4
   prefetch_factor: 10
   seed: 42

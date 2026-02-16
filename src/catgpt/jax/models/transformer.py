@@ -755,6 +755,37 @@ class BidirectionalTransformer(nn.Module):
             )(pooled)  # (batch, 64)
             outputs["next_pawn_move_logit"] = next_pawn_move_logits
 
+        # Move value head: predict teacher's win probability for each legal move's
+        # resulting position. Per-token projection to 73 dims (same layout as policy),
+        # with sigmoid to produce values in [0, 1].
+        if head_config.move_value_head:
+            # hidden: (batch, 64, hidden_size) -> (batch, 64, 73)
+            move_value_logits = nn.Dense(
+                _POLICY_TO_DIM,
+                dtype=jnp.float32,
+                name="move_value_head",
+            )(hidden)
+            # Sigmoid to map to [0, 1] win probability
+            move_values = jax.nn.sigmoid(move_value_logits)
+            # Flatten: (batch, 64, 73) -> (batch, 64*73)
+            outputs["move_value"] = move_values.reshape(batch_size, -1)
+
+        # Move variance head: predict teacher's prediction variance (uncertainty)
+        # for each legal move's resulting position. Per-token projection to 73 dims,
+        # with softplus activation to ensure non-negative output.
+        # Variance of a [0,1] distribution is bounded by 0.25.
+        if head_config.move_variance_head:
+            # hidden: (batch, 64, hidden_size) -> (batch, 64, 73)
+            move_variance_logits = nn.Dense(
+                _POLICY_TO_DIM,
+                dtype=jnp.float32,
+                name="move_variance_head",
+            )(hidden)
+            # Softplus for non-negative output: log(1 + exp(x))
+            move_variances = jax.nn.softplus(move_variance_logits)
+            # Flatten: (batch, 64, 73) -> (batch, 64*73)
+            outputs["move_variance"] = move_variances.reshape(batch_size, -1)
+
         return outputs
 
     @classmethod

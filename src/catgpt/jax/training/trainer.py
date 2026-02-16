@@ -409,6 +409,47 @@ class Trainer:
                 weight = head_config.next_pawn_move_weight if head_config else 0.1
                 losses["next_pawn_move"] = masked_loss * weight
 
+            # Move value head: MSE loss masked to legal moves only
+            # Predicts teacher's win probability for resulting position of each legal move
+            if "move_value" in outputs and "move_value_target" in batch:
+                target = batch["move_value_target"].astype(jnp.float32)  # (batch, 64*73)
+                pred = outputs["move_value"].astype(jnp.float32)  # (batch, 64*73)
+
+                # Mask: legal moves have non-zero target values
+                # Use policy_target if available (more reliable), else use move_value_target
+                if "policy_target" in batch:
+                    legal_mask = (batch["policy_target"].astype(jnp.float32) > 0).astype(jnp.float32)
+                else:
+                    legal_mask = (target != 0).astype(jnp.float32)
+
+                per_element_loss = (pred - target) ** 2
+                move_value_loss = jnp.sum(per_element_loss * legal_mask) / jnp.maximum(
+                    legal_mask.sum(), 1.0
+                )
+                weight = head_config.move_value_weight if head_config else 1.0
+                losses["move_value"] = move_value_loss * weight
+
+            # Move variance head: MSE loss masked to legal moves only
+            # Predicts teacher's prediction variance for each legal move's resulting position
+            if "move_variance" in outputs and "move_variance_target" in batch:
+                target = batch["move_variance_target"].astype(jnp.float32)  # (batch, 64*73)
+                pred = outputs["move_variance"].astype(jnp.float32)  # (batch, 64*73)
+
+                # Mask: legal moves have non-zero values in move_value_target or policy_target
+                if "policy_target" in batch:
+                    legal_mask = (batch["policy_target"].astype(jnp.float32) > 0).astype(jnp.float32)
+                elif "move_value_target" in batch:
+                    legal_mask = (batch["move_value_target"].astype(jnp.float32) != 0).astype(jnp.float32)
+                else:
+                    legal_mask = (target != 0).astype(jnp.float32)
+
+                per_element_loss = (pred - target) ** 2
+                move_variance_loss = jnp.sum(per_element_loss * legal_mask) / jnp.maximum(
+                    legal_mask.sum(), 1.0
+                )
+                weight = head_config.move_variance_weight if head_config else 0.5
+                losses["move_variance"] = move_variance_loss * weight
+
             total_loss = sum(losses.values())
             return total_loss, (outputs, losses)
 
@@ -489,6 +530,32 @@ class Trainer:
             metrics["next_pawn_move_accuracy"] = accuracy
             # Also track fraction of valid samples
             metrics["next_pawn_move_valid_frac"] = jnp.mean(mask.astype(jnp.float32))
+
+        # Move value head metrics (MSE on legal moves only)
+        if "move_value" in outputs and "move_value_target" in batch:
+            target = batch["move_value_target"].astype(jnp.float32)
+            pred = outputs["move_value"].astype(jnp.float32)
+            if "policy_target" in batch:
+                legal_mask = (batch["policy_target"].astype(jnp.float32) > 0).astype(jnp.float32)
+            else:
+                legal_mask = (target != 0).astype(jnp.float32)
+            per_element_mse = (pred - target) ** 2
+            move_value_mse = jnp.sum(per_element_mse * legal_mask) / jnp.maximum(legal_mask.sum(), 1.0)
+            metrics["move_value_mse"] = move_value_mse
+
+        # Move variance head metrics (MSE on legal moves only)
+        if "move_variance" in outputs and "move_variance_target" in batch:
+            target = batch["move_variance_target"].astype(jnp.float32)
+            pred = outputs["move_variance"].astype(jnp.float32)
+            if "policy_target" in batch:
+                legal_mask = (batch["policy_target"].astype(jnp.float32) > 0).astype(jnp.float32)
+            elif "move_value_target" in batch:
+                legal_mask = (batch["move_value_target"].astype(jnp.float32) != 0).astype(jnp.float32)
+            else:
+                legal_mask = (target != 0).astype(jnp.float32)
+            per_element_mse = (pred - target) ** 2
+            move_variance_mse = jnp.sum(per_element_mse * legal_mask) / jnp.maximum(legal_mask.sum(), 1.0)
+            metrics["move_variance_mse"] = move_variance_mse
 
         # Layer gradient norms (computed unconditionally, filtering done at logging time)
         layer_grad_norms = compute_layer_grad_norms(grads)
@@ -593,6 +660,32 @@ class Trainer:
                     )
                     loss = jnp.sum(per_sample * mask) / jnp.maximum(jnp.sum(mask), 1.0)
                     weight = head_config.next_pawn_move_weight if head_config else 0.1
+                    return loss * weight
+
+                elif _head_name == "move_value" and "move_value" in outputs and "move_value_target" in batch:
+                    target = batch["move_value_target"].astype(jnp.float32)
+                    pred = outputs["move_value"].astype(jnp.float32)
+                    if "policy_target" in batch:
+                        legal_mask = (batch["policy_target"].astype(jnp.float32) > 0).astype(jnp.float32)
+                    else:
+                        legal_mask = (target != 0).astype(jnp.float32)
+                    per_element = (pred - target) ** 2
+                    loss = jnp.sum(per_element * legal_mask) / jnp.maximum(legal_mask.sum(), 1.0)
+                    weight = head_config.move_value_weight if head_config else 1.0
+                    return loss * weight
+
+                elif _head_name == "move_variance" and "move_variance" in outputs and "move_variance_target" in batch:
+                    target = batch["move_variance_target"].astype(jnp.float32)
+                    pred = outputs["move_variance"].astype(jnp.float32)
+                    if "policy_target" in batch:
+                        legal_mask = (batch["policy_target"].astype(jnp.float32) > 0).astype(jnp.float32)
+                    elif "move_value_target" in batch:
+                        legal_mask = (batch["move_value_target"].astype(jnp.float32) != 0).astype(jnp.float32)
+                    else:
+                        legal_mask = (target != 0).astype(jnp.float32)
+                    per_element = (pred - target) ** 2
+                    loss = jnp.sum(per_element * legal_mask) / jnp.maximum(legal_mask.sum(), 1.0)
+                    weight = head_config.move_variance_weight if head_config else 0.5
                     return loss * weight
 
                 # Fallback: return zero loss for unknown heads
@@ -723,6 +816,38 @@ class Trainer:
             weight = head_config.next_pawn_move_weight if head_config else 0.1
             losses["next_pawn_move"] = masked_loss * weight
 
+        # Move value head: MSE loss masked to legal moves only
+        if "move_value" in outputs and "move_value_target" in batch:
+            target = batch["move_value_target"].astype(jnp.float32)
+            pred = outputs["move_value"].astype(jnp.float32)
+            if "policy_target" in batch:
+                legal_mask = (batch["policy_target"].astype(jnp.float32) > 0).astype(jnp.float32)
+            else:
+                legal_mask = (target != 0).astype(jnp.float32)
+            per_element_loss = (pred - target) ** 2
+            move_value_loss = jnp.sum(per_element_loss * legal_mask) / jnp.maximum(
+                legal_mask.sum(), 1.0
+            )
+            weight = head_config.move_value_weight if head_config else 1.0
+            losses["move_value"] = move_value_loss * weight
+
+        # Move variance head: MSE loss masked to legal moves only
+        if "move_variance" in outputs and "move_variance_target" in batch:
+            target = batch["move_variance_target"].astype(jnp.float32)
+            pred = outputs["move_variance"].astype(jnp.float32)
+            if "policy_target" in batch:
+                legal_mask = (batch["policy_target"].astype(jnp.float32) > 0).astype(jnp.float32)
+            elif "move_value_target" in batch:
+                legal_mask = (batch["move_value_target"].astype(jnp.float32) != 0).astype(jnp.float32)
+            else:
+                legal_mask = (target != 0).astype(jnp.float32)
+            per_element_loss = (pred - target) ** 2
+            move_variance_loss = jnp.sum(per_element_loss * legal_mask) / jnp.maximum(
+                legal_mask.sum(), 1.0
+            )
+            weight = head_config.move_variance_weight if head_config else 0.5
+            losses["move_variance"] = move_variance_loss * weight
+
         total_loss = sum(losses.values())
 
         # Compute metrics
@@ -809,6 +934,32 @@ class Trainer:
             accuracy = jnp.sum(correct.astype(jnp.float32)) / jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
             metrics["next_pawn_move_accuracy"] = accuracy
             metrics["next_pawn_move_valid_frac"] = jnp.mean(mask.astype(jnp.float32))
+
+        # Move value head metrics
+        if "move_value" in outputs and "move_value_target" in batch:
+            target = batch["move_value_target"].astype(jnp.float32)
+            pred = outputs["move_value"].astype(jnp.float32)
+            if "policy_target" in batch:
+                legal_mask = (batch["policy_target"].astype(jnp.float32) > 0).astype(jnp.float32)
+            else:
+                legal_mask = (target != 0).astype(jnp.float32)
+            per_element_mse = (pred - target) ** 2
+            move_value_mse = jnp.sum(per_element_mse * legal_mask) / jnp.maximum(legal_mask.sum(), 1.0)
+            metrics["move_value_mse"] = move_value_mse
+
+        # Move variance head metrics
+        if "move_variance" in outputs and "move_variance_target" in batch:
+            target = batch["move_variance_target"].astype(jnp.float32)
+            pred = outputs["move_variance"].astype(jnp.float32)
+            if "policy_target" in batch:
+                legal_mask = (batch["policy_target"].astype(jnp.float32) > 0).astype(jnp.float32)
+            elif "move_value_target" in batch:
+                legal_mask = (batch["move_value_target"].astype(jnp.float32) != 0).astype(jnp.float32)
+            else:
+                legal_mask = (target != 0).astype(jnp.float32)
+            per_element_mse = (pred - target) ** 2
+            move_variance_mse = jnp.sum(per_element_mse * legal_mask) / jnp.maximum(legal_mask.sum(), 1.0)
+            metrics["move_variance_mse"] = move_variance_mse
 
         return metrics
 
@@ -1128,6 +1279,18 @@ class Trainer:
                 log_dict["train/next_pawn_move_accuracy"] = float(metrics["next_pawn_move_accuracy"])
             if "next_pawn_move_valid_frac" in metrics:
                 log_dict["train/next_pawn_move_valid_frac"] = float(metrics["next_pawn_move_valid_frac"])
+
+            # Add move value head metrics
+            if "move_value_loss" in metrics:
+                log_dict["train/move_value_loss"] = float(metrics["move_value_loss"])
+            if "move_value_mse" in metrics:
+                log_dict["train/move_value_mse"] = float(metrics["move_value_mse"])
+
+            # Add move variance head metrics
+            if "move_variance_loss" in metrics:
+                log_dict["train/move_variance_loss"] = float(metrics["move_variance_loss"])
+            if "move_variance_mse" in metrics:
+                log_dict["train/move_variance_mse"] = float(metrics["move_variance_mse"])
 
             # Add gradient norms (layer-wise) if enabled
             if self.metrics_config.log_layer_grad_norms:
