@@ -28,7 +28,7 @@ cpp_build_dir: "cpp/build/bin"
 
 # Engine A configuration (the "new" or "test" engine)
 engine_a:
-  binary_path: "engines/frac_variance_25"
+  binary_path: "engines/frac_variance_18"
   trt_engine: "sample.trt"
   type: "fractional_mcts"  # Options: "value", "policy", "mcts", "fractional_mcts"
 
@@ -45,7 +45,7 @@ engine_a:
 
 # Engine B configuration (the "baseline" engine)
 engine_b:
-  binary_path: "engines/frac"
+  binary_path: "engines/frac_variance_25"
   trt_engine: "sample.trt"
   type: "fractional_mcts"
 
