@@ -371,6 +371,7 @@ def main(cfg: DictConfig) -> None:
     # Track results
     wins, losses, draws = 0, 0, 0
     syzygy_adjudications = 0
+    total_nodes_a, total_nodes_b = 0, 0
     all_games: list[GameResult] = []
 
     # Setup PGN writer (writes games incrementally as they finish)
@@ -425,6 +426,14 @@ def main(cfg: DictConfig) -> None:
                 if game.termination == GameTermination.SYZYGY_ADJUDICATED:
                     syzygy_adjudications += 1
 
+                # Accumulate GPU evals per engine
+                if game.engine_a_white:
+                    total_nodes_a += game.nodes_white
+                    total_nodes_b += game.nodes_black
+                else:
+                    total_nodes_a += game.nodes_black
+                    total_nodes_b += game.nodes_white
+
             # Update SPRT
             sprt_result = sprt.update(wins, losses, draws)
 
@@ -458,6 +467,8 @@ def main(cfg: DictConfig) -> None:
                         "draw_rate": sprt_result.draw_rate,
                         "loss_rate": sprt_result.loss_rate,
                         "syzygy_adjudications": syzygy_adjudications,
+                        "total_nodes_a": total_nodes_a,
+                        "total_nodes_b": total_nodes_b,
                     }
                 )
 
@@ -505,6 +516,10 @@ def main(cfg: DictConfig) -> None:
             f"\nFinal Elo: [bold]{final_result.elo_estimate:+.1f} "
             f"± {final_result.elo_error:.1f}[/bold]"
         )
+        console.print(
+            f"Total GPU evals: {engine_a_name}={total_nodes_a:,}  "
+            f"{engine_b_name}={total_nodes_b:,}"
+        )
 
         # Log final result to W&B
         if wandb_run:
@@ -518,6 +533,8 @@ def main(cfg: DictConfig) -> None:
             wb.summary["final_losses"] = losses
             wb.summary["final_draws"] = draws
             wb.summary["final_syzygy_adjudications"] = syzygy_adjudications
+            wb.summary["final_total_nodes_a"] = total_nodes_a
+            wb.summary["final_total_nodes_b"] = total_nodes_b
 
         # Upload PGN to W&B if enabled
         if pgn_writer is not None and wandb_run:
