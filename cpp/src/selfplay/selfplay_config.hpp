@@ -38,8 +38,9 @@ struct SelfPlayConfig {
 
     // === Game Limits ===
 
-    /** Total number of game PAIRS to play (each pair = 2 games). 0 = unlimited. */
-    int total_pairs = 500;
+    /** Total number of game PAIRS to play (each pair = 2 games).
+     *  0 = one pair per opening position (default). */
+    int total_pairs = 0;
 
     /** Maximum number of moves (plies) per game before adjudicating as draw. */
     int max_moves = 512;
