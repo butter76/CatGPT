@@ -95,6 +95,12 @@ public:
             openings_.push_back("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
         }
 
+        // Default total_pairs to number of openings (one pair per opening)
+        if (config_.total_pairs <= 0) {
+            config_.total_pairs = static_cast<int>(openings_.size());
+            std::println(stderr, "[SelfPlay] Pairs defaulting to opening count: {}", config_.total_pairs);
+        }
+
         // Create thread pool
         pool_ = coro::thread_pool::make_shared(coro::thread_pool::options{
             .thread_count = static_cast<uint32_t>(config_.num_search_threads),
@@ -185,14 +191,18 @@ private:
 
             const auto& opening = openings_[pair_num % openings_.size()];
 
-            // Game 1: Challenger=White, Baseline=Black
+            // Alternate starting color across pairs so the challenger
+            // doesn't always get the first move in game 1.
+            bool challenger_white_first = (pair_num % 2 == 0);
+
+            // Game 1
             GameRecord game1 = co_await play_one_game(
-                opening, /*challenger_is_white=*/true);
+                opening, /*challenger_is_white=*/challenger_white_first);
             on_game_complete(game1, pair_num * 2, slot_id);
 
-            // Game 2: Baseline=White, Challenger=Black
+            // Game 2: colors swapped
             GameRecord game2 = co_await play_one_game(
-                opening, /*challenger_is_white=*/false);
+                opening, /*challenger_is_white=*/!challenger_white_first);
             on_game_complete(game2, pair_num * 2 + 1, slot_id);
         }
     }
@@ -237,6 +247,23 @@ private:
         co_return record;
     }
 
+    // ─── Elo estimation ──────────────────────────────────────────────────
+
+    /**
+     * Estimate Elo difference from W/D/L.
+     * Uses: score = (W + 0.5*D) / N, then Elo = -400 * log10(1/score - 1).
+     * Returns 0 if there are no games or score is exactly 50%.
+     * Clamps to ±9999 for extreme scores.
+     */
+    [[nodiscard]] static float estimate_elo(int wins, int draws, int losses) {
+        int total = wins + draws + losses;
+        if (total == 0) return 0.0f;
+        float score = (static_cast<float>(wins) + 0.5f * draws) / total;
+        // Clamp to avoid log(0) / division by zero
+        score = std::clamp(score, 0.0001f, 0.9999f);
+        return -400.0f * std::log10(1.0f / score - 1.0f);
+    }
+
     // ─── Result tracking ────────────────────────────────────────────────
 
     void on_game_complete(const GameRecord& record, int game_num, int slot_id) {
@@ -277,12 +304,13 @@ private:
                 bool challenger_won = (white_won != record.baseline_white);
                 winner = challenger_won ? config_.challenger_name : config_.baseline_name;
             }
+            float elo = estimate_elo(challenger_wins_, draws_, challenger_losses_);
             std::println(stderr, "[SelfPlay] Game #{}: {} ({}) in {} moves (slot={}) | "
-                         "{} W/D/L: {}/{}/{} ({} games)",
+                         "{} W/D/L: {}/{}/{} ({} games, Elo: {:+.0f})",
                          completed, record.result_string(), winner,
                          record.moves.size(), slot_id,
                          config_.challenger_name,
-                         challenger_wins_, draws_, challenger_losses_, completed);
+                         challenger_wins_, draws_, challenger_losses_, completed, elo);
         }
     }
 
@@ -338,10 +366,11 @@ private:
         float avg_moves = static_cast<float>(stats_total_moves_) / total;
         float avg_evals = static_cast<float>(stats_total_evals_) / total;
         float score_pct = (challenger_wins_ + 0.5f * draws_) / total * 100.0f;
+        float elo = estimate_elo(challenger_wins_, draws_, challenger_losses_);
 
-        std::println(stderr, "[SelfPlay] {} vs {}: W={} D={} L={} ({} games, {:.1f}%)",
+        std::println(stderr, "[SelfPlay] {} vs {}: W={} D={} L={} ({} games, {:.1f}%, Elo: {:+.0f})",
                      config_.challenger_name, config_.baseline_name,
-                     challenger_wins_, draws_, challenger_losses_, total, score_pct);
+                     challenger_wins_, draws_, challenger_losses_, total, score_pct, elo);
         std::println(stderr, "[SelfPlay] Avg moves/game: {:.1f}, Avg GPU evals/game: {:.0f}",
                      avg_moves, avg_evals);
     }

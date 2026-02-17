@@ -41,7 +41,7 @@ void print_usage(const char* argv0) {
     std::println(stderr, "Usage: {} <engine_path> [options]", argv0);
     std::println(stderr, "");
     std::println(stderr, "Tournament options:");
-    std::println(stderr, "  --pairs N            Game pairs (default: 500, each pair = 2 games)");
+    std::println(stderr, "  --pairs N            Game pairs (default: one per opening, each pair = 2 games)");
     std::println(stderr, "  --concurrent N       Concurrent game slots (default: 32)");
     std::println(stderr, "  --threads N          Search worker threads (default: 8)");
     std::println(stderr, "  --batch N            Max GPU batch size (default: 32)");
@@ -200,12 +200,43 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Prompt for run name and set PGN output path
+    if (config.output_pgn.empty()) {
+        std::print(stderr, "Run name: ");
+        std::string run_name;
+        std::getline(std::cin, run_name);
+
+        // Trim whitespace
+        auto s = run_name.find_first_not_of(" \t\r\n");
+        auto e = run_name.find_last_not_of(" \t\r\n");
+        if (s != std::string::npos) {
+            run_name = run_name.substr(s, e - s + 1);
+        }
+
+        // Replace spaces with underscores
+        for (auto& c : run_name) {
+            if (c == ' ') c = '_';
+        }
+
+        if (run_name.empty()) {
+            run_name = "unnamed";
+        }
+
+        // Ensure outputs directory exists
+        fs::create_directories("outputs");
+        config.output_pgn = "outputs/sprt_" + run_name + ".pgn";
+    }
+
     std::println(stderr, "╔════════════════════════════════════════════════╗");
     std::println(stderr, "║       CatGPT Batched Tournament               ║");
     std::println(stderr, "╚════════════════════════════════════════════════╝");
     std::println(stderr, "");
     std::println(stderr, "  Engine:       {}", config.engine_path);
-    std::println(stderr, "  Pairs:        {} ({} games)", config.total_pairs, config.total_pairs * 2);
+    if (config.total_pairs > 0) {
+        std::println(stderr, "  Pairs:        {} ({} games)", config.total_pairs, config.total_pairs * 2);
+    } else {
+        std::println(stderr, "  Pairs:        (one per opening)");
+    }
     std::println(stderr, "  Concurrent:   {}", config.num_concurrent_games);
     std::println(stderr, "  Threads:      {}", config.num_search_threads);
     std::println(stderr, "  Batch size:   {}", config.max_batch_size);
