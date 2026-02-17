@@ -1,22 +1,19 @@
 /**
  * Self-Play Runner — the main orchestrator.
  *
- * Manages N concurrent games, a thread pool for search coroutines,
- * and a BatchEvaluator for GPU inference.  Games are played
- * continuously: when one finishes, a new game immediately starts
- * in that slot.
+ * Pits ChallengerSearch (engine A) against CoroutineSearch (engine B)
+ * in a tournament.  Each opening is played TWICE with colors swapped
+ * to eliminate first-move bias:
+ *   Game 1: Challenger=White  vs  Baseline=Black
+ *   Game 2: Baseline=White   vs  Challenger=Black
+ *
+ * Statistics are tracked from the Challenger's perspective:
+ *   W = Challenger wins, L = Challenger losses, D = draws
  *
  * Architecture:
- *   Main thread   → runs the event loop (spawn/collect games)
- *   Thread pool   → runs search coroutines (8 worker threads)
+ *   Main thread   → runs the event loop (spawn/collect game pairs)
+ *   Thread pool   → runs search coroutines (N worker threads)
  *   GPU thread    → batches and runs TRT inference
- *
- * Flow for one game:
- *   1. Spawn a coroutine that plays one full game
- *   2. The coroutine alternates: search_move → apply_move → check_game_over
- *   3. Each search_move may suspend many times for GPU evals
- *   4. When the game finishes, the coroutine co_returns the GameRecord
- *   5. The runner collects the result and spawns a new game in that slot
  */
 
 #ifndef CATGPT_SELFPLAY_SELFPLAY_RUNNER_HPP
@@ -38,6 +35,7 @@
 
 #include "../../external/chess-library/include/chess.hpp"
 #include "batch_evaluator.hpp"
+#include "challenger_search.hpp"
 #include "coroutine_search.hpp"
 #include "game_slot.hpp"
 #include "selfplay_config.hpp"
@@ -94,7 +92,6 @@ public:
             std::println(stderr, "[SelfPlay] Loaded {} openings", openings_.size());
         }
         if (openings_.empty()) {
-            // Fallback: standard starting position
             openings_.push_back("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
         }
 
@@ -123,26 +120,27 @@ public:
     }
 
     /**
-     * Run self-play until the target number of games is reached.
+     * Run the tournament until the target number of game pairs is reached.
      */
     void run() {
         auto start = std::chrono::steady_clock::now();
 
-        std::println(stderr, "[SelfPlay] Starting: {} concurrent games, {} search threads, "
-                     "max_batch={}, target={} games",
+        int total_games = config_.total_pairs * 2;
+        std::println(stderr, "[SelfPlay] {} vs {}",
+                     config_.challenger_name, config_.baseline_name);
+        std::println(stderr, "[SelfPlay] Starting: {} concurrent slots, {} search threads, "
+                     "max_batch={}, target={} pairs ({} games)",
                      config_.num_concurrent_games, config_.num_search_threads,
-                     config_.max_batch_size,
-                     config_.total_games > 0 ? std::to_string(config_.total_games) : "unlimited");
+                     config_.max_batch_size, config_.total_pairs, total_games);
 
-        // Block on the main coroutine
-        coro::sync_wait(run_all_games());
+        coro::sync_wait(run_all_pairs());
 
         auto elapsed = std::chrono::steady_clock::now() - start;
         double secs = std::chrono::duration<double>(elapsed).count();
 
+        int completed = games_completed_.load();
         std::println(stderr, "\n[SelfPlay] Done: {} games in {:.1f}s ({:.1f} games/sec)",
-                     games_completed_.load(), secs,
-                     games_completed_.load() / secs);
+                     completed, secs, completed / secs);
         std::println(stderr, "[SelfPlay] GPU evals: {} ({:.0f} evals/sec)",
                      evaluator_->total_evals(),
                      evaluator_->total_evals() / secs);
@@ -150,106 +148,113 @@ public:
     }
 
 private:
-    /**
-     * Top-level coroutine: spawn N game coroutines, collect results,
-     * respawn games until the target is reached.
-     */
-    coro::task<void> run_all_games() {
-        // Schedule onto the thread pool
+    // ─── Coroutine orchestration ────────────────────────────────────────
+
+    coro::task<void> run_all_pairs() {
         co_await pool_->schedule();
 
         int num_slots = config_.num_concurrent_games;
-        int target = config_.total_games;
+        int target_pairs = config_.total_pairs;
 
-        // Spawn initial batch of game coroutines
-        // We use a simple model: spawn all games, each one plays until done,
-        // then we spawn replacement games.
-        // With the when_all approach, we spawn all and wait for all.
-        // But we want continuous replacement, so instead we use spawn().
+        std::atomic<int> pairs_started{0};
 
-        std::atomic<int> games_started{0};
-
-        // Launch concurrent game coroutines
-        // Each game_worker plays games in a loop until the target is reached
         std::vector<coro::task<void>> workers;
         workers.reserve(num_slots);
 
         for (int slot = 0; slot < num_slots; ++slot) {
-            workers.push_back(game_worker(slot, games_started, target));
+            workers.push_back(pair_worker(slot, pairs_started, target_pairs));
         }
 
         co_await coro::when_all(std::move(workers));
     }
 
     /**
-     * A single game worker that plays games in a loop.
-     * Each worker occupies one "slot" and keeps playing games
-     * until the global target is reached.
+     * A worker that plays game pairs in a loop.
+     * Each iteration plays one opening twice (colors swapped).
      */
-    coro::task<void> game_worker(int slot_id,
-                                 std::atomic<int>& games_started,
-                                 int target) {
-        // Schedule onto thread pool
+    coro::task<void> pair_worker(int slot_id,
+                                 std::atomic<int>& pairs_started,
+                                 int target_pairs) {
         co_await pool_->schedule();
 
         while (true) {
-            // Atomically claim a game number
-            int game_num = games_started.fetch_add(1);
-            if (target > 0 && game_num >= target) {
-                break;  // Target reached
-            }
-
-            // Pick an opening (round-robin through the list)
-            const auto& opening = openings_[game_num % openings_.size()];
-
-            // Play one full game
-            GameRecord record = co_await play_one_game(opening);
-
-            // Record result
-            on_game_complete(record, game_num, slot_id);
-        }
-    }
-
-    /**
-     * Play one full game from the given opening, returning the record.
-     */
-    coro::task<GameRecord> play_one_game(const std::string& opening_fen) {
-        GameSlot slot;
-        slot.start(opening_fen);
-
-        while (!slot.is_terminated()) {
-            // Search for the best move
-            CoroutineSearch search(*evaluator_, config_.search_config);
-            MoveResult move_result = co_await search.search_move(slot.board());
-
-            if (move_result.best_move == chess::Move::NO_MOVE) {
-                // No legal moves — game should already be detected as over
+            int pair_num = pairs_started.fetch_add(1);
+            if (target_pairs > 0 && pair_num >= target_pairs) {
                 break;
             }
 
-            // Apply the move
-            slot.apply_move(move_result.best_move, move_result.cp_score, move_result.gpu_evals);
+            const auto& opening = openings_[pair_num % openings_.size()];
 
-            // Check for game over
-            slot.check_game_over(config_);
+            // Game 1: Challenger=White, Baseline=Black
+            GameRecord game1 = co_await play_one_game(
+                opening, /*challenger_is_white=*/true);
+            on_game_complete(game1, pair_num * 2, slot_id);
+
+            // Game 2: Baseline=White, Challenger=Black
+            GameRecord game2 = co_await play_one_game(
+                opening, /*challenger_is_white=*/false);
+            on_game_complete(game2, pair_num * 2 + 1, slot_id);
         }
-
-        co_return slot.to_record();
     }
 
     /**
-     * Called when a game completes (thread-safe).
+     * Play one game.  On each move, the current side-to-move determines
+     * which search engine is used.
+     *
+     * @param challenger_is_white  If true, ChallengerSearch plays White.
      */
+    coro::task<GameRecord> play_one_game(const std::string& opening_fen,
+                                         bool challenger_is_white) {
+        GameSlot slot;
+        slot.start(opening_fen);
+
+        // baseline_white is the opposite of challenger_is_white
+        bool baseline_white = !challenger_is_white;
+
+        while (!slot.is_terminated()) {
+            bool white_to_move = slot.board().sideToMove() == chess::Color::WHITE;
+            bool challenger_to_move = (white_to_move == challenger_is_white);
+
+            MoveResult move_result;
+            if (challenger_to_move) {
+                ChallengerSearch search(*evaluator_, config_.challenger_config);
+                move_result = co_await search.search_move(slot.board());
+            } else {
+                CoroutineSearch search(*evaluator_, config_.baseline_config);
+                move_result = co_await search.search_move(slot.board());
+            }
+
+            if (move_result.best_move == chess::Move::NO_MOVE) {
+                break;
+            }
+
+            slot.apply_move(move_result.best_move, move_result.cp_score, move_result.gpu_evals);
+            slot.check_game_over(config_);
+        }
+
+        auto record = slot.to_record();
+        record.baseline_white = baseline_white;
+        co_return record;
+    }
+
+    // ─── Result tracking ────────────────────────────────────────────────
+
     void on_game_complete(const GameRecord& record, int game_num, int slot_id) {
         int completed = games_completed_.fetch_add(1) + 1;
 
-        // Update stats
+        // Track from challenger's perspective
+        float score = record.baseline_score();
+        // baseline_score() returns score for baseline; invert for challenger
+        float challenger_score = 1.0f - score;
+
         {
             std::lock_guard lock(stats_mutex_);
-            switch (record.outcome) {
-                case GameOutcome::WHITE_WIN: ++stats_wins_; break;
-                case GameOutcome::BLACK_WIN: ++stats_losses_; break;
-                case GameOutcome::DRAW:      ++stats_draws_; break;
+            if (challenger_score > 0.75f) {
+                ++challenger_wins_;
+            } else if (challenger_score < 0.25f) {
+                ++challenger_losses_;
+            } else {
+                ++draws_;
             }
             stats_total_moves_ += static_cast<int>(record.moves.size());
             stats_total_evals_ += record.total_gpu_evals;
@@ -260,33 +265,48 @@ private:
             write_pgn(record, game_num + 1);
         }
 
-        // Progress logging (every 10 games or at low counts)
+        // Progress logging
         if (completed <= 5 || completed % 10 == 0) {
             std::lock_guard lock(stats_mutex_);
-            std::println(stderr, "[SelfPlay] Game #{}: {} in {} moves (slot={}) | "
-                         "W/D/L: {}/{}/{} ({} total)",
-                         completed, record.result_string(),
+            // Show which engine won
+            std::string winner;
+            if (record.outcome == GameOutcome::DRAW) {
+                winner = "draw";
+            } else {
+                bool white_won = (record.outcome == GameOutcome::WHITE_WIN);
+                bool challenger_won = (white_won != record.baseline_white);
+                winner = challenger_won ? config_.challenger_name : config_.baseline_name;
+            }
+            std::println(stderr, "[SelfPlay] Game #{}: {} ({}) in {} moves (slot={}) | "
+                         "{} W/D/L: {}/{}/{} ({} games)",
+                         completed, record.result_string(), winner,
                          record.moves.size(), slot_id,
-                         stats_wins_, stats_draws_, stats_losses_, completed);
+                         config_.challenger_name,
+                         challenger_wins_, draws_, challenger_losses_, completed);
         }
     }
 
-    /**
-     * Write a game record as PGN.
-     */
+    // ─── PGN output ─────────────────────────────────────────────────────
+
     void write_pgn(const GameRecord& record, int round) {
         std::lock_guard lock(pgn_mutex_);
         if (!pgn_file_.is_open()) return;
 
-        pgn_file_ << "[Event \"CatGPT Self-Play\"]\n";
+        // Determine engine names for White and Black
+        const std::string& white_name = record.baseline_white
+            ? config_.baseline_name : config_.challenger_name;
+        const std::string& black_name = record.baseline_white
+            ? config_.challenger_name : config_.baseline_name;
+
+        pgn_file_ << "[Event \"CatGPT Tournament\"]\n";
         pgn_file_ << "[Round \"" << round << "\"]\n";
-        pgn_file_ << "[White \"CatGPT\"]\n";
-        pgn_file_ << "[Black \"CatGPT\"]\n";
+        pgn_file_ << "[White \"" << white_name << "\"]\n";
+        pgn_file_ << "[Black \"" << black_name << "\"]\n";
         pgn_file_ << "[Result \"" << record.result_string() << "\"]\n";
         pgn_file_ << "[FEN \"" << record.opening_fen << "\"]\n";
         pgn_file_ << "[SetUp \"1\"]\n";
 
-        // Write moves (reconstruct board to get SAN)
+        // Write moves
         chess::Board board(record.opening_fen);
         int move_num = board.fullMoveNumber();
         bool white_to_move = board.sideToMove() == chess::Color::WHITE;
@@ -312,14 +332,16 @@ private:
 
     void print_stats() {
         std::lock_guard lock(stats_mutex_);
-        int total = stats_wins_ + stats_draws_ + stats_losses_;
+        int total = challenger_wins_ + draws_ + challenger_losses_;
         if (total == 0) return;
 
         float avg_moves = static_cast<float>(stats_total_moves_) / total;
         float avg_evals = static_cast<float>(stats_total_evals_) / total;
+        float score_pct = (challenger_wins_ + 0.5f * draws_) / total * 100.0f;
 
-        std::println(stderr, "[SelfPlay] Final: W={} D={} L={} ({} games)",
-                     stats_wins_, stats_draws_, stats_losses_, total);
+        std::println(stderr, "[SelfPlay] {} vs {}: W={} D={} L={} ({} games, {:.1f}%)",
+                     config_.challenger_name, config_.baseline_name,
+                     challenger_wins_, draws_, challenger_losses_, total, score_pct);
         std::println(stderr, "[SelfPlay] Avg moves/game: {:.1f}, Avg GPU evals/game: {:.0f}",
                      avg_moves, avg_evals);
     }
@@ -336,12 +358,12 @@ private:
     std::ofstream pgn_file_;
     std::mutex pgn_mutex_;
 
-    // Statistics
+    // Statistics (from challenger's perspective)
     std::atomic<int> games_completed_{0};
     std::mutex stats_mutex_;
-    int stats_wins_ = 0;
-    int stats_draws_ = 0;
-    int stats_losses_ = 0;
+    int challenger_wins_ = 0;
+    int draws_ = 0;
+    int challenger_losses_ = 0;
     int stats_total_moves_ = 0;
     int stats_total_evals_ = 0;
 };

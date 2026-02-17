@@ -53,6 +53,9 @@ struct GameRecord {
     GameOutcome outcome = GameOutcome::DRAW;
     int total_gpu_evals = 0;
 
+    /** True if the baseline engine played White in this game. */
+    bool baseline_white = true;
+
     /** Convert outcome to PGN result string. */
     [[nodiscard]] std::string result_string() const {
         switch (outcome) {
@@ -61,6 +64,17 @@ struct GameRecord {
             case GameOutcome::DRAW:      return "1/2-1/2";
         }
         return "*";
+    }
+
+    /**
+     * Result from the baseline engine's perspective.
+     * 1.0 = baseline win, 0.5 = draw, 0.0 = baseline loss.
+     */
+    [[nodiscard]] float baseline_score() const {
+        if (outcome == GameOutcome::DRAW) return 0.5f;
+        bool white_won = (outcome == GameOutcome::WHITE_WIN);
+        bool baseline_won = (white_won == baseline_white);
+        return baseline_won ? 1.0f : 0.0f;
     }
 };
 
