@@ -1,0 +1,100 @@
+/**
+ * Evaluation Request — the coroutine-to-GPU bridge.
+ *
+ * An EvalRequest holds the input tokens for a position and an output slot
+ * for the neural network result.  When a search coroutine needs a GPU
+ * evaluation it creates an EvalAwaitable, which:
+ *   1. Packs the tokens into an EvalRequest
+ *   2. Submits the request to the BatchEvaluator queue
+ *   3. Suspends the coroutine (returning its handle for later resumption)
+ *   4. On resumption (by the GPU thread → thread pool), returns the result
+ *
+ * Lifetime: EvalAwaitable is a temporary materialized in the coroutine
+ * frame by `co_await`, so it (and the embedded EvalRequest) is alive for
+ * the entire suspension.  The GPU thread reads `tokens` and writes `result`
+ * while the coroutine is suspended; the coroutine reads `result` on resume.
+ */
+
+#ifndef CATGPT_SELFPLAY_EVAL_REQUEST_HPP
+#define CATGPT_SELFPLAY_EVAL_REQUEST_HPP
+
+#include <array>
+#include <coroutine>
+#include <cstdint>
+
+#include "../engine/policy.hpp"
+#include "../engine/trt_evaluator.hpp"  // VALUE_NUM_BINS
+
+namespace catgpt {
+
+// Forward declaration — defined in batch_evaluator.hpp
+class BatchEvaluator;
+
+/**
+ * Raw neural-network output for a single position.
+ * This is what the GPU thread writes after batched inference.
+ */
+struct RawNNOutput {
+    float value;                                    // Win probability [0, 1]
+    std::array<float, VALUE_NUM_BINS> value_probs;  // Value distribution (81 bins)
+    std::array<float, POLICY_SIZE> policy;          // Policy logits (4672)
+};
+
+/**
+ * A single evaluation request.
+ *
+ * Allocated inside the coroutine frame (via EvalAwaitable).
+ * The GPU thread reads `tokens` and writes `result`, then resumes
+ * the coroutine via `continuation`.
+ */
+struct EvalRequest {
+    // --- Input (written by coroutine before suspend) ---
+    std::array<std::int32_t, 64> tokens;
+
+    // --- Output (written by GPU thread before resuming coroutine) ---
+    RawNNOutput result;
+
+    // --- Coroutine handle (set by await_suspend, used by GPU thread) ---
+    std::coroutine_handle<> continuation;
+};
+
+/**
+ * Awaitable that submits an eval request to the batch evaluator
+ * and suspends the calling coroutine until the GPU result is ready.
+ *
+ * Usage inside a coroutine:
+ *   RawNNOutput output = co_await EvalAwaitable(evaluator, tokens);
+ */
+class EvalAwaitable {
+public:
+    EvalAwaitable(BatchEvaluator& evaluator,
+                  const std::array<std::uint8_t, 64>& tokens)
+        : evaluator_(evaluator)
+    {
+        // Convert uint8 tokens to int32 (TRT input format)
+        for (int i = 0; i < 64; ++i) {
+            request_.tokens[i] = static_cast<std::int32_t>(tokens[i]);
+        }
+    }
+
+    // Never immediately ready — always go through the GPU.
+    bool await_ready() const noexcept { return false; }
+
+    // Submit the request and suspend.  Defined after BatchEvaluator
+    // is complete (see bottom of batch_evaluator.hpp).
+    void await_suspend(std::coroutine_handle<> h) noexcept;
+
+    // Called when the coroutine resumes — the GPU thread has already
+    // filled request_.result.
+    RawNNOutput await_resume() noexcept {
+        return request_.result;
+    }
+
+private:
+    BatchEvaluator& evaluator_;
+    EvalRequest request_;
+};
+
+}  // namespace catgpt
+
+#endif  // CATGPT_SELFPLAY_EVAL_REQUEST_HPP
