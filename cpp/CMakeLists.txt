@@ -93,66 +93,6 @@ set_target_properties(trt_benchmark PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
 
-# === Dummy Search POC executable ===
-add_executable(dummy_search
-    src/dummy_search/main.cpp
-)
-
-target_include_directories(dummy_search PRIVATE
-    ${CHESS_LIBRARY_INCLUDE_DIR}
-    ${LIBCORO_INCLUDE_DIR}
-)
-
-target_link_libraries(dummy_search PRIVATE
-    ${LIBCORO_LIB}
-    pthread  # Required for libcoro thread_pool
-)
-
-set_target_properties(dummy_search PROPERTIES
-    BUILD_RPATH "${GCC14_LIB_DIR}"
-    INSTALL_RPATH "${GCC14_LIB_DIR}"
-)
-
-# === CatGPT UCI Engine ===
-add_executable(catgpt_uci
-    src/uci_main.cpp
-)
-
-target_include_directories(catgpt_uci PRIVATE
-    ${CHESS_LIBRARY_INCLUDE_DIR}
-)
-
-target_link_libraries(catgpt_uci PRIVATE
-    pthread
-)
-
-set_target_properties(catgpt_uci PROPERTIES
-    BUILD_RPATH "${GCC14_LIB_DIR}"
-    INSTALL_RPATH "${GCC14_LIB_DIR}"
-)
-
-# === CatGPT MCTS UCI Engine (with TensorRT) ===
-add_executable(catgpt_mcts
-    src/mcts_uci_main.cpp
-)
-
-target_include_directories(catgpt_mcts PRIVATE
-    ${CHESS_LIBRARY_INCLUDE_DIR}
-    ${TENSORRT_INCLUDE_DIR}
-    ${CUDA_INCLUDE_DIR}
-)
-
-target_link_libraries(catgpt_mcts PRIVATE
-    ${NVINFER_LIB}
-    ${CUDART_LIB}
-    pthread
-)
-
-set_target_properties(catgpt_mcts PROPERTIES
-    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-)
-
 # === CatGPT Fractional MCTS UCI Engine (with TensorRT) ===
 add_executable(catgpt_fractional_mcts
     src/fractional_mcts_uci_main.cpp
@@ -171,50 +111,6 @@ target_link_libraries(catgpt_fractional_mcts PRIVATE
 )
 
 set_target_properties(catgpt_fractional_mcts PROPERTIES
-    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-)
-
-# === CatGPT Value UCI Engine (with TensorRT) ===
-add_executable(catgpt_value
-    src/value_uci_main.cpp
-)
-
-target_include_directories(catgpt_value PRIVATE
-    ${CHESS_LIBRARY_INCLUDE_DIR}
-    ${TENSORRT_INCLUDE_DIR}
-    ${CUDA_INCLUDE_DIR}
-)
-
-target_link_libraries(catgpt_value PRIVATE
-    ${NVINFER_LIB}
-    ${CUDART_LIB}
-    pthread
-)
-
-set_target_properties(catgpt_value PROPERTIES
-    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-)
-
-# === CatGPT Policy UCI Engine (with TensorRT) ===
-add_executable(catgpt_policy
-    src/policy_uci_main.cpp
-)
-
-target_include_directories(catgpt_policy PRIVATE
-    ${CHESS_LIBRARY_INCLUDE_DIR}
-    ${TENSORRT_INCLUDE_DIR}
-    ${CUDA_INCLUDE_DIR}
-)
-
-target_link_libraries(catgpt_policy PRIVATE
-    ${NVINFER_LIB}
-    ${CUDART_LIB}
-    pthread
-)
-
-set_target_properties(catgpt_policy PROPERTIES
     BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
@@ -241,16 +137,39 @@ set_target_properties(catgpt_analyze PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
 
+# === CatGPT Batched Self-Play (coroutines + TensorRT) ===
+add_executable(catgpt_selfplay
+    src/selfplay_main.cpp
+)
+
+target_include_directories(catgpt_selfplay PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+    ${LIBCORO_INCLUDE_DIR}
+)
+
+target_link_libraries(catgpt_selfplay PRIVATE
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    ${LIBCORO_LIB}
+    pthread
+)
+
+# libcoro requires -fcoroutines on GCC
+target_compile_options(catgpt_selfplay PRIVATE -fcoroutines)
+
+set_target_properties(catgpt_selfplay PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
+)
+
 # Enable colored output
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)
     target_compile_options(trt_benchmark PRIVATE -fdiagnostics-color=always)
     target_compile_options(chess_lib_tests PRIVATE -fdiagnostics-color=always)
-    target_compile_options(dummy_search PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_uci PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_mcts PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_fractional_mcts PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_value PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_policy PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_analyze PRIVATE -fdiagnostics-color=always)
+    target_compile_options(catgpt_selfplay PRIVATE -fdiagnostics-color=always)
 endif()
