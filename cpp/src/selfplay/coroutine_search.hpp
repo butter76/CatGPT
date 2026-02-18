@@ -101,8 +101,9 @@ public:
 
         while (total_gpu_evals_ < target_evals && iteration < 10000) {
             last_used_N = N;
-            int alpha = compute_percentile_bin(root->distQ, 0.16f);
-            int beta  = compute_percentile_bin(root->distQ, 0.84f);
+            int median = compute_percentile_bin(root->distQ, 0.50f);
+            int alpha = std::max(0, median);
+            int beta  = std::min(VALUE_NUM_BINS - 1, median);
             co_await recursive_search(root.get(), board, N, alpha, beta);
             N += 1.0f;
             ++iteration;
@@ -217,7 +218,7 @@ private:
         alt_variance *= 2.0f;
 
         float effective_variance = std::min(node->variance, alt_variance);
-        float N_reduction = effective_variance * 18.0f;
+        float N_reduction = effective_variance * 8.0f;
         float effective_N = N * N_reduction;
 
         if (node->children.empty()) {
