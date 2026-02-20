@@ -660,6 +660,33 @@ class BidirectionalTransformer(nn.Module):
             outputs["value_probs"] = value_probs  # For visualization
             outputs["value"] = expected_value  # Scalar for metrics/inference
 
+        # Hard value head: separate MLP trained against sharper HL-Gauss target
+        # Same architecture as value head but independent parameters.
+        # Sharper target (lower sigma) is more useful at inference.
+        if head_config.hard_value_head:
+            pooled = hidden[:, -1, :]  # (batch, hidden)
+
+            num_bins = head_config.value_num_bins
+            hv_hidden = nn.Dense(
+                self.config.hidden_size // 2,
+                dtype=jnp.float32,
+                name="hard_value_head_fc1",
+            )(pooled)
+            hv_hidden = nn.gelu(hv_hidden, approximate=True)
+            hv_logits = nn.Dense(
+                num_bins,
+                dtype=jnp.float32,
+                name="hard_value_head_fc2",
+            )(hv_hidden)
+
+            hv_probs = jax.nn.softmax(hv_logits, axis=-1)
+            bin_centers = (jnp.arange(num_bins) + 0.5) / num_bins
+            hv_expected = jnp.sum(hv_probs * bin_centers, axis=-1)
+
+            outputs["hard_value_logit"] = hv_logits
+            outputs["hard_value_probs"] = hv_probs
+            outputs["hard_value"] = hv_expected
+
         # Policy head: per-token projection to (64, 73) move distribution
         if head_config.policy_head:
             if head_config.policy_attention_head:

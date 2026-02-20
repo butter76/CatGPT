@@ -59,6 +59,16 @@ class JaxOutputHeadConfig:
     hard_policy_temperature: float = 0.25  # Temperature for sharpening (lower = more peaked)
     hard_policy_weight: float = 0.1  # Small weight since harder targets are noisier
 
+    # Hard value auxiliary target
+    # Trains a separate value head against a sharper HL-Gauss distribution.
+    # The hard sigma = value_sigma_ratio * hard_value_temperature, so with defaults
+    # (0.75 * 0.25 = 0.1875) the target concentrates into ~1-2 bins vs ~5 for the
+    # soft version. Same idea as hard_policy: smoother target trains better, but the
+    # sharper head is more useful at inference.
+    hard_value_head: bool = False
+    hard_value_temperature: float = 0.25  # Sigma multiplier (lower = sharper target)
+    hard_value_weight: float = 0.1  # Small weight since sharper targets are noisier
+
     # Square prediction heads (noisy auxiliary targets)
     # Predict which square has the piece that will be captured next / pawn that will move next
     # These are 64-way classification tasks with masking for positions without valid targets

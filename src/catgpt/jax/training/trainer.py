@@ -300,6 +300,15 @@ class Trainer:
                 weight = head_config.value_weight if head_config else 1.0
                 losses["value"] = value_loss * weight
 
+            # Hard value head: cross-entropy with sharper HL-Gauss target distribution
+            if "hard_value_logit" in outputs and "hard_target" in batch:
+                hard_value_loss = optax.softmax_cross_entropy(
+                    outputs["hard_value_logit"].astype(jnp.float32),
+                    batch["hard_target"].astype(jnp.float32),
+                ).mean()
+                weight = head_config.hard_value_weight if head_config else 0.1
+                losses["hard_value"] = hard_value_loss * weight
+
             # Policy head: cross-entropy with soft policy targets
             # Mask out illegal moves (zero probability in target) by setting logits to -inf
             if "policy_logit" in outputs and "policy_target" in batch:
@@ -443,6 +452,19 @@ class Trainer:
             accuracy = (preds == targets_binary).mean()
             metrics["accuracy"] = accuracy
 
+        # Hard value metrics
+        if "hard_value" in outputs and "hard_target" in batch:
+            num_bins = batch["hard_target"].shape[-1]
+            bin_centers = (jnp.arange(num_bins) + 0.5) / num_bins
+            hard_target_expected = jnp.sum(batch["hard_target"] * bin_centers, axis=-1)
+
+            hard_value_mse = jnp.mean((outputs["hard_value"] - hard_target_expected.astype(jnp.float32)) ** 2)
+            metrics["hard_value_mse"] = hard_value_mse
+
+            hard_preds = (outputs["hard_value"] > 0.5).astype(jnp.float32)
+            hard_targets_binary = (hard_target_expected > 0.5).astype(jnp.float32)
+            metrics["hard_value_accuracy"] = (hard_preds == hard_targets_binary).mean()
+
         # Self head metrics
         if "self" in outputs:
             # Token prediction accuracy
@@ -573,6 +595,14 @@ class Trainer:
                     weight = head_config.hard_policy_weight if head_config else 0.1
                     return loss * weight
 
+                elif _head_name == "hard_value" and "hard_value_logit" in outputs and "hard_target" in batch:
+                    loss = optax.softmax_cross_entropy(
+                        outputs["hard_value_logit"].astype(jnp.float32),
+                        batch["hard_target"].astype(jnp.float32),
+                    ).mean()
+                    weight = head_config.hard_value_weight if head_config else 0.1
+                    return loss * weight
+
                 elif _head_name == "next_capture" and "next_capture_logit" in outputs and "next_capture_target" in batch:
                     target = batch["next_capture_target"]
                     mask = (target >= 0).astype(jnp.float32)
@@ -648,6 +678,15 @@ class Trainer:
             ).mean()
             weight = head_config.value_weight if head_config else 1.0
             losses["value"] = value_loss * weight
+
+        # Hard value head: cross-entropy with sharper HL-Gauss target distribution
+        if "hard_value_logit" in outputs and "hard_target" in batch:
+            hard_value_loss = optax.softmax_cross_entropy(
+                outputs["hard_value_logit"].astype(jnp.float32),
+                batch["hard_target"].astype(jnp.float32),
+            ).mean()
+            weight = head_config.hard_value_weight if head_config else 0.1
+            losses["hard_value"] = hard_value_loss * weight
 
         # Policy head: cross-entropy with soft policy targets
         # Mask out illegal moves (zero probability in target) by setting logits to -inf
@@ -749,6 +788,19 @@ class Trainer:
             targets_binary = (target_expected > 0.5).astype(jnp.float32)
             accuracy = (preds == targets_binary).mean()
             metrics["accuracy"] = accuracy
+
+        # Hard value metrics
+        if "hard_value" in outputs and "hard_target" in batch:
+            num_bins = batch["hard_target"].shape[-1]
+            bin_centers = (jnp.arange(num_bins) + 0.5) / num_bins
+            hard_target_expected = jnp.sum(batch["hard_target"] * bin_centers, axis=-1)
+
+            hard_value_mse = jnp.mean((outputs["hard_value"] - hard_target_expected.astype(jnp.float32)) ** 2)
+            metrics["hard_value_mse"] = hard_value_mse
+
+            hard_preds = (outputs["hard_value"] > 0.5).astype(jnp.float32)
+            hard_targets_binary = (hard_target_expected > 0.5).astype(jnp.float32)
+            metrics["hard_value_accuracy"] = (hard_preds == hard_targets_binary).mean()
 
         # Self head metrics
         if "self" in outputs:

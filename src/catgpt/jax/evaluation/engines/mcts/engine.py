@@ -349,8 +349,9 @@ class MCTSEngine:
         tokens_jax = jnp.array(padded_tokens)
         outputs = self._apply_fn(self.params, tokens_jax)
 
-        # Extract value and convert from [0, 1] to [-1, 1]
-        raw_value = float(outputs["value"][0])
+        # Prefer hard_value head (sharper, better for play) when available
+        value_key = "hard_value" if "hard_value" in outputs else "value"
+        raw_value = float(outputs[value_key][0])
         value = 2.0 * raw_value - 1.0
 
         # Extract policy logits and compute priors for legal moves

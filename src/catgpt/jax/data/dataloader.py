@@ -99,12 +99,16 @@ class ConvertToJax(pygrain.MapTransform):
             self._include_policy = output_heads_config.policy_head
             self._include_next_capture = output_heads_config.next_capture_head
             self._include_next_pawn_move = output_heads_config.next_pawn_move_head
+            self._include_hard_value = output_heads_config.hard_value_head
+            self._hard_value_temperature = output_heads_config.hard_value_temperature
         else:
             self._num_bins = 81
             self._sigma_ratio = 0.75
             self._include_policy = False
             self._include_next_capture = False
             self._include_next_pawn_move = False
+            self._include_hard_value = False
+            self._hard_value_temperature = 0.25
 
     def map(self, element):
         """Convert a batched element to JAX-compatible arrays.
@@ -154,6 +158,18 @@ class ConvertToJax(pygrain.MapTransform):
             "input": input_array,
             "target": target_array,  # Shape: (batch, num_bins)
         }
+
+        # Hard value target: sharper HL-Gauss distribution (lower sigma)
+        if self._include_hard_value:
+            hard_sigma_ratio = self._sigma_ratio * self._hard_value_temperature
+            hard_target_array = _hl_gauss_transform_numpy(
+                targets,
+                num_bins=self._num_bins,
+                sigma_ratio=hard_sigma_ratio,
+                min_value=0.0,
+                max_value=1.0,
+            )
+            result["hard_target"] = hard_target_array
 
         # Add policy target if enabled
         if self._include_policy and policy_targets is not None:

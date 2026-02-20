@@ -58,6 +58,9 @@ model:
     hard_policy_head: true  # Enable hard policy (sharpened target)
     hard_policy_temperature: 0.25  # p^4 sharpening
     hard_policy_weight: 0.1  # Small weight (harder targets are noisier)
+    hard_value_head: true   # Enable hard value (sharper HL-Gauss target)
+    hard_value_temperature: 0.25  # sigma *= 0.25 → ~1-2 bins vs ~5
+    hard_value_weight: 0.1  # Small weight (sharper targets are noisier)
     # Square prediction heads (noisy auxiliary targets)
     next_capture_head: false  # Predict square of piece to be captured next
     next_capture_weight: 0.2  # Small weight for noisy auxiliary target
@@ -103,7 +106,7 @@ scheduler:
 # Training loop configuration
 # Training is step-based with "pseudo-epochs" for validation/checkpointing
 training:
-  max_steps: 600000  # Total training steps
+  max_steps: 120000  # Total training steps
   steps_per_epoch: 6000  # Steps per pseudo-epoch (validation interval)
   batch_size: 1024
   gradient_clip: 1.0

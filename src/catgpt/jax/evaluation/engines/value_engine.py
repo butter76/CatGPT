@@ -263,8 +263,9 @@ class ValueEngine:
             # Run model
             outputs = self._apply_fn(self.params, tokens_jax)
 
-            # Extract only the values for actual positions (not padding)
-            values = outputs["value"][:actual_size]
+            # Prefer hard_value head (sharper, better for play) when available
+            value_key = "hard_value" if "hard_value" in outputs else "value"
+            values = outputs[value_key][:actual_size]
             all_values.extend(values.tolist())
 
         return all_values
