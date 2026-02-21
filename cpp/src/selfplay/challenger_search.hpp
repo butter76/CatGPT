@@ -208,7 +208,7 @@ private:
         alt_variance *= 2.0f;
 
         float effective_variance = std::min(node->variance, alt_variance);
-        float N_reduction = effective_variance * 8.0f;
+        float N_reduction = effective_variance * 12.0f;
         float effective_N = N * N_reduction;
 
         if (node->children.empty()) {
