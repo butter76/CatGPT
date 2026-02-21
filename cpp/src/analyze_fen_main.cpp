@@ -111,6 +111,118 @@ void print_prob_bar(float prob, int width = 20) {
 }
 
 /**
+ * Print a horizontal histogram of the 81-bin value distribution.
+ *
+ * Each bin covers a range in [0, 1]. The bar length is proportional to
+ * the bin's probability relative to the maximum bin. Uses block characters
+ * for sub-character precision (eighths).
+ */
+void print_value_histogram(const std::array<float, catgpt::VALUE_NUM_BINS>& probs,
+                           int max_bar_width = 50) {
+    constexpr int N = catgpt::VALUE_NUM_BINS;
+
+    // Find max probability for scaling
+    float max_prob = *std::max_element(probs.begin(), probs.end());
+    if (max_prob <= 0.0f) max_prob = 1.0f;  // Avoid division by zero
+
+    // Unicode block elements for sub-character precision (eighths)
+    static const char* eighths[] = {
+        " ", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"
+    };
+
+    // Compute expected value from distribution (in [0, 1])
+    float ev = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        float center = static_cast<float>(i) / static_cast<float>(N - 1);
+        ev += probs[i] * center;
+    }
+
+    // Compute mean and variance in [-1, 1] scale (matching MCTS node convention)
+    // Bin centers: c_i = -1 + (i + 0.5) * (2 / N)
+    constexpr float bin_width = 2.0f / N;
+    float mean_11 = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        float center = -1.0f + (static_cast<float>(i) + 0.5f) * bin_width;
+        mean_11 += probs[i] * center;
+    }
+    float variance = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        float center = -1.0f + (static_cast<float>(i) + 0.5f) * bin_width;
+        float diff = center - mean_11;
+        variance += probs[i] * diff * diff;
+    }
+    float stddev = std::sqrt(variance);
+
+    // Find the peak bin
+    int peak_bin = static_cast<int>(
+        std::max_element(probs.begin(), probs.end()) - probs.begin());
+    float peak_center = static_cast<float>(peak_bin) / static_cast<float>(N - 1);
+
+    std::cout << "  E[v] = " << std::fixed << std::setprecision(3) << ev
+              << "  |  Peak at bin " << peak_bin
+              << " (v ≈ " << std::setprecision(3) << peak_center << ")\n";
+    std::cout << "  Variance ([-1,1]) = " << std::setprecision(4) << variance
+              << "  |  Std Dev = " << std::setprecision(4) << stddev
+              << "  |  Mean ([-1,1]) = " << std::setprecision(4) << mean_11 << "\n\n";
+
+    // Helper to repeat a multi-byte UTF-8 string
+    auto repeat_str = [](const std::string& s, int n) {
+        std::string result;
+        result.reserve(s.size() * n);
+        for (int i = 0; i < n; ++i) result += s;
+        return result;
+    };
+
+    // Print axis label
+    std::cout << "  Bin  Value │ Prob   │ Distribution\n";
+    std::cout << "  ──── ───── ┼ ────── ┼ " << repeat_str("─", max_bar_width) << "\n";
+
+    for (int i = 0; i < N; ++i) {
+        float center = static_cast<float>(i) / static_cast<float>(N - 1);
+        float prob = probs[i];
+        float fraction = prob / max_prob;
+        float bar_exact = fraction * max_bar_width;
+
+        int full_blocks = static_cast<int>(bar_exact);
+        int eighth = static_cast<int>((bar_exact - full_blocks) * 8.0f);
+        if (eighth > 8) eighth = 8;
+
+        // Color hint: highlight the peak bin
+        bool is_peak = (i == peak_bin);
+
+        std::cout << "  " << std::setw(3) << i << "  "
+                  << std::fixed << std::setprecision(3) << center << " │ "
+                  << std::setw(5) << std::setprecision(1) << (prob * 100.0f) << "% │ ";
+
+        if (is_peak) std::cout << "\033[1;33m";  // Bold yellow for peak
+
+        for (int b = 0; b < full_blocks; ++b) {
+            std::cout << "█";
+        }
+        if (full_blocks < max_bar_width && eighth > 0) {
+            std::cout << eighths[eighth];
+        }
+
+        if (is_peak) std::cout << "\033[0m";  // Reset
+
+        std::cout << "\n";
+    }
+
+    // Bottom axis with scale markers
+    std::cout << "  ──── ───── ┼ ────── ┼ " << repeat_str("─", max_bar_width) << "\n";
+    std::cout << "                        0%";
+    int mid_pos = max_bar_width / 2 - 3;
+    int end_pos = max_bar_width - 7;
+    if (mid_pos > 3) {
+        std::cout << std::string(mid_pos - 2, ' ')
+                  << std::fixed << std::setprecision(1) << (max_prob * 50.0f) << "%";
+        std::cout << std::string(end_pos - mid_pos - 3, ' ')
+                  << std::setprecision(1) << (max_prob * 100.0f) << "%";
+    }
+    std::cout << "\n";
+}
+
+/**
  * Print the board in ASCII format.
  */
 void print_board(const chess::Board& board) {
@@ -247,6 +359,15 @@ int main(int argc, char* argv[]) {
 
         std::cout << "\nInterpretation: " << interpret_value(win_prob) << "\n\n";
 
+        // === Value Distribution ===
+        std::cout << "───────────────────────────────────────────────────────────────\n";
+        std::cout << "                     VALUE DISTRIBUTION\n";
+        std::cout << "───────────────────────────────────────────────────────────────\n\n";
+
+        print_value_histogram(output.value_probs);
+
+        std::cout << "\n";
+
         // === Policy ===
         std::cout << "───────────────────────────────────────────────────────────────\n";
         std::cout << "                           POLICY\n";
@@ -254,26 +375,20 @@ int main(int argc, char* argv[]) {
 
         auto move_probs = get_move_probabilities(board, output.policy);
 
-        std::cout << "Top moves (sorted by probability):\n\n";
-
-        int display_count = std::min(static_cast<int>(move_probs.size()), 15);
+        std::cout << "All legal moves (sorted by probability):\n\n";
 
         std::cout << "  Rank │  Move  │  Prob  │ Visual\n";
         std::cout << "  ─────┼────────┼────────┼────────────────────────\n";
 
-        for (int i = 0; i < display_count; ++i) {
+        for (int i = 0; i < static_cast<int>(move_probs.size()); ++i) {
             const auto& [move, prob] = move_probs[i];
 
             std::cout << "  " << std::setw(4) << (i + 1) << " │ ";
             std::cout << std::setw(6) << format_move_uci(move) << " │ ";
-            std::cout << std::setw(5) << std::fixed << std::setprecision(1)
+            std::cout << std::setw(6) << std::fixed << std::setprecision(2)
                       << (prob * 100.0f) << "% │ ";
             print_prob_bar(prob, 20);
             std::cout << "\n";
-        }
-
-        if (move_probs.size() > 15) {
-            std::cout << "\n  ... and " << (move_probs.size() - 15) << " more moves\n";
         }
 
         std::cout << "\nTotal legal moves: " << move_probs.size() << "\n";
