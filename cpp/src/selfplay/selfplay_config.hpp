@@ -28,13 +28,13 @@ struct SelfPlayConfig {
     // === Concurrency ===
 
     /** Number of game-pairs running simultaneously (each pair = 2 games). */
-    int num_concurrent_games = 32;
+    int num_concurrent_games = 64;
 
     /** Number of worker threads for running search coroutines. */
     int num_search_threads = 8;
 
     /** Maximum GPU batch size (requests are batched up to this limit). */
-    int max_batch_size = 32;
+    int max_batch_size = 64;
 
     // === Game Limits ===
 

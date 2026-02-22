@@ -13,9 +13,9 @@
  *
  * Options:
  *   --pairs N            Game pairs to play (default: 500, each pair = 2 games)
- *   --concurrent N       Concurrent game slots (default: 32)
+ *   --concurrent N       Concurrent game slots (default: 64)
  *   --threads N          Search worker threads (default: 8)
- *   --batch N            Max GPU batch size (default: 32)
+ *   --batch N            Max GPU batch size (default: 64)
  *   --evals N            Min GPU evals per move for BOTH engines (default: 400)
  *   --baseline-evals N   Override evals for baseline only
  *   --challenger-evals N Override evals for challenger only
@@ -42,9 +42,9 @@ void print_usage(const char* argv0) {
     std::println(stderr, "");
     std::println(stderr, "Tournament options:");
     std::println(stderr, "  --pairs N            Game pairs (default: one per opening, each pair = 2 games)");
-    std::println(stderr, "  --concurrent N       Concurrent game slots (default: 32)");
+    std::println(stderr, "  --concurrent N       Concurrent game slots (default: 64)");
     std::println(stderr, "  --threads N          Search worker threads (default: 8)");
-    std::println(stderr, "  --batch N            Max GPU batch size (default: 32)");
+    std::println(stderr, "  --batch N            Max GPU batch size (default: 64)");
     std::println(stderr, "");
     std::println(stderr, "Search options (apply to both engines unless overridden):");
     std::println(stderr, "  --evals N            Min GPU evals per move (default: 400)");
