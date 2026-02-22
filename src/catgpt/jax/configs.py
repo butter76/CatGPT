@@ -59,15 +59,6 @@ class JaxOutputHeadConfig:
     hard_policy_temperature: float = 0.25  # Temperature for sharpening (lower = more peaked)
     hard_policy_weight: float = 0.1  # Small weight since harder targets are noisier
 
-    # Square prediction heads (noisy auxiliary targets)
-    # Predict which square has the piece that will be captured next / pawn that will move next
-    # These are 64-way classification tasks with masking for positions without valid targets
-    next_capture_head: bool = False
-    next_capture_weight: float = 0.1  # Small weight for noisy auxiliary target
-
-    next_pawn_move_head: bool = False
-    next_pawn_move_weight: float = 0.1  # Small weight for noisy auxiliary target
-
     # Attention-based policy head (LC0-style)
     # Instead of a simple Dense(73) projection, uses Q·K^T attention for 64x64 main
     # move logits, with a separate projection scaled up for underpromotions.
