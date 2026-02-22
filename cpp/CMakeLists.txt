@@ -164,6 +164,24 @@ set_target_properties(catgpt_selfplay PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
 
+# === Lock-Free Hash Table Benchmark (no GPU dependencies) ===
+add_executable(lockfree_map_bench
+    src/lockfree_map_bench.cpp
+)
+
+target_include_directories(lockfree_map_bench PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+)
+
+target_link_libraries(lockfree_map_bench PRIVATE
+    pthread
+)
+
+set_target_properties(lockfree_map_bench PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR}"
+)
+
 # Enable colored output
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)
@@ -172,4 +190,5 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(catgpt_fractional_mcts PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_analyze PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_selfplay PRIVATE -fdiagnostics-color=always)
+    target_compile_options(lockfree_map_bench PRIVATE -fdiagnostics-color=always)
 endif()
