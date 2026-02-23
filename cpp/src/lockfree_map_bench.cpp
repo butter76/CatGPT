@@ -72,8 +72,8 @@ struct Node {
     uint16_t num_remaining_moves{0};    // Count of moves beyond top 10 (each assumed MIN_POLICY)
     uint16_t total_moves{0};            // Total legal moves for this position
 
-    bool evaluated{false};
-    bool is_terminal{false};
+    // INVARIANT: Any node in the TT or a children array is already evaluated.
+    // No `evaluated` flag needed.
 
     [[nodiscard]] bool has_terminal_win() const { return best_terminal_value > 0.5f; }
     [[nodiscard]] bool has_terminal() const { return best_terminal_value > -1.5f; }
@@ -244,12 +244,8 @@ private:
         movegen::legalmoves(moves, board);
         node.total_moves = static_cast<uint16_t>(moves.size());
 
-        if (moves.empty()) {
-            node.is_terminal = true;
-            node.value = board.inCheck() ? -1.0f : 0.0f;
-            node.evaluated = true;
-            return;
-        }
+        // Nodes are never created for terminal positions (handled as terminal children)
+        assert(!moves.empty() && "Node created for terminal position");
 
         // ─── 3. Compute policy scores via softmax ────────────────
         std::vector<std::pair<Move, float>> move_scores;
@@ -352,8 +348,6 @@ private:
         // ─── 8. Count remaining moves ────────────────────────────
         node.num_remaining_moves = static_cast<uint16_t>(
             std::max(0, static_cast<int>(non_terminal_moves.size()) - TOP_CHILDREN_COUNT));
-
-        node.evaluated = true;
     }
 
     NodePool& pool_;
@@ -373,18 +367,8 @@ public:
         : table_(table), pool_(pool), gpu_(gpu) {}
 
     float search(Board& board, float initial_depth) {
-        uint32_t root_idx = get_or_create_node(board);
-        Node& root = pool_.get(root_idx);
-
-        // Evaluate root if needed
-        if (!root.evaluated) {
-            gpu_.queue(root_idx, board);
-            gpu_.flush();
-        }
-
-        if (root.is_terminal) {
-            return root.value;
-        }
+        uint32_t root_idx = get_or_create_evaluated_node(board);
+        const Node& root = pool_.get(root_idx);
 
         // Check for immediate winning terminal move
         if (root.has_terminal_win()) {
@@ -404,31 +388,33 @@ public:
     [[nodiscard]] size_t new_nodes() const { return new_nodes_; }
 
 private:
-    uint32_t get_or_create_node(const Board& board) {
+    /// Get an existing evaluated node from TT, or create+evaluate+insert a new one.
+    /// Guarantees the returned node is evaluated (maintains invariant).
+    uint32_t get_or_create_evaluated_node(const Board& board) {
         uint64_t key = board.hash();
 
+        // Check TT first - if found, it's guaranteed to be evaluated
         uint32_t existing = table_.find(key, pool_);
         if (existing != UINT32_MAX) {
             ++table_hits_;
             return existing;
         }
 
+        // Allocate, evaluate, then insert into TT
         uint32_t new_idx = pool_.allocate(key);
-        auto [idx, inserted] = table_.insert_or_find(key, new_idx, pool_);
+        gpu_.queue(new_idx, board);
+        gpu_.flush();
 
-        if (inserted) {
-            ++new_nodes_;
-        } else {
-            ++table_hits_;
-        }
+        // Now insert into TT (node is evaluated)
+        table_.insert_or_find(key, new_idx, pool_);
+        ++new_nodes_;
 
-        return idx;
+        return new_idx;
     }
 
     void recursive_search(uint32_t node_idx, Board& board, float depth) {
         Node& node = pool_.get(node_idx);
 
-        if (node.is_terminal) return;
         if (node.searched_depth >= depth) return;
         node.searched_depth = depth;
 
@@ -463,39 +449,58 @@ private:
     }
 
     void expand_children(uint32_t node_idx, Board& board, float depth) {
-        Node& node = pool_.get(node_idx);
+        // Track children that need evaluation (not yet in TT)
+        struct PendingChild {
+            size_t child_array_idx;
+            uint32_t node_idx;
+            uint64_t key;
+        };
+        std::vector<PendingChild> pending;
 
-        for (size_t i = 0; i < TOP_CHILDREN_COUNT; ++i) {
-            ChildEntry& entry = node.children[i];
-            if (!entry.is_valid()) break;
-            if (entry.is_expanded()) continue;
+        // ─── Pass 1: Check TT, queue new nodes for GPU ───────────
+        {
+            Node& node = pool_.get(node_idx);
 
-            float child_depth = depth + std::log(entry.policy);
+            for (size_t i = 0; i < TOP_CHILDREN_COUNT; ++i) {
+                ChildEntry& entry = node.children[i];
+                if (!entry.is_valid()) break;
+                if (entry.is_expanded()) continue;
 
-            // Force expand first FORCE_EXPAND_COUNT children
-            bool force_expand = static_cast<int>(i) < FORCE_EXPAND_COUNT;
+                float child_depth = depth + std::log(entry.policy);
 
-            if (!force_expand && child_depth < MIN_CHILD_DEPTH) continue;
+                // Force expand first FORCE_EXPAND_COUNT children
+                bool force_expand = static_cast<int>(i) < FORCE_EXPAND_COUNT;
+                if (!force_expand && child_depth < MIN_CHILD_DEPTH) continue;
 
-            // Make move and create child node
-            board.makeMove<true>(entry.move);
+                board.makeMove<true>(entry.move);
+                uint64_t key = board.hash();
 
-            uint32_t child_idx = get_or_create_node(board);
-            Node& child = pool_.get(child_idx);
+                // Check TT - if found, node is already evaluated
+                uint32_t existing = table_.find(key, pool_);
+                if (existing != UINT32_MAX) {
+                    ++table_hits_;
+                    pool_.get(node_idx).children[i].node_idx = existing;
+                } else {
+                    // Allocate and queue for GPU (don't add to TT yet)
+                    uint32_t child_idx = pool_.allocate(key);
+                    gpu_.queue(child_idx, board);
+                    pending.push_back({i, child_idx, key});
+                }
 
-            if (!child.evaluated) {
-                gpu_.queue(child_idx, board);
+                board.unmakeMove(entry.move);
             }
-
-            board.unmakeMove(entry.move);
-
-            // Update entry with child index (re-fetch node in case of reallocation)
-            pool_.get(node_idx).children[i].node_idx = child_idx;
         }
 
-        // Flush GPU batch
-        if (gpu_.pending_count() > 0) {
+        // ─── Batch evaluate all pending nodes ────────────────────
+        if (!pending.empty()) {
             gpu_.flush();
+
+            // ─── Pass 2: Insert evaluated nodes into TT and set children indices
+            for (const auto& p : pending) {
+                table_.insert_or_find(p.key, p.node_idx, pool_);
+                pool_.get(node_idx).children[p.child_array_idx].node_idx = p.node_idx;
+                ++new_nodes_;
+            }
         }
     }
 
