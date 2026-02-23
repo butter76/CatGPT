@@ -68,18 +68,51 @@ struct Node {
     // === Top 10 non-terminal children ===
     std::array<ChildEntry, TOP_CHILDREN_COUNT> children{};
 
-    // === Remaining moves (beyond top 10) ===
-    uint16_t num_remaining_moves{0};    // Count of moves beyond top 10 (each assumed MIN_POLICY)
-    uint16_t total_moves{0};            // Total legal moves for this position
+    // === Extra moves (beyond top 10, lazily allocated) ===
+    uint32_t extra_moves_idx{UINT32_MAX};  // Index into ExtraMovesPool (UINT32_MAX = not allocated)
+    uint16_t num_extra_moves{0};           // Count of extra moves (set during GPU eval)
 
     // INVARIANT: Any node in the TT or a children array is already evaluated.
-    // No `evaluated` flag needed.
 
     [[nodiscard]] bool has_terminal_win() const { return best_terminal_value > 0.5f; }
     [[nodiscard]] bool has_terminal() const { return best_terminal_value > -1.5f; }
+    [[nodiscard]] bool has_extra_moves_allocated() const { return extra_moves_idx != UINT32_MAX; }
 };
 
 static_assert(sizeof(Node) <= 192, "Node should be at most 192 bytes");
+
+// ─── Extra moves pool (bump allocator for ChildEntry arrays) ─────────
+
+class ExtraMovesPool {
+public:
+    explicit ExtraMovesPool(size_t capacity)
+        : entries_(capacity), next_(0) {}
+
+    /// Allocate a contiguous block of ChildEntry slots.
+    /// @return Starting index into the pool.
+    uint32_t allocate(uint16_t count) {
+        uint32_t idx = next_;
+        next_ += count;
+        if (next_ > entries_.size()) {
+            std::println(stderr, "ExtraMovesPool exhausted at index {}", next_);
+            std::abort();
+        }
+        return idx;
+    }
+
+    [[nodiscard]] ChildEntry& get(uint32_t idx) { return entries_[idx]; }
+    [[nodiscard]] const ChildEntry& get(uint32_t idx) const { return entries_[idx]; }
+
+    [[nodiscard]] size_t allocated() const { return next_; }
+    [[nodiscard]] size_t capacity() const { return entries_.size(); }
+    [[nodiscard]] size_t memory_bytes() const {
+        return entries_.capacity() * sizeof(ChildEntry);
+    }
+
+private:
+    std::vector<ChildEntry> entries_;
+    uint32_t next_;
+};
 
 // ─── Node pool (bump allocator) ──────────────────────────────────────
 
@@ -242,7 +275,6 @@ private:
         // ─── 2. Generate legal moves ─────────────────────────────
         Movelist moves;
         movegen::legalmoves(moves, board);
-        node.total_moves = static_cast<uint16_t>(moves.size());
 
         // Nodes are never created for terminal positions (handled as terminal children)
         assert(!moves.empty() && "Node created for terminal position");
@@ -345,8 +377,8 @@ private:
             }
         }
 
-        // ─── 8. Count remaining moves ────────────────────────────
-        node.num_remaining_moves = static_cast<uint16_t>(
+        // ─── 8. Count extra moves (beyond top 10) ───────────────
+        node.num_extra_moves = static_cast<uint16_t>(
             std::max(0, static_cast<int>(non_terminal_moves.size()) - TOP_CHILDREN_COUNT));
     }
 
@@ -363,8 +395,9 @@ private:
 
 class FractionalSearch {
 public:
-    FractionalSearch(TranspositionTable& table, NodePool& pool, SimulatedGPU& gpu)
-        : table_(table), pool_(pool), gpu_(gpu) {}
+    FractionalSearch(TranspositionTable& table, NodePool& pool, SimulatedGPU& gpu,
+                     ExtraMovesPool& extra_pool)
+        : table_(table), pool_(pool), gpu_(gpu), extra_pool_(extra_pool) {}
 
     float search(Board& board, float initial_depth) {
         uint32_t root_idx = get_or_create_evaluated_node(board);
@@ -421,15 +454,20 @@ private:
         // Can this node have children? (depth > ln(2))
         if (depth <= LN_2) return;
 
-        // ─── Phase 1: Expand children ────────────────────────────
+        // Allocate extra moves if depth exceeds threshold and not yet allocated
+        if (depth >= MIN_POLICY_DEPTH_THRESHOLD &&
+            node.num_extra_moves > 0 &&
+            !node.has_extra_moves_allocated()) {
+            allocate_extra_moves(node_idx, board);
+        }
+
+        // ─── Phase 1: Expand children (top 10 + extra moves) ─────
         expand_children(node_idx, board, depth);
 
-        // ─── Phase 2: Recurse into expanded children ─────────────
-        Node& node_after_expand = pool_.get(node_idx);  // Re-fetch after potential reallocation
-
-        for (auto& child_entry : node_after_expand.children) {
-            if (!child_entry.is_valid()) break;  // No more valid children
-            if (!child_entry.is_expanded()) continue;  // Not expanded
+        // ─── Phase 2: Recurse into expanded top children ─────────
+        for (const auto& child_entry : node.children) {
+            if (!child_entry.is_valid()) break;
+            if (!child_entry.is_expanded()) continue;
 
             float child_depth = depth + std::log(child_entry.policy);
             if (child_depth >= MIN_CHILD_DEPTH) {
@@ -439,9 +477,19 @@ private:
             }
         }
 
-        // ─── Phase 3: Handle remaining moves if depth is high enough
-        if (depth >= MIN_POLICY_DEPTH_THRESHOLD && node_after_expand.num_remaining_moves > 0) {
-            check_remaining_moves(node_idx, board, depth);
+        // ─── Phase 3: Recurse into expanded extra moves ──────────
+        if (node.has_extra_moves_allocated()) {
+            float extra_depth = depth + std::log(MIN_POLICY);
+            if (extra_depth >= MIN_CHILD_DEPTH) {
+                for (uint16_t i = 0; i < node.num_extra_moves; ++i) {
+                    const ChildEntry& entry = extra_pool_.get(node.extra_moves_idx + i);
+                    if (!entry.is_expanded()) continue;
+
+                    board.makeMove<true>(entry.move);
+                    recursive_search(entry.node_idx, board, extra_depth);
+                    board.unmakeMove(entry.move);
+                }
+            }
         }
 
         // ─── Phase 4: Compute weighted average ───────────────────
@@ -451,43 +499,65 @@ private:
     void expand_children(uint32_t node_idx, Board& board, float depth) {
         // Track children that need evaluation (not yet in TT)
         struct PendingChild {
-            size_t child_array_idx;
+            uint32_t* target_node_idx;  // Pointer to where to store the node_idx
             uint32_t node_idx;
             uint64_t key;
         };
         std::vector<PendingChild> pending;
 
-        // ─── Pass 1: Check TT, queue new nodes for GPU ───────────
-        {
-            Node& node = pool_.get(node_idx);
+        Node& node = pool_.get(node_idx);
 
-            for (size_t i = 0; i < TOP_CHILDREN_COUNT; ++i) {
-                ChildEntry& entry = node.children[i];
-                if (!entry.is_valid()) break;
-                if (entry.is_expanded()) continue;
+        // ─── Process top 10 children ─────────────────────────────
+        for (size_t i = 0; i < TOP_CHILDREN_COUNT; ++i) {
+            ChildEntry& entry = node.children[i];
+            if (!entry.is_valid()) break;
+            if (entry.is_expanded()) continue;
 
-                float child_depth = depth + std::log(entry.policy);
+            float child_depth = depth + std::log(entry.policy);
 
-                // Force expand first FORCE_EXPAND_COUNT children
-                bool force_expand = static_cast<int>(i) < FORCE_EXPAND_COUNT;
-                if (!force_expand && child_depth < MIN_CHILD_DEPTH) continue;
+            // Force expand first FORCE_EXPAND_COUNT children
+            bool force_expand = static_cast<int>(i) < FORCE_EXPAND_COUNT;
+            if (!force_expand && child_depth < MIN_CHILD_DEPTH) continue;
 
-                board.makeMove<true>(entry.move);
-                uint64_t key = board.hash();
+            board.makeMove<true>(entry.move);
+            uint64_t key = board.hash();
 
-                // Check TT - if found, node is already evaluated
-                uint32_t existing = table_.find(key, pool_);
-                if (existing != UINT32_MAX) {
-                    ++table_hits_;
-                    pool_.get(node_idx).children[i].node_idx = existing;
-                } else {
-                    // Allocate and queue for GPU (don't add to TT yet)
-                    uint32_t child_idx = pool_.allocate(key);
-                    gpu_.queue(child_idx, board);
-                    pending.push_back({i, child_idx, key});
+            uint32_t existing = table_.find(key, pool_);
+            if (existing != UINT32_MAX) {
+                ++table_hits_;
+                entry.node_idx = existing;
+            } else {
+                uint32_t child_idx = pool_.allocate(key);
+                gpu_.queue(child_idx, board);
+                pending.push_back({&entry.node_idx, child_idx, key});
+            }
+
+            board.unmakeMove(entry.move);
+        }
+
+        // ─── Process extra moves (if allocated and depth is high enough) ───
+        if (node.has_extra_moves_allocated()) {
+            float extra_depth = depth + std::log(MIN_POLICY);
+            if (extra_depth >= MIN_CHILD_DEPTH) {
+                for (uint16_t i = 0; i < node.num_extra_moves; ++i) {
+                    ChildEntry& entry = extra_pool_.get(node.extra_moves_idx + i);
+                    if (entry.is_expanded()) continue;
+
+                    board.makeMove<true>(entry.move);
+                    uint64_t key = board.hash();
+
+                    uint32_t existing = table_.find(key, pool_);
+                    if (existing != UINT32_MAX) {
+                        ++table_hits_;
+                        entry.node_idx = existing;
+                    } else {
+                        uint32_t child_idx = pool_.allocate(key);
+                        gpu_.queue(child_idx, board);
+                        pending.push_back({&entry.node_idx, child_idx, key});
+                    }
+
+                    board.unmakeMove(entry.move);
                 }
-
-                board.unmakeMove(entry.move);
             }
         }
 
@@ -495,30 +565,25 @@ private:
         if (!pending.empty()) {
             gpu_.flush();
 
-            // ─── Pass 2: Insert evaluated nodes into TT and set children indices
             for (const auto& p : pending) {
                 table_.insert_or_find(p.key, p.node_idx, pool_);
-                pool_.get(node_idx).children[p.child_array_idx].node_idx = p.node_idx;
+                *p.target_node_idx = p.node_idx;
                 ++new_nodes_;
             }
         }
     }
 
-    void check_remaining_moves(uint32_t node_idx, Board& board, float depth) {
-        // For remaining moves (beyond top 10), check TT for existing evaluations
-        // These moves are assumed to have MIN_POLICY weight
-
+    /// Allocate and populate extra moves array for a node.
+    /// Called once when depth first exceeds MIN_POLICY_DEPTH_THRESHOLD.
+    void allocate_extra_moves(uint32_t node_idx, Board& board) {
         Node& node = pool_.get(node_idx);
-        if (node.num_remaining_moves == 0) return;
+        if (node.num_extra_moves == 0) return;
 
-        float remaining_depth = depth + std::log(MIN_POLICY);
-        if (remaining_depth < MIN_CHILD_DEPTH) return;
-
-        // Generate all moves to find the remaining ones
+        // Generate all legal moves
         Movelist moves;
         movegen::legalmoves(moves, board);
 
-        // Collect moves that are in top 10
+        // Collect top 10 moves for filtering
         std::array<Move, TOP_CHILDREN_COUNT> top_moves{};
         for (size_t i = 0; i < TOP_CHILDREN_COUNT; ++i) {
             if (node.children[i].is_valid()) {
@@ -526,7 +591,10 @@ private:
             }
         }
 
-        // Check remaining moves in TT
+        // Collect extra moves (not in top 10, not terminal)
+        std::vector<Move> extra_moves;
+        extra_moves.reserve(node.num_extra_moves);
+
         for (const auto& move : moves) {
             // Skip if in top 10
             bool in_top = false;
@@ -538,24 +606,29 @@ private:
             }
             if (in_top) continue;
 
-            // Check if terminal (skip those)
+            // Skip terminal moves (already handled in GPU eval)
             board.makeMove<true>(move);
             auto [reason, result] = board.isGameOver();
-
-            if (result == GameResult::NONE) {
-                // Non-terminal: check TT
-                uint64_t child_key = board.hash();
-                uint32_t child_idx = table_.find(child_key, pool_);
-
-                if (child_idx != UINT32_MAX) {
-                    // Found in TT - this child's value will be included in compute_value
-                    // via the remaining_moves mechanism
-                    ++tt_remaining_hits_;
-                }
-            }
-
             board.unmakeMove(move);
+
+            if (result != GameResult::NONE) continue;
+
+            extra_moves.push_back(move);
         }
+
+        // Allocate in ExtraMovesPool
+        uint32_t idx = extra_pool_.allocate(static_cast<uint16_t>(extra_moves.size()));
+        node.extra_moves_idx = idx;
+
+        // Fill entries with MIN_POLICY
+        for (size_t i = 0; i < extra_moves.size(); ++i) {
+            ChildEntry& entry = extra_pool_.get(idx + i);
+            entry.move = extra_moves[i];
+            entry.policy = MIN_POLICY;
+            entry.node_idx = UINT32_MAX;  // Unexpanded
+        }
+
+        ++extra_allocs_;
     }
 
     void compute_value(uint32_t node_idx) {
@@ -566,7 +639,6 @@ private:
 
         // Include terminal children
         if (node.has_terminal()) {
-            // Use best terminal value weighted by total terminal policy
             weighted_sum += node.best_terminal_value * node.terminal_policy_sum;
             total_weight += node.terminal_policy_sum;
         }
@@ -577,14 +649,23 @@ private:
             if (!entry.is_expanded()) continue;
 
             const Node& child = pool_.get(entry.node_idx);
-            // Child value is from opponent's perspective, so negate
             float child_value = -child.value;
             weighted_sum += child_value * entry.policy;
             total_weight += entry.policy;
         }
 
-        // Note: remaining moves are currently not included in the average
-        // (they would need TT lookup which we've counted but not stored)
+        // Include extra moves (if allocated)
+        if (node.has_extra_moves_allocated()) {
+            for (uint16_t i = 0; i < node.num_extra_moves; ++i) {
+                const ChildEntry& entry = extra_pool_.get(node.extra_moves_idx + i);
+                if (!entry.is_expanded()) continue;
+
+                const Node& child = pool_.get(entry.node_idx);
+                float child_value = -child.value;
+                weighted_sum += child_value * entry.policy;
+                total_weight += entry.policy;
+            }
+        }
 
         if (total_weight > 0.0f) {
             node.value = weighted_sum / total_weight;
@@ -594,10 +675,11 @@ private:
     TranspositionTable& table_;
     NodePool& pool_;
     SimulatedGPU& gpu_;
+    ExtraMovesPool& extra_pool_;
 
     size_t table_hits_{0};
     size_t new_nodes_{0};
-    size_t tt_remaining_hits_{0};
+    size_t extra_allocs_{0};
 };
 
 }  // anonymous namespace
@@ -607,12 +689,13 @@ private:
 int main() {
     using namespace chess;
 
-    constexpr float  INITIAL_DEPTH = 10.0f;       // Higher depth to exercise remaining moves
+    constexpr float  INITIAL_DEPTH = 10.0f;       // Higher depth to exercise extra moves
     constexpr size_t TABLE_LOG2    = 24;          // 2^24 = 16M slots
     constexpr size_t POOL_SIZE     = 10'000'000;  // 10M nodes
+    constexpr size_t EXTRA_POOL_SIZE = 1'000'000; // 1M extra move entries
 
     std::println("╔══════════════════════════════════════════╗");
-    std::println("║   Fractional MCTS Benchmark (v2)         ║");
+    std::println("║   Fractional MCTS Benchmark (v3)         ║");
     std::println("╚══════════════════════════════════════════╝");
     std::println("");
     std::println("Initial depth      : {:.1f}", INITIAL_DEPTH);
@@ -624,6 +707,7 @@ int main() {
                  MIN_POLICY * 100.0f, MIN_POLICY_DEPTH_THRESHOLD);
     std::println("Table capacity     : {} slots (2^{})", 1ULL << TABLE_LOG2, TABLE_LOG2);
     std::println("Node pool          : {} nodes", POOL_SIZE);
+    std::println("Extra moves pool   : {} entries", EXTRA_POOL_SIZE);
     std::println("Node size          : {} bytes", sizeof(Node));
     std::println("");
 
@@ -632,6 +716,7 @@ int main() {
 
     TranspositionTable table(TABLE_LOG2);
     NodePool pool(POOL_SIZE);
+    ExtraMovesPool extra_pool(EXTRA_POOL_SIZE);
     SimulatedGPU gpu(pool);
 
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -639,6 +724,7 @@ int main() {
 
     std::println("Table memory       : {:.2f} MB", table.memory_bytes() / 1e6);
     std::println("Pool memory        : {:.2f} MB", pool.memory_bytes() / 1e6);
+    std::println("Extra pool memory  : {:.2f} MB", extra_pool.memory_bytes() / 1e6);
     std::println("Allocation         : {:.0f} ms", alloc_ms);
     std::println("");
 
@@ -649,7 +735,7 @@ int main() {
 
     auto t_search_start = std::chrono::high_resolution_clock::now();
 
-    FractionalSearch search(table, pool, gpu);
+    FractionalSearch search(table, pool, gpu, extra_pool);
     float root_value = search.search(root, INITIAL_DEPTH);
 
     auto t_search_end = std::chrono::high_resolution_clock::now();
@@ -679,6 +765,10 @@ int main() {
                  pool.allocated(), pool.capacity(),
                  100.0 * static_cast<double>(pool.allocated())
                        / static_cast<double>(pool.capacity()));
+    std::println("Extra pool used    : {:L} / {:L} ({:.1f}%)",
+                 extra_pool.allocated(), extra_pool.capacity(),
+                 100.0 * static_cast<double>(extra_pool.allocated())
+                       / static_cast<double>(extra_pool.capacity()));
     std::println("Throughput         : {:.2f} K evals/sec",
                  static_cast<double>(gpu.total_evals()) / search_ms);
     std::println("");
@@ -698,8 +788,9 @@ int main() {
                          root_node.terminal_policy_sum * 100.0f);
         }
 
-        std::println("  Remaining moves: {} (each assumed {:.2f}%)",
-                     root_node.num_remaining_moves, MIN_POLICY * 100.0f);
+        std::println("  Extra moves: {} (each {:.2f}%, allocated: {})",
+                     root_node.num_extra_moves, MIN_POLICY * 100.0f,
+                     root_node.has_extra_moves_allocated() ? "yes" : "no");
         std::println("");
 
         // Collect and sort children by value
