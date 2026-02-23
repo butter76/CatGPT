@@ -35,8 +35,32 @@ using namespace chess;
 
 struct Node {
     uint64_t key{0};                    // Full Zobrist key for verification
-    std::atomic<int32_t> eval{0};       // Best-known eval (cp, side-to-move POV)
-    std::atomic<int8_t>  depth{-1};     // Depth at which eval was computed
+
+    /// Eval (lower 32 bits) and depth (next 8 bits) packed into a single
+    /// atomic so that concurrent updates are always consistent.
+    std::atomic<uint64_t> eval_depth{pack_eval_depth(-1, 0)};
+
+    static constexpr uint64_t pack_eval_depth(int8_t depth, int32_t eval) {
+        return (static_cast<uint64_t>(static_cast<uint8_t>(depth)) << 32)
+             | static_cast<uint32_t>(eval);
+    }
+    static constexpr int8_t  unpack_depth(uint64_t v) { return static_cast<int8_t>(v >> 32); }
+    static constexpr int32_t unpack_eval(uint64_t v)  { return static_cast<int32_t>(static_cast<uint32_t>(v)); }
+
+    /// Atomically update eval+depth, but only if new_depth is strictly
+    /// deeper than what is already stored.  Uses a CAS loop.
+    void update_if_deeper(int8_t new_depth, int32_t new_eval) {
+        uint64_t new_val = pack_eval_depth(new_depth, new_eval);
+        uint64_t old_val = eval_depth.load(std::memory_order_acquire);
+        while (unpack_depth(old_val) < new_depth) {
+            if (eval_depth.compare_exchange_weak(
+                    old_val, new_val,
+                    std::memory_order_release,
+                    std::memory_order_acquire))
+                return;
+            // old_val reloaded by failed CAS — re-check depth.
+        }
+    }
 };
 
 static_assert(sizeof(Node) == 16, "Node should be 16 bytes");
@@ -216,10 +240,10 @@ int minimax(Board& board, int depth,
     // ── Probe table ──────────────────────────────────────────────
     Node* node = table.find(key);
     if (node != nullptr) {
-        int8_t nd = node->depth.load(std::memory_order_acquire);
-        if (nd >= static_cast<int8_t>(depth)) {
+        uint64_t ed = node->eval_depth.load(std::memory_order_acquire);
+        if (Node::unpack_depth(ed) >= static_cast<int8_t>(depth)) {
             ++stats.table_hits;
-            return node->eval.load(std::memory_order_relaxed);
+            return Node::unpack_eval(ed);
         }
     }
 
@@ -249,18 +273,12 @@ int minimax(Board& board, int depth,
     }
 
     // ── Store / update table entry ───────────────────────────────
-    //
-    // NOTE: The eval+depth update is NOT jointly atomic.  Two threads
-    // racing to update the same node could interleave writes.  This is
-    // acceptable for a benchmark — worst case is a slightly stale eval
-    // is used for one lookup.  A production engine would pack eval and
-    // depth into a single atomic<uint64_t> and CAS them together.
 
     if (node == nullptr) {
         Node* new_node = pool.allocate(key);
-        new_node->eval.store(eval, std::memory_order_relaxed);
-        new_node->depth.store(static_cast<int8_t>(store_depth),
-                              std::memory_order_release);
+        new_node->eval_depth.store(
+            Node::pack_eval_depth(static_cast<int8_t>(store_depth), eval),
+            std::memory_order_release);
 
         auto [existing, inserted] = table.insert_or_find(key, new_node);
         if (inserted) {
@@ -268,19 +286,11 @@ int minimax(Board& board, int depth,
         } else {
             ++stats.pool_waste;
             // Someone else inserted first.  Update if we searched deeper.
-            if (store_depth > existing->depth.load(std::memory_order_acquire)) {
-                existing->eval.store(eval, std::memory_order_relaxed);
-                existing->depth.store(static_cast<int8_t>(store_depth),
-                                      std::memory_order_release);
-            }
+            existing->update_if_deeper(static_cast<int8_t>(store_depth), eval);
         }
     } else {
-        // Node existed but with insufficient depth — update it.
-        if (store_depth > node->depth.load(std::memory_order_acquire)) {
-            node->eval.store(eval, std::memory_order_relaxed);
-            node->depth.store(static_cast<int8_t>(store_depth),
-                              std::memory_order_release);
-        }
+        // Node existed but with insufficient depth — update if deeper.
+        node->update_if_deeper(static_cast<int8_t>(store_depth), eval);
     }
 
     return eval;
@@ -293,9 +303,9 @@ int minimax(Board& board, int depth,
 int main() {
     using namespace chess;
 
-    constexpr int    MAX_DEPTH  = 5;
-    constexpr size_t TABLE_LOG2 = 27;            // 2^27 ≈ 134M slots
-    constexpr size_t POOL_SIZE  = 80'000'000;    // 80M nodes
+    constexpr int    MAX_DEPTH  = 6;
+    constexpr size_t TABLE_LOG2 = 29;            // 2^29 ≈ 536M slots
+    constexpr size_t POOL_SIZE  = 200'000'000;    // 200M nodes
 
     std::println("╔══════════════════════════════════════════╗");
     std::println("║   Lock-Free Hash Table Benchmark         ║");
