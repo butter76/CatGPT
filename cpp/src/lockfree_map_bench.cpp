@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -30,6 +31,16 @@
 namespace {
 
 using namespace chess;
+
+// ─── Atomic depth+value pair for lock-free updates ───────────────────
+
+struct alignas(8) DepthValue {
+    float searched_depth{-1.0f};  // Depth at which this node was last searched
+    float value{0.0f};            // Evaluation [-1, 1], from side-to-move
+};
+static_assert(sizeof(DepthValue) == 8, "DepthValue must be 8 bytes for atomic ops");
+static_assert(std::atomic<DepthValue>::is_always_lock_free,
+              "DepthValue atomic must be lock-free");
 
 // ─── Constants ───────────────────────────────────────────────────────
 
@@ -57,8 +68,9 @@ static_assert(sizeof(ChildEntry) == 12, "ChildEntry should be 12 bytes");
 
 struct Node {
     uint64_t key{0};                    // Zobrist key for verification
-    float value{0.0f};                  // Evaluation [-1, 1], from side-to-move
-    float searched_depth{-1.0f};        // Depth at which this node was last searched
+
+    // === Atomic depth+value (updated together at end of search) ===
+    std::atomic<DepthValue> depth_value{DepthValue{-1.0f, 0.0f}};
 
     // === Terminal children (pre-computed during GPU eval) ===
     float best_terminal_value{-2.0f};   // Best terminal value from our POV (-2 = none)
@@ -73,6 +85,14 @@ struct Node {
     uint16_t num_extra_moves{0};           // Count of extra moves (set during GPU eval)
 
     // INVARIANT: Any node in the TT or a children array is already evaluated.
+
+    // Atomic accessors
+    [[nodiscard]] DepthValue load_depth_value(std::memory_order order = std::memory_order_acquire) const {
+        return depth_value.load(order);
+    }
+    void store_depth_value(DepthValue dv, std::memory_order order = std::memory_order_release) {
+        depth_value.store(dv, order);
+    }
 
     [[nodiscard]] bool has_terminal_win() const { return best_terminal_value > 0.5f; }
     [[nodiscard]] bool has_terminal() const { return best_terminal_value > -1.5f; }
@@ -270,7 +290,8 @@ private:
         if (board.sideToMove() == Color::BLACK) {
             value = -value;
         }
-        node.value = value;
+        // Store initial value with searched_depth=-1 (not yet searched)
+        node.store_depth_value({-1.0f, value});
 
         // ─── 2. Generate legal moves ─────────────────────────────
         Movelist moves;
@@ -410,7 +431,7 @@ public:
 
         recursive_search(root_idx, board, initial_depth);
 
-        return pool_.get(root_idx).value;
+        return pool_.get(root_idx).load_depth_value().value;
     }
 
     [[nodiscard]] uint32_t get_root_idx(const Board& board) const {
@@ -448,11 +469,16 @@ private:
     void recursive_search(uint32_t node_idx, Board& board, float depth) {
         Node& node = pool_.get(node_idx);
 
-        if (node.searched_depth >= depth) return;
-        node.searched_depth = depth;
+        // Load current depth+value atomically
+        DepthValue current = node.load_depth_value();
+        if (current.searched_depth >= depth) return;
 
         // Can this node have children? (depth > ln(2))
-        if (depth <= LN_2) return;
+        if (depth <= LN_2) {
+            // No children to search, just update depth atomically
+            node.store_depth_value({depth, current.value});
+            return;
+        }
 
         // Allocate extra moves if depth exceeds threshold and not yet allocated
         if (depth >= MIN_POLICY_DEPTH_THRESHOLD &&
@@ -492,8 +518,9 @@ private:
             }
         }
 
-        // ─── Phase 4: Compute weighted average ───────────────────
-        compute_value(node_idx);
+        // ─── Phase 4: Compute weighted average and store atomically ───
+        float new_value = compute_value(node_idx, current.value);
+        node.store_depth_value({depth, new_value});
     }
 
     void expand_children(uint32_t node_idx, Board& board, float depth) {
@@ -631,8 +658,12 @@ private:
         ++extra_allocs_;
     }
 
-    void compute_value(uint32_t node_idx) {
-        Node& node = pool_.get(node_idx);
+    /// Compute weighted average value from children.
+    /// @param node_idx Index of the node to compute value for
+    /// @param current_value Fallback value if no children are expanded
+    /// @return The computed value
+    [[nodiscard]] float compute_value(uint32_t node_idx, float current_value) {
+        const Node& node = pool_.get(node_idx);
 
         float weighted_sum = 0.0f;
         float total_weight = 0.0f;
@@ -649,7 +680,7 @@ private:
             if (!entry.is_expanded()) continue;
 
             const Node& child = pool_.get(entry.node_idx);
-            float child_value = -child.value;
+            float child_value = -child.load_depth_value().value;
             weighted_sum += child_value * entry.policy;
             total_weight += entry.policy;
         }
@@ -661,15 +692,16 @@ private:
                 if (!entry.is_expanded()) continue;
 
                 const Node& child = pool_.get(entry.node_idx);
-                float child_value = -child.value;
+                float child_value = -child.load_depth_value().value;
                 weighted_sum += child_value * entry.policy;
                 total_weight += entry.policy;
             }
         }
 
         if (total_weight > 0.0f) {
-            node.value = weighted_sum / total_weight;
+            return weighted_sum / total_weight;
         }
+        return current_value;
     }
 
     TranspositionTable& table_;
@@ -804,7 +836,7 @@ int main() {
 
             if (expanded) {
                 const Node& child = pool.get(entry.node_idx);
-                child_value = -child.value;  // Negate for parent's perspective
+                child_value = -child.load_depth_value().value;  // Negate for parent's perspective
             }
 
             move_info.emplace_back(entry.move, entry.policy, child_value, expanded);
