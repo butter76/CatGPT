@@ -208,6 +208,7 @@ class TrainingPositionData:
     legal_moves: list[tuple[str, float]]  # (move_uci, probability)
     root_q: float
     root_d: float
+    best_q: float
     best_move_uci: str | None
 
     # Game result from terminal evaluation
@@ -221,6 +222,7 @@ def encode_training_position(position: TrainingPositionData) -> bytes:
         "legal_moves": position.legal_moves,
         "root_q": position.root_q,
         "root_d": position.root_d,
+        "best_q": position.best_q,
         "best_move_uci": position.best_move_uci,
         "game_result": position.game_result,
     }
@@ -235,6 +237,7 @@ def decode_training_position(encoded: bytes) -> TrainingPositionData:
         legal_moves=[(m, p) for m, p in data["legal_moves"]],
         root_q=data["root_q"],
         root_d=data["root_d"],
+        best_q=data.get("best_q", data["root_q"]),
         best_move_uci=data["best_move_uci"],
         game_result=data["game_result"],
     )
@@ -424,6 +427,7 @@ def convert_bagz_to_bag(
                     legal_moves=pos.legal_moves,
                     root_q=pos.root_q,
                     root_d=pos.root_d,
+                    best_q=pos.best_q,
                     best_move_uci=pos.best_move_uci,
                     game_result=game_result,
                 )

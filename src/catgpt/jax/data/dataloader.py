@@ -106,19 +106,22 @@ class ConvertToJax(pygrain.MapTransform):
         """Convert a batched element to JAX-compatible arrays.
 
         Args:
-            element: Tuple of (inputs, targets, [policy_targets])
+            element: Tuple of (inputs, rootq_targets, bestq_targets, [policy_targets])
                 as numpy arrays. Optional elements depend on head configuration.
 
         Returns:
-            Dictionary with 'input', 'target', and optional targets as numpy arrays.
+            Dictionary with 'input', 'target', 'best_q_target', and optional targets
+            as numpy arrays.
             - 'input': Token indices, shape (batch, seq_len)
-            - 'target': HL-Gauss distribution, shape (batch, num_bins)
+            - 'target': HL-Gauss distribution for rootQ, shape (batch, num_bins)
+            - 'best_q_target': HL-Gauss distribution for bestQ, shape (batch, num_bins)
             - 'policy_target': Flattened policy distribution, shape (batch, 64*73)
         """
         # Unpack tuple based on configuration
         element = list(element)
         inputs = element.pop(0)
-        targets = element.pop(0)
+        targets = element.pop(0)  # rootQ win probabilities
+        best_q_targets = element.pop(0)  # bestQ win probabilities
 
         policy_targets = None
 
@@ -138,9 +141,18 @@ class ConvertToJax(pygrain.MapTransform):
             max_value=1.0,
         )
 
+        best_q_target_array = _hl_gauss_transform_numpy(
+            best_q_targets,
+            num_bins=self._num_bins,
+            sigma_ratio=self._sigma_ratio,
+            min_value=0.0,
+            max_value=1.0,
+        )
+
         result = {
             "input": input_array,
-            "target": target_array,  # Shape: (batch, num_bins)
+            "target": target_array,  # Shape: (batch, num_bins) - rootQ
+            "best_q_target": best_q_target_array,  # Shape: (batch, num_bins) - bestQ
         }
 
         # Add policy target if enabled

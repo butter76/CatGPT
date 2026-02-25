@@ -521,9 +521,11 @@ class BidirectionalTransformer(nn.Module):
         Returns:
             Dictionary with output heads:
             - "self": Token reconstruction logits (batch, seq, vocab_size) if self_head enabled
-            - "value_logit": HL-Gauss logits (batch, num_bins) for cross-entropy loss
-            - "value_probs": Softmax probabilities (batch, num_bins) for visualization
-            - "value": Expected win probability scalar (batch,) for metrics/inference
+            - "value_logit": Concatenated rootQ+bestQ HL-Gauss logits (batch, num_bins*2)
+            - "rootq_logit": RootQ HL-Gauss logits (batch, num_bins) for cross-entropy loss
+            - "bestq_logit": BestQ HL-Gauss logits (batch, num_bins) for cross-entropy loss
+            - "value": Expected rootQ win probability scalar (batch,) for metrics/inference
+            - "best_value": Expected bestQ win probability scalar (batch,) for metrics
             - "policy_logit": Move distribution logits (batch, 64*73) if policy_head enabled
         """
         batch_size, seq_len = x.shape
@@ -629,12 +631,13 @@ class BidirectionalTransformer(nn.Module):
             outputs["self"] = self_logits
 
         # Value head: HL-Gauss categorical distribution from last token
-        # Uses 2-layer MLP (matching PyTorch/searchless_chess architecture)
+        # Outputs logits for BOTH rootQ and bestQ (concatenated), each with num_bins.
+        # Uses 2-layer MLP: hidden -> hidden/2 -> num_bins * 2
         if head_config.value_head:
             # Use last token representation (similar to GPT-style classification)
             pooled = hidden[:, -1, :]  # (batch, hidden)
 
-            # 2-layer MLP: hidden -> hidden/2 -> num_bins (matching PyTorch)
+            # 2-layer MLP: hidden -> hidden/2 -> num_bins * 2 (rootQ + bestQ)
             num_bins = head_config.value_num_bins
             value_hidden = nn.Dense(
                 self.config.hidden_size // 2,
@@ -643,22 +646,30 @@ class BidirectionalTransformer(nn.Module):
             )(pooled)  # (batch, hidden/2)
             value_hidden = nn.gelu(value_hidden, approximate=True)
             value_logits = nn.Dense(
-                num_bins,
+                num_bins * 2,
                 dtype=jnp.float32,
                 name="value_head_fc2",
-            )(value_hidden)  # (batch, num_bins)
+            )(value_hidden)  # (batch, num_bins * 2)
 
-            # Softmax to get probability distribution
-            value_probs = jax.nn.softmax(value_logits, axis=-1)  # (batch, num_bins)
+            # Split into rootQ and bestQ halves
+            rootq_logits = value_logits[:, :num_bins]  # (batch, num_bins)
+            bestq_logits = value_logits[:, num_bins:]  # (batch, num_bins)
+
+            # Softmax to get probability distributions
+            rootq_probs = jax.nn.softmax(rootq_logits, axis=-1)  # (batch, num_bins)
+            bestq_probs = jax.nn.softmax(bestq_logits, axis=-1)  # (batch, num_bins)
 
             # Expected value: weighted sum of bin centers
             # Bins span [0, 1], so centers are at (i + 0.5) / num_bins for i in [0, num_bins)
             bin_centers = (jnp.arange(num_bins) + 0.5) / num_bins  # (num_bins,)
-            expected_value = jnp.sum(value_probs * bin_centers, axis=-1)  # (batch,)
+            rootq_expected = jnp.sum(rootq_probs * bin_centers, axis=-1)  # (batch,)
+            bestq_expected = jnp.sum(bestq_probs * bin_centers, axis=-1)  # (batch,)
 
-            outputs["value_logit"] = value_logits  # For cross-entropy loss
-            outputs["value_probs"] = value_probs  # For visualization
-            outputs["value"] = expected_value  # Scalar for metrics/inference
+            outputs["value_logit"] = value_logits  # Full concatenated logits (batch, num_bins*2)
+            outputs["rootq_logit"] = rootq_logits  # For rootQ cross-entropy loss
+            outputs["bestq_logit"] = bestq_logits  # For bestQ cross-entropy loss
+            outputs["value"] = rootq_expected  # RootQ scalar for metrics/inference
+            outputs["best_value"] = bestq_expected  # BestQ scalar for metrics
 
         # Policy head: per-token projection to (64, 73) move distribution
         if head_config.policy_head:

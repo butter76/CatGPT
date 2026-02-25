@@ -290,15 +290,23 @@ class Trainer:
                 losses["self"] = self_loss * weight
 
             # Value head: cross-entropy with HL-Gauss target distribution
-            if "value_logit" in outputs:
-                # outputs["value_logit"]: (batch, num_bins) logits
-                # batch["target"]: (batch, num_bins) HL-Gauss probability distribution
-                value_loss = optax.softmax_cross_entropy(
-                    outputs["value_logit"].astype(jnp.float32),
+            # Trains on both rootQ and bestQ with half weight each
+            if "rootq_logit" in outputs:
+                weight = head_config.value_weight if head_config else 1.0
+
+                # RootQ loss: outputs["rootq_logit"] (batch, num_bins) vs batch["target"]
+                rootq_loss = optax.softmax_cross_entropy(
+                    outputs["rootq_logit"].astype(jnp.float32),
                     batch["target"].astype(jnp.float32),
                 ).mean()
-                weight = head_config.value_weight if head_config else 1.0
-                losses["value"] = value_loss * weight
+                losses["rootq"] = rootq_loss * weight * 0.5
+
+                # BestQ loss: outputs["bestq_logit"] (batch, num_bins) vs batch["best_q_target"]
+                bestq_loss = optax.softmax_cross_entropy(
+                    outputs["bestq_logit"].astype(jnp.float32),
+                    batch["best_q_target"].astype(jnp.float32),
+                ).mean()
+                losses["bestq"] = bestq_loss * weight * 0.5
 
             # Policy head: cross-entropy with soft policy targets
             # Mask out illegal moves (zero probability in target) by setting logits to -inf
@@ -393,8 +401,7 @@ class Trainer:
 
         # Value metrics (using expected value from HL-Gauss distribution)
         if "value" in outputs:
-            # outputs["value"] is the expected value (batch,)
-            # For target expected value, compute from target distribution
+            # RootQ metrics
             num_bins = batch["target"].shape[-1]
             bin_centers = (jnp.arange(num_bins) + 0.5) / num_bins
             target_expected = jnp.sum(batch["target"] * bin_centers, axis=-1)  # (batch,)
@@ -408,6 +415,14 @@ class Trainer:
             targets_binary = (target_expected > 0.5).astype(jnp.float32)
             accuracy = (preds == targets_binary).mean()
             metrics["accuracy"] = accuracy
+
+        # BestQ metrics
+        if "best_value" in outputs and "best_q_target" in batch:
+            num_bins_bq = batch["best_q_target"].shape[-1]
+            bin_centers_bq = (jnp.arange(num_bins_bq) + 0.5) / num_bins_bq
+            bestq_target_expected = jnp.sum(batch["best_q_target"] * bin_centers_bq, axis=-1)
+            bestq_mse = jnp.mean((outputs["best_value"] - bestq_target_expected.astype(jnp.float32)) ** 2)
+            metrics["bestq_mse"] = bestq_mse
 
         # Self head metrics
         if "self" in outputs:
@@ -479,13 +494,21 @@ class Trainer:
                     weight = head_config.self_weight if head_config else 0.1
                     return loss * weight
 
-                elif _head_name == "value" and "value_logit" in outputs:
+                elif _head_name == "rootq" and "rootq_logit" in outputs:
                     loss = optax.softmax_cross_entropy(
-                        outputs["value_logit"].astype(jnp.float32),
+                        outputs["rootq_logit"].astype(jnp.float32),
                         batch["target"].astype(jnp.float32),
                     ).mean()
                     weight = head_config.value_weight if head_config else 1.0
-                    return loss * weight
+                    return loss * weight * 0.5
+
+                elif _head_name == "bestq" and "bestq_logit" in outputs:
+                    loss = optax.softmax_cross_entropy(
+                        outputs["bestq_logit"].astype(jnp.float32),
+                        batch["best_q_target"].astype(jnp.float32),
+                    ).mean()
+                    weight = head_config.value_weight if head_config else 1.0
+                    return loss * weight * 0.5
 
                 elif _head_name == "policy" and "policy_logit" in outputs and "policy_target" in batch:
                     loss = optax.softmax_cross_entropy(
@@ -561,15 +584,23 @@ class Trainer:
             losses["self"] = self_loss * weight
 
         # Value head: cross-entropy with HL-Gauss target distribution
-        if "value_logit" in outputs:
-            # outputs["value_logit"]: (batch, num_bins) logits
-            # batch["target"]: (batch, num_bins) HL-Gauss probability distribution
-            value_loss = optax.softmax_cross_entropy(
-                outputs["value_logit"].astype(jnp.float32),
+        # Trains on both rootQ and bestQ with half weight each
+        if "rootq_logit" in outputs:
+            weight = head_config.value_weight if head_config else 1.0
+
+            # RootQ loss
+            rootq_loss = optax.softmax_cross_entropy(
+                outputs["rootq_logit"].astype(jnp.float32),
                 batch["target"].astype(jnp.float32),
             ).mean()
-            weight = head_config.value_weight if head_config else 1.0
-            losses["value"] = value_loss * weight
+            losses["rootq"] = rootq_loss * weight * 0.5
+
+            # BestQ loss
+            bestq_loss = optax.softmax_cross_entropy(
+                outputs["bestq_logit"].astype(jnp.float32),
+                batch["best_q_target"].astype(jnp.float32),
+            ).mean()
+            losses["bestq"] = bestq_loss * weight * 0.5
 
         # Policy head: cross-entropy with soft policy targets
         # Mask out illegal moves (zero probability in target) by setting logits to -inf
@@ -628,8 +659,7 @@ class Trainer:
 
         # Value metrics (using expected value from HL-Gauss distribution)
         if "value" in outputs:
-            # outputs["value"] is the expected value (batch,)
-            # For target expected value, compute from target distribution
+            # RootQ metrics
             num_bins = batch["target"].shape[-1]
             bin_centers = (jnp.arange(num_bins) + 0.5) / num_bins
             target_expected = jnp.sum(batch["target"] * bin_centers, axis=-1)  # (batch,)
@@ -643,6 +673,14 @@ class Trainer:
             targets_binary = (target_expected > 0.5).astype(jnp.float32)
             accuracy = (preds == targets_binary).mean()
             metrics["accuracy"] = accuracy
+
+        # BestQ metrics
+        if "best_value" in outputs and "best_q_target" in batch:
+            num_bins_bq = batch["best_q_target"].shape[-1]
+            bin_centers_bq = (jnp.arange(num_bins_bq) + 0.5) / num_bins_bq
+            bestq_target_expected = jnp.sum(batch["best_q_target"] * bin_centers_bq, axis=-1)
+            bestq_mse = jnp.mean((outputs["best_value"] - bestq_target_expected.astype(jnp.float32)) ** 2)
+            metrics["bestq_mse"] = bestq_mse
 
         # Self head metrics
         if "self" in outputs:

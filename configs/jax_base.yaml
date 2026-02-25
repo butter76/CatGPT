@@ -58,11 +58,6 @@ model:
     hard_policy_head: true  # Enable hard policy (sharpened target)
     hard_policy_temperature: 0.25  # p^4 sharpening
     hard_policy_weight: 0.1  # Small weight (harder targets are noisier)
-    # Square prediction heads (noisy auxiliary targets)
-    next_capture_head: false  # Predict square of piece to be captured next
-    next_capture_weight: 0.2  # Small weight for noisy auxiliary target
-    next_pawn_move_head: false  # Predict square of pawn that will move next
-    next_pawn_move_weight: 0.1  # Small weight for noisy auxiliary target
 
 # Tokenizer configuration
 tokenizer:
