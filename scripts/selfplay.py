@@ -22,6 +22,7 @@ Usage:
     uv run python scripts/selfplay.py wandb.enabled=false
 """
 
+import difflib
 import json
 import subprocess
 import sys
@@ -150,6 +151,36 @@ def main(cfg: DictConfig) -> None:
                 config=wandb_config,
             )
             logger.info(f"W&B initialized: {wb.run.url}")
+
+            # Track search source files so each run records exactly what code was used
+            baseline_path = project_root / "cpp" / "src" / "selfplay" / "coroutine_search.hpp"
+            challenger_path = project_root / "cpp" / "src" / "selfplay" / "challenger_search.hpp"
+
+            for f in [baseline_path, challenger_path]:
+                if f.exists():
+                    wb.save(str(f), base_path=str(project_root), policy="now")
+                    logger.info(f"W&B tracking: {f.relative_to(project_root)}")
+
+            # Generate and upload a unified diff between baseline and challenger
+            if baseline_path.exists() and challenger_path.exists():
+                baseline_lines = baseline_path.read_text().splitlines(keepends=True)
+                challenger_lines = challenger_path.read_text().splitlines(keepends=True)
+                diff = difflib.unified_diff(
+                    baseline_lines,
+                    challenger_lines,
+                    fromfile="coroutine_search.hpp (baseline)",
+                    tofile="challenger_search.hpp (challenger)",
+                )
+                diff_text = "".join(diff)
+                if diff_text:
+                    diff_path = project_root / "outputs" / f"challenger_diff_{run_name}.patch"
+                    diff_path.parent.mkdir(parents=True, exist_ok=True)
+                    diff_path.write_text(diff_text)
+                    wb.save(str(diff_path), base_path=str(project_root), policy="now")
+                    logger.info(f"W&B tracking diff: {diff_path.relative_to(project_root)}")
+                else:
+                    logger.info("Baseline and challenger are identical — no diff to upload")
+
         except ImportError:
             logger.warning("wandb not installed, skipping W&B logging")
         except Exception as e:
