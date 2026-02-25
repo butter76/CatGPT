@@ -40,6 +40,7 @@
 #include "coroutine_search.hpp"
 #include "game_slot.hpp"
 #include "selfplay_config.hpp"
+#include "syzygy.hpp"
 
 namespace catgpt {
 
@@ -110,6 +111,11 @@ public:
         // Create batch evaluator (starts GPU thread)
         evaluator_ = std::make_unique<BatchEvaluator>(
             config_.engine_path, pool_, config_.max_batch_size);
+
+        // Initialize Syzygy tablebases
+        if (!config_.syzygy_path.empty()) {
+            syzygy_ = std::make_unique<SyzygyProber>(config_.syzygy_path);
+        }
 
         // Open PGN output file
         if (!config_.output_pgn.empty()) {
@@ -262,7 +268,7 @@ private:
             }
 
             slot.apply_move(move_result.best_move, move_result.cp_score, move_result.gpu_evals);
-            slot.check_game_over(config_);
+            slot.check_game_over(config_, syzygy_.get());
         }
 
         auto record = slot.to_record();
@@ -299,6 +305,7 @@ private:
             case GameTermination::FIFTY_MOVE_RULE:        return "fifty_move_rule";
             case GameTermination::DRAW_ADJUDICATED:       return "draw_adjudicated";
             case GameTermination::RESIGN_ADJUDICATED:     return "resign_adjudicated";
+            case GameTermination::SYZYGY_ADJUDICATED:     return "syzygy_adjudicated";
             case GameTermination::MAX_MOVES:              return "max_moves";
         }
         return "unknown";
@@ -452,6 +459,7 @@ private:
 
     std::shared_ptr<coro::thread_pool> pool_;
     std::unique_ptr<BatchEvaluator> evaluator_;
+    std::unique_ptr<SyzygyProber> syzygy_;
 
     // PGN output
     std::ofstream pgn_file_;

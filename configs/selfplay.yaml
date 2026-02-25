@@ -43,6 +43,10 @@ challenger_cpuct: null
 baseline_name: "Baseline"
 challenger_name: "Challenger"
 
+# Syzygy tablebase adjudication
+# Set to null to use $SYZYGY_HOME env var, or provide explicit path
+syzygy_path: null
+
 # PGN output (null = auto-generate from run name)
 pgn_path: null
 

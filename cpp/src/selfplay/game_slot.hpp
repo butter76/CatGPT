@@ -16,6 +16,7 @@
 
 #include "../../external/chess-library/include/chess.hpp"
 #include "selfplay_config.hpp"
+#include "syzygy.hpp"
 
 namespace catgpt {
 
@@ -31,6 +32,7 @@ enum class GameTermination {
     FIFTY_MOVE_RULE,
     DRAW_ADJUDICATED,
     RESIGN_ADJUDICATED,
+    SYZYGY_ADJUDICATED,
     MAX_MOVES,
 };
 
@@ -126,9 +128,11 @@ public:
      * Check if the game is over (after applying the last move).
      * Sets termination_ and outcome_ if the game has ended.
      *
+     * @param config  Selfplay configuration (adjudication thresholds).
+     * @param syzygy  Optional Syzygy prober (nullptr to skip tablebase adjudication).
      * @return true if the game is over.
      */
-    bool check_game_over(const SelfPlayConfig& config) {
+    bool check_game_over(const SelfPlayConfig& config, const SyzygyProber* syzygy = nullptr) {
         // Set adjudication thresholds
         draw_cp_threshold_ = config.draw_cp_threshold;
         resign_cp_threshold_ = config.resign_cp_threshold;
@@ -164,6 +168,38 @@ public:
         if (board_.isHalfMoveDraw()) {
             set_result(GameTermination::FIFTY_MOVE_RULE, GameOutcome::DRAW);
             return true;
+        }
+
+        // Syzygy tablebase adjudication
+        if (syzygy != nullptr && syzygy->is_available()) {
+            auto wdl = syzygy->probe_wdl(board_);
+            if (wdl.has_value()) {
+                // Adjudicate wins/losses (WDL = WIN or LOSS)
+                // Draws are also adjudicated.
+                // Cursed wins / blessed losses are treated as draws
+                // (the 50-move rule can save the losing side).
+                switch (*wdl) {
+                    case SyzygyWDL::WIN:
+                        if (board_.sideToMove() == chess::Color::WHITE) {
+                            set_result(GameTermination::SYZYGY_ADJUDICATED, GameOutcome::WHITE_WIN);
+                        } else {
+                            set_result(GameTermination::SYZYGY_ADJUDICATED, GameOutcome::BLACK_WIN);
+                        }
+                        return true;
+                    case SyzygyWDL::LOSS:
+                        if (board_.sideToMove() == chess::Color::WHITE) {
+                            set_result(GameTermination::SYZYGY_ADJUDICATED, GameOutcome::BLACK_WIN);
+                        } else {
+                            set_result(GameTermination::SYZYGY_ADJUDICATED, GameOutcome::WHITE_WIN);
+                        }
+                        return true;
+                    case SyzygyWDL::DRAW:
+                    case SyzygyWDL::CURSED_WIN:
+                    case SyzygyWDL::BLESSED_LOSS:
+                        set_result(GameTermination::SYZYGY_ADJUDICATED, GameOutcome::DRAW);
+                        return true;
+                }
+            }
         }
 
         // Max moves

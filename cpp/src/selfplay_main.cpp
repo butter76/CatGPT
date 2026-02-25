@@ -28,6 +28,7 @@
  *   --challenger-name S  Label for challenger (default: Challenger)
  */
 
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <print>
@@ -61,6 +62,7 @@ void print_usage(const char* argv0) {
     std::println(stderr, "I/O options:");
     std::println(stderr, "  --openings PATH      Opening book file (EPD/FEN)");
     std::println(stderr, "  --pgn PATH           Output PGN file");
+    std::println(stderr, "  --syzygy PATH        Syzygy tablebase directory (or $SYZYGY_HOME)");
     std::println(stderr, "  --json-metrics       Emit JSON-lines metrics to stdout");
 }
 
@@ -160,6 +162,8 @@ int main(int argc, char* argv[]) {
             config.baseline_name = next_string();
         } else if (arg == "--challenger-name") {
             config.challenger_name = next_string();
+        } else if (arg == "--syzygy") {
+            config.syzygy_path = next_string();
         } else if (arg == "--json-metrics") {
             config.json_metrics = true;
         } else {
@@ -189,6 +193,13 @@ int main(int argc, char* argv[]) {
     }
     if (challenger_cpuct_set) {
         config.challenger_config.c_puct = challenger_cpuct;
+    }
+
+    // Syzygy: fall back to $SYZYGY_HOME if --syzygy not provided
+    if (config.syzygy_path.empty()) {
+        if (const char* env = std::getenv("SYZYGY_HOME"); env != nullptr) {
+            config.syzygy_path = env;
+        }
     }
 
     // Validate engine path
@@ -248,6 +259,7 @@ int main(int argc, char* argv[]) {
     std::println(stderr, "  Threads:      {}", config.num_search_threads);
     std::println(stderr, "  Batch size:   {}", config.max_batch_size);
     std::println(stderr, "  Openings:     {}", config.openings_path.empty() ? "(startpos)" : config.openings_path);
+    std::println(stderr, "  Syzygy:       {}", config.syzygy_path.empty() ? "(disabled)" : config.syzygy_path);
     std::println(stderr, "  PGN output:   {}", config.output_pgn.empty() ? "(none)" : config.output_pgn);
     std::println(stderr, "");
     std::println(stderr, "  {} (challenger):", config.challenger_name);

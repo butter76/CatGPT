@@ -107,6 +107,14 @@ def build_command(cfg: DictConfig, project_root: Path, pgn_path: Path) -> list[s
     else:
         logger.warning(f"Openings file not found: {openings_path}, using startpos")
 
+    # Syzygy tablebase path (explicit config or $SYZYGY_HOME handled by C++ binary)
+    if cfg.syzygy_path is not None:
+        syzygy = project_root / cfg.syzygy_path if not Path(cfg.syzygy_path).is_absolute() else Path(cfg.syzygy_path)
+        if syzygy.exists():
+            cmd += ["--syzygy", str(syzygy)]
+        else:
+            logger.warning(f"Syzygy path not found: {syzygy}, falling back to $SYZYGY_HOME")
+
     # PGN output
     cmd += ["--pgn", str(pgn_path)]
 

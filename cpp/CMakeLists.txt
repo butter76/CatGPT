@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(ChessEngine VERSION 0.1.0 LANGUAGES CXX)
+project(ChessEngine VERSION 0.1.0 LANGUAGES C CXX)
 
 # Set C++23 standard
 set(CMAKE_CXX_STANDARD 23)
@@ -137,6 +137,19 @@ set_target_properties(catgpt_analyze PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
 
+# === Fathom (Syzygy tablebase probing, C library) ===
+set(FATHOM_SRC_DIR "${CMAKE_SOURCE_DIR}/external/fathom/src")
+add_library(fathom STATIC
+    ${FATHOM_SRC_DIR}/tbprobe.c
+)
+target_include_directories(fathom PUBLIC ${FATHOM_SRC_DIR})
+# Fathom is C — suppress C++ warnings, compile as C with optimizations
+set_target_properties(fathom PROPERTIES
+    C_STANDARD 11
+    POSITION_INDEPENDENT_CODE ON
+)
+target_compile_options(fathom PRIVATE -O3 -w)
+
 # === CatGPT Batched Self-Play (coroutines + TensorRT) ===
 add_executable(catgpt_selfplay
     src/selfplay_main.cpp
@@ -147,12 +160,14 @@ target_include_directories(catgpt_selfplay PRIVATE
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
     ${LIBCORO_INCLUDE_DIR}
+    ${FATHOM_SRC_DIR}
 )
 
 target_link_libraries(catgpt_selfplay PRIVATE
     ${NVINFER_LIB}
     ${CUDART_LIB}
     ${LIBCORO_LIB}
+    fathom
     pthread
 )
 

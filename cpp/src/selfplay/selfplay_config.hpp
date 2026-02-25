@@ -85,6 +85,9 @@ struct SelfPlayConfig {
     /** Path to output PGN file. Empty = no PGN output. */
     std::string output_pgn;
 
+    /** Path to Syzygy tablebase directory. Empty = no tablebase adjudication. */
+    std::string syzygy_path;
+
     /** If true, emit JSON-lines metrics to stdout after each game. */
     bool json_metrics = false;
 };

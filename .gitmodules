@@ -1,3 +1,6 @@
 [submodule "cpp/external/chess-library"]
 	path = cpp/external/chess-library
 	url = https://github.com/Disservin/chess-library.git
+[submodule "cpp/external/fathom"]
+	path = cpp/external/fathom
+	url = https://github.com/jdart1/Fathom.git
