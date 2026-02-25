@@ -1,0 +1,58 @@
+# CatGPT Selfplay Tournament Configuration
+# Runs the C++ batched selfplay binary with W&B logging.
+#
+# Usage:
+#   # Run with defaults (prompts for run name)
+#   uv run python scripts/selfplay.py
+#
+#   # Override search params
+#   uv run python scripts/selfplay.py evals=800 cpuct=2.0
+#
+#   # Override per-engine
+#   uv run python scripts/selfplay.py challenger_evals=800 baseline_evals=400
+#
+#   # Disable W&B
+#   uv run python scripts/selfplay.py wandb.enabled=false
+
+# C++ binary (relative to project root)
+cpp_build_dir: "cpp/build/bin"
+
+# TensorRT engine
+trt_engine: "sample.trt"
+
+# Opening book
+openings: "openings/UHO_2024/UHO_2024_+100_+109/UHO_2024_6mvs_+100_+109.epd"
+
+# Tournament settings
+pairs: 0            # 0 = one pair per opening
+concurrent: 64      # Concurrent game slots
+threads: 8          # Search worker threads
+batch: 64           # Max GPU batch size
+
+# Search settings (apply to both engines unless overridden)
+evals: 400          # Min GPU evals per move
+cpuct: 1.75         # PUCT exploration constant
+
+# Per-engine overrides (null = use shared value above)
+baseline_evals: null
+challenger_evals: null
+baseline_cpuct: null
+challenger_cpuct: null
+
+# Engine labels
+baseline_name: "Baseline"
+challenger_name: "Challenger"
+
+# PGN output (null = auto-generate from run name)
+pgn_path: null
+
+# Weights & Biases logging
+wandb:
+  enabled: true
+  project: "catgpt-selfplay"
+  entity: null
+  tags:
+    - "selfplay"
+
+# Logging
+verbose: false

@@ -61,6 +61,7 @@ void print_usage(const char* argv0) {
     std::println(stderr, "I/O options:");
     std::println(stderr, "  --openings PATH      Opening book file (EPD/FEN)");
     std::println(stderr, "  --pgn PATH           Output PGN file");
+    std::println(stderr, "  --json-metrics       Emit JSON-lines metrics to stdout");
 }
 
 int main(int argc, char* argv[]) {
@@ -159,6 +160,8 @@ int main(int argc, char* argv[]) {
             config.baseline_name = next_string();
         } else if (arg == "--challenger-name") {
             config.challenger_name = next_string();
+        } else if (arg == "--json-metrics") {
+            config.json_metrics = true;
         } else {
             std::println(stderr, "Unknown option: {}", arg);
             print_usage(argv[0]);
@@ -200,22 +203,26 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Prompt for run name and set PGN output path
+    // Prompt for run name and set PGN output path (skip if --json-metrics, the wrapper handles it)
     if (config.output_pgn.empty()) {
-        std::print(stderr, "Run name: ");
         std::string run_name;
-        std::getline(std::cin, run_name);
+        if (config.json_metrics) {
+            run_name = "selfplay";
+        } else {
+            std::print(stderr, "Run name: ");
+            std::getline(std::cin, run_name);
 
-        // Trim whitespace
-        auto s = run_name.find_first_not_of(" \t\r\n");
-        auto e = run_name.find_last_not_of(" \t\r\n");
-        if (s != std::string::npos) {
-            run_name = run_name.substr(s, e - s + 1);
-        }
+            // Trim whitespace
+            auto s = run_name.find_first_not_of(" \t\r\n");
+            auto e = run_name.find_last_not_of(" \t\r\n");
+            if (s != std::string::npos) {
+                run_name = run_name.substr(s, e - s + 1);
+            }
 
-        // Replace spaces with underscores
-        for (auto& c : run_name) {
-            if (c == ' ') c = '_';
+            // Replace spaces with underscores
+            for (auto& c : run_name) {
+                if (c == ' ') c = '_';
+            }
         }
 
         if (run_name.empty()) {

@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -129,7 +130,7 @@ public:
      * Run the tournament until the target number of game pairs is reached.
      */
     void run() {
-        auto start = std::chrono::steady_clock::now();
+        start_time_ = std::chrono::steady_clock::now();
 
         int total_games = config_.total_pairs * 2;
         std::println(stderr, "[SelfPlay] {} vs {}",
@@ -141,7 +142,7 @@ public:
 
         coro::sync_wait(run_all_pairs());
 
-        auto elapsed = std::chrono::steady_clock::now() - start;
+        auto elapsed = std::chrono::steady_clock::now() - start_time_;
         double secs = std::chrono::duration<double>(elapsed).count();
 
         int completed = games_completed_.load();
@@ -151,6 +152,28 @@ public:
                      evaluator_->total_evals(),
                      evaluator_->total_evals() / secs);
         print_stats();
+
+        // JSON summary
+        if (config_.json_metrics) {
+            std::lock_guard lock(stats_mutex_);
+            int total = challenger_wins_ + draws_ + challenger_losses_;
+            float elo = estimate_elo(challenger_wins_, draws_, challenger_losses_);
+            float avg_moves = total > 0 ? static_cast<float>(stats_total_moves_) / total : 0.0f;
+            float avg_evals = total > 0 ? static_cast<float>(stats_total_evals_) / total : 0.0f;
+            std::printf(
+                "{\"type\":\"summary\",\"games\":%d,"
+                "\"challenger_wins\":%d,\"draws\":%d,\"challenger_losses\":%d,"
+                "\"elo\":%.1f,\"avg_moves\":%.1f,\"avg_gpu_evals\":%.1f,"
+                "\"total_secs\":%.1f,\"games_per_sec\":%.2f,"
+                "\"total_gpu_evals\":%lld,\"gpu_evals_per_sec\":%.0f}\n",
+                total,
+                challenger_wins_, draws_, challenger_losses_,
+                elo, avg_moves, avg_evals,
+                secs, total > 0 ? completed / secs : 0.0,
+                static_cast<long long>(evaluator_->total_evals()),
+                secs > 0 ? evaluator_->total_evals() / secs : 0.0);
+            std::fflush(stdout);
+        }
     }
 
 private:
@@ -266,6 +289,21 @@ private:
 
     // ─── Result tracking ────────────────────────────────────────────────
 
+    [[nodiscard]] static const char* termination_name(GameTermination t) {
+        switch (t) {
+            case GameTermination::ONGOING:                return "ongoing";
+            case GameTermination::CHECKMATE:              return "checkmate";
+            case GameTermination::STALEMATE:              return "stalemate";
+            case GameTermination::INSUFFICIENT_MATERIAL:  return "insufficient_material";
+            case GameTermination::THREEFOLD_REPETITION:   return "threefold_repetition";
+            case GameTermination::FIFTY_MOVE_RULE:        return "fifty_move_rule";
+            case GameTermination::DRAW_ADJUDICATED:       return "draw_adjudicated";
+            case GameTermination::RESIGN_ADJUDICATED:     return "resign_adjudicated";
+            case GameTermination::MAX_MOVES:              return "max_moves";
+        }
+        return "unknown";
+    }
+
     void on_game_complete(const GameRecord& record, int game_num, int slot_id) {
         int completed = games_completed_.fetch_add(1) + 1;
 
@@ -274,10 +312,12 @@ private:
         // baseline_score() returns score for baseline; invert for challenger
         float challenger_score = 1.0f - score;
 
+        bool challenger_won = false;
         {
             std::lock_guard lock(stats_mutex_);
             if (challenger_score > 0.75f) {
                 ++challenger_wins_;
+                challenger_won = true;
             } else if (challenger_score < 0.25f) {
                 ++challenger_losses_;
             } else {
@@ -292,6 +332,36 @@ private:
             write_pgn(record, game_num + 1);
         }
 
+        // JSON metrics to stdout (for Python wrapper / wandb)
+        if (config_.json_metrics) {
+            std::lock_guard lock(stats_mutex_);
+            float elo = estimate_elo(challenger_wins_, draws_, challenger_losses_);
+            int total = challenger_wins_ + draws_ + challenger_losses_;
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - start_time_).count();
+            double games_per_sec = elapsed > 0.0 ? completed / elapsed : 0.0;
+
+            // Manual JSON construction (no dependency needed)
+            std::printf(
+                "{\"type\":\"game\",\"game_num\":%d,"
+                "\"challenger_wins\":%d,\"draws\":%d,\"challenger_losses\":%d,"
+                "\"games\":%d,\"elo\":%.1f,"
+                "\"game_moves\":%d,\"game_gpu_evals\":%d,"
+                "\"termination\":\"%s\",\"challenger_won\":%s,"
+                "\"avg_moves\":%.1f,\"avg_gpu_evals\":%.1f,"
+                "\"games_per_sec\":%.2f,\"elapsed_secs\":%.1f}\n",
+                completed,
+                challenger_wins_, draws_, challenger_losses_,
+                total, elo,
+                static_cast<int>(record.moves.size()), record.total_gpu_evals,
+                termination_name(record.termination),
+                challenger_won ? "true" : (record.outcome == GameOutcome::DRAW ? "false" : "false"),
+                total > 0 ? static_cast<float>(stats_total_moves_) / total : 0.0f,
+                total > 0 ? static_cast<float>(stats_total_evals_) / total : 0.0f,
+                games_per_sec, elapsed);
+            std::fflush(stdout);
+        }
+
         // Progress logging
         if (completed <= 5 || completed % 10 == 0) {
             std::lock_guard lock(stats_mutex_);
@@ -301,8 +371,8 @@ private:
                 winner = "draw";
             } else {
                 bool white_won = (record.outcome == GameOutcome::WHITE_WIN);
-                bool challenger_won = (white_won != record.baseline_white);
-                winner = challenger_won ? config_.challenger_name : config_.baseline_name;
+                bool chal_won = (white_won != record.baseline_white);
+                winner = chal_won ? config_.challenger_name : config_.baseline_name;
             }
             float elo = estimate_elo(challenger_wins_, draws_, challenger_losses_);
             std::println(stderr, "[SelfPlay] Game #{}: {} ({}) in {} moves (slot={}) | "
@@ -386,6 +456,9 @@ private:
     // PGN output
     std::ofstream pgn_file_;
     std::mutex pgn_mutex_;
+
+    // Timing
+    std::chrono::steady_clock::time_point start_time_;
 
     // Statistics (from challenger's perspective)
     std::atomic<int> games_completed_{0};

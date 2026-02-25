@@ -84,6 +84,9 @@ struct SelfPlayConfig {
 
     /** Path to output PGN file. Empty = no PGN output. */
     std::string output_pgn;
+
+    /** If true, emit JSON-lines metrics to stdout after each game. */
+    bool json_metrics = false;
 };
 
 }  // namespace catgpt
