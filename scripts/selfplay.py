@@ -45,8 +45,8 @@ def setup_logging(verbose: bool = False) -> None:
     )
 
 
-def prompt_run_name() -> str:
-    """Prompt user for a run name."""
+def prompt_run_info() -> tuple[str, str]:
+    """Prompt user for a run name and description."""
     print("\n" + "=" * 50)
     print("CatGPT Selfplay Tournament")
     print("=" * 50)
@@ -56,8 +56,10 @@ def prompt_run_name() -> str:
     run_name = run_name.replace(" ", "_")
     run_name = "".join(c for c in run_name if c.isalnum() or c in "_-")
     print(f"Run name: {run_name}")
+    print("-" * 50)
+    run_description = input("Describe this run (for W&B notes): ").strip()
     print("=" * 50 + "\n")
-    return run_name
+    return run_name, run_description
 
 
 def build_command(cfg: DictConfig, project_root: Path, pgn_path: Path) -> list[str]:
@@ -127,7 +129,7 @@ def build_command(cfg: DictConfig, project_root: Path, pgn_path: Path) -> list[s
 @hydra.main(version_base=None, config_path="../configs", config_name="selfplay")
 def main(cfg: DictConfig) -> None:
     """Main selfplay entry point."""
-    run_name = prompt_run_name()
+    run_name, run_description = prompt_run_info()
 
     # Hydra changes cwd, so resolve project root
     project_root = Path(hydra.utils.get_original_cwd())
@@ -135,6 +137,8 @@ def main(cfg: DictConfig) -> None:
     setup_logging(cfg.verbose)
     logger.info("Starting CatGPT Selfplay Tournament")
     logger.info(f"Run name: {run_name}")
+    if run_description:
+        logger.info(f"Description: {run_description}")
     logger.info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
 
     # PGN path
@@ -151,14 +155,54 @@ def main(cfg: DictConfig) -> None:
             import wandb as wb
 
             wandb_config = OmegaConf.to_container(cfg, resolve=True)
+            # Capture git metadata before init so it lands in the config
+            git_commit = None
+            git_diff_text = None
+            try:
+                git_commit = (
+                    subprocess.check_output(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=str(project_root),
+                        stderr=subprocess.DEVNULL,
+                    )
+                    .decode()
+                    .strip()
+                )
+                git_diff_text = (
+                    subprocess.check_output(
+                        ["git", "diff", "HEAD"],
+                        cwd=str(project_root),
+                        stderr=subprocess.DEVNULL,
+                    )
+                    .decode()
+                )
+                wandb_config["git_commit"] = git_commit
+                if git_diff_text:
+                    wandb_config["git_dirty"] = True
+                else:
+                    wandb_config["git_dirty"] = False
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                logger.warning("Could not read git info — not a git repo or git not installed")
+
             wandb_run = wb.init(
                 project=cfg.wandb.project,
                 entity=cfg.wandb.entity,
                 name=run_name,
+                notes=run_description or None,
                 tags=list(cfg.wandb.tags),
                 config=wandb_config,
             )
             logger.info(f"W&B initialized: {wb.run.url}")
+
+            # Upload git diff as a patch file
+            if git_diff_text:
+                git_diff_path = project_root / "outputs" / f"git_diff_{run_name}.patch"
+                git_diff_path.parent.mkdir(parents=True, exist_ok=True)
+                git_diff_path.write_text(git_diff_text)
+                wb.save(str(git_diff_path), base_path=str(project_root), policy="now")
+                logger.info(f"W&B tracking git diff ({len(git_diff_text)} bytes, commit {git_commit})")
+            elif git_commit:
+                logger.info(f"Clean working tree at commit {git_commit}")
 
             # Track search source files so each run records exactly what code was used
             baseline_path = project_root / "cpp" / "src" / "selfplay" / "coroutine_search.hpp"
