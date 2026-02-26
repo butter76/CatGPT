@@ -665,11 +665,16 @@ class BidirectionalTransformer(nn.Module):
             rootq_expected = jnp.sum(rootq_probs * bin_centers, axis=-1)  # (batch,)
             bestq_expected = jnp.sum(bestq_probs * bin_centers, axis=-1)  # (batch,)
 
+            # Variance of bestQ distribution: Var(X) = E[X^2] - E[X]^2
+            # Used by the optimistic policy head as the value uncertainty estimate.
+            bestq_var = jnp.sum(bestq_probs * bin_centers**2, axis=-1) - bestq_expected**2  # (batch,)
+
             outputs["value_logit"] = value_logits  # Full concatenated logits (batch, num_bins*2)
             outputs["rootq_logit"] = rootq_logits  # For rootQ cross-entropy loss
             outputs["bestq_logit"] = bestq_logits  # For bestQ cross-entropy loss
             outputs["value"] = rootq_expected  # RootQ scalar for metrics/inference
             outputs["best_value"] = bestq_expected  # BestQ scalar for metrics
+            outputs["bestq_var"] = bestq_var  # BestQ variance for optimistic policy weighting
 
         # Policy head: per-token projection to (64, 73) move distribution
         if head_config.policy_head:
@@ -726,21 +731,37 @@ class BidirectionalTransformer(nn.Module):
 
             outputs["soft_policy_logit"] = soft_policy_logits_flat
 
-        # Hard policy head: auxiliary head for sharpened policy target
-        # Uses temperature < 1 (e.g., 0.25) to sharpen the distribution, focusing
-        # training on getting the absolute best move right (p^4 for T=0.25).
-        if head_config.hard_policy_head:
-            # Same architecture as policy head but separate parameters
-            hard_policy_logits = nn.Dense(
-                _POLICY_TO_DIM,
-                dtype=jnp.float32,
-                name="hard_policy_head",
-            )(hidden)  # (batch, 64, 73)
+        # Optimistic policy head (LC0 BT3/BT4 method): attention-based policy head
+        # trained with per-sample optimism weights. Same architecture as vanilla
+        # policy (Q·K^T attention for 64x64 + underpromo projection) but with
+        # separate parameters. During training, samples are weighted by how much
+        # the value target exceeded the model's prediction.
+        if head_config.optimistic_policy_head:
+            if head_config.policy_attention_head:
+                # LC0-style attention policy head (same arch, separate params)
+                qk_dim = head_config.policy_qk_dim
+                opt_query = nn.Dense(qk_dim, dtype=jnp.float32, name="optimistic_policy_query")(hidden)
+                opt_key = nn.Dense(qk_dim, dtype=jnp.float32, name="optimistic_policy_key")(hidden)
+                opt_main_logits = jnp.matmul(opt_query, jnp.transpose(opt_key, (0, 2, 1)))
 
-            # Flatten for cross-entropy loss: (batch, 64*73) = (batch, 4672)
-            hard_policy_logits_flat = hard_policy_logits.reshape(batch_size, -1)
+                opt_underpromo_logits = nn.Dense(
+                    9, dtype=jnp.float32, name="optimistic_policy_underpromo"
+                )(hidden)
+                opt_underpromo_logits = opt_underpromo_logits * jnp.sqrt(qk_dim).astype(jnp.float32)
 
-            outputs["hard_policy_logit"] = hard_policy_logits_flat
+                opt_policy_logits = jnp.concatenate(
+                    [opt_main_logits, opt_underpromo_logits], axis=-1
+                )
+            else:
+                # Simple projection fallback
+                opt_policy_logits = nn.Dense(
+                    _POLICY_TO_DIM,
+                    dtype=jnp.float32,
+                    name="optimistic_policy_head",
+                )(hidden)
+
+            opt_policy_logits_flat = opt_policy_logits.reshape(batch_size, -1)
+            outputs["optimistic_policy_logit"] = opt_policy_logits_flat
 
         return outputs
 

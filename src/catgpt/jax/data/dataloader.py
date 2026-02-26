@@ -106,15 +106,18 @@ class ConvertToJax(pygrain.MapTransform):
         """Convert a batched element to JAX-compatible arrays.
 
         Args:
-            element: Tuple of (inputs, rootq_targets, bestq_targets, [policy_targets])
-                as numpy arrays. Optional elements depend on head configuration.
+            element: Tuple of (inputs, rootq_targets, bestq_targets, st_q_targets,
+                [policy_targets]) as numpy arrays. Optional elements depend on
+                head configuration.
 
         Returns:
-            Dictionary with 'input', 'target', 'best_q_target', and optional targets
-            as numpy arrays.
+            Dictionary with 'input', 'target', 'best_q_target', 'st_q_target',
+            and optional targets as numpy arrays.
             - 'input': Token indices, shape (batch, seq_len)
             - 'target': HL-Gauss distribution for rootQ, shape (batch, num_bins)
             - 'best_q_target': HL-Gauss distribution for bestQ, shape (batch, num_bins)
+            - 'st_q_target': HL-Gauss distribution for short-term Q, shape (batch, num_bins)
+            - 'st_q_scalar': Raw short-term Q win probability, shape (batch, 1)
             - 'policy_target': Flattened policy distribution, shape (batch, 64*73)
         """
         # Unpack tuple based on configuration
@@ -122,6 +125,7 @@ class ConvertToJax(pygrain.MapTransform):
         inputs = element.pop(0)
         targets = element.pop(0)  # rootQ win probabilities
         best_q_targets = element.pop(0)  # bestQ win probabilities
+        st_q_targets = element.pop(0)  # short-term Q win probabilities
 
         policy_targets = None
 
@@ -149,10 +153,20 @@ class ConvertToJax(pygrain.MapTransform):
             max_value=1.0,
         )
 
+        st_q_target_array = _hl_gauss_transform_numpy(
+            st_q_targets,
+            num_bins=self._num_bins,
+            sigma_ratio=self._sigma_ratio,
+            min_value=0.0,
+            max_value=1.0,
+        )
+
         result = {
             "input": input_array,
             "target": target_array,  # Shape: (batch, num_bins) - rootQ
             "best_q_target": best_q_target_array,  # Shape: (batch, num_bins) - bestQ
+            "st_q_target": st_q_target_array,  # Shape: (batch, num_bins) - short-term Q
+            "st_q_scalar": np.asarray(st_q_targets, dtype=np.float32),  # Raw scalar for optimism weights
         }
 
         # Add policy target if enabled

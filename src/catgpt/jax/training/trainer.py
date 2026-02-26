@@ -357,31 +357,42 @@ class Trainer:
                 weight = head_config.soft_policy_weight if head_config else 8.0
                 losses["soft_policy"] = soft_policy_loss * weight
 
-            # Hard policy head: auxiliary head for sharpened policy target
-            # Applies low temperature to sharpen the distribution, focusing on the best move.
-            if "hard_policy_logit" in outputs and "policy_target" in batch:
+            # Optimistic policy head (LC0 BT3/BT4 method): same targets as vanilla
+            # policy but weighted by how much the value target exceeded expectations.
+            # weight = sigmoid((z - strength) * 3) where z = (st_q - best_value) / bestq_std
+            # bestq_std is computed from the bestQ HL-Gauss distribution variance (no extra head).
+            if "optimistic_policy_logit" in outputs and "policy_target" in batch:
                 policy_target = batch["policy_target"].astype(jnp.float32)
 
                 # Mask illegal moves
                 legal_mask = policy_target > 0
                 masked_logits = jnp.where(
                     legal_mask,
-                    outputs["hard_policy_logit"].astype(jnp.float32),
+                    outputs["optimistic_policy_logit"].astype(jnp.float32),
                     jnp.float32(-1e9),
                 )
 
-                # Compute hard target: p^(1/T) where T=0.25 → p^4 then renormalize
-                temp = head_config.hard_policy_temperature if head_config else 0.25
-                # Add small epsilon for numerical stability before taking power
-                hard_target = jnp.pow(policy_target + 1e-10, 1.0 / temp)
-                hard_target = hard_target / jnp.sum(hard_target, axis=-1, keepdims=True)
-
-                hard_policy_loss = optax.softmax_cross_entropy(
+                # Per-sample cross-entropy (unreduced)
+                per_sample_ce = optax.softmax_cross_entropy(
                     masked_logits,
-                    hard_target,
-                ).mean()
-                weight = head_config.hard_policy_weight if head_config else 0.1
-                losses["hard_policy"] = hard_policy_loss * weight
+                    policy_target,
+                )  # (batch,)
+
+                # Compute optimism weights from bestQ distribution variance
+                if "bestq_var" in outputs and "st_q_scalar" in batch and "best_value" in outputs:
+                    st_q_scalar = batch["st_q_scalar"].astype(jnp.float32).squeeze(-1)
+                    best_value_pred = jax.lax.stop_gradient(outputs["best_value"].astype(jnp.float32))
+                    bestq_std = jax.lax.stop_gradient(jnp.sqrt(outputs["bestq_var"].astype(jnp.float32) + 1e-8))
+                    z_values = (st_q_scalar - best_value_pred) / (bestq_std + 1e-5)
+                    strength = head_config.optimistic_strength if head_config else 2.0
+                    optimism_weights = jax.nn.sigmoid((z_values - strength) * 3.0)  # (batch,)
+                else:
+                    # Fallback: uniform weights (no value head)
+                    optimism_weights = jnp.ones_like(per_sample_ce)
+
+                optimistic_policy_loss = jnp.mean(per_sample_ce * optimism_weights)
+                weight = head_config.optimistic_policy_weight if head_config else 1.0
+                losses["optimistic_policy"] = optimistic_policy_loss * weight
 
             total_loss = sum(losses.values())
             return total_loss, (outputs, losses)
@@ -529,15 +540,26 @@ class Trainer:
                     weight = head_config.soft_policy_weight if head_config else 8.0
                     return loss * weight
 
-                elif _head_name == "hard_policy" and "hard_policy_logit" in outputs and "policy_target" in batch:
-                    temp = head_config.hard_policy_temperature if head_config else 0.25
-                    hard_target = jnp.pow(batch["policy_target"] + 1e-10, 1.0 / temp)
-                    hard_target = hard_target / jnp.sum(hard_target, axis=-1, keepdims=True)
-                    loss = optax.softmax_cross_entropy(
-                        outputs["hard_policy_logit"].astype(jnp.float32),
-                        hard_target.astype(jnp.float32),
-                    ).mean()
-                    weight = head_config.hard_policy_weight if head_config else 0.1
+                elif _head_name == "optimistic_policy" and "optimistic_policy_logit" in outputs and "policy_target" in batch:
+                    policy_target = batch["policy_target"].astype(jnp.float32)
+                    legal_mask = policy_target > 0
+                    masked_logits = jnp.where(
+                        legal_mask,
+                        outputs["optimistic_policy_logit"].astype(jnp.float32),
+                        jnp.float32(-1e9),
+                    )
+                    per_sample_ce = optax.softmax_cross_entropy(masked_logits, policy_target)
+                    if "bestq_var" in outputs and "st_q_scalar" in batch and "best_value" in outputs:
+                        st_q_scalar = batch["st_q_scalar"].astype(jnp.float32).squeeze(-1)
+                        best_value_pred = jax.lax.stop_gradient(outputs["best_value"].astype(jnp.float32))
+                        bestq_std = jax.lax.stop_gradient(jnp.sqrt(outputs["bestq_var"].astype(jnp.float32) + 1e-8))
+                        z_values = (st_q_scalar - best_value_pred) / (bestq_std + 1e-5)
+                        strength = head_config.optimistic_strength if head_config else 2.0
+                        optimism_weights = jax.nn.sigmoid((z_values - strength) * 3.0)
+                    else:
+                        optimism_weights = jnp.ones_like(per_sample_ce)
+                    loss = jnp.mean(per_sample_ce * optimism_weights)
+                    weight = head_config.optimistic_policy_weight if head_config else 1.0
                     return loss * weight
 
                 # Fallback: return zero loss for unknown heads
@@ -648,6 +670,29 @@ class Trainer:
             weight = head_config.soft_policy_weight if head_config else 8.0
             losses["soft_policy"] = soft_policy_loss * weight
 
+        # Optimistic policy head (eval)
+        if "optimistic_policy_logit" in outputs and "policy_target" in batch:
+            policy_target = batch["policy_target"].astype(jnp.float32)
+            legal_mask = policy_target > 0
+            masked_logits = jnp.where(
+                legal_mask,
+                outputs["optimistic_policy_logit"].astype(jnp.float32),
+                jnp.float32(-1e9),
+            )
+            per_sample_ce = optax.softmax_cross_entropy(masked_logits, policy_target)
+            if "bestq_var" in outputs and "st_q_scalar" in batch and "best_value" in outputs:
+                st_q_scalar = batch["st_q_scalar"].astype(jnp.float32).squeeze(-1)
+                best_value_pred = outputs["best_value"].astype(jnp.float32)
+                bestq_std = jnp.sqrt(outputs["bestq_var"].astype(jnp.float32) + 1e-8)
+                z_values = (st_q_scalar - best_value_pred) / (bestq_std + 1e-5)
+                strength = head_config.optimistic_strength if head_config else 2.0
+                optimism_weights = jax.nn.sigmoid((z_values - strength) * 3.0)
+            else:
+                optimism_weights = jnp.ones_like(per_sample_ce)
+            optimistic_policy_loss = jnp.mean(per_sample_ce * optimism_weights)
+            weight = head_config.optimistic_policy_weight if head_config else 1.0
+            losses["optimistic_policy"] = optimistic_policy_loss * weight
+
         total_loss = sum(losses.values())
 
         # Compute metrics
@@ -708,19 +753,19 @@ class Trainer:
 
             # Policy perplexity: exp(cross_entropy)
             # Measures prediction uncertainty; lower = more confident/accurate
-            # Note: With 4672 move classes (64×73), uniform perplexity would be ~4672
+            # Note: With 4672 move classes (64*73), uniform perplexity would be ~4672
             policy_ce = optax.softmax_cross_entropy(
                 masked_logits,
                 policy_target,
             ).mean()
             metrics["policy_perplexity"] = jnp.exp(policy_ce)
 
-            # Hard policy perplexity: cross-entropy against hard label (argmax of target)
-            hard_policy_ce = optax.softmax_cross_entropy_with_integer_labels(
+            # Top-1 policy perplexity: cross-entropy against argmax of target (best move)
+            top1_policy_ce = optax.softmax_cross_entropy_with_integer_labels(
                 masked_logits,
                 target_moves,
             ).mean()
-            metrics["hard_policy_perplexity"] = jnp.exp(hard_policy_ce)
+            metrics["top1_policy_perplexity"] = jnp.exp(top1_policy_ce)
 
         return metrics
 

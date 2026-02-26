@@ -29,6 +29,7 @@ from pathlib import Path
 
 import chess
 import msgpack
+import numpy as np
 
 from catgpt.core.data.grain.bagz import BagReader, BagWriter
 from catgpt.core.data.grain.coders import LeelaPositionData, decode_game
@@ -87,6 +88,58 @@ def find_move_between_positions(
         f"No legal move found between positions: "
         f"{board_before.fen()} -> {board_after.fen()}"
     )
+
+
+def compute_st_q(
+    best_qs: list[float],
+    alpha: float = 1 - 1 / 6,
+) -> list[float]:
+    """Compute short-term Q values from bestQ values across a game.
+
+    Uses a backward exponential moving average with sign alternation
+    (since each position's Q is from the side-to-move perspective, which
+    alternates each ply).
+
+    The EMA is computed backward from the end of the game:
+        st_q[-1] = best_q[-1]
+        st_q[i]  = alpha * st_q[i+1] + (1 - alpha) * best_q[i]
+    (with sign alternation applied before and after to handle perspective changes)
+
+    With alpha = 1 - 1/6 ≈ 0.833, this captures roughly the next ~6 plies,
+    providing a smooth "what actually happened short-term" signal that's more
+    stable than single-ply root_q but less noisy than the game result.
+
+    Args:
+        best_qs: List of bestQ values for each position in game order.
+            Each value is in [-1, 1] from the side-to-move perspective.
+        alpha: EMA decay factor. Higher = longer memory. Default 1-1/6.
+
+    Returns:
+        List of short-term Q values, same length as input.
+    """
+    qs = np.array(best_qs, dtype=np.float64)
+    n = len(qs)
+    if n == 0:
+        return []
+
+    # Alternate signs: positions at even indices keep sign, odd indices flip.
+    # This normalizes all Q values to the same perspective before averaging.
+    signs = (-1.0) ** np.arange(n)
+    qs_normed = qs * signs
+
+    # Backward EMA: propagate from end of game to start
+    st = np.zeros(n, dtype=np.float64)
+    st[-1] = qs_normed[-1]
+    for i in range(n - 2, -1, -1):
+        st[i] = alpha * st[i + 1] + (1 - alpha) * qs_normed[i]
+
+    # Restore per-position perspective
+    st_q = st * signs
+
+    # Clamp to [-1, 1] for safety
+    st_q = np.clip(st_q, -1.0, 1.0)
+
+    return st_q.tolist()
 
 
 def compute_game_result(positions: list[LeelaPositionData]) -> list[int]:
@@ -214,6 +267,11 @@ class TrainingPositionData:
     # Game result from terminal evaluation
     game_result: int  # -1=loss, 0=draw, 1=win from side-to-move perspective
 
+    # Short-term Q value: backward EMA of bestQ across the game.
+    # Used as value target for the optimistic policy head's weighting.
+    # In [-1, 1] from the side-to-move perspective.
+    st_q: float = 0.0
+
 
 def encode_training_position(position: TrainingPositionData) -> bytes:
     """Encode a training position to bytes."""
@@ -225,6 +283,7 @@ def encode_training_position(position: TrainingPositionData) -> bytes:
         "best_q": position.best_q,
         "best_move_uci": position.best_move_uci,
         "game_result": position.game_result,
+        "st_q": position.st_q,
     }
     return msgpack.packb(data, use_bin_type=True)
 
@@ -240,6 +299,7 @@ def decode_training_position(encoded: bytes) -> TrainingPositionData:
         best_q=data.get("best_q", data["root_q"]),
         best_move_uci=data["best_move_uci"],
         game_result=data["game_result"],
+        st_q=data.get("st_q", 0.0),
     )
 
 
@@ -398,10 +458,14 @@ def convert_bagz_to_bag(
             # Compute game result for all positions
             game_results = compute_game_result(game_positions)
 
+            # Compute short-term Q values from bestQ across the game
+            best_qs = [pos.best_q for pos in game_positions]
+            st_qs = compute_st_q(best_qs)
+
             # Sub-select positions: keep only those where pos_idx % 3 == cycle_index
             # and where the half-move clock is at most 90 (avoids near-draw positions)
             selected_positions = [
-                (pos_idx, pos, game_results[pos_idx])
+                (pos_idx, pos, game_results[pos_idx], st_qs[pos_idx])
                 for pos_idx, pos in enumerate(game_positions)
                 if pos_idx % 3 == cycle_index
                 and int(pos.fen.split()[4]) <= 90
@@ -413,7 +477,7 @@ def convert_bagz_to_bag(
             positions_before_dedup += len(selected_positions)
 
             # Write in reverse order so that later (rarer) positions win dedup ties
-            for _pos_idx, pos, game_result in reversed(selected_positions):
+            for _pos_idx, pos, game_result, st_q in reversed(selected_positions):
                 dedup_key = fen_dedup_key(pos.fen)
 
                 if dedup_key in seen_fens:
@@ -421,7 +485,7 @@ def convert_bagz_to_bag(
 
                 seen_fens.add(dedup_key)
 
-                # Create training position with core fields + game result
+                # Create training position with core fields + game result + st_q
                 training_pos = TrainingPositionData(
                     fen=pos.fen,
                     legal_moves=pos.legal_moves,
@@ -430,6 +494,7 @@ def convert_bagz_to_bag(
                     best_q=pos.best_q,
                     best_move_uci=pos.best_move_uci,
                     game_result=game_result,
+                    st_q=st_q,
                 )
 
                 encoded = encode_training_position(training_pos)

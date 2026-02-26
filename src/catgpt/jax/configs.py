@@ -52,12 +52,20 @@ class JaxOutputHeadConfig:
     soft_policy_temperature: float = 4.0  # Temperature for softening (higher = more uniform)
     soft_policy_weight: float = 8.0  # Loss weight (compensates for smaller gradients)
 
-    # Hard policy auxiliary target
-    # Applies low temperature to sharpen the policy target, focusing training on
-    # getting the absolute best move right. T=0.25 means p^(1/0.25) = p^4.
-    hard_policy_head: bool = False  # Enable auxiliary hard policy head
-    hard_policy_temperature: float = 0.25  # Temperature for sharpening (lower = more peaked)
-    hard_policy_weight: float = 0.1  # Small weight since harder targets are noisier
+    # Optimistic policy auxiliary target (LC0 BT3/BT4 method)
+    # A separate policy head trained on the same MCTS targets but with per-sample
+    # weights that emphasize positions where the value target (st_q) significantly
+    # exceeded the model's value prediction. This creates a policy biased toward
+    # finding tactics and surprising wins.
+    #
+    # Weighting: w = sigmoid((z - strength) * 3) where z = (st_q - value_pred) / value_std
+    # value_std is computed directly from the bestQ HL-Gauss distribution (no extra head).
+    # Only positions where z > strength (~2 std devs better than expected) contribute.
+    # The per-sample gating already heavily downweights most samples, so the loss
+    # weight should be ~1.0 (same as vanilla policy).
+    optimistic_policy_head: bool = False  # Enable optimistic policy head
+    optimistic_policy_weight: float = 1.0  # Loss weight (per-sample gating handles regularization)
+    optimistic_strength: float = 2.0  # Z-score threshold (higher = more selective)
 
     # Attention-based policy head (LC0-style)
     # Instead of a simple Dense(73) projection, uses Q·K^T attention for 64x64 main

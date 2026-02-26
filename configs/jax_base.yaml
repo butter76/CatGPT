@@ -55,9 +55,9 @@ model:
     soft_policy_head: false  # Enable soft policy
     soft_policy_temperature: 4.0  # KataGo default
     soft_policy_weight: 8.0  # KataGo default (compensates for smaller gradients)
-    hard_policy_head: true  # Enable hard policy (sharpened target)
-    hard_policy_temperature: 0.25  # p^4 sharpening
-    hard_policy_weight: 0.1  # Small weight (harder targets are noisier)
+    optimistic_policy_head: true  # Enable optimistic policy (value-surprise weighted)
+    optimistic_policy_weight: 1.0  # Per-sample gating handles regularization
+    optimistic_strength: 2.0  # Z-score threshold for optimism weighting
 
 # Tokenizer configuration
 tokenizer:
@@ -115,8 +115,8 @@ training:
 
 # Data loading
 data:
-  train_path: "~/training_bag/training-run1-test80-202507*.bag"
-  val_path: "~/training_bag/training-run1-test80-202508*.bag"
+  train_path: "~/training_bag_opt/training-run1-test80-202507*.bag"
+  val_path: "~/training_bag_opt/training-run1-test80-202508*.bag"
   num_workers: 4
   prefetch_factor: 10
   seed: 42
