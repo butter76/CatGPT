@@ -166,13 +166,22 @@ private:
     uint32_t next_;
 };
 
-// ─── Transposition table (sequential, no atomics) ────────────────────
+// ─── Transposition table (inline keys, no node-pool chase) ───────────
+
+struct TTSlot {
+    PackedBoard key{};               // Inline key for comparison without chasing into NodePool
+    uint32_t node_idx{UINT32_MAX};   // UINT32_MAX = empty slot
+
+    [[nodiscard]] bool is_empty() const { return node_idx == UINT32_MAX; }
+};
+
+static_assert(sizeof(TTSlot) == 28, "TTSlot should be 28 bytes (24-byte key + 4-byte index)");
 
 class TranspositionTable {
 public:
     explicit TranspositionTable(size_t log2_capacity)
         : mask_((1ULL << log2_capacity) - 1)
-        , slots_(1ULL << log2_capacity, UINT32_MAX) {}
+        , slots_(1ULL << log2_capacity) {}
 
     /// Hash a PackedBoard (24 bytes) down to a uint64_t for slot indexing.
     static uint64_t hash_key(const PackedBoard& key) {
@@ -185,20 +194,21 @@ public:
 
     /// Insert a new node index or find existing entry for this key.
     /// @return {node_idx, true} if inserted, {existing_idx, false} if found
-    std::pair<uint32_t, bool> insert_or_find(const PackedBoard& key, uint32_t new_idx, const NodePool& pool) {
+    std::pair<uint32_t, bool> insert_or_find(const PackedBoard& key, uint32_t new_idx) {
         size_t idx = hash_key(key) & mask_;
 
         for (size_t probe = 0; probe <= mask_; ++probe) {
             size_t slot_idx = (idx + probe) & mask_;
-            uint32_t& slot = slots_[slot_idx];
+            TTSlot& slot = slots_[slot_idx];
 
-            if (slot == UINT32_MAX) {
-                slot = new_idx;
+            if (slot.is_empty()) {
+                slot.key = key;
+                slot.node_idx = new_idx;
                 return {new_idx, true};
             }
 
-            if (pool.get(slot).key == key) {
-                return {slot, false};
+            if (slot.key == key) {
+                return {slot.node_idx, false};
             }
         }
 
@@ -206,15 +216,15 @@ public:
         __builtin_unreachable();
     }
 
-    [[nodiscard]] uint32_t find(const PackedBoard& key, const NodePool& pool) const {
+    [[nodiscard]] uint32_t find(const PackedBoard& key) const {
         size_t idx = hash_key(key) & mask_;
 
         for (size_t probe = 0; probe <= mask_; ++probe) {
             size_t slot_idx = (idx + probe) & mask_;
-            uint32_t slot = slots_[slot_idx];
+            const TTSlot& slot = slots_[slot_idx];
 
-            if (slot == UINT32_MAX) return UINT32_MAX;
-            if (pool.get(slot).key == key) return slot;
+            if (slot.is_empty()) return UINT32_MAX;
+            if (slot.key == key) return slot.node_idx;
         }
 
         return UINT32_MAX;
@@ -222,12 +232,12 @@ public:
 
     [[nodiscard]] size_t capacity() const { return mask_ + 1; }
     [[nodiscard]] size_t memory_bytes() const {
-        return (mask_ + 1) * sizeof(uint32_t);
+        return (mask_ + 1) * sizeof(TTSlot);
     }
 
 private:
     size_t mask_;
-    std::vector<uint32_t> slots_;
+    std::vector<TTSlot> slots_;
 };
 
 // ─── Simulated GPU evaluator ─────────────────────────────────────────
@@ -417,7 +427,7 @@ private:
             std::max(0, static_cast<int>(non_terminal_moves.size()) - TOP_CHILDREN_COUNT));
 
         // ─── 9. Insert into TT and link to parent ───────────────
-        auto [tt_idx, inserted] = table_.insert_or_find(req.key, new_idx, pool_);
+        auto [tt_idx, inserted] = table_.insert_or_find(req.key, new_idx);
         uint32_t result_idx = tt_idx;
 
         if (req.parent_node_idx != UINT32_MAX) {
@@ -465,7 +475,7 @@ public:
     }
 
     [[nodiscard]] uint32_t get_root_idx(const Board& board) const {
-        return table_.find(Board::Compact::encode(board), pool_);
+        return table_.find(Board::Compact::encode(board));
     }
 
     [[nodiscard]] size_t table_hits() const { return table_hits_; }
@@ -478,7 +488,7 @@ private:
         PackedBoard key = Board::Compact::encode(board);
 
         // Check TT first - if found, it's guaranteed to be evaluated
-        uint32_t existing = table_.find(key, pool_);
+        uint32_t existing = table_.find(key);
         if (existing != UINT32_MAX) {
             ++table_hits_;
             return existing;
@@ -490,7 +500,7 @@ private:
         ++new_nodes_;
 
         // GPU allocated, evaluated, and inserted into TT
-        return table_.find(key, pool_);
+        return table_.find(key);
     }
 
     void recursive_search(uint32_t node_idx, float depth) {
@@ -579,7 +589,7 @@ private:
             PackedBoard key = Board::Compact::encode(board);
             board.unmakeMove(entry.move);
 
-            uint32_t existing = table_.find(key, pool_);
+            uint32_t existing = table_.find(key);
             if (existing != UINT32_MAX) {
                 ++table_hits_;
                 entry.node_idx = existing;
@@ -601,7 +611,7 @@ private:
                     PackedBoard key = Board::Compact::encode(board);
                     board.unmakeMove(entry.move);
 
-                    uint32_t existing = table_.find(key, pool_);
+                    uint32_t existing = table_.find(key);
                     if (existing != UINT32_MAX) {
                         ++table_hits_;
                         entry.node_idx = existing;
@@ -741,7 +751,7 @@ private:
 int main() {
     using namespace chess;
 
-    constexpr float  INITIAL_DEPTH = 10.0f;       // Higher depth to exercise extra moves
+    constexpr float  INITIAL_DEPTH = 17.5f;       // Higher depth to exercise extra moves
     constexpr size_t TABLE_LOG2    = 24;          // 2^24 = 16M slots
     constexpr size_t POOL_SIZE     = 10'000'000;  // 10M nodes
     constexpr size_t EXTRA_POOL_SIZE = 1'000'000; // 1M extra move entries
