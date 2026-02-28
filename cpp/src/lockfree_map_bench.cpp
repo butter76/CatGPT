@@ -233,8 +233,9 @@ private:
 // ─── Simulated GPU evaluator ─────────────────────────────────────────
 
 struct EvalRequest {
-    uint32_t node_idx;
-    Board board;
+    uint32_t parent_node_idx;  // UINT32_MAX for root nodes
+    PackedBoard key;           // PackedBoard of the child to create
+    uint16_t child_index;      // 0-9: top children, 10+: extra moves
 };
 
 /**
@@ -243,11 +244,12 @@ struct EvalRequest {
  */
 class SimulatedGPU {
 public:
-    explicit SimulatedGPU(NodePool& pool, unsigned seed = 42)
-        : pool_(pool), rng_(seed), noise_(0.0f, 1.0f) {}
+    explicit SimulatedGPU(NodePool& pool, TranspositionTable& table, ExtraMovesPool& extra_pool,
+                          unsigned seed = 42)
+        : pool_(pool), table_(table), extra_pool_(extra_pool), rng_(seed), noise_(0.0f, 1.0f) {}
 
-    void queue(uint32_t node_idx, const Board& board) {
-        pending_.push_back({node_idx, board});
+    void queue(uint32_t parent_node_idx, const PackedBoard& key, uint16_t child_index) {
+        pending_.push_back({parent_node_idx, key, child_index});
     }
 
     size_t flush() {
@@ -269,8 +271,10 @@ public:
 
 private:
     void evaluate_single(EvalRequest& req) {
-        Node& node = pool_.get(req.node_idx);
-        Board& board = req.board;
+        // Allocate node in pool and decode board from packed representation
+        uint32_t new_idx = pool_.allocate(req.key);
+        Node& node = pool_.get(new_idx);
+        Board board = Board::Compact::decode(req.key);
 
         // ─── 1. Compute value from material ──────────────────────
         constexpr float PAWN_V   = 1.0f;
@@ -411,9 +415,25 @@ private:
         // ─── 8. Count extra moves (beyond top 10) ───────────────
         node.num_extra_moves = static_cast<uint16_t>(
             std::max(0, static_cast<int>(non_terminal_moves.size()) - TOP_CHILDREN_COUNT));
+
+        // ─── 9. Insert into TT and link to parent ───────────────
+        auto [tt_idx, inserted] = table_.insert_or_find(req.key, new_idx, pool_);
+        uint32_t result_idx = tt_idx;
+
+        if (req.parent_node_idx != UINT32_MAX) {
+            Node& parent = pool_.get(req.parent_node_idx);
+            if (req.child_index < TOP_CHILDREN_COUNT) {
+                parent.children[req.child_index].node_idx = result_idx;
+            } else {
+                uint16_t extra_i = req.child_index - TOP_CHILDREN_COUNT;
+                extra_pool_.get(parent.extra_moves_idx + extra_i).node_idx = result_idx;
+            }
+        }
     }
 
     NodePool& pool_;
+    TranspositionTable& table_;
+    ExtraMovesPool& extra_pool_;
     std::vector<EvalRequest> pending_;
     size_t total_evals_{0};
     size_t batch_count_{0};
@@ -464,16 +484,13 @@ private:
             return existing;
         }
 
-        // Allocate, evaluate, then insert into TT
-        uint32_t new_idx = pool_.allocate(key);
-        gpu_.queue(new_idx, board);
+        // Queue for GPU eval (no parent)
+        gpu_.queue(UINT32_MAX, key, 0);
         gpu_.flush();
-
-        // Now insert into TT (node is evaluated)
-        table_.insert_or_find(key, new_idx, pool_);
         ++new_nodes_;
 
-        return new_idx;
+        // GPU allocated, evaluated, and inserted into TT
+        return table_.find(key, pool_);
     }
 
     void recursive_search(uint32_t node_idx, float depth) {
@@ -522,15 +539,8 @@ private:
     }
 
     void expand_children(uint32_t node_idx, Board& board, float depth) {
-        // Track children that need evaluation (not yet in TT)
-        struct PendingChild {
-            uint32_t* target_node_idx;  // Pointer to where to store the node_idx
-            uint32_t node_idx;
-            PackedBoard key;
-        };
-        std::vector<PendingChild> pending;
-
         Node& node = pool_.get(node_idx);
+        size_t queued = 0;
 
         // ─── Process top 10 children ─────────────────────────────
         for (size_t i = 0; i < TOP_CHILDREN_COUNT; ++i) {
@@ -546,18 +556,16 @@ private:
 
             board.makeMove<true>(entry.move);
             PackedBoard key = Board::Compact::encode(board);
+            board.unmakeMove(entry.move);
 
             uint32_t existing = table_.find(key, pool_);
             if (existing != UINT32_MAX) {
                 ++table_hits_;
                 entry.node_idx = existing;
             } else {
-                uint32_t child_idx = pool_.allocate(key);
-                gpu_.queue(child_idx, board);
-                pending.push_back({&entry.node_idx, child_idx, key});
+                gpu_.queue(node_idx, key, static_cast<uint16_t>(i));
+                ++queued;
             }
-
-            board.unmakeMove(entry.move);
         }
 
         // ─── Process extra moves (if allocated and depth is high enough) ───
@@ -570,31 +578,24 @@ private:
 
                     board.makeMove<true>(entry.move);
                     PackedBoard key = Board::Compact::encode(board);
+                    board.unmakeMove(entry.move);
 
                     uint32_t existing = table_.find(key, pool_);
                     if (existing != UINT32_MAX) {
                         ++table_hits_;
                         entry.node_idx = existing;
                     } else {
-                        uint32_t child_idx = pool_.allocate(key);
-                        gpu_.queue(child_idx, board);
-                        pending.push_back({&entry.node_idx, child_idx, key});
+                        gpu_.queue(node_idx, key, static_cast<uint16_t>(TOP_CHILDREN_COUNT + i));
+                        ++queued;
                     }
-
-                    board.unmakeMove(entry.move);
                 }
             }
         }
 
         // ─── Batch evaluate all pending nodes ────────────────────
-        if (!pending.empty()) {
+        if (queued > 0) {
             gpu_.flush();
-
-            for (const auto& p : pending) {
-                table_.insert_or_find(p.key, p.node_idx, pool_);
-                *p.target_node_idx = p.node_idx;
-                ++new_nodes_;
-            }
+            new_nodes_ += queued;
         }
     }
 
@@ -747,7 +748,7 @@ int main() {
     TranspositionTable table(TABLE_LOG2);
     NodePool pool(POOL_SIZE);
     ExtraMovesPool extra_pool(EXTRA_POOL_SIZE);
-    SimulatedGPU gpu(pool);
+    SimulatedGPU gpu(pool, table, extra_pool);
 
     auto t1 = std::chrono::high_resolution_clock::now();
     double alloc_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
