@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <print>
 #include <random>
 #include <vector>
@@ -67,7 +68,7 @@ static_assert(sizeof(ChildEntry) == 12, "ChildEntry should be 12 bytes");
 // ─── Node structure (fixed size, no managed memory) ──────────────────
 
 struct Node {
-    uint64_t key{0};                    // Zobrist key for verification
+    PackedBoard key{};                  // Exact 24-byte board representation
 
     // === Atomic depth+value (updated together at end of search) ===
     std::atomic<DepthValue> depth_value{DepthValue{-1.0f, 0.0f}};
@@ -141,7 +142,7 @@ public:
     explicit NodePool(size_t capacity)
         : nodes_(capacity), next_(0) {}
 
-    uint32_t allocate(uint64_t key) {
+    uint32_t allocate(const PackedBoard& key) {
         uint32_t idx = next_++;
         if (idx >= nodes_.size()) {
             std::println(stderr, "NodePool exhausted at index {}", idx);
@@ -173,10 +174,19 @@ public:
         : mask_((1ULL << log2_capacity) - 1)
         , slots_(1ULL << log2_capacity, UINT32_MAX) {}
 
+    /// Hash a PackedBoard (24 bytes) down to a uint64_t for slot indexing.
+    static uint64_t hash_key(const PackedBoard& key) {
+        uint64_t h0, h1, h2;
+        std::memcpy(&h0, key.data(), 8);
+        std::memcpy(&h1, key.data() + 8, 8);
+        std::memcpy(&h2, key.data() + 16, 8);
+        return h0 ^ (h1 * 0x9e3779b97f4a7c15ULL) ^ (h2 * 0x517cc1b727220a95ULL);
+    }
+
     /// Insert a new node index or find existing entry for this key.
     /// @return {node_idx, true} if inserted, {existing_idx, false} if found
-    std::pair<uint32_t, bool> insert_or_find(uint64_t key, uint32_t new_idx, const NodePool& pool) {
-        size_t idx = key & mask_;
+    std::pair<uint32_t, bool> insert_or_find(const PackedBoard& key, uint32_t new_idx, const NodePool& pool) {
+        size_t idx = hash_key(key) & mask_;
 
         for (size_t probe = 0; probe <= mask_; ++probe) {
             size_t slot_idx = (idx + probe) & mask_;
@@ -196,8 +206,8 @@ public:
         __builtin_unreachable();
     }
 
-    [[nodiscard]] uint32_t find(uint64_t key, const NodePool& pool) const {
-        size_t idx = key & mask_;
+    [[nodiscard]] uint32_t find(const PackedBoard& key, const NodePool& pool) const {
+        size_t idx = hash_key(key) & mask_;
 
         for (size_t probe = 0; probe <= mask_; ++probe) {
             size_t slot_idx = (idx + probe) & mask_;
@@ -429,13 +439,13 @@ public:
             return root.best_terminal_value;
         }
 
-        recursive_search(root_idx, board, initial_depth);
+        recursive_search(root_idx, initial_depth);
 
         return pool_.get(root_idx).load_depth_value().value;
     }
 
     [[nodiscard]] uint32_t get_root_idx(const Board& board) const {
-        return table_.find(board.hash(), pool_);
+        return table_.find(Board::Compact::encode(board), pool_);
     }
 
     [[nodiscard]] size_t table_hits() const { return table_hits_; }
@@ -445,7 +455,7 @@ private:
     /// Get an existing evaluated node from TT, or create+evaluate+insert a new one.
     /// Guarantees the returned node is evaluated (maintains invariant).
     uint32_t get_or_create_evaluated_node(const Board& board) {
-        uint64_t key = board.hash();
+        PackedBoard key = Board::Compact::encode(board);
 
         // Check TT first - if found, it's guaranteed to be evaluated
         uint32_t existing = table_.find(key, pool_);
@@ -466,7 +476,7 @@ private:
         return new_idx;
     }
 
-    void recursive_search(uint32_t node_idx, Board& board, float depth) {
+    void recursive_search(uint32_t node_idx, float depth) {
         Node& node = pool_.get(node_idx);
 
         // Load current depth+value atomically
@@ -480,6 +490,9 @@ private:
             return;
         }
 
+        // Reconstruct board from packed representation (only when we need children)
+        Board board = Board::Compact::decode(node.key);
+
         // Allocate extra moves if depth exceeds threshold and not yet allocated
         if (depth >= MIN_POLICY_DEPTH_THRESHOLD &&
             node.num_extra_moves > 0 &&
@@ -491,15 +504,14 @@ private:
         expand_children(node_idx, board, depth);
 
         // ─── Phase 2: Recurse into expanded top children ─────────
+        // No make/unmake needed — each child stores its own PackedBoard key
         for (const auto& child_entry : node.children) {
             if (!child_entry.is_valid()) break;
             if (!child_entry.is_expanded()) continue;
 
             float child_depth = depth + std::log(child_entry.policy);
             if (child_depth >= MIN_CHILD_DEPTH) {
-                board.makeMove<true>(child_entry.move);
-                recursive_search(child_entry.node_idx, board, child_depth);
-                board.unmakeMove(child_entry.move);
+                recursive_search(child_entry.node_idx, child_depth);
             }
         }
 
@@ -510,10 +522,7 @@ private:
                 for (uint16_t i = 0; i < node.num_extra_moves; ++i) {
                     const ChildEntry& entry = extra_pool_.get(node.extra_moves_idx + i);
                     if (!entry.is_expanded()) continue;
-
-                    board.makeMove<true>(entry.move);
-                    recursive_search(entry.node_idx, board, extra_depth);
-                    board.unmakeMove(entry.move);
+                    recursive_search(entry.node_idx, extra_depth);
                 }
             }
         }
@@ -528,7 +537,7 @@ private:
         struct PendingChild {
             uint32_t* target_node_idx;  // Pointer to where to store the node_idx
             uint32_t node_idx;
-            uint64_t key;
+            PackedBoard key;
         };
         std::vector<PendingChild> pending;
 
@@ -547,7 +556,7 @@ private:
             if (!force_expand && child_depth < MIN_CHILD_DEPTH) continue;
 
             board.makeMove<true>(entry.move);
-            uint64_t key = board.hash();
+            PackedBoard key = Board::Compact::encode(board);
 
             uint32_t existing = table_.find(key, pool_);
             if (existing != UINT32_MAX) {
@@ -571,7 +580,7 @@ private:
                     if (entry.is_expanded()) continue;
 
                     board.makeMove<true>(entry.move);
-                    uint64_t key = board.hash();
+                    PackedBoard key = Board::Compact::encode(board);
 
                     uint32_t existing = table_.find(key, pool_);
                     if (existing != UINT32_MAX) {
