@@ -61,19 +61,37 @@ def compute_layer_grad_norms(grads: dict) -> dict[str, jax.Array]:
     # Navigate to params dict (may or may not have 'params' wrapper)
     params = grads.get("params", grads)
 
+    # Group related parameter keys into logical components for aggregated norms.
+    # e.g. value_head_fc1, value_head_fc2 → "value_head";
+    #      policy_query, policy_key, policy_underpromo → "policy_head"
+    component_groups: dict[str, list] = {}
+
     for key, subtree in params.items():
         if key.startswith("block_"):
-            # Per transformer block: block_0, block_1, ...
             norms[f"grad_norm/{key}"] = optax.global_norm(subtree)
-        elif key.startswith("Embed"):
-            # Embeddings: Embed_0 (token), Embed_1 (position)
-            norms[f"grad_norm/{key}"] = optax.global_norm(subtree)
-        elif key.endswith("_head"):
-            # Output heads: value_head, self_head, policy_head, etc.
+        elif key.startswith("Embed") or key == "position_embedding" or key in ("ma_mult_gate", "ma_add_gate"):
             norms[f"grad_norm/{key}"] = optax.global_norm(subtree)
         elif key == "smolgen_weight_gen":
-            # Shared smolgen weight generation kernel
             norms["grad_norm/smolgen_weight_gen"] = optax.global_norm(subtree)
+        elif key.startswith("value_head"):
+            component_groups.setdefault("value_head", []).append(subtree)
+        elif key.startswith(("policy_query", "policy_key", "policy_underpromo")):
+            component_groups.setdefault("policy_head", []).append(subtree)
+        elif key.startswith("optimistic_policy"):
+            component_groups.setdefault("optimistic_policy_head", []).append(subtree)
+        elif key.endswith("_head"):
+            norms[f"grad_norm/{key}"] = optax.global_norm(subtree)
+        else:
+            component_groups.setdefault("other", []).append(subtree)
+
+    # Compute aggregated norms for grouped components
+    for group_name, subtrees in component_groups.items():
+        all_leaves = []
+        for st in subtrees:
+            all_leaves.extend(jax.tree_util.tree_leaves(st))
+        norms[f"grad_norm/{group_name}"] = jnp.sqrt(
+            sum(jnp.sum(leaf**2) for leaf in all_leaves)
+        )
 
     return norms
 
@@ -308,6 +326,15 @@ class Trainer:
                 ).mean()
                 losses["bestq"] = bestq_loss * weight * 0.5
 
+            # WDL head: cross-entropy classification on game result
+            if "wdl_logit" in outputs and "wdl_target" in batch:
+                wdl_loss = optax.softmax_cross_entropy(
+                    outputs["wdl_logit"].astype(jnp.float32),
+                    batch["wdl_target"].astype(jnp.float32),
+                ).mean()
+                wdl_weight = head_config.wdl_weight if head_config else 0.05
+                losses["wdl"] = wdl_loss * wdl_weight
+
             # Policy head: cross-entropy with soft policy targets
             # Mask out illegal moves (zero probability in target) by setting logits to -inf
             if "policy_logit" in outputs and "policy_target" in batch:
@@ -434,6 +461,29 @@ class Trainer:
             bestq_target_expected = jnp.sum(batch["best_q_target"] * bin_centers_bq, axis=-1)
             bestq_mse = jnp.mean((outputs["best_value"] - bestq_target_expected.astype(jnp.float32)) ** 2)
             metrics["bestq_mse"] = bestq_mse
+
+        # WDL metrics
+        if "wdl_value" in outputs:
+            wdl_value = outputs["wdl_value"].astype(jnp.float32)
+            metrics["wdl_value"] = jnp.mean(wdl_value)
+
+            # MSE of WDL value vs bestQ target
+            if "best_q_target" in batch:
+                num_bins_bq = batch["best_q_target"].shape[-1]
+                bin_centers_bq = (jnp.arange(num_bins_bq) + 0.5) / num_bins_bq
+                bestq_target_expected = jnp.sum(
+                    batch["best_q_target"] * bin_centers_bq, axis=-1
+                )
+                wdl_bestq_mse = jnp.mean(
+                    (wdl_value - bestq_target_expected.astype(jnp.float32)) ** 2
+                )
+                metrics["wdl_bestq_mse"] = wdl_bestq_mse
+
+            # MSE of WDL value vs game result (as win probability)
+            if "game_result_scalar" in batch:
+                game_result_wp = batch["game_result_scalar"].astype(jnp.float32)
+                wdl_result_mse = jnp.mean((wdl_value - game_result_wp) ** 2)
+                metrics["wdl_result_mse"] = wdl_result_mse
 
         # Self head metrics
         if "self" in outputs:
@@ -562,6 +612,14 @@ class Trainer:
                     weight = head_config.optimistic_policy_weight if head_config else 1.0
                     return loss * weight
 
+                elif _head_name == "wdl" and "wdl_logit" in outputs and "wdl_target" in batch:
+                    loss = optax.softmax_cross_entropy(
+                        outputs["wdl_logit"].astype(jnp.float32),
+                        batch["wdl_target"].astype(jnp.float32),
+                    ).mean()
+                    wdl_w = head_config.wdl_weight if head_config else 0.05
+                    return loss * wdl_w
+
                 # Fallback: return zero loss for unknown heads
                 return jnp.array(0.0)
 
@@ -623,6 +681,15 @@ class Trainer:
                 batch["best_q_target"].astype(jnp.float32),
             ).mean()
             losses["bestq"] = bestq_loss * weight * 0.5
+
+        # WDL head: cross-entropy classification on game result
+        if "wdl_logit" in outputs and "wdl_target" in batch:
+            wdl_loss = optax.softmax_cross_entropy(
+                outputs["wdl_logit"].astype(jnp.float32),
+                batch["wdl_target"].astype(jnp.float32),
+            ).mean()
+            wdl_weight = head_config.wdl_weight if head_config else 0.05
+            losses["wdl"] = wdl_loss * wdl_weight
 
         # Policy head: cross-entropy with soft policy targets
         # Mask out illegal moves (zero probability in target) by setting logits to -inf
@@ -726,6 +793,27 @@ class Trainer:
             bestq_target_expected = jnp.sum(batch["best_q_target"] * bin_centers_bq, axis=-1)
             bestq_mse = jnp.mean((outputs["best_value"] - bestq_target_expected.astype(jnp.float32)) ** 2)
             metrics["bestq_mse"] = bestq_mse
+
+        # WDL metrics
+        if "wdl_value" in outputs:
+            wdl_value = outputs["wdl_value"].astype(jnp.float32)
+            metrics["wdl_value"] = jnp.mean(wdl_value)
+
+            if "best_q_target" in batch:
+                num_bins_bq = batch["best_q_target"].shape[-1]
+                bin_centers_bq = (jnp.arange(num_bins_bq) + 0.5) / num_bins_bq
+                bestq_target_expected = jnp.sum(
+                    batch["best_q_target"] * bin_centers_bq, axis=-1
+                )
+                wdl_bestq_mse = jnp.mean(
+                    (wdl_value - bestq_target_expected.astype(jnp.float32)) ** 2
+                )
+                metrics["wdl_bestq_mse"] = wdl_bestq_mse
+
+            if "game_result_scalar" in batch:
+                game_result_wp = batch["game_result_scalar"].astype(jnp.float32)
+                wdl_result_mse = jnp.mean((wdl_value - game_result_wp) ** 2)
+                metrics["wdl_result_mse"] = wdl_result_mse
 
         # Self head metrics
         if "self" in outputs:
@@ -1070,6 +1158,16 @@ class Trainer:
                 log_dict["train/value_mse"] = float(metrics["value_mse"])
             if "accuracy" in metrics:
                 log_dict["train/accuracy"] = float(metrics["accuracy"])
+
+            # Add WDL metrics
+            if "wdl_loss" in metrics:
+                log_dict["train/wdl_loss"] = float(metrics["wdl_loss"])
+            if "wdl_value" in metrics:
+                log_dict["train/wdl_value"] = float(metrics["wdl_value"])
+            if "wdl_bestq_mse" in metrics:
+                log_dict["train/wdl_bestq_mse"] = float(metrics["wdl_bestq_mse"])
+            if "wdl_result_mse" in metrics:
+                log_dict["train/wdl_result_mse"] = float(metrics["wdl_result_mse"])
 
             # Add self head metrics
             if "self_accuracy" in metrics:

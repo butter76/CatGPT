@@ -521,9 +521,11 @@ class BidirectionalTransformer(nn.Module):
         Returns:
             Dictionary with output heads:
             - "self": Token reconstruction logits (batch, seq, vocab_size) if self_head enabled
-            - "value_logit": Concatenated rootQ+bestQ HL-Gauss logits (batch, num_bins*2)
+            - "value_logit": Concatenated rootQ+bestQ+WDL logits (batch, num_bins*2+3)
             - "rootq_logit": RootQ HL-Gauss logits (batch, num_bins) for cross-entropy loss
             - "bestq_logit": BestQ HL-Gauss logits (batch, num_bins) for cross-entropy loss
+            - "wdl_logit": WDL classification logits (batch, 3) [W, D, L]
+            - "wdl_value": WDL-derived value P(W)+0.5*P(D) (batch,)
             - "value": Expected rootQ win probability scalar (batch,) for metrics/inference
             - "best_value": Expected bestQ win probability scalar (batch,) for metrics
             - "policy_logit": Move distribution logits (batch, 64*73) if policy_head enabled
@@ -631,13 +633,12 @@ class BidirectionalTransformer(nn.Module):
             outputs["self"] = self_logits
 
         # Value head: HL-Gauss categorical distribution from last token
-        # Outputs logits for BOTH rootQ and bestQ (concatenated), each with num_bins.
-        # Uses 2-layer MLP: hidden -> hidden/2 -> num_bins * 2
+        # Outputs logits for rootQ, bestQ (each num_bins), and WDL (3 classes).
+        # Uses 2-layer MLP: hidden -> hidden/2 -> num_bins * 2 + 3
         if head_config.value_head:
             # Use last token representation (similar to GPT-style classification)
             pooled = hidden[:, -1, :]  # (batch, hidden)
 
-            # 2-layer MLP: hidden -> hidden/2 -> num_bins * 2 (rootQ + bestQ)
             num_bins = head_config.value_num_bins
             value_hidden = nn.Dense(
                 self.config.hidden_size // 2,
@@ -646,18 +647,20 @@ class BidirectionalTransformer(nn.Module):
             )(pooled)  # (batch, hidden/2)
             value_hidden = nn.gelu(value_hidden, approximate=True)
             value_logits = nn.Dense(
-                num_bins * 2,
+                num_bins * 2 + 3,
                 dtype=jnp.float32,
                 name="value_head_fc2",
-            )(value_hidden)  # (batch, num_bins * 2)
+            )(value_hidden)  # (batch, num_bins * 2 + 3)
 
-            # Split into rootQ and bestQ halves
+            # Split into rootQ, bestQ, and WDL
             rootq_logits = value_logits[:, :num_bins]  # (batch, num_bins)
-            bestq_logits = value_logits[:, num_bins:]  # (batch, num_bins)
+            bestq_logits = value_logits[:, num_bins:num_bins * 2]  # (batch, num_bins)
+            wdl_logits = value_logits[:, num_bins * 2:]  # (batch, 3) → [W, D, L]
 
             # Softmax to get probability distributions
             rootq_probs = jax.nn.softmax(rootq_logits, axis=-1)  # (batch, num_bins)
             bestq_probs = jax.nn.softmax(bestq_logits, axis=-1)  # (batch, num_bins)
+            wdl_probs = jax.nn.softmax(wdl_logits, axis=-1)  # (batch, 3)
 
             # Expected value: weighted sum of bin centers
             # Bins span [0, 1], so centers are at (i + 0.5) / num_bins for i in [0, num_bins)
@@ -665,13 +668,17 @@ class BidirectionalTransformer(nn.Module):
             rootq_expected = jnp.sum(rootq_probs * bin_centers, axis=-1)  # (batch,)
             bestq_expected = jnp.sum(bestq_probs * bin_centers, axis=-1)  # (batch,)
 
+            # WDL value: P(W)*1 + P(D)*0.5 + P(L)*0
+            wdl_value = wdl_probs[:, 0] + 0.5 * wdl_probs[:, 1]  # (batch,)
+
             # Variance of bestQ distribution: Var(X) = E[X^2] - E[X]^2
-            # Used by the optimistic policy head as the value uncertainty estimate.
             bestq_var = jnp.sum(bestq_probs * bin_centers**2, axis=-1) - bestq_expected**2  # (batch,)
 
-            outputs["value_logit"] = value_logits  # Full concatenated logits (batch, num_bins*2)
+            outputs["value_logit"] = value_logits  # Full concatenated logits
             outputs["rootq_logit"] = rootq_logits  # For rootQ cross-entropy loss
             outputs["bestq_logit"] = bestq_logits  # For bestQ cross-entropy loss
+            outputs["wdl_logit"] = wdl_logits  # For WDL cross-entropy loss (batch, 3)
+            outputs["wdl_value"] = wdl_value  # WDL-derived value for metrics (batch,)
             outputs["value"] = rootq_expected  # RootQ scalar for metrics/inference
             outputs["best_value"] = bestq_expected  # BestQ scalar for metrics
             outputs["bestq_var"] = bestq_var  # BestQ variance for optimistic policy weighting

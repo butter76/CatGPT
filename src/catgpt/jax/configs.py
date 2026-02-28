@@ -74,6 +74,10 @@ class JaxOutputHeadConfig:
     policy_attention_head: bool = True  # Use Q·K^T attention for 64x64 logits
     policy_qk_dim: int = 32  # Dimension for Q/K projections
 
+    # WDL (Win/Draw/Loss) classification head: 3-class auxiliary target from game result
+    # Shares the value MLP with 3 extra output logits (W, D, L).
+    wdl_weight: float = 0.05  # Loss weight (noisy target, keep low)
+
     # HL-Gauss configuration for value head
     # Converts scalar win probability (0-1) to categorical distribution
     value_num_bins: int = 81  # Number of bins for value distribution

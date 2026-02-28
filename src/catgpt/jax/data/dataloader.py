@@ -107,8 +107,8 @@ class ConvertToJax(pygrain.MapTransform):
 
         Args:
             element: Tuple of (inputs, rootq_targets, bestq_targets, st_q_targets,
-                [policy_targets]) as numpy arrays. Optional elements depend on
-                head configuration.
+                game_results, [policy_targets]) as numpy arrays. Optional elements
+                depend on head configuration.
 
         Returns:
             Dictionary with 'input', 'target', 'best_q_target', 'st_q_target',
@@ -118,6 +118,8 @@ class ConvertToJax(pygrain.MapTransform):
             - 'best_q_target': HL-Gauss distribution for bestQ, shape (batch, num_bins)
             - 'st_q_target': HL-Gauss distribution for short-term Q, shape (batch, num_bins)
             - 'st_q_scalar': Raw short-term Q win probability, shape (batch, 1)
+            - 'wdl_target': One-hot WDL target [W, D, L], shape (batch, 3)
+            - 'game_result_scalar': Game result as win prob {0, 0.5, 1}, shape (batch,)
             - 'policy_target': Flattened policy distribution, shape (batch, 64*73)
         """
         # Unpack tuple based on configuration
@@ -126,6 +128,7 @@ class ConvertToJax(pygrain.MapTransform):
         targets = element.pop(0)  # rootQ win probabilities
         best_q_targets = element.pop(0)  # bestQ win probabilities
         st_q_targets = element.pop(0)  # short-term Q win probabilities
+        game_results = element.pop(0)  # game result: +1=win, 0=draw, -1=loss
 
         policy_targets = None
 
@@ -161,12 +164,23 @@ class ConvertToJax(pygrain.MapTransform):
             max_value=1.0,
         )
 
+        # WDL target: one-hot encode game result (+1=W, 0=D, -1=L) → [W, D, L]
+        game_result_array = np.asarray(game_results, dtype=np.int32).squeeze(-1)  # (batch,)
+        wdl_target = np.zeros((game_result_array.shape[0], 3), dtype=np.float32)
+        wdl_target[game_result_array == 1, 0] = 1.0   # Win
+        wdl_target[game_result_array == 0, 1] = 1.0   # Draw
+        wdl_target[game_result_array == -1, 2] = 1.0  # Loss
+        # Game result as win probability scalar: (1 + result) / 2 → {0, 0.5, 1}
+        game_result_scalar = (1.0 + game_result_array.astype(np.float32)) / 2.0
+
         result = {
             "input": input_array,
             "target": target_array,  # Shape: (batch, num_bins) - rootQ
             "best_q_target": best_q_target_array,  # Shape: (batch, num_bins) - bestQ
             "st_q_target": st_q_target_array,  # Shape: (batch, num_bins) - short-term Q
             "st_q_scalar": np.asarray(st_q_targets, dtype=np.float32),  # Raw scalar for optimism weights
+            "wdl_target": wdl_target,  # Shape: (batch, 3) - one-hot [W, D, L]
+            "game_result_scalar": game_result_scalar,  # Shape: (batch,) - {0, 0.5, 1}
         }
 
         # Add policy target if enabled

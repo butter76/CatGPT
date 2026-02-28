@@ -123,7 +123,7 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
     self.include_policy = include_policy
 
   def map(self, element: bytes):
-    """Map a training position to (state_tokens, win_prob, best_q_prob, st_q_prob, [policy]).
+    """Map a training position to (state_tokens, win_prob, best_q_prob, st_q_prob, game_result, [policy]).
 
     Args:
       element: Msgpack-encoded TrainingPositionData.
@@ -134,6 +134,7 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
         - win_prob: np.ndarray of shape (1,) with rootQ win probability in [0, 1]
         - best_q_prob: np.ndarray of shape (1,) with bestQ win probability in [0, 1]
         - st_q_prob: np.ndarray of shape (1,) with short-term Q win probability in [0, 1]
+        - game_result: np.ndarray of shape (1,) with game result {-1, 0, +1}
         - policy_target: np.ndarray of shape (64, 73) (if include_policy)
     """
     # Decode msgpack data
@@ -158,8 +159,17 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
     best_q_prob = (1.0 + best_q) / 2.0
     st_q_prob = (1.0 + st_q) / 2.0
 
+    # Game result: +1=win, 0=draw, -1=loss (from side-to-move perspective)
+    game_result = data.get("game_result", data.get("result", 0))
+
     # Build result tuple
-    result = [state, np.array([win_prob]), np.array([best_q_prob]), np.array([st_q_prob])]
+    result = [
+        state,
+        np.array([win_prob]),
+        np.array([best_q_prob]),
+        np.array([st_q_prob]),
+        np.array([game_result], dtype=np.int8),
+    ]
 
     if self.include_policy:
       # Build policy target from legal moves
