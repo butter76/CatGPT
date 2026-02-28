@@ -61,19 +61,37 @@ def compute_layer_grad_norms(grads: dict) -> dict[str, jax.Array]:
     # Navigate to params dict (may or may not have 'params' wrapper)
     params = grads.get("params", grads)
 
+    # Group related parameter keys into logical components for aggregated norms.
+    # e.g. value_head_fc1, value_head_fc2 → "value_head";
+    #      policy_query, policy_key, policy_underpromo → "policy_head"
+    component_groups: dict[str, list] = {}
+
     for key, subtree in params.items():
         if key.startswith("block_"):
-            # Per transformer block: block_0, block_1, ...
             norms[f"grad_norm/{key}"] = optax.global_norm(subtree)
-        elif key.startswith("Embed"):
-            # Embeddings: Embed_0 (token), Embed_1 (position)
-            norms[f"grad_norm/{key}"] = optax.global_norm(subtree)
-        elif key.endswith("_head"):
-            # Output heads: value_head, self_head, policy_head, etc.
+        elif key.startswith("Embed") or key == "position_embedding" or key in ("ma_mult_gate", "ma_add_gate"):
             norms[f"grad_norm/{key}"] = optax.global_norm(subtree)
         elif key == "smolgen_weight_gen":
-            # Shared smolgen weight generation kernel
             norms["grad_norm/smolgen_weight_gen"] = optax.global_norm(subtree)
+        elif key.startswith("value_head"):
+            component_groups.setdefault("value_head", []).append(subtree)
+        elif key.startswith(("policy_query", "policy_key", "policy_underpromo")):
+            component_groups.setdefault("policy_head", []).append(subtree)
+        elif key.startswith("optimistic_policy"):
+            component_groups.setdefault("optimistic_policy_head", []).append(subtree)
+        elif key.endswith("_head"):
+            norms[f"grad_norm/{key}"] = optax.global_norm(subtree)
+        else:
+            component_groups.setdefault("other", []).append(subtree)
+
+    # Compute aggregated norms for grouped components
+    for group_name, subtrees in component_groups.items():
+        all_leaves = []
+        for st in subtrees:
+            all_leaves.extend(jax.tree_util.tree_leaves(st))
+        norms[f"grad_norm/{group_name}"] = jnp.sqrt(
+            sum(jnp.sum(leaf**2) for leaf in all_leaves)
+        )
 
     return norms
 
@@ -290,15 +308,32 @@ class Trainer:
                 losses["self"] = self_loss * weight
 
             # Value head: cross-entropy with HL-Gauss target distribution
-            if "value_logit" in outputs:
-                # outputs["value_logit"]: (batch, num_bins) logits
-                # batch["target"]: (batch, num_bins) HL-Gauss probability distribution
-                value_loss = optax.softmax_cross_entropy(
-                    outputs["value_logit"].astype(jnp.float32),
+            # Trains on both rootQ and bestQ with half weight each
+            if "rootq_logit" in outputs:
+                weight = head_config.value_weight if head_config else 1.0
+
+                # RootQ loss: outputs["rootq_logit"] (batch, num_bins) vs batch["target"]
+                rootq_loss = optax.softmax_cross_entropy(
+                    outputs["rootq_logit"].astype(jnp.float32),
                     batch["target"].astype(jnp.float32),
                 ).mean()
-                weight = head_config.value_weight if head_config else 1.0
-                losses["value"] = value_loss * weight
+                losses["rootq"] = rootq_loss * weight * 0.5
+
+                # BestQ loss: outputs["bestq_logit"] (batch, num_bins) vs batch["best_q_target"]
+                bestq_loss = optax.softmax_cross_entropy(
+                    outputs["bestq_logit"].astype(jnp.float32),
+                    batch["best_q_target"].astype(jnp.float32),
+                ).mean()
+                losses["bestq"] = bestq_loss * weight * 0.5
+
+            # WDL head: cross-entropy classification on game result
+            if "wdl_logit" in outputs and "wdl_target" in batch:
+                wdl_loss = optax.softmax_cross_entropy(
+                    outputs["wdl_logit"].astype(jnp.float32),
+                    batch["wdl_target"].astype(jnp.float32),
+                ).mean()
+                wdl_weight = head_config.wdl_weight if head_config else 0.05
+                losses["wdl"] = wdl_loss * wdl_weight
 
             # Policy head: cross-entropy with soft policy targets
             # Mask out illegal moves (zero probability in target) by setting logits to -inf
@@ -349,65 +384,42 @@ class Trainer:
                 weight = head_config.soft_policy_weight if head_config else 8.0
                 losses["soft_policy"] = soft_policy_loss * weight
 
-            # Hard policy head: auxiliary head for sharpened policy target
-            # Applies low temperature to sharpen the distribution, focusing on the best move.
-            if "hard_policy_logit" in outputs and "policy_target" in batch:
+            # Optimistic policy head (LC0 BT3/BT4 method): same targets as vanilla
+            # policy but weighted by how much the value target exceeded expectations.
+            # weight = sigmoid((z - strength) * 3) where z = (st_q - best_value) / bestq_std
+            # bestq_std is computed from the bestQ HL-Gauss distribution variance (no extra head).
+            if "optimistic_policy_logit" in outputs and "policy_target" in batch:
                 policy_target = batch["policy_target"].astype(jnp.float32)
 
                 # Mask illegal moves
                 legal_mask = policy_target > 0
                 masked_logits = jnp.where(
                     legal_mask,
-                    outputs["hard_policy_logit"].astype(jnp.float32),
+                    outputs["optimistic_policy_logit"].astype(jnp.float32),
                     jnp.float32(-1e9),
                 )
 
-                # Compute hard target: p^(1/T) where T=0.25 → p^4 then renormalize
-                temp = head_config.hard_policy_temperature if head_config else 0.25
-                # Add small epsilon for numerical stability before taking power
-                hard_target = jnp.pow(policy_target + 1e-10, 1.0 / temp)
-                hard_target = hard_target / jnp.sum(hard_target, axis=-1, keepdims=True)
-
-                hard_policy_loss = optax.softmax_cross_entropy(
+                # Per-sample cross-entropy (unreduced)
+                per_sample_ce = optax.softmax_cross_entropy(
                     masked_logits,
-                    hard_target,
-                ).mean()
-                weight = head_config.hard_policy_weight if head_config else 0.1
-                losses["hard_policy"] = hard_policy_loss * weight
+                    policy_target,
+                )  # (batch,)
 
-            # Next capture head: cross-entropy with masking for None values
-            # Target is -1 for positions without future captures
-            if "next_capture_logit" in outputs and "next_capture_target" in batch:
-                target = batch["next_capture_target"]  # (batch,) int32, -1 = invalid
-                mask = (target >= 0).astype(jnp.float32)  # (batch,)
+                # Compute optimism weights from bestQ distribution variance
+                if "bestq_var" in outputs and "st_q_scalar" in batch and "best_value" in outputs:
+                    st_q_scalar = batch["st_q_scalar"].astype(jnp.float32).squeeze(-1)
+                    best_value_pred = jax.lax.stop_gradient(outputs["best_value"].astype(jnp.float32))
+                    bestq_std = jax.lax.stop_gradient(jnp.sqrt(outputs["bestq_var"].astype(jnp.float32) + 1e-8))
+                    z_values = (st_q_scalar - best_value_pred) / (bestq_std + 1e-5)
+                    strength = head_config.optimistic_strength if head_config else 2.0
+                    optimism_weights = jax.nn.sigmoid((z_values - strength) * 3.0)  # (batch,)
+                else:
+                    # Fallback: uniform weights (no value head)
+                    optimism_weights = jnp.ones_like(per_sample_ce)
 
-                # Replace -1 with 0 for safe indexing (masked out anyway)
-                safe_target = jnp.maximum(target, 0)
-                per_sample_loss = optax.softmax_cross_entropy_with_integer_labels(
-                    outputs["next_capture_logit"].astype(jnp.float32),
-                    safe_target,
-                )
-                # Average over valid samples only
-                masked_loss = jnp.sum(per_sample_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
-                weight = head_config.next_capture_weight if head_config else 0.1
-                losses["next_capture"] = masked_loss * weight
-
-            # Next pawn move head: cross-entropy with masking for None values
-            # Target is -1 for positions without future pawn moves
-            if "next_pawn_move_logit" in outputs and "next_pawn_move_target" in batch:
-                target = batch["next_pawn_move_target"]  # (batch,) int32, -1 = invalid
-                mask = (target >= 0).astype(jnp.float32)  # (batch,)
-
-                # Replace -1 with 0 for safe indexing (masked out anyway)
-                safe_target = jnp.maximum(target, 0)
-                per_sample_loss = optax.softmax_cross_entropy_with_integer_labels(
-                    outputs["next_pawn_move_logit"].astype(jnp.float32),
-                    safe_target,
-                )
-                # Average over valid samples only
-                masked_loss = jnp.sum(per_sample_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
-                weight = head_config.next_pawn_move_weight if head_config else 0.1
-                losses["next_pawn_move"] = masked_loss * weight
+                optimistic_policy_loss = jnp.mean(per_sample_ce * optimism_weights)
+                weight = head_config.optimistic_policy_weight if head_config else 1.0
+                losses["optimistic_policy"] = optimistic_policy_loss * weight
 
             total_loss = sum(losses.values())
             return total_loss, (outputs, losses)
@@ -427,8 +439,7 @@ class Trainer:
 
         # Value metrics (using expected value from HL-Gauss distribution)
         if "value" in outputs:
-            # outputs["value"] is the expected value (batch,)
-            # For target expected value, compute from target distribution
+            # RootQ metrics
             num_bins = batch["target"].shape[-1]
             bin_centers = (jnp.arange(num_bins) + 0.5) / num_bins
             target_expected = jnp.sum(batch["target"] * bin_centers, axis=-1)  # (batch,)
@@ -442,6 +453,37 @@ class Trainer:
             targets_binary = (target_expected > 0.5).astype(jnp.float32)
             accuracy = (preds == targets_binary).mean()
             metrics["accuracy"] = accuracy
+
+        # BestQ metrics
+        if "best_value" in outputs and "best_q_target" in batch:
+            num_bins_bq = batch["best_q_target"].shape[-1]
+            bin_centers_bq = (jnp.arange(num_bins_bq) + 0.5) / num_bins_bq
+            bestq_target_expected = jnp.sum(batch["best_q_target"] * bin_centers_bq, axis=-1)
+            bestq_mse = jnp.mean((outputs["best_value"] - bestq_target_expected.astype(jnp.float32)) ** 2)
+            metrics["bestq_mse"] = bestq_mse
+
+        # WDL metrics
+        if "wdl_value" in outputs:
+            wdl_value = outputs["wdl_value"].astype(jnp.float32)
+            metrics["wdl_value"] = jnp.mean(wdl_value)
+
+            # MSE of WDL value vs bestQ target
+            if "best_q_target" in batch:
+                num_bins_bq = batch["best_q_target"].shape[-1]
+                bin_centers_bq = (jnp.arange(num_bins_bq) + 0.5) / num_bins_bq
+                bestq_target_expected = jnp.sum(
+                    batch["best_q_target"] * bin_centers_bq, axis=-1
+                )
+                wdl_bestq_mse = jnp.mean(
+                    (wdl_value - bestq_target_expected.astype(jnp.float32)) ** 2
+                )
+                metrics["wdl_bestq_mse"] = wdl_bestq_mse
+
+            # MSE of WDL value vs game result (as win probability)
+            if "game_result_scalar" in batch:
+                game_result_wp = batch["game_result_scalar"].astype(jnp.float32)
+                wdl_result_mse = jnp.mean((wdl_value - game_result_wp) ** 2)
+                metrics["wdl_result_mse"] = wdl_result_mse
 
         # Self head metrics
         if "self" in outputs:
@@ -467,28 +509,6 @@ class Trainer:
             target_moves = jnp.argmax(policy_target, axis=-1)  # (batch,)
             policy_accuracy = (pred_moves == target_moves).mean()
             metrics["policy_accuracy"] = policy_accuracy
-
-        # Next capture head metrics (accuracy on valid samples only)
-        if "next_capture_logit" in outputs and "next_capture_target" in batch:
-            target = batch["next_capture_target"]
-            mask = target >= 0
-            pred = jnp.argmax(outputs["next_capture_logit"], axis=-1)
-            correct = (pred == target) & mask
-            accuracy = jnp.sum(correct.astype(jnp.float32)) / jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
-            metrics["next_capture_accuracy"] = accuracy
-            # Also track fraction of valid samples
-            metrics["next_capture_valid_frac"] = jnp.mean(mask.astype(jnp.float32))
-
-        # Next pawn move head metrics (accuracy on valid samples only)
-        if "next_pawn_move_logit" in outputs and "next_pawn_move_target" in batch:
-            target = batch["next_pawn_move_target"]
-            mask = target >= 0
-            pred = jnp.argmax(outputs["next_pawn_move_logit"], axis=-1)
-            correct = (pred == target) & mask
-            accuracy = jnp.sum(correct.astype(jnp.float32)) / jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
-            metrics["next_pawn_move_accuracy"] = accuracy
-            # Also track fraction of valid samples
-            metrics["next_pawn_move_valid_frac"] = jnp.mean(mask.astype(jnp.float32))
 
         # Layer gradient norms (computed unconditionally, filtering done at logging time)
         layer_grad_norms = compute_layer_grad_norms(grads)
@@ -535,13 +555,21 @@ class Trainer:
                     weight = head_config.self_weight if head_config else 0.1
                     return loss * weight
 
-                elif _head_name == "value" and "value_logit" in outputs:
+                elif _head_name == "rootq" and "rootq_logit" in outputs:
                     loss = optax.softmax_cross_entropy(
-                        outputs["value_logit"].astype(jnp.float32),
+                        outputs["rootq_logit"].astype(jnp.float32),
                         batch["target"].astype(jnp.float32),
                     ).mean()
                     weight = head_config.value_weight if head_config else 1.0
-                    return loss * weight
+                    return loss * weight * 0.5
+
+                elif _head_name == "bestq" and "bestq_logit" in outputs:
+                    loss = optax.softmax_cross_entropy(
+                        outputs["bestq_logit"].astype(jnp.float32),
+                        batch["best_q_target"].astype(jnp.float32),
+                    ).mean()
+                    weight = head_config.value_weight if head_config else 1.0
+                    return loss * weight * 0.5
 
                 elif _head_name == "policy" and "policy_logit" in outputs and "policy_target" in batch:
                     loss = optax.softmax_cross_entropy(
@@ -562,38 +590,35 @@ class Trainer:
                     weight = head_config.soft_policy_weight if head_config else 8.0
                     return loss * weight
 
-                elif _head_name == "hard_policy" and "hard_policy_logit" in outputs and "policy_target" in batch:
-                    temp = head_config.hard_policy_temperature if head_config else 0.25
-                    hard_target = jnp.pow(batch["policy_target"] + 1e-10, 1.0 / temp)
-                    hard_target = hard_target / jnp.sum(hard_target, axis=-1, keepdims=True)
+                elif _head_name == "optimistic_policy" and "optimistic_policy_logit" in outputs and "policy_target" in batch:
+                    policy_target = batch["policy_target"].astype(jnp.float32)
+                    legal_mask = policy_target > 0
+                    masked_logits = jnp.where(
+                        legal_mask,
+                        outputs["optimistic_policy_logit"].astype(jnp.float32),
+                        jnp.float32(-1e9),
+                    )
+                    per_sample_ce = optax.softmax_cross_entropy(masked_logits, policy_target)
+                    if "bestq_var" in outputs and "st_q_scalar" in batch and "best_value" in outputs:
+                        st_q_scalar = batch["st_q_scalar"].astype(jnp.float32).squeeze(-1)
+                        best_value_pred = jax.lax.stop_gradient(outputs["best_value"].astype(jnp.float32))
+                        bestq_std = jax.lax.stop_gradient(jnp.sqrt(outputs["bestq_var"].astype(jnp.float32) + 1e-8))
+                        z_values = (st_q_scalar - best_value_pred) / (bestq_std + 1e-5)
+                        strength = head_config.optimistic_strength if head_config else 2.0
+                        optimism_weights = jax.nn.sigmoid((z_values - strength) * 3.0)
+                    else:
+                        optimism_weights = jnp.ones_like(per_sample_ce)
+                    loss = jnp.mean(per_sample_ce * optimism_weights)
+                    weight = head_config.optimistic_policy_weight if head_config else 1.0
+                    return loss * weight
+
+                elif _head_name == "wdl" and "wdl_logit" in outputs and "wdl_target" in batch:
                     loss = optax.softmax_cross_entropy(
-                        outputs["hard_policy_logit"].astype(jnp.float32),
-                        hard_target.astype(jnp.float32),
+                        outputs["wdl_logit"].astype(jnp.float32),
+                        batch["wdl_target"].astype(jnp.float32),
                     ).mean()
-                    weight = head_config.hard_policy_weight if head_config else 0.1
-                    return loss * weight
-
-                elif _head_name == "next_capture" and "next_capture_logit" in outputs and "next_capture_target" in batch:
-                    target = batch["next_capture_target"]
-                    mask = (target >= 0).astype(jnp.float32)
-                    safe_target = jnp.maximum(target, 0)
-                    per_sample = optax.softmax_cross_entropy_with_integer_labels(
-                        outputs["next_capture_logit"].astype(jnp.float32), safe_target
-                    )
-                    loss = jnp.sum(per_sample * mask) / jnp.maximum(jnp.sum(mask), 1.0)
-                    weight = head_config.next_capture_weight if head_config else 0.1
-                    return loss * weight
-
-                elif _head_name == "next_pawn_move" and "next_pawn_move_logit" in outputs and "next_pawn_move_target" in batch:
-                    target = batch["next_pawn_move_target"]
-                    mask = (target >= 0).astype(jnp.float32)
-                    safe_target = jnp.maximum(target, 0)
-                    per_sample = optax.softmax_cross_entropy_with_integer_labels(
-                        outputs["next_pawn_move_logit"].astype(jnp.float32), safe_target
-                    )
-                    loss = jnp.sum(per_sample * mask) / jnp.maximum(jnp.sum(mask), 1.0)
-                    weight = head_config.next_pawn_move_weight if head_config else 0.1
-                    return loss * weight
+                    wdl_w = head_config.wdl_weight if head_config else 0.05
+                    return loss * wdl_w
 
                 # Fallback: return zero loss for unknown heads
                 return jnp.array(0.0)
@@ -639,15 +664,32 @@ class Trainer:
             losses["self"] = self_loss * weight
 
         # Value head: cross-entropy with HL-Gauss target distribution
-        if "value_logit" in outputs:
-            # outputs["value_logit"]: (batch, num_bins) logits
-            # batch["target"]: (batch, num_bins) HL-Gauss probability distribution
-            value_loss = optax.softmax_cross_entropy(
-                outputs["value_logit"].astype(jnp.float32),
+        # Trains on both rootQ and bestQ with half weight each
+        if "rootq_logit" in outputs:
+            weight = head_config.value_weight if head_config else 1.0
+
+            # RootQ loss
+            rootq_loss = optax.softmax_cross_entropy(
+                outputs["rootq_logit"].astype(jnp.float32),
                 batch["target"].astype(jnp.float32),
             ).mean()
-            weight = head_config.value_weight if head_config else 1.0
-            losses["value"] = value_loss * weight
+            losses["rootq"] = rootq_loss * weight * 0.5
+
+            # BestQ loss
+            bestq_loss = optax.softmax_cross_entropy(
+                outputs["bestq_logit"].astype(jnp.float32),
+                batch["best_q_target"].astype(jnp.float32),
+            ).mean()
+            losses["bestq"] = bestq_loss * weight * 0.5
+
+        # WDL head: cross-entropy classification on game result
+        if "wdl_logit" in outputs and "wdl_target" in batch:
+            wdl_loss = optax.softmax_cross_entropy(
+                outputs["wdl_logit"].astype(jnp.float32),
+                batch["wdl_target"].astype(jnp.float32),
+            ).mean()
+            wdl_weight = head_config.wdl_weight if head_config else 0.05
+            losses["wdl"] = wdl_loss * wdl_weight
 
         # Policy head: cross-entropy with soft policy targets
         # Mask out illegal moves (zero probability in target) by setting logits to -inf
@@ -695,33 +737,28 @@ class Trainer:
             weight = head_config.soft_policy_weight if head_config else 8.0
             losses["soft_policy"] = soft_policy_loss * weight
 
-        # Next capture head: cross-entropy with masking for None values
-        if "next_capture_logit" in outputs and "next_capture_target" in batch:
-            target = batch["next_capture_target"]
-            mask = (target >= 0).astype(jnp.float32)
-
-            safe_target = jnp.maximum(target, 0)
-            per_sample_loss = optax.softmax_cross_entropy_with_integer_labels(
-                outputs["next_capture_logit"].astype(jnp.float32),
-                safe_target,
+        # Optimistic policy head (eval)
+        if "optimistic_policy_logit" in outputs and "policy_target" in batch:
+            policy_target = batch["policy_target"].astype(jnp.float32)
+            legal_mask = policy_target > 0
+            masked_logits = jnp.where(
+                legal_mask,
+                outputs["optimistic_policy_logit"].astype(jnp.float32),
+                jnp.float32(-1e9),
             )
-            masked_loss = jnp.sum(per_sample_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
-            weight = head_config.next_capture_weight if head_config else 0.1
-            losses["next_capture"] = masked_loss * weight
-
-        # Next pawn move head: cross-entropy with masking for None values
-        if "next_pawn_move_logit" in outputs and "next_pawn_move_target" in batch:
-            target = batch["next_pawn_move_target"]
-            mask = (target >= 0).astype(jnp.float32)
-
-            safe_target = jnp.maximum(target, 0)
-            per_sample_loss = optax.softmax_cross_entropy_with_integer_labels(
-                outputs["next_pawn_move_logit"].astype(jnp.float32),
-                safe_target,
-            )
-            masked_loss = jnp.sum(per_sample_loss * mask) / jnp.maximum(jnp.sum(mask), 1.0)
-            weight = head_config.next_pawn_move_weight if head_config else 0.1
-            losses["next_pawn_move"] = masked_loss * weight
+            per_sample_ce = optax.softmax_cross_entropy(masked_logits, policy_target)
+            if "bestq_var" in outputs and "st_q_scalar" in batch and "best_value" in outputs:
+                st_q_scalar = batch["st_q_scalar"].astype(jnp.float32).squeeze(-1)
+                best_value_pred = outputs["best_value"].astype(jnp.float32)
+                bestq_std = jnp.sqrt(outputs["bestq_var"].astype(jnp.float32) + 1e-8)
+                z_values = (st_q_scalar - best_value_pred) / (bestq_std + 1e-5)
+                strength = head_config.optimistic_strength if head_config else 2.0
+                optimism_weights = jax.nn.sigmoid((z_values - strength) * 3.0)
+            else:
+                optimism_weights = jnp.ones_like(per_sample_ce)
+            optimistic_policy_loss = jnp.mean(per_sample_ce * optimism_weights)
+            weight = head_config.optimistic_policy_weight if head_config else 1.0
+            losses["optimistic_policy"] = optimistic_policy_loss * weight
 
         total_loss = sum(losses.values())
 
@@ -734,8 +771,7 @@ class Trainer:
 
         # Value metrics (using expected value from HL-Gauss distribution)
         if "value" in outputs:
-            # outputs["value"] is the expected value (batch,)
-            # For target expected value, compute from target distribution
+            # RootQ metrics
             num_bins = batch["target"].shape[-1]
             bin_centers = (jnp.arange(num_bins) + 0.5) / num_bins
             target_expected = jnp.sum(batch["target"] * bin_centers, axis=-1)  # (batch,)
@@ -749,6 +785,35 @@ class Trainer:
             targets_binary = (target_expected > 0.5).astype(jnp.float32)
             accuracy = (preds == targets_binary).mean()
             metrics["accuracy"] = accuracy
+
+        # BestQ metrics
+        if "best_value" in outputs and "best_q_target" in batch:
+            num_bins_bq = batch["best_q_target"].shape[-1]
+            bin_centers_bq = (jnp.arange(num_bins_bq) + 0.5) / num_bins_bq
+            bestq_target_expected = jnp.sum(batch["best_q_target"] * bin_centers_bq, axis=-1)
+            bestq_mse = jnp.mean((outputs["best_value"] - bestq_target_expected.astype(jnp.float32)) ** 2)
+            metrics["bestq_mse"] = bestq_mse
+
+        # WDL metrics
+        if "wdl_value" in outputs:
+            wdl_value = outputs["wdl_value"].astype(jnp.float32)
+            metrics["wdl_value"] = jnp.mean(wdl_value)
+
+            if "best_q_target" in batch:
+                num_bins_bq = batch["best_q_target"].shape[-1]
+                bin_centers_bq = (jnp.arange(num_bins_bq) + 0.5) / num_bins_bq
+                bestq_target_expected = jnp.sum(
+                    batch["best_q_target"] * bin_centers_bq, axis=-1
+                )
+                wdl_bestq_mse = jnp.mean(
+                    (wdl_value - bestq_target_expected.astype(jnp.float32)) ** 2
+                )
+                metrics["wdl_bestq_mse"] = wdl_bestq_mse
+
+            if "game_result_scalar" in batch:
+                game_result_wp = batch["game_result_scalar"].astype(jnp.float32)
+                wdl_result_mse = jnp.mean((wdl_value - game_result_wp) ** 2)
+                metrics["wdl_result_mse"] = wdl_result_mse
 
         # Self head metrics
         if "self" in outputs:
@@ -776,39 +841,19 @@ class Trainer:
 
             # Policy perplexity: exp(cross_entropy)
             # Measures prediction uncertainty; lower = more confident/accurate
-            # Note: With 4672 move classes (64×73), uniform perplexity would be ~4672
+            # Note: With 4672 move classes (64*73), uniform perplexity would be ~4672
             policy_ce = optax.softmax_cross_entropy(
                 masked_logits,
                 policy_target,
             ).mean()
             metrics["policy_perplexity"] = jnp.exp(policy_ce)
 
-            # Hard policy perplexity: cross-entropy against hard label (argmax of target)
-            hard_policy_ce = optax.softmax_cross_entropy_with_integer_labels(
+            # Top-1 policy perplexity: cross-entropy against argmax of target (best move)
+            top1_policy_ce = optax.softmax_cross_entropy_with_integer_labels(
                 masked_logits,
                 target_moves,
             ).mean()
-            metrics["hard_policy_perplexity"] = jnp.exp(hard_policy_ce)
-
-        # Next capture head metrics (accuracy on valid samples only)
-        if "next_capture_logit" in outputs and "next_capture_target" in batch:
-            target = batch["next_capture_target"]
-            mask = target >= 0
-            pred = jnp.argmax(outputs["next_capture_logit"], axis=-1)
-            correct = (pred == target) & mask
-            accuracy = jnp.sum(correct.astype(jnp.float32)) / jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
-            metrics["next_capture_accuracy"] = accuracy
-            metrics["next_capture_valid_frac"] = jnp.mean(mask.astype(jnp.float32))
-
-        # Next pawn move head metrics (accuracy on valid samples only)
-        if "next_pawn_move_logit" in outputs and "next_pawn_move_target" in batch:
-            target = batch["next_pawn_move_target"]
-            mask = target >= 0
-            pred = jnp.argmax(outputs["next_pawn_move_logit"], axis=-1)
-            correct = (pred == target) & mask
-            accuracy = jnp.sum(correct.astype(jnp.float32)) / jnp.maximum(jnp.sum(mask.astype(jnp.float32)), 1.0)
-            metrics["next_pawn_move_accuracy"] = accuracy
-            metrics["next_pawn_move_valid_frac"] = jnp.mean(mask.astype(jnp.float32))
+            metrics["top1_policy_perplexity"] = jnp.exp(top1_policy_ce)
 
         return metrics
 
@@ -832,6 +877,15 @@ class Trainer:
         )
 
         data_iter = self._infinite_dataloader()
+
+        # When resuming, fast-forward the dataloader to match consumed batches.
+        # Each global_step consumed accumulation_steps batches, so skip that many.
+        batches_to_skip = self.global_step * accumulation_steps
+        if batches_to_skip > 0:
+            logger.info(f"Skipping {batches_to_skip} batches to align dataloader with checkpoint...")
+            for _ in tqdm(range(batches_to_skip), desc="Skipping batches", unit="batch"):
+                next(data_iter)
+            logger.info("Dataloader fast-forward complete.")
 
         epoch_loss = 0.0
         epoch_batches = 0
@@ -1105,6 +1159,16 @@ class Trainer:
             if "accuracy" in metrics:
                 log_dict["train/accuracy"] = float(metrics["accuracy"])
 
+            # Add WDL metrics
+            if "wdl_loss" in metrics:
+                log_dict["train/wdl_loss"] = float(metrics["wdl_loss"])
+            if "wdl_value" in metrics:
+                log_dict["train/wdl_value"] = float(metrics["wdl_value"])
+            if "wdl_bestq_mse" in metrics:
+                log_dict["train/wdl_bestq_mse"] = float(metrics["wdl_bestq_mse"])
+            if "wdl_result_mse" in metrics:
+                log_dict["train/wdl_result_mse"] = float(metrics["wdl_result_mse"])
+
             # Add self head metrics
             if "self_accuracy" in metrics:
                 log_dict["train/self_accuracy"] = float(metrics["self_accuracy"])
@@ -1112,22 +1176,6 @@ class Trainer:
             # Add policy head metrics
             if "policy_accuracy" in metrics:
                 log_dict["train/policy_accuracy"] = float(metrics["policy_accuracy"])
-
-            # Add next capture head metrics
-            if "next_capture_loss" in metrics:
-                log_dict["train/next_capture_loss"] = float(metrics["next_capture_loss"])
-            if "next_capture_accuracy" in metrics:
-                log_dict["train/next_capture_accuracy"] = float(metrics["next_capture_accuracy"])
-            if "next_capture_valid_frac" in metrics:
-                log_dict["train/next_capture_valid_frac"] = float(metrics["next_capture_valid_frac"])
-
-            # Add next pawn move head metrics
-            if "next_pawn_move_loss" in metrics:
-                log_dict["train/next_pawn_move_loss"] = float(metrics["next_pawn_move_loss"])
-            if "next_pawn_move_accuracy" in metrics:
-                log_dict["train/next_pawn_move_accuracy"] = float(metrics["next_pawn_move_accuracy"])
-            if "next_pawn_move_valid_frac" in metrics:
-                log_dict["train/next_pawn_move_valid_frac"] = float(metrics["next_pawn_move_valid_frac"])
 
             # Add gradient norms (layer-wise) if enabled
             if self.metrics_config.log_layer_grad_norms:
@@ -1330,7 +1378,7 @@ class Trainer:
 
             opt_state_path = path / "opt_state"
             if opt_state_path.exists():
-                opt_state = checkpointer.restore(opt_state_path)
+                opt_state = checkpointer.restore(opt_state_path, item=self.state.opt_state)
                 self.state = self.state.replace(opt_state=opt_state)
         except ImportError:
             logger.warning("Orbax not installed, falling back to simple loading")

@@ -72,7 +72,7 @@ class ConvertToJax(pygrain.MapTransform):
     """Convert numpy arrays to JAX-compatible arrays with HL-Gauss target transform.
 
     Transforms batched data from PyGrain (numpy) to JAX-compatible format.
-    Expected input: tuple of (inputs, targets, [policy_targets], [next_capture], [next_pawn]).
+    Expected input: tuple of (inputs, targets, [policy_targets]).
 
     If HL-Gauss is enabled, converts scalar win probabilities to categorical
     distributions over bins for training with cross-entropy loss.
@@ -97,45 +97,43 @@ class ConvertToJax(pygrain.MapTransform):
             self._num_bins = output_heads_config.value_num_bins
             self._sigma_ratio = output_heads_config.value_sigma_ratio
             self._include_policy = output_heads_config.policy_head
-            self._include_next_capture = output_heads_config.next_capture_head
-            self._include_next_pawn_move = output_heads_config.next_pawn_move_head
         else:
             self._num_bins = 81
             self._sigma_ratio = 0.75
             self._include_policy = False
-            self._include_next_capture = False
-            self._include_next_pawn_move = False
 
     def map(self, element):
         """Convert a batched element to JAX-compatible arrays.
 
         Args:
-            element: Tuple of (inputs, targets, [policy_targets], [next_capture], [next_pawn])
-                as numpy arrays. Optional elements depend on head configuration.
+            element: Tuple of (inputs, rootq_targets, bestq_targets, st_q_targets,
+                game_results, [policy_targets]) as numpy arrays. Optional elements
+                depend on head configuration.
 
         Returns:
-            Dictionary with 'input', 'target', and optional targets as numpy arrays.
+            Dictionary with 'input', 'target', 'best_q_target', 'st_q_target',
+            and optional targets as numpy arrays.
             - 'input': Token indices, shape (batch, seq_len)
-            - 'target': HL-Gauss distribution, shape (batch, num_bins)
+            - 'target': HL-Gauss distribution for rootQ, shape (batch, num_bins)
+            - 'best_q_target': HL-Gauss distribution for bestQ, shape (batch, num_bins)
+            - 'st_q_target': HL-Gauss distribution for short-term Q, shape (batch, num_bins)
+            - 'st_q_scalar': Raw short-term Q win probability, shape (batch, 1)
+            - 'wdl_target': One-hot WDL target [W, D, L], shape (batch, 3)
+            - 'game_result_scalar': Game result as win prob {0, 0.5, 1}, shape (batch,)
             - 'policy_target': Flattened policy distribution, shape (batch, 64*73)
-            - 'next_capture_target': Square indices, shape (batch,), -1 = invalid
-            - 'next_pawn_move_target': Square indices, shape (batch,), -1 = invalid
         """
         # Unpack tuple based on configuration
         element = list(element)
         inputs = element.pop(0)
-        targets = element.pop(0)
+        targets = element.pop(0)  # rootQ win probabilities
+        best_q_targets = element.pop(0)  # bestQ win probabilities
+        st_q_targets = element.pop(0)  # short-term Q win probabilities
+        game_results = element.pop(0)  # game result: +1=win, 0=draw, -1=loss
 
         policy_targets = None
-        next_capture_targets = None
-        next_pawn_move_targets = None
 
         if self._include_policy:
             policy_targets = element.pop(0)
-        if self._include_next_capture:
-            next_capture_targets = element.pop(0)
-        if self._include_next_pawn_move:
-            next_pawn_move_targets = element.pop(0)
 
         # Keep as numpy - JAX will convert when needed
         # This avoids unnecessary device transfers during data loading
@@ -150,9 +148,39 @@ class ConvertToJax(pygrain.MapTransform):
             max_value=1.0,
         )
 
+        best_q_target_array = _hl_gauss_transform_numpy(
+            best_q_targets,
+            num_bins=self._num_bins,
+            sigma_ratio=self._sigma_ratio,
+            min_value=0.0,
+            max_value=1.0,
+        )
+
+        st_q_target_array = _hl_gauss_transform_numpy(
+            st_q_targets,
+            num_bins=self._num_bins,
+            sigma_ratio=self._sigma_ratio,
+            min_value=0.0,
+            max_value=1.0,
+        )
+
+        # WDL target: one-hot encode game result (+1=W, 0=D, -1=L) → [W, D, L]
+        game_result_array = np.asarray(game_results, dtype=np.int32).squeeze(-1)  # (batch,)
+        wdl_target = np.zeros((game_result_array.shape[0], 3), dtype=np.float32)
+        wdl_target[game_result_array == 1, 0] = 1.0   # Win
+        wdl_target[game_result_array == 0, 1] = 1.0   # Draw
+        wdl_target[game_result_array == -1, 2] = 1.0  # Loss
+        # Game result as win probability scalar: (1 + result) / 2 → {0, 0.5, 1}
+        game_result_scalar = (1.0 + game_result_array.astype(np.float32)) / 2.0
+
         result = {
             "input": input_array,
-            "target": target_array,  # Shape: (batch, num_bins)
+            "target": target_array,  # Shape: (batch, num_bins) - rootQ
+            "best_q_target": best_q_target_array,  # Shape: (batch, num_bins) - bestQ
+            "st_q_target": st_q_target_array,  # Shape: (batch, num_bins) - short-term Q
+            "st_q_scalar": np.asarray(st_q_targets, dtype=np.float32),  # Raw scalar for optimism weights
+            "wdl_target": wdl_target,  # Shape: (batch, 3) - one-hot [W, D, L]
+            "game_result_scalar": game_result_scalar,  # Shape: (batch,) - {0, 0.5, 1}
         }
 
         # Add policy target if enabled
@@ -161,20 +189,6 @@ class ConvertToJax(pygrain.MapTransform):
             policy_array = np.asarray(policy_targets, dtype=np.float32)
             policy_array = policy_array.reshape(policy_array.shape[0], -1)
             result["policy_target"] = policy_array
-
-        # Add next capture target if enabled
-        if self._include_next_capture and next_capture_targets is not None:
-            # next_capture_targets: (batch,) int in [-1, 63]
-            result["next_capture_target"] = np.asarray(
-                next_capture_targets, dtype=np.int32
-            )
-
-        # Add next pawn move target if enabled
-        if self._include_next_pawn_move and next_pawn_move_targets is not None:
-            # next_pawn_move_targets: (batch,) int in [-1, 63]
-            result["next_pawn_move_target"] = np.asarray(
-                next_pawn_move_targets, dtype=np.int32
-            )
 
         return result
 
@@ -251,21 +265,13 @@ def create_grain_dataloader(
     include_policy = (
         output_heads_config is not None and output_heads_config.policy_head
     )
-    include_next_capture = (
-        output_heads_config is not None and output_heads_config.next_capture_head
-    )
-    include_next_pawn_move = (
-        output_heads_config is not None and output_heads_config.next_pawn_move_head
-    )
 
     # Define transformations pipeline
     transformations = (
         ConvertTrainingBagDataToSequence(
             core_tokenizer_config,
             include_policy=include_policy,
-            include_next_capture=include_next_capture,
-            include_next_pawn_move=include_next_pawn_move,
-        ),  # bytes -> (state, win_prob, [policy], [next_capture], [next_pawn])
+        ),  # bytes -> (state, win_prob, [policy])
         pygrain.Batch(batch_size=batch_size, drop_remainder=split == "train"),
         ConvertToJax(output_heads_config),  # numpy -> jax-compatible arrays with HL-Gauss
     )
@@ -288,8 +294,7 @@ def create_grain_dataloader(
         f"Created JAX PyGrain DataLoader: batch_size={batch_size}, "
         f"shuffle={shuffle}, workers={config.num_workers}, "
         f"hl_gauss(bins={num_bins}, sigma_ratio={sigma_ratio}), "
-        f"policy={include_policy}, next_capture={include_next_capture}, "
-        f"next_pawn_move={include_next_pawn_move}"
+        f"policy={include_policy}"
     )
 
     return dataloader

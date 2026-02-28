@@ -34,28 +34,8 @@ from catgpt.core.utils import (
     POLICY_TO_DIM,
     TokenizerConfig,
     encode_policy_target,
-    flip_square,
-    parse_square,
-    parse_uci_move,
     tokenizer,
 )
-
-
-def square_to_index(square_name: str | None, flip: bool = False) -> int:
-    """Convert square name to 0-63 index, or -1 if None.
-
-    Args:
-        square_name: Square name like "e4", or None.
-        flip: Whether to flip the square (for black to move).
-
-    Returns:
-        Index 0-63 for valid squares, -1 for None.
-    """
-    if square_name is None:
-        return -1
-    if flip:
-        square_name = flip_square(square_name)
-    return parse_square(square_name)
 
 
 def convert_old_win_prob_to_new(old_win_prob: float) -> float:
@@ -117,20 +97,13 @@ class ConvertStateValueDataToSequence(ConvertToSequence):
 class ConvertTrainingBagDataToSequence(ConvertToSequence):
   """Converts training .bag data (from bagz_to_bag.py) to a sequence of integers.
 
-  This coder handles the new .bag format produced by bagz_to_bag.py, which
-  contains msgpack-encoded TrainingPositionData with rich meta-features.
+  This coder handles the .bag format produced by bagz_to_bag.py, which
+  contains msgpack-encoded TrainingPositionData.
 
   Extracts:
   - fen: tokenized board state
   - root_q: converted to win probability
   - legal_moves: converted to policy target (64, 73) tensor
-  - next_capture_square: square index of piece to be captured (auxiliary target)
-  - next_pawn_move_square: square index of pawn that will move (auxiliary target)
-
-  Future versions can leverage additional fields like:
-  - game_result: final game outcome
-  - piece_will_move_to: next move predictions
-  - square_will_be_occupied_from: forward board state
   """
 
   def __init__(
@@ -138,25 +111,19 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
       tokenizer_config: TokenizerConfig | None = None,
       *,
       include_policy: bool = True,
-      include_next_capture: bool = False,
-      include_next_pawn_move: bool = False,
   ) -> None:
     """Initialize with tokenizer configuration.
 
     Args:
       tokenizer_config: Configuration for tokenization. If None, uses default.
       include_policy: Whether to include policy target in output.
-      include_next_capture: Whether to include next_capture_square target.
-      include_next_pawn_move: Whether to include next_pawn_move_square target.
     """
     super().__init__()
     self.tokenizer_config = tokenizer_config or TokenizerConfig()
     self.include_policy = include_policy
-    self.include_next_capture = include_next_capture
-    self.include_next_pawn_move = include_next_pawn_move
 
   def map(self, element: bytes):
-    """Map a training position to (state_tokens, win_prob, ...).
+    """Map a training position to (state_tokens, win_prob, best_q_prob, st_q_prob, game_result, [policy]).
 
     Args:
       element: Msgpack-encoded TrainingPositionData.
@@ -164,10 +131,11 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
     Returns:
       Tuple with variable length depending on configuration:
         - state_tokens: np.ndarray of tokenized FEN
-        - win_prob: np.ndarray of shape (1,) with win probability in [0, 1]
+        - win_prob: np.ndarray of shape (1,) with rootQ win probability in [0, 1]
+        - best_q_prob: np.ndarray of shape (1,) with bestQ win probability in [0, 1]
+        - st_q_prob: np.ndarray of shape (1,) with short-term Q win probability in [0, 1]
+        - game_result: np.ndarray of shape (1,) with game result {-1, 0, +1}
         - policy_target: np.ndarray of shape (64, 73) (if include_policy)
-        - next_capture_idx: int in [-1, 63] (if include_next_capture)
-        - next_pawn_move_idx: int in [-1, 63] (if include_next_pawn_move)
     """
     # Decode msgpack data
     data = msgpack.unpackb(element, raw=False)
@@ -175,48 +143,39 @@ class ConvertTrainingBagDataToSequence(ConvertToSequence):
     # Extract fields
     fen = data["fen"]
     root_q = data["root_q"]  # Q value in [-1, 1]
+    best_q = data.get("best_q", root_q)  # Q value in [-1, 1], fallback to root_q
+    st_q = data.get("st_q", best_q)  # Short-term Q, fallback to best_q
 
     # Parse FEN fields
     fen_parts = fen.split()
     side_to_move = fen_parts[1]
     flip = side_to_move == "b"
-    # Full move counter is the 6th field (1-indexed move number)
-    fullmove = int(fen_parts[5])
 
     # Tokenize FEN (tokenizer handles flip internally)
     state = tokenizer.tokenize(fen, self.tokenizer_config)
 
     # Convert Q to win probability: Q ∈ [-1, 1] → win_prob ∈ [0, 1]
     win_prob = (1.0 + root_q) / 2.0
+    best_q_prob = (1.0 + best_q) / 2.0
+    st_q_prob = (1.0 + st_q) / 2.0
+
+    # Game result: +1=win, 0=draw, -1=loss (from side-to-move perspective)
+    game_result = data.get("game_result", data.get("result", 0))
 
     # Build result tuple
-    result = [state, np.array([win_prob])]
+    result = [
+        state,
+        np.array([win_prob]),
+        np.array([best_q_prob]),
+        np.array([st_q_prob]),
+        np.array([game_result], dtype=np.int8),
+    ]
 
     if self.include_policy:
       # Build policy target from legal moves
       legal_moves = data["legal_moves"]
       policy_target = encode_policy_target(legal_moves, flip=flip)
       result.append(policy_target)
-
-    if self.include_next_capture:
-      # Convert square name to index (-1 if None)
-      # Only train on positions where fullmove > 15 (opening phase is too noisy)
-      if fullmove > 15:
-        next_capture_sq = data.get("next_capture_square")
-        next_capture_idx = square_to_index(next_capture_sq, flip=flip)
-      else:
-        next_capture_idx = -1  # Masked out
-      result.append(next_capture_idx)
-
-    if self.include_next_pawn_move:
-      # Convert square name to index (-1 if None)
-      # Only train on positions where fullmove > 15 (opening phase is too noisy)
-      if fullmove > 15:
-        next_pawn_sq = data.get("next_pawn_move_square")
-        next_pawn_idx = square_to_index(next_pawn_sq, flip=flip)
-      else:
-        next_pawn_idx = -1  # Masked out
-      result.append(next_pawn_idx)
 
     return tuple(result)
 

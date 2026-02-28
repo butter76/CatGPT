@@ -84,14 +84,6 @@ def dump_entries(
             print(f"  Game Result:     {pos.game_result} (-1=loss, 0=draw, 1=win)")
             print(f"  Best Move:       {pos.best_move_uci or 'None'}")
             print(f"  Legal Moves:     {len(pos.legal_moves)}")
-
-            # Show meta-features if available
-            if pos.next_capture_square:
-                print(f"  Next Capture:    {pos.next_capture_square}")
-            if pos.next_pawn_move_square:
-                print(f"  Next Pawn Move:  {pos.next_pawn_move_square}")
-            if pos.piece_will_move_to:
-                print(f"  Pieces Moving:   {len(pos.piece_will_move_to)}")
         else:
             # Old format: (fen, win_prob) tuple
             fen, old_win_prob = STATE_VALUE_CODER.decode(raw_data)

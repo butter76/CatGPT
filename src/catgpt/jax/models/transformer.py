@@ -521,9 +521,13 @@ class BidirectionalTransformer(nn.Module):
         Returns:
             Dictionary with output heads:
             - "self": Token reconstruction logits (batch, seq, vocab_size) if self_head enabled
-            - "value_logit": HL-Gauss logits (batch, num_bins) for cross-entropy loss
-            - "value_probs": Softmax probabilities (batch, num_bins) for visualization
-            - "value": Expected win probability scalar (batch,) for metrics/inference
+            - "value_logit": Concatenated rootQ+bestQ+WDL logits (batch, num_bins*2+3)
+            - "rootq_logit": RootQ HL-Gauss logits (batch, num_bins) for cross-entropy loss
+            - "bestq_logit": BestQ HL-Gauss logits (batch, num_bins) for cross-entropy loss
+            - "wdl_logit": WDL classification logits (batch, 3) [W, D, L]
+            - "wdl_value": WDL-derived value P(W)+0.5*P(D) (batch,)
+            - "value": Expected rootQ win probability scalar (batch,) for metrics/inference
+            - "best_value": Expected bestQ win probability scalar (batch,) for metrics
             - "policy_logit": Move distribution logits (batch, 64*73) if policy_head enabled
         """
         batch_size, seq_len = x.shape
@@ -629,12 +633,12 @@ class BidirectionalTransformer(nn.Module):
             outputs["self"] = self_logits
 
         # Value head: HL-Gauss categorical distribution from last token
-        # Uses 2-layer MLP (matching PyTorch/searchless_chess architecture)
+        # Outputs logits for rootQ, bestQ (each num_bins), and WDL (3 classes).
+        # Uses 2-layer MLP: hidden -> hidden/2 -> num_bins * 2 + 3
         if head_config.value_head:
             # Use last token representation (similar to GPT-style classification)
             pooled = hidden[:, -1, :]  # (batch, hidden)
 
-            # 2-layer MLP: hidden -> hidden/2 -> num_bins (matching PyTorch)
             num_bins = head_config.value_num_bins
             value_hidden = nn.Dense(
                 self.config.hidden_size // 2,
@@ -643,22 +647,41 @@ class BidirectionalTransformer(nn.Module):
             )(pooled)  # (batch, hidden/2)
             value_hidden = nn.gelu(value_hidden, approximate=True)
             value_logits = nn.Dense(
-                num_bins,
+                num_bins * 2 + 3,
                 dtype=jnp.float32,
                 name="value_head_fc2",
-            )(value_hidden)  # (batch, num_bins)
+            )(value_hidden)  # (batch, num_bins * 2 + 3)
 
-            # Softmax to get probability distribution
-            value_probs = jax.nn.softmax(value_logits, axis=-1)  # (batch, num_bins)
+            # Split into rootQ, bestQ, and WDL
+            rootq_logits = value_logits[:, :num_bins]  # (batch, num_bins)
+            bestq_logits = value_logits[:, num_bins:num_bins * 2]  # (batch, num_bins)
+            wdl_logits = value_logits[:, num_bins * 2:]  # (batch, 3) → [W, D, L]
+
+            # Softmax to get probability distributions
+            rootq_probs = jax.nn.softmax(rootq_logits, axis=-1)  # (batch, num_bins)
+            bestq_probs = jax.nn.softmax(bestq_logits, axis=-1)  # (batch, num_bins)
+            wdl_probs = jax.nn.softmax(wdl_logits, axis=-1)  # (batch, 3)
 
             # Expected value: weighted sum of bin centers
             # Bins span [0, 1], so centers are at (i + 0.5) / num_bins for i in [0, num_bins)
             bin_centers = (jnp.arange(num_bins) + 0.5) / num_bins  # (num_bins,)
-            expected_value = jnp.sum(value_probs * bin_centers, axis=-1)  # (batch,)
+            rootq_expected = jnp.sum(rootq_probs * bin_centers, axis=-1)  # (batch,)
+            bestq_expected = jnp.sum(bestq_probs * bin_centers, axis=-1)  # (batch,)
 
-            outputs["value_logit"] = value_logits  # For cross-entropy loss
-            outputs["value_probs"] = value_probs  # For visualization
-            outputs["value"] = expected_value  # Scalar for metrics/inference
+            # WDL value: P(W)*1 + P(D)*0.5 + P(L)*0
+            wdl_value = wdl_probs[:, 0] + 0.5 * wdl_probs[:, 1]  # (batch,)
+
+            # Variance of bestQ distribution: Var(X) = E[X^2] - E[X]^2
+            bestq_var = jnp.sum(bestq_probs * bin_centers**2, axis=-1) - bestq_expected**2  # (batch,)
+
+            outputs["value_logit"] = value_logits  # Full concatenated logits
+            outputs["rootq_logit"] = rootq_logits  # For rootQ cross-entropy loss
+            outputs["bestq_logit"] = bestq_logits  # For bestQ cross-entropy loss
+            outputs["wdl_logit"] = wdl_logits  # For WDL cross-entropy loss (batch, 3)
+            outputs["wdl_value"] = wdl_value  # WDL-derived value for metrics (batch,)
+            outputs["value"] = rootq_expected  # RootQ scalar for metrics/inference
+            outputs["best_value"] = bestq_expected  # BestQ scalar for metrics
+            outputs["bestq_var"] = bestq_var  # BestQ variance for optimistic policy weighting
 
         # Policy head: per-token projection to (64, 73) move distribution
         if head_config.policy_head:
@@ -715,45 +738,37 @@ class BidirectionalTransformer(nn.Module):
 
             outputs["soft_policy_logit"] = soft_policy_logits_flat
 
-        # Hard policy head: auxiliary head for sharpened policy target
-        # Uses temperature < 1 (e.g., 0.25) to sharpen the distribution, focusing
-        # training on getting the absolute best move right (p^4 for T=0.25).
-        if head_config.hard_policy_head:
-            # Same architecture as policy head but separate parameters
-            hard_policy_logits = nn.Dense(
-                _POLICY_TO_DIM,
-                dtype=jnp.float32,
-                name="hard_policy_head",
-            )(hidden)  # (batch, 64, 73)
+        # Optimistic policy head (LC0 BT3/BT4 method): attention-based policy head
+        # trained with per-sample optimism weights. Same architecture as vanilla
+        # policy (Q·K^T attention for 64x64 + underpromo projection) but with
+        # separate parameters. During training, samples are weighted by how much
+        # the value target exceeded the model's prediction.
+        if head_config.optimistic_policy_head:
+            if head_config.policy_attention_head:
+                # LC0-style attention policy head (same arch, separate params)
+                qk_dim = head_config.policy_qk_dim
+                opt_query = nn.Dense(qk_dim, dtype=jnp.float32, name="optimistic_policy_query")(hidden)
+                opt_key = nn.Dense(qk_dim, dtype=jnp.float32, name="optimistic_policy_key")(hidden)
+                opt_main_logits = jnp.matmul(opt_query, jnp.transpose(opt_key, (0, 2, 1)))
 
-            # Flatten for cross-entropy loss: (batch, 64*73) = (batch, 4672)
-            hard_policy_logits_flat = hard_policy_logits.reshape(batch_size, -1)
+                opt_underpromo_logits = nn.Dense(
+                    9, dtype=jnp.float32, name="optimistic_policy_underpromo"
+                )(hidden)
+                opt_underpromo_logits = opt_underpromo_logits * jnp.sqrt(qk_dim).astype(jnp.float32)
 
-            outputs["hard_policy_logit"] = hard_policy_logits_flat
+                opt_policy_logits = jnp.concatenate(
+                    [opt_main_logits, opt_underpromo_logits], axis=-1
+                )
+            else:
+                # Simple projection fallback
+                opt_policy_logits = nn.Dense(
+                    _POLICY_TO_DIM,
+                    dtype=jnp.float32,
+                    name="optimistic_policy_head",
+                )(hidden)
 
-        # Next capture head: predict which square has the piece to be captured next
-        # This is a noisy auxiliary target - many games have no future captures
-        if head_config.next_capture_head:
-            # Mean pooling over sequence (like value head)
-            pooled = hidden.mean(axis=1)  # (batch, hidden)
-            next_capture_logits = nn.Dense(
-                64,  # One logit per square
-                dtype=jnp.float32,
-                name="next_capture_head",
-            )(pooled)  # (batch, 64)
-            outputs["next_capture_logit"] = next_capture_logits
-
-        # Next pawn move head: predict which square has the pawn that will move next
-        # This is a noisy auxiliary target - many positions have no future pawn moves
-        if head_config.next_pawn_move_head:
-            # Mean pooling over sequence (like value head)
-            pooled = hidden.mean(axis=1)  # (batch, hidden)
-            next_pawn_move_logits = nn.Dense(
-                64,  # One logit per square
-                dtype=jnp.float32,
-                name="next_pawn_move_head",
-            )(pooled)  # (batch, 64)
-            outputs["next_pawn_move_logit"] = next_pawn_move_logits
+            opt_policy_logits_flat = opt_policy_logits.reshape(batch_size, -1)
+            outputs["optimistic_policy_logit"] = opt_policy_logits_flat
 
         return outputs
 
