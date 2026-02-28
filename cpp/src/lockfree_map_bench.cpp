@@ -494,13 +494,21 @@ private:
     }
 
     void recursive_search(uint32_t node_idx, float depth) {
+        if (!search_expand(node_idx, depth)) return;
+        search_recurse(node_idx, depth);
+        search_finalize(node_idx, depth);
+    }
+
+    /// Preamble + Phase 1: Check depth, allocate extra moves, expand children.
+    /// Returns false if search was skipped (depth already sufficient).
+    bool search_expand(uint32_t node_idx, float depth) {
         Node& node = pool_.get(node_idx);
 
         // Load current depth+value atomically
         DepthValue current = node.load_depth_value();
-        if (current.searched_depth >= depth) return;
+        if (current.searched_depth >= depth) return false;
 
-        // Reconstruct board from packed representation (only when we need children)
+        // Reconstruct board from packed representation
         Board board = Board::Compact::decode(node.key);
 
         // Allocate extra moves if depth exceeds threshold and not yet allocated
@@ -510,10 +518,18 @@ private:
             allocate_extra_moves(node_idx, board);
         }
 
-        // ─── Phase 1: Expand children (top 10 + extra moves) ─────
+        // Expand children (top 10 + extra moves)
         expand_children(node_idx, board, depth);
 
-        // ─── Phase 2: Recurse into expanded top children ─────────
+        return true;
+    }
+
+    /// Phase 2 + Phase 3: Recurse into all expanded children.
+    void search_recurse(uint32_t node_idx, float depth) {
+        const Node& node = pool_.get(node_idx);
+        [[maybe_unused]] Board board = Board::Compact::decode(node.key);
+
+        // ─── Recurse into expanded top children ──────────────────
         // No make/unmake needed — each child stores its own PackedBoard key
         for (const auto& child_entry : node.children) {
             if (!child_entry.is_valid()) break;
@@ -523,7 +539,7 @@ private:
             recursive_search(child_entry.node_idx, child_depth);
         }
 
-        // ─── Phase 3: Recurse into expanded extra moves ──────────
+        // ─── Recurse into expanded extra moves ──────────────────
         if (node.has_extra_moves_allocated()) {
             float extra_depth = depth + std::log(MIN_POLICY);
             for (uint16_t i = 0; i < node.num_extra_moves; ++i) {
@@ -532,8 +548,13 @@ private:
                 recursive_search(entry.node_idx, extra_depth);
             }
         }
+    }
 
-        // ─── Phase 4: Compute weighted average and store atomically ───
+    /// Phase 4: Compute weighted average value and store atomically.
+    void search_finalize(uint32_t node_idx, float depth) {
+        Node& node = pool_.get(node_idx);
+
+        DepthValue current = node.load_depth_value();
         float new_value = compute_value(node_idx, current.value);
         node.store_depth_value({depth, new_value});
     }
