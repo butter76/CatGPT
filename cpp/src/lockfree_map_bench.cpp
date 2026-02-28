@@ -71,7 +71,7 @@ struct Node {
     PackedBoard key{};                  // Exact 24-byte board representation
 
     // === Atomic depth+value (updated together at end of search) ===
-    std::atomic<DepthValue> depth_value{DepthValue{-1.0f, 0.0f}};
+    std::atomic<DepthValue> depth_value{DepthValue{LN_2, 0.0f}};
 
     // === Terminal children (pre-computed during GPU eval) ===
     float best_terminal_value{-2.0f};   // Best terminal value from our POV (-2 = none)
@@ -300,8 +300,8 @@ private:
         if (board.sideToMove() == Color::BLACK) {
             value = -value;
         }
-        // Store initial value with searched_depth=-1 (not yet searched)
-        node.store_depth_value({-1.0f, value});
+        // Store initial value at LN_2 depth (leaf node, no children searched yet)
+        node.store_depth_value({LN_2, value});
 
         // ─── 2. Generate legal moves ─────────────────────────────
         Movelist moves;
@@ -483,13 +483,6 @@ private:
         DepthValue current = node.load_depth_value();
         if (current.searched_depth >= depth) return;
 
-        // Can this node have children? (depth > ln(2))
-        if (depth <= LN_2) {
-            // No children to search, just update depth atomically
-            node.store_depth_value({depth, current.value});
-            return;
-        }
-
         // Reconstruct board from packed representation (only when we need children)
         Board board = Board::Compact::decode(node.key);
 
@@ -510,20 +503,16 @@ private:
             if (!child_entry.is_expanded()) continue;
 
             float child_depth = depth + std::log(child_entry.policy);
-            if (child_depth >= MIN_CHILD_DEPTH) {
-                recursive_search(child_entry.node_idx, child_depth);
-            }
+            recursive_search(child_entry.node_idx, child_depth);
         }
 
         // ─── Phase 3: Recurse into expanded extra moves ──────────
         if (node.has_extra_moves_allocated()) {
             float extra_depth = depth + std::log(MIN_POLICY);
-            if (extra_depth >= MIN_CHILD_DEPTH) {
-                for (uint16_t i = 0; i < node.num_extra_moves; ++i) {
-                    const ChildEntry& entry = extra_pool_.get(node.extra_moves_idx + i);
-                    if (!entry.is_expanded()) continue;
-                    recursive_search(entry.node_idx, extra_depth);
-                }
+            for (uint16_t i = 0; i < node.num_extra_moves; ++i) {
+                const ChildEntry& entry = extra_pool_.get(node.extra_moves_idx + i);
+                if (!entry.is_expanded()) continue;
+                recursive_search(entry.node_idx, extra_depth);
             }
         }
 
