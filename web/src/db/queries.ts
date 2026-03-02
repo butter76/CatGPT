@@ -7,7 +7,7 @@ import {
   policyEntries,
   engineAnalyses,
 } from "./schema";
-import type { Position, SharpMoveAnnotation, NetworkAnalysis, PolicyEntry, EngineAnalysis } from "@/lib/types";
+import type { Position, SharpMoveAnnotation, NetworkAnalysis, PolicyEntry, EngineAnalysis, EngineInfoLine } from "@/lib/types";
 
 // ─── Helpers to assemble full Position objects ────────────────────
 
@@ -185,6 +185,7 @@ export async function createEngineAnalysisRecord(
     depth: number;
     nodes: number;
     pv: string[];
+    depthHistory?: EngineInfoLine[];
   }
 ): Promise<void> {
   await db.insert(engineAnalyses).values({
@@ -195,6 +196,7 @@ export async function createEngineAnalysisRecord(
     depth: data.depth,
     nodes: data.nodes,
     pv: data.pv,
+    depthHistory: data.depthHistory ?? [],
   });
 
   // Update the position's updatedAt
@@ -202,6 +204,10 @@ export async function createEngineAnalysisRecord(
     .update(positions)
     .set({ updatedAt: new Date() })
     .where(eq(positions.id, positionId));
+}
+
+export async function deleteEngineAnalysis(id: number): Promise<void> {
+  await db.delete(engineAnalyses).where(eq(engineAnalyses.id, id));
 }
 
 // ─── Assembly helpers ─────────────────────────────────────────────
@@ -234,12 +240,14 @@ function assemblePosition(
   }
 
   const engineAnalysesData: EngineAnalysis[] = eas.map((ea) => ({
+    id: ea.id,
     engine: ea.engine,
     bestMove: ea.bestMove,
     evaluation: ea.evaluation,
     depth: ea.depth,
     nodes: ea.nodes,
     pv: ea.pv ?? [],
+    depthHistory: (ea.depthHistory as EngineInfoLine[]) ?? [],
     timestamp: ea.createdAt.toISOString(),
   }));
 

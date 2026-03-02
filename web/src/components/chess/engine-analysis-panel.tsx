@@ -58,6 +58,12 @@ export function EngineAnalysisPanel({
   const [nodes, setNodes] = useState(500000);
   const [availableEngines, setAvailableEngines] = useState<string[]>([]);
 
+  // Default nodes: 500k for Stockfish (CPU-cheap), 5k for GPU engines
+  const handleEngineChange = (eng: EngineKind) => {
+    setSelectedEngine(eng);
+    setNodes(eng === "stockfish" ? 500000 : 5000);
+  };
+
   // Fetch available engines
   useEffect(() => {
     fetch("/api/analyze/engines")
@@ -125,7 +131,7 @@ export function EngineAnalysisPanel({
                 <Label className="text-xs">Engine</Label>
                 <Select
                   value={selectedEngine}
-                  onValueChange={(v) => setSelectedEngine(v as EngineKind)}
+                  onValueChange={(v) => handleEngineChange(v as EngineKind)}
                 >
                   <SelectTrigger className="h-8 text-xs">
                     <SelectValue />

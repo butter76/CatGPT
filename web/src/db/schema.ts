@@ -7,6 +7,7 @@ import {
   doublePrecision,
   timestamp,
   unique,
+  jsonb,
 } from "drizzle-orm/pg-core";
 
 // ─── Enums ────────────────────────────────────────────────────────
@@ -78,5 +79,6 @@ export const engineAnalyses = pgTable("engine_analyses", {
   depth: integer("depth").notNull(),
   nodes: integer("nodes").notNull(),
   pv: text("pv").array().notNull().default([]),
+  depthHistory: jsonb("depth_history").notNull().default([]),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });

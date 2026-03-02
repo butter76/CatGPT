@@ -22,9 +22,10 @@ import {
   ExpectedOutcomeBadge,
 } from "@/components/chess/move-annotations";
 import { EngineAnalysisPanel } from "@/components/chess/engine-analysis-panel";
-import { fetchPosition, deletePositionAPI } from "@/lib/store";
-import { sideToMove } from "@/lib/chess-utils";
-import type { Position } from "@/lib/types";
+import { fetchPosition, deletePositionAPI, deleteEngineAnalysisAPI } from "@/lib/store";
+import { usePositionStore } from "@/lib/store";
+import { sideToMove, uciToAlgebraic } from "@/lib/chess-utils";
+import type { Position, EngineAnalysis } from "@/lib/types";
 import {
   ArrowLeft,
   Zap,
@@ -285,33 +286,22 @@ export default function PositionDetailPage({
           />
 
           {/* Stored Engine Analyses */}
-          {position.engineAnalyses && position.engineAnalyses.length > 0 && (
-            <Card>
-              <CardHeader className="pb-3">
-                <CardTitle className="text-base">📊 Stored Engine Results</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                {position.engineAnalyses.map((ea, i) => (
-                  <div key={i} className="flex items-center justify-between text-sm border-b last:border-0 pb-2 last:pb-0">
-                    <div>
-                      <span className="font-medium capitalize">{ea.engine}</span>
-                      <span className="text-muted-foreground">
-                        {" "}— depth {ea.depth}, {ea.nodes.toLocaleString()} nodes
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className={`font-mono font-bold ${ea.evaluation >= 0 ? "text-green-600" : "text-red-600"}`}>
-                        {ea.evaluation >= 0 ? "+" : ""}{(ea.evaluation / 100).toFixed(2)}
-                      </span>
-                      <Badge variant="outline" className="font-mono text-xs">
-                        {ea.bestMove}
-                      </Badge>
-                    </div>
-                  </div>
-                ))}
-              </CardContent>
-            </Card>
-          )}
+          {position.engineAnalyses && position.engineAnalyses.length > 0 &&
+            position.engineAnalyses.map((ea, i) => (
+              <StoredEngineResultCard
+                key={ea.id ?? i}
+                ea={ea}
+                fen={position.fen}
+                onDelete={async () => {
+                  if (ea.id != null) {
+                    await deleteEngineAnalysisAPI(ea.id);
+                    const refreshed = await fetchPosition(id);
+                    if (refreshed) setPosition(refreshed);
+                  }
+                }}
+              />
+            ))
+          }
 
           {!position.networkAnalysis && (
             <Card>
@@ -326,5 +316,168 @@ export default function PositionDetailPage({
         </div>
       </div>
     </div>
+  );
+}
+
+// ─── Stored Engine Result with Depth History ──────────────────────
+
+function StoredEngineResultCard({
+  ea,
+  fen,
+  onDelete,
+}: {
+  ea: EngineAnalysis;
+  fen: string;
+  onDelete: () => Promise<void>;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const { notationFormat } = usePositionStore();
+
+  const fmtMove = (move: string) =>
+    notationFormat === "algebraic" ? uciToAlgebraic(fen, move) : move;
+
+  const fmtEval = (scoreType: string, value: number) => {
+    if (scoreType === "mate") return `M${value}`;
+    const cp = value / 100;
+    return cp >= 0 ? `+${cp.toFixed(2)}` : cp.toFixed(2);
+  };
+
+  const hasHistory = ea.depthHistory && ea.depthHistory.length > 0;
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-base flex items-center justify-between">
+          <span>
+            📊 {ea.engine === "stockfish" ? "Stockfish" : "Leela Chess Zero"}
+          </span>
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-muted-foreground font-normal">
+              {new Date(ea.timestamp).toLocaleDateString()}
+            </span>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 w-6 p-0 text-muted-foreground hover:text-destructive"
+              disabled={deleting}
+              onClick={async () => {
+                setDeleting(true);
+                await onDelete();
+                setDeleting(false);
+              }}
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </Button>
+          </div>
+        </CardTitle>
+        <p className="text-xs text-muted-foreground">
+          depth {ea.depth} • {ea.nodes.toLocaleString()} nodes
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {/* Summary */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span
+              className={`text-2xl font-bold font-mono ${
+                ea.evaluation >= 0 ? "text-green-600" : "text-red-600"
+              }`}
+            >
+              {fmtEval("cp", ea.evaluation)}
+            </span>
+            <Badge variant="outline" className="font-mono">
+              {fmtMove(ea.bestMove)}
+            </Badge>
+          </div>
+        </div>
+
+        {/* PV */}
+        {ea.pv.length > 0 && (
+          <div className="text-xs font-mono text-muted-foreground break-all">
+            <span className="text-foreground font-medium">{fmtMove(ea.pv[0])}</span>
+            {ea.pv.slice(1, 10).map((m, i) => (
+              <span key={i}>{" "}{m}</span>
+            ))}
+            {ea.pv.length > 10 && " ..."}
+          </div>
+        )}
+
+        {/* Depth History */}
+        {hasHistory && (
+          <>
+            <Separator />
+            <Button
+              variant="ghost"
+              size="sm"
+              className="w-full text-xs"
+              onClick={() => setExpanded(!expanded)}
+            >
+              {expanded ? "Hide" : "Show"} depth history ({ea.depthHistory!.length} entries)
+            </Button>
+            {expanded && (
+              <div className="max-h-64 overflow-y-auto">
+                <table className="w-full text-xs font-mono">
+                  <thead className="text-muted-foreground sticky top-0 bg-card">
+                    <tr>
+                      <th className="text-left py-1 pr-2">Depth</th>
+                      <th className="text-right py-1 pr-2">Eval</th>
+                      <th className="text-left py-1 pr-2">Best</th>
+                      <th className="text-left py-1 pr-2">PV</th>
+                      <th className="text-right py-1">Nodes</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ea.depthHistory!.map((info, i) => {
+                      const prevBest =
+                        i > 0 ? ea.depthHistory![i - 1].pv[0] : null;
+                      const bestChanged =
+                        prevBest !== null && info.pv[0] !== prevBest;
+                      return (
+                        <tr
+                          key={i}
+                          className={
+                            bestChanged
+                              ? "text-amber-500 font-medium"
+                              : i === ea.depthHistory!.length - 1
+                              ? "text-foreground font-medium"
+                              : "text-muted-foreground"
+                          }
+                        >
+                          <td className="py-0.5 pr-2">{info.depth}</td>
+                          <td
+                            className={`text-right py-0.5 pr-2 ${
+                              info.score.value >= 0
+                                ? "text-green-600"
+                                : "text-red-600"
+                            }`}
+                          >
+                            {fmtEval(info.score.type, info.score.value)}
+                          </td>
+                          <td className="py-0.5 pr-2">
+                            <span className={bestChanged ? "underline" : ""}>
+                              {info.pv[0] ? fmtMove(info.pv[0]) : "-"}
+                            </span>
+                          </td>
+                          <td className="py-0.5 pr-2 text-muted-foreground truncate max-w-[160px]">
+                            {info.pv.slice(1, 5).join(" ")}
+                            {info.pv.length > 5 && " …"}
+                          </td>
+                          <td className="text-right py-0.5">
+                            {info.nodes >= 1000
+                              ? `${(info.nodes / 1000).toFixed(0)}k`
+                              : info.nodes}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
+        )}
+      </CardContent>
+    </Card>
   );
 }
