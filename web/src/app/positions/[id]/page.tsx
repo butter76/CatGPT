@@ -1,6 +1,6 @@
 "use client";
 
-import { use, useState } from "react";
+import { use, useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -21,8 +21,9 @@ import {
   MoveAnnotationsList,
   ExpectedOutcomeBadge,
 } from "@/components/chess/move-annotations";
-import { usePositionStore } from "@/lib/store";
+import { fetchPosition, deletePositionAPI } from "@/lib/store";
 import { sideToMove } from "@/lib/chess-utils";
+import type { Position } from "@/lib/types";
 import {
   ArrowLeft,
   Zap,
@@ -31,6 +32,7 @@ import {
   Check,
   RotateCcw,
   Trash2,
+  Loader2,
 } from "lucide-react";
 
 export default function PositionDetailPage({
@@ -40,11 +42,25 @@ export default function PositionDetailPage({
 }) {
   const { id } = use(params);
   const router = useRouter();
-  const { getPosition, removePosition } = usePositionStore();
-  const position = getPosition(id);
+  const [position, setPosition] = useState<Position | null>(null);
+  const [loading, setLoading] = useState(true);
   const [copied, setCopied] = useState(false);
   const [orientation, setOrientation] = useState<"white" | "black">("white");
   const [showAnnotations, setShowAnnotations] = useState(true);
+
+  useEffect(() => {
+    fetchPosition(id)
+      .then(setPosition)
+      .finally(() => setLoading(false));
+  }, [id]);
+
+  if (loading) {
+    return (
+      <div className="flex justify-center py-16">
+        <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
 
   if (!position) {
     return (
@@ -70,8 +86,8 @@ export default function PositionDetailPage({
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleDelete = () => {
-    removePosition(position.id);
+  const handleDelete = async () => {
+    await deletePositionAPI(position.id);
     router.push("/positions");
   };
 

@@ -1,13 +1,23 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { usePositionStore } from "@/lib/store";
-import { Database, FlaskConical, Zap, Castle } from "lucide-react";
+import { fetchPositions } from "@/lib/store";
+import type { Position } from "@/lib/types";
+import { Database, FlaskConical, Zap, Castle, Loader2 } from "lucide-react";
 
 export default function HomePage() {
-  const { positions } = usePositionStore();
+  const [positions, setPositions] = useState<Position[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetchPositions()
+      .then(setPositions)
+      .finally(() => setLoading(false));
+  }, []);
+
   const sharpCount = positions.filter((p) => p.type === "SHARP").length;
   const fortressCount = positions.filter((p) => p.type === "FORTRESS").length;
 
@@ -25,65 +35,71 @@ export default function HomePage() {
       </div>
 
       {/* Stats Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Total Positions
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center gap-2">
-              <Database className="w-5 h-5 text-primary" />
-              <span className="text-3xl font-bold">{positions.length}</span>
-            </div>
-          </CardContent>
-        </Card>
+      {loading ? (
+        <div className="flex justify-center py-8">
+          <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">
+                Total Positions
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="flex items-center gap-2">
+                <Database className="w-5 h-5 text-primary" />
+                <span className="text-3xl font-bold">{positions.length}</span>
+              </div>
+            </CardContent>
+          </Card>
 
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Sharp Positions
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center gap-2">
-              <Zap className="w-5 h-5 text-amber-500" />
-              <span className="text-3xl font-bold">{sharpCount}</span>
-            </div>
-          </CardContent>
-        </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">
+                Sharp Positions
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="flex items-center gap-2">
+                <Zap className="w-5 h-5 text-amber-500" />
+                <span className="text-3xl font-bold">{sharpCount}</span>
+              </div>
+            </CardContent>
+          </Card>
 
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Fortress Positions
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center gap-2">
-              <Castle className="w-5 h-5 text-blue-500" />
-              <span className="text-3xl font-bold">{fortressCount}</span>
-            </div>
-          </CardContent>
-        </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">
+                Fortress Positions
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="flex items-center gap-2">
+                <Castle className="w-5 h-5 text-blue-500" />
+                <span className="text-3xl font-bold">{fortressCount}</span>
+              </div>
+            </CardContent>
+          </Card>
 
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Analyzed
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center gap-2">
-              <FlaskConical className="w-5 h-5 text-green-500" />
-              <span className="text-3xl font-bold">
-                {positions.filter((p) => p.networkAnalysis).length}
-              </span>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">
+                Analyzed
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="flex items-center gap-2">
+                <FlaskConical className="w-5 h-5 text-green-500" />
+                <span className="text-3xl font-bold">
+                  {positions.filter((p) => p.networkAnalysis).length}
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
 
       {/* Quick Actions */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">

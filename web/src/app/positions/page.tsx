@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import Link from "next/link";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -9,8 +9,8 @@ import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CompactBoard } from "@/components/chess/analysis-board";
 import { AddPositionDialog } from "@/components/chess/add-position-dialog";
-import { usePositionStore } from "@/lib/store";
-import type { PositionType, Outcome } from "@/lib/types";
+import { fetchPositions } from "@/lib/store";
+import type { Position, PositionType, Outcome } from "@/lib/types";
 import {
   Plus,
   Search,
@@ -20,6 +20,7 @@ import {
   Minus,
   Skull,
   ArrowRight,
+  Loader2,
 } from "lucide-react";
 
 type FilterType = "ALL" | PositionType;
@@ -31,9 +32,21 @@ const OUTCOME_ICONS: Record<Outcome, React.ReactNode> = {
 };
 
 export default function PositionsPage() {
-  const { positions } = usePositionStore();
+  const [positions, setPositions] = useState<Position[]>([]);
+  const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<FilterType>("ALL");
   const [search, setSearch] = useState("");
+
+  const loadPositions = useCallback(() => {
+    setLoading(true);
+    fetchPositions()
+      .then(setPositions)
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    loadPositions();
+  }, [loadPositions]);
 
   const filtered = useMemo(() => {
     let result = positions;
@@ -63,7 +76,7 @@ export default function PositionsPage() {
             database
           </p>
         </div>
-        <AddPositionDialog>
+        <AddPositionDialog onAdded={loadPositions}>
           <Button>
             <Plus className="w-4 h-4 mr-1.5" />
             Add Position
@@ -98,8 +111,15 @@ export default function PositionsPage() {
         </Tabs>
       </div>
 
+      {/* Loading */}
+      {loading && (
+        <div className="flex justify-center py-16">
+          <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+        </div>
+      )}
+
       {/* Position Grid */}
-      {filtered.length === 0 ? (
+      {!loading && filtered.length === 0 ? (
         <div className="text-center py-16 text-muted-foreground">
           <p className="text-lg">No positions found</p>
           <p className="text-sm mt-1">
@@ -109,99 +129,101 @@ export default function PositionsPage() {
           </p>
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {filtered.map((position) => (
-            <Link
-              key={position.id}
-              href={`/positions/${position.id}`}
-              className="group"
-            >
-              <Card className="h-full transition-all hover:shadow-lg hover:border-primary/30 group-hover:-translate-y-0.5">
-                <CardContent className="p-4 space-y-3">
-                  {/* Board preview */}
-                  <div className="flex justify-center">
-                    <CompactBoard fen={position.fen} width={180} />
-                  </div>
-
-                  {/* Info */}
-                  <div className="space-y-2">
-                    <div className="flex items-start justify-between gap-2">
-                      <h3 className="font-semibold text-sm leading-tight line-clamp-1">
-                        {position.name}
-                      </h3>
-                      <Badge
-                        variant="outline"
-                        className={`shrink-0 text-[10px] ${
-                          position.type === "SHARP"
-                            ? "border-amber-500 text-amber-600"
-                            : "border-blue-500 text-blue-600"
-                        }`}
-                      >
-                        {position.type === "SHARP" ? (
-                          <Zap className="w-3 h-3 mr-0.5" />
-                        ) : (
-                          <Castle className="w-3 h-3 mr-0.5" />
-                        )}
-                        {position.type}
-                      </Badge>
+        !loading && (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {filtered.map((position) => (
+              <Link
+                key={position.id}
+                href={`/positions/${position.id}`}
+                className="group"
+              >
+                <Card className="h-full transition-all hover:shadow-lg hover:border-primary/30 group-hover:-translate-y-0.5">
+                  <CardContent className="p-4 space-y-3">
+                    {/* Board preview */}
+                    <div className="flex justify-center">
+                      <CompactBoard fen={position.fen} width={180} />
                     </div>
 
-                    {position.description && (
-                      <p className="text-xs text-muted-foreground line-clamp-2">
-                        {position.description}
-                      </p>
-                    )}
-
-                    {/* Type-specific info */}
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                        {position.type === "SHARP" &&
-                          position.moveAnnotations && (
-                            <span>
-                              {
-                                position.moveAnnotations.filter(
-                                  (a) => a.annotation === "correct"
-                                ).length
-                              }{" "}
-                              correct,{" "}
-                              {
-                                position.moveAnnotations.filter(
-                                  (a) => a.annotation === "blunder"
-                                ).length
-                              }{" "}
-                              blunders
-                            </span>
+                    {/* Info */}
+                    <div className="space-y-2">
+                      <div className="flex items-start justify-between gap-2">
+                        <h3 className="font-semibold text-sm leading-tight line-clamp-1">
+                          {position.name}
+                        </h3>
+                        <Badge
+                          variant="outline"
+                          className={`shrink-0 text-[10px] ${
+                            position.type === "SHARP"
+                              ? "border-amber-500 text-amber-600"
+                              : "border-blue-500 text-blue-600"
+                          }`}
+                        >
+                          {position.type === "SHARP" ? (
+                            <Zap className="w-3 h-3 mr-0.5" />
+                          ) : (
+                            <Castle className="w-3 h-3 mr-0.5" />
                           )}
-                        {position.type === "FORTRESS" &&
-                          position.expectedOutcome && (
-                            <span className="flex items-center gap-1">
-                              {OUTCOME_ICONS[position.expectedOutcome]}
-                              {position.expectedOutcome === "draw"
-                                ? "Drawn"
-                                : position.expectedOutcome === "win"
-                                ? "Decisive (Win)"
-                                : "Decisive (Loss)"}
-                            </span>
-                          )}
+                          {position.type}
+                        </Badge>
                       </div>
-                      <ArrowRight className="w-4 h-4 text-muted-foreground group-hover:text-primary transition-colors" />
+
+                      {position.description && (
+                        <p className="text-xs text-muted-foreground line-clamp-2">
+                          {position.description}
+                        </p>
+                      )}
+
+                      {/* Type-specific info */}
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                          {position.type === "SHARP" &&
+                            position.moveAnnotations && (
+                              <span>
+                                {
+                                  position.moveAnnotations.filter(
+                                    (a) => a.annotation === "correct"
+                                  ).length
+                                }{" "}
+                                correct,{" "}
+                                {
+                                  position.moveAnnotations.filter(
+                                    (a) => a.annotation === "blunder"
+                                  ).length
+                                }{" "}
+                                blunders
+                              </span>
+                            )}
+                          {position.type === "FORTRESS" &&
+                            position.expectedOutcome && (
+                              <span className="flex items-center gap-1">
+                                {OUTCOME_ICONS[position.expectedOutcome]}
+                                {position.expectedOutcome === "draw"
+                                  ? "Drawn"
+                                  : position.expectedOutcome === "win"
+                                  ? "Decisive (Win)"
+                                  : "Decisive (Loss)"}
+                              </span>
+                            )}
+                        </div>
+                        <ArrowRight className="w-4 h-4 text-muted-foreground group-hover:text-primary transition-colors" />
+                      </div>
+
+                      {/* Analysis indicator */}
+                      {position.networkAnalysis && (
+                        <div className="flex items-center gap-1">
+                          <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
+                          <span className="text-[10px] text-muted-foreground">
+                            Network analysis available
+                          </span>
+                        </div>
+                      )}
                     </div>
-
-                    {/* Analysis indicator */}
-                    {position.networkAnalysis && (
-                      <div className="flex items-center gap-1">
-                        <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
-                        <span className="text-[10px] text-muted-foreground">
-                          Network analysis available
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                </CardContent>
-              </Card>
-            </Link>
-          ))}
-        </div>
+                  </CardContent>
+                </Card>
+              </Link>
+            ))}
+          </div>
+        )
       )}
     </div>
   );

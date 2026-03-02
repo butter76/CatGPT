@@ -24,9 +24,9 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Chessboard } from "react-chessboard";
 import { isValidFEN, algebraicToUCI, getLegalMoves, uciToAlgebraic } from "@/lib/chess-utils";
-import { usePositionStore } from "@/lib/store";
+import { usePositionStore, createPosition } from "@/lib/store";
 import type { PositionType, Outcome, SharpMoveAnnotation } from "@/lib/types";
-import { Plus, X, CheckCircle2, XCircle } from "lucide-react";
+import { Plus, X, CheckCircle2, XCircle, Loader2 } from "lucide-react";
 
 interface AddPositionDialogProps {
   /** Pre-fill the FEN (e.g. from the analysis page) */
@@ -42,8 +42,9 @@ export function AddPositionDialog({
   children,
   onAdded,
 }: AddPositionDialogProps) {
-  const { addPosition, notationFormat } = usePositionStore();
+  const { notationFormat } = usePositionStore();
   const [open, setOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [fen, setFen] = useState(initialFen ?? "");
@@ -66,15 +67,12 @@ export function AddPositionDialog({
     // Try to parse as algebraic if it doesn't look like UCI
     if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(uciMove)) {
       const parsed = algebraicToUCI(fen, uciMove);
-      if (!parsed) return; // invalid move
+      if (!parsed) return;
       uciMove = parsed;
     }
 
-    // Check it's a legal move
     const legalMoves = getLegalMoves(fen);
     if (!legalMoves.includes(uciMove)) return;
-
-    // Don't add duplicates
     if (annotations.some((a) => a.move === uciMove)) return;
 
     setAnnotations([...annotations, { move: uciMove, annotation: annotationType }]);
@@ -85,31 +83,34 @@ export function AddPositionDialog({
     setAnnotations(annotations.filter((a) => a.move !== move));
   };
 
-  const handleSubmit = () => {
-    if (!name.trim() || !fenValid) return;
+  const handleSubmit = async () => {
+    if (!name.trim() || !fenValid || saving) return;
 
-    const now = new Date().toISOString();
-    addPosition({
-      id: `pos-${Date.now()}`,
-      name: name.trim(),
-      description: description.trim() || undefined,
-      type,
-      fen,
-      moveAnnotations: type === "SHARP" ? annotations : undefined,
-      expectedOutcome: type === "FORTRESS" ? expectedOutcome : undefined,
-      createdAt: now,
-      updatedAt: now,
-    });
+    setSaving(true);
+    try {
+      await createPosition({
+        name: name.trim(),
+        description: description.trim() || undefined,
+        type,
+        fen,
+        moveAnnotations: type === "SHARP" ? annotations : undefined,
+        expectedOutcome: type === "FORTRESS" ? expectedOutcome : undefined,
+      });
 
-    // Reset
-    setName("");
-    setDescription("");
-    setFen("");
-    setType("SHARP");
-    setAnnotations([]);
-    setMoveInput("");
-    setOpen(false);
-    onAdded?.();
+      // Reset
+      setName("");
+      setDescription("");
+      setFen("");
+      setType("SHARP");
+      setAnnotations([]);
+      setMoveInput("");
+      setOpen(false);
+      onAdded?.();
+    } catch (err) {
+      console.error("Failed to save position:", err);
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -289,9 +290,13 @@ export function AddPositionDialog({
           <Button variant="outline" onClick={() => setOpen(false)}>
             Cancel
           </Button>
-          <Button onClick={handleSubmit} disabled={!name.trim() || !fenValid}>
-            <Plus className="w-4 h-4 mr-1" />
-            Add Position
+          <Button onClick={handleSubmit} disabled={!name.trim() || !fenValid || saving}>
+            {saving ? (
+              <Loader2 className="w-4 h-4 mr-1 animate-spin" />
+            ) : (
+              <Plus className="w-4 h-4 mr-1" />
+            )}
+            {saving ? "Saving..." : "Add Position"}
           </Button>
         </DialogFooter>
       </DialogContent>
