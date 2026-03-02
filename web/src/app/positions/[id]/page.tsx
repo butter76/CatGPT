@@ -21,6 +21,7 @@ import {
   MoveAnnotationsList,
   ExpectedOutcomeBadge,
 } from "@/components/chess/move-annotations";
+import { EngineAnalysisPanel } from "@/components/chess/engine-analysis-panel";
 import { fetchPosition, deletePositionAPI } from "@/lib/store";
 import { sideToMove } from "@/lib/chess-utils";
 import type { Position } from "@/lib/types";
@@ -273,17 +274,39 @@ export default function PositionDetailPage({
             </Card>
           )}
 
-          {/* Engine Analysis (future) */}
+          {/* Live Engine Analysis */}
+          <EngineAnalysisPanel
+            fen={position.fen}
+            positionId={position.id}
+            onSaved={() => {
+              // Refresh position data after save
+              fetchPosition(id).then((p) => p && setPosition(p));
+            }}
+          />
+
+          {/* Stored Engine Analyses */}
           {position.engineAnalyses && position.engineAnalyses.length > 0 && (
             <Card>
               <CardHeader className="pb-3">
-                <CardTitle className="text-base">🔧 Engine Analysis</CardTitle>
+                <CardTitle className="text-base">📊 Stored Engine Results</CardTitle>
               </CardHeader>
-              <CardContent>
+              <CardContent className="space-y-3">
                 {position.engineAnalyses.map((ea, i) => (
-                  <div key={i} className="text-sm">
-                    <span className="font-medium capitalize">{ea.engine}</span>:{" "}
-                    depth {ea.depth}, eval {ea.evaluation}
+                  <div key={i} className="flex items-center justify-between text-sm border-b last:border-0 pb-2 last:pb-0">
+                    <div>
+                      <span className="font-medium capitalize">{ea.engine}</span>
+                      <span className="text-muted-foreground">
+                        {" "}— depth {ea.depth}, {ea.nodes.toLocaleString()} nodes
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className={`font-mono font-bold ${ea.evaluation >= 0 ? "text-green-600" : "text-red-600"}`}>
+                        {ea.evaluation >= 0 ? "+" : ""}{(ea.evaluation / 100).toFixed(2)}
+                      </span>
+                      <Badge variant="outline" className="font-mono text-xs">
+                        {ea.bestMove}
+                      </Badge>
+                    </div>
                   </div>
                 ))}
               </CardContent>

@@ -104,7 +104,7 @@ export default function HomePage() {
       {/* Quick Actions */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         <Card className="relative overflow-hidden">
-          <div className="absolute inset-0 bg-gradient-to-br from-amber-500/10 to-transparent" />
+          <div className="absolute inset-0 bg-gradient-to-br from-amber-500/10 to-transparent pointer-events-none" />
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <Database className="w-5 h-5" />
@@ -116,14 +116,14 @@ export default function HomePage() {
               Browse and manage your collection of SHARP and FORTRESS positions.
               View network analysis, policy distributions, and move annotations.
             </p>
-            <Link href="/positions">
-              <Button>Browse Positions →</Button>
-            </Link>
+            <Button asChild>
+              <Link href="/positions">Browse Positions →</Link>
+            </Button>
           </CardContent>
         </Card>
 
         <Card className="relative overflow-hidden">
-          <div className="absolute inset-0 bg-gradient-to-br from-blue-500/10 to-transparent" />
+          <div className="absolute inset-0 bg-gradient-to-br from-blue-500/10 to-transparent pointer-events-none" />
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <FlaskConical className="w-5 h-5" />
@@ -135,9 +135,9 @@ export default function HomePage() {
               Paste a FEN string and instantly see the board. Request analysis
               from CatGPT&apos;s network, then optionally save it to the database.
             </p>
-            <Link href="/analyze">
-              <Button variant="secondary">Analyze Position →</Button>
-            </Link>
+            <Button variant="secondary" asChild>
+              <Link href="/analyze">Analyze Position →</Link>
+            </Button>
           </CardContent>
         </Card>
       </div>

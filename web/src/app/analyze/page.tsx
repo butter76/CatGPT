@@ -18,6 +18,7 @@ import {
   WDLBar,
   QValueDisplay,
 } from "@/components/chess/policy-chart";
+import { EngineAnalysisPanel } from "@/components/chess/engine-analysis-panel";
 import { isValidFEN, sideToMove } from "@/lib/chess-utils";
 import type { NetworkAnalysis } from "@/lib/types";
 import {
@@ -209,6 +210,10 @@ export default function AnalyzePage() {
 
           {/* Analysis Panel */}
           <div className="space-y-4">
+            {/* Engine Analysis (live) */}
+            <EngineAnalysisPanel fen={fen} />
+
+            {/* CatGPT Network Analysis (mock for now) */}
             {analysis ? (
               <Card>
                 <CardHeader className="pb-3">
@@ -232,13 +237,12 @@ export default function AnalyzePage() {
               <Card>
                 <CardContent className="p-12 text-center text-muted-foreground">
                   <FlaskConical className="w-12 h-12 mx-auto mb-3 opacity-30" />
-                  <p className="text-lg font-medium">No analysis yet</p>
+                  <p className="text-lg font-medium">No CatGPT analysis yet</p>
                   <p className="text-sm mt-1">
-                    Click &quot;Analyze&quot; to request evaluation from
-                    CatGPT&apos;s network.
+                    Click &quot;Analyze&quot; above to request CatGPT network evaluation.
                   </p>
                   <p className="text-xs mt-3 opacity-60">
-                    Currently using mock data. Backend integration coming soon.
+                    Currently using mock data. CatGPT backend integration coming soon.
                   </p>
                 </CardContent>
               </Card>

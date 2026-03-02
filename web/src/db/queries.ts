@@ -174,6 +174,36 @@ export async function createNetworkAnalysis(
   };
 }
 
+// ─── Engine Analysis ──────────────────────────────────────────────
+
+export async function createEngineAnalysisRecord(
+  positionId: string,
+  data: {
+    engine: "leela" | "stockfish";
+    bestMove: string;
+    evaluation: number;
+    depth: number;
+    nodes: number;
+    pv: string[];
+  }
+): Promise<void> {
+  await db.insert(engineAnalyses).values({
+    positionId,
+    engine: data.engine,
+    bestMove: data.bestMove,
+    evaluation: data.evaluation,
+    depth: data.depth,
+    nodes: data.nodes,
+    pv: data.pv,
+  });
+
+  // Update the position's updatedAt
+  await db
+    .update(positions)
+    .set({ updatedAt: new Date() })
+    .where(eq(positions.id, positionId));
+}
+
 // ─── Assembly helpers ─────────────────────────────────────────────
 
 function assemblePosition(
