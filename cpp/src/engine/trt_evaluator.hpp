@@ -58,10 +58,17 @@ constexpr int VALUE_NUM_BINS = 81;
 
 /**
  * Result of neural network evaluation.
+ *
+ * The model exports four heads:
+ *   value       — WDL-derived Q value P(W)+0.5*P(D) in [0, 1]
+ *   value_probs — BestQ HL-Gauss distribution (81 bins over [0, 1])
+ *   wdl         — Win/Draw/Loss probabilities [W, D, L]
+ *   policy      — Move distribution logits (64 * 73 = 4672)
  */
 struct NNOutput {
-    float value;                                    // Win probability [0, 1] (expected value)
-    std::array<float, VALUE_NUM_BINS> value_probs;  // Value distribution (81 bins over [0, 1])
+    float value;                                    // WDL-derived Q value [0, 1]
+    std::array<float, VALUE_NUM_BINS> value_probs;  // BestQ distribution (81 bins over [0, 1])
+    std::array<float, 3> wdl;                       // Win/Draw/Loss probabilities [W, D, L]
     std::array<float, POLICY_SIZE> policy;          // Policy logits (64 * 73 = 4672)
 };
 
@@ -92,10 +99,12 @@ public:
         if (d_input_) cudaFree(d_input_);
         if (d_value_) cudaFree(d_value_);
         if (d_value_probs_) cudaFree(d_value_probs_);
+        if (d_wdl_) cudaFree(d_wdl_);
         if (d_policy_) cudaFree(d_policy_);
         if (h_input_) cudaFreeHost(h_input_);
         if (h_value_) cudaFreeHost(h_value_);
         if (h_value_probs_) cudaFreeHost(h_value_probs_);
+        if (h_wdl_) cudaFreeHost(h_wdl_);
         if (h_policy_) cudaFreeHost(h_policy_);
     }
 
@@ -125,6 +134,11 @@ public:
         NNOutput output;
         output.value = h_value_[0];
         std::memcpy(output.value_probs.data(), h_value_probs_, VALUE_NUM_BINS * sizeof(float));
+        if (h_wdl_) {
+            std::memcpy(output.wdl.data(), h_wdl_, 3 * sizeof(float));
+        } else {
+            output.wdl = {0.0f, 1.0f, 0.0f};  // Default to draw if WDL not available
+        }
         std::memcpy(output.policy.data(), h_policy_, POLICY_SIZE * sizeof(float));
 
         return output;
@@ -173,38 +187,45 @@ private:
 
             if (mode == nvinfer1::TensorIOMode::kINPUT) {
                 input_name_ = name;
-            } else {
-                std::string name_str(name);
+                continue;
+            }
 
-                // Try to match by name first (order matters: check value_probs before value)
-                if (name_str.find("value_probs") != std::string::npos ||
-                    name_str.find("ValueProbs") != std::string::npos) {
-                    value_probs_output_name_ = name;
-                } else if (name_str.find("value") != std::string::npos ||
-                           name_str.find("Value") != std::string::npos) {
-                    value_output_name_ = name;
-                } else if (name_str.find("policy") != std::string::npos ||
-                           name_str.find("Policy") != std::string::npos) {
-                    policy_output_name_ = name;
+            std::string name_str(name);
+
+            // Try to match by name first (order matters: check specific names before generic)
+            if (name_str.find("wdl") != std::string::npos ||
+                name_str.find("WDL") != std::string::npos) {
+                // Distinguish wdl_probs from wdl_value by shape
+                if (dims.nbDims == 2 && dims.d[1] == 3) {
+                    wdl_output_name_ = name;
                 } else {
-                    // Fallback: detect by shape
-                    // Value output: scalar or (batch,) or (batch, 1)
-                    // Value probs output: (batch, 81)
-                    // Policy output: (batch, 4672)
-                    int64_t output_size = 1;
-                    for (int d = 0; d < dims.nbDims; ++d) {
-                        if (dims.d[d] > 0) output_size *= dims.d[d];
-                    }
-
-                    if (output_size == 1 || (dims.nbDims == 1) ||
-                        (dims.nbDims == 2 && dims.d[1] == 1)) {
-                        value_output_name_ = name;
-                    } else if (dims.nbDims == 2 && dims.d[1] == VALUE_NUM_BINS) {
-                        value_probs_output_name_ = name;
-                    } else if (output_size >= POLICY_SIZE ||
-                               (dims.nbDims == 2 && dims.d[1] == POLICY_SIZE)) {
-                        policy_output_name_ = name;
-                    }
+                    // wdl_value is a scalar — treat as the value output
+                    value_output_name_ = name;
+                }
+            } else if (name_str.find("value_probs") != std::string::npos ||
+                       name_str.find("bestq_probs") != std::string::npos) {
+                value_probs_output_name_ = name;
+            } else if (name_str.find("value") != std::string::npos ||
+                       name_str.find("Value") != std::string::npos) {
+                value_output_name_ = name;
+            } else if (name_str.find("policy") != std::string::npos ||
+                       name_str.find("Policy") != std::string::npos) {
+                policy_output_name_ = name;
+            } else {
+                // Fallback: detect by shape
+                // Value output: scalar or (batch,) or (batch, 1)
+                // Value probs output: (batch, 81)
+                // WDL output: (batch, 3)
+                // Policy output: (batch, 4672)
+                if (dims.nbDims == 1 ||
+                    (dims.nbDims == 2 && dims.d[1] == 1)) {
+                    if (value_output_name_.empty()) value_output_name_ = name;
+                } else if (dims.nbDims == 2 && dims.d[1] == VALUE_NUM_BINS) {
+                    if (value_probs_output_name_.empty()) value_probs_output_name_ = name;
+                } else if (dims.nbDims == 2 && dims.d[1] == 3) {
+                    if (wdl_output_name_.empty()) wdl_output_name_ = name;
+                } else if (dims.nbDims == 2 && dims.d[1] == POLICY_SIZE) {
+                    if (policy_output_name_.empty()) policy_output_name_ = name;
                 }
             }
         }
@@ -213,7 +234,10 @@ private:
             throw std::runtime_error("Could not find all required I/O tensors");
         }
         if (value_probs_output_name_.empty()) {
-            std::println(stderr, "[TRT WARNING] value_probs output not found - using zeros");
+            std::println(stderr, "[TRT WARNING] bestq_probs output not found - using zeros");
+        }
+        if (wdl_output_name_.empty()) {
+            std::println(stderr, "[TRT WARNING] wdl_probs output not found - using defaults");
         }
     }
 
@@ -225,12 +249,14 @@ private:
         CATGPT_CUDA_CHECK(cudaMalloc(&d_input_, SEQ_LENGTH * sizeof(std::int32_t)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_value_, sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_value_probs_, VALUE_NUM_BINS * sizeof(float)));
+        CATGPT_CUDA_CHECK(cudaMalloc(&d_wdl_, 3 * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_policy_, POLICY_SIZE * sizeof(float)));
 
         // Allocate pinned host buffers for async transfers
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_input_, SEQ_LENGTH * sizeof(std::int32_t)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_value_, sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_value_probs_, VALUE_NUM_BINS * sizeof(float)));
+        CATGPT_CUDA_CHECK(cudaMallocHost(&h_wdl_, 3 * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_policy_, POLICY_SIZE * sizeof(float)));
     }
 
@@ -240,6 +266,9 @@ private:
         context_->setTensorAddress(value_output_name_.c_str(), d_value_);
         if (!value_probs_output_name_.empty()) {
             context_->setTensorAddress(value_probs_output_name_.c_str(), d_value_probs_);
+        }
+        if (!wdl_output_name_.empty()) {
+            context_->setTensorAddress(wdl_output_name_.c_str(), d_wdl_);
         }
         context_->setTensorAddress(policy_output_name_.c_str(), d_policy_);
 
@@ -274,6 +303,11 @@ private:
                 h_value_probs_, d_value_probs_, VALUE_NUM_BINS * sizeof(float),
                 cudaMemcpyDeviceToHost, stream_));
         }
+        if (!wdl_output_name_.empty()) {
+            CATGPT_CUDA_CHECK(cudaMemcpyAsync(
+                h_wdl_, d_wdl_, 3 * sizeof(float),
+                cudaMemcpyDeviceToHost, stream_));
+        }
         CATGPT_CUDA_CHECK(cudaMemcpyAsync(
             h_policy_, d_policy_, POLICY_SIZE * sizeof(float),
             cudaMemcpyDeviceToHost, stream_));
@@ -293,6 +327,7 @@ private:
     std::string input_name_;
     std::string value_output_name_;
     std::string value_probs_output_name_;
+    std::string wdl_output_name_;
     std::string policy_output_name_;
 
     cudaStream_t stream_ = nullptr;
@@ -302,12 +337,14 @@ private:
     std::int32_t* d_input_ = nullptr;
     float* d_value_ = nullptr;
     float* d_value_probs_ = nullptr;
+    float* d_wdl_ = nullptr;
     float* d_policy_ = nullptr;
 
     // Pinned host buffers
     std::int32_t* h_input_ = nullptr;
     float* h_value_ = nullptr;
     float* h_value_probs_ = nullptr;
+    float* h_wdl_ = nullptr;
     float* h_policy_ = nullptr;
 };
 

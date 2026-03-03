@@ -5,14 +5,20 @@
 # real tensor dimensions, then post-process the ONNX graph to replace all
 # occurrences with dynamic dimension (-1).
 #
+# Outputs (in order):
+#   wdl_value    — WDL-derived Q value, scalar (batch,)
+#   bestq_probs  — BestQ HL-Gauss distribution (batch, 81)
+#   wdl_probs    — Win/Draw/Loss probabilities (batch, 3)
+#   policy_logit — Move distribution logits (batch, 4672)
+#
 # Usage: ./export-onnx.sh [checkpoint_path]
 
 set -e
 
 uv run python scripts/export_onnx.py \
-    --checkpoint ./checkpoints_jax/best \
+    --checkpoint ./checkpoints_jax/WDL_main/best \
     --output-path sample.onnx \
-    --output-keys value value_probs policy_logit \
+    --output-keys wdl_value bestq_probs wdl_probs policy_logit \
     --dynamic-batch \
     --opset 20 \
     --validate

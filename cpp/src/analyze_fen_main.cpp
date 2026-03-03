@@ -2,7 +2,8 @@
  * CatGPT FEN Analyzer - Human-readable value & policy output
  *
  * Takes a FEN string as input and displays:
- * - Value: win probability with interpretation
+ * - WDL: Win/Draw/Loss probabilities
+ * - BestQ: distribution histogram and expected value
  * - Policy: top moves ranked by probability
  *
  * Usage:
@@ -344,24 +345,41 @@ int main(int argc, char* argv[]) {
                   << (board.sideToMove() == chess::Color::WHITE ? "White" : "Black")
                   << "\n\n";
 
-        // === Value ===
+        // === WDL ===
         std::cout << "───────────────────────────────────────────────────────────────\n";
-        std::cout << "                            VALUE\n";
+        std::cout << "                           WDL\n";
         std::cout << "───────────────────────────────────────────────────────────────\n\n";
 
-        float win_prob = output.value;
-        std::cout << "Win probability (for side to move): ";
-        std::cout << std::fixed << std::setprecision(1) << (win_prob * 100.0f) << "%\n";
+        float win  = output.wdl[0];
+        float draw = output.wdl[1];
+        float loss = output.wdl[2];
+        float wdl_value = win + 0.5f * draw;  // Q in [0, 1]
 
+        std::cout << "  Win:  " << std::fixed << std::setprecision(1)
+                  << (win * 100.0f) << "%   ";
+        print_prob_bar(win, 25);
         std::cout << "\n";
-        print_prob_bar(win_prob, 40);
+
+        std::cout << "  Draw: " << std::fixed << std::setprecision(1)
+                  << (draw * 100.0f) << "%   ";
+        print_prob_bar(draw, 25);
         std::cout << "\n";
 
-        std::cout << "\nInterpretation: " << interpret_value(win_prob) << "\n\n";
+        std::cout << "  Loss: " << std::fixed << std::setprecision(1)
+                  << (loss * 100.0f) << "%   ";
+        print_prob_bar(loss, 25);
+        std::cout << "\n\n";
 
-        // === Value Distribution ===
+        // Q value from WDL (converted to [-1, 1])
+        float q_11 = 2.0f * wdl_value - 1.0f;
+        int cp = static_cast<int>(90.0f * std::tan(q_11 * 1.5637541897f));
+        std::cout << "  Q (WDL): " << std::showpos << std::setprecision(3) << q_11
+                  << std::noshowpos << "  (" << interpret_value(wdl_value) << ", "
+                  << std::showpos << cp << std::noshowpos << " cp)\n\n";
+
+        // === BestQ Distribution ===
         std::cout << "───────────────────────────────────────────────────────────────\n";
-        std::cout << "                     VALUE DISTRIBUTION\n";
+        std::cout << "                    BESTQ DISTRIBUTION\n";
         std::cout << "───────────────────────────────────────────────────────────────\n\n";
 
         print_value_histogram(output.value_probs);

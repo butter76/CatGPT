@@ -679,8 +679,10 @@ class BidirectionalTransformer(nn.Module):
             outputs["bestq_logit"] = bestq_logits  # For bestQ cross-entropy loss
             outputs["wdl_logit"] = wdl_logits  # For WDL cross-entropy loss (batch, 3)
             outputs["wdl_value"] = wdl_value  # WDL-derived value for metrics (batch,)
+            outputs["wdl_probs"] = wdl_probs  # WDL probabilities [W, D, L] (batch, 3)
             outputs["value"] = rootq_expected  # RootQ scalar for metrics/inference
             outputs["best_value"] = bestq_expected  # BestQ scalar for metrics
+            outputs["bestq_probs"] = bestq_probs  # BestQ probability distribution (batch, num_bins)
             outputs["bestq_var"] = bestq_var  # BestQ variance for optimistic policy weighting
 
         # Policy head: per-token projection to (64, 73) move distribution
