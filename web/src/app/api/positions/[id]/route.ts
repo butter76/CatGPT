@@ -1,5 +1,5 @@
-import { NextResponse } from "next/server";
-import { getPositionById, deletePosition } from "@/db/queries";
+import { NextRequest, NextResponse } from "next/server";
+import { getPositionById, deletePosition, updatePositionMeta } from "@/db/queries";
 
 // GET /api/positions/[id] — get a single position
 export async function GET(
@@ -17,6 +17,44 @@ export async function GET(
     console.error("Failed to fetch position:", error);
     return NextResponse.json(
       { error: "Failed to fetch position" },
+      { status: 500 }
+    );
+  }
+}
+
+// PATCH /api/positions/[id] — update name/description
+export async function PATCH(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  try {
+    const { id } = await params;
+    const position = await getPositionById(id);
+    if (!position) {
+      return NextResponse.json({ error: "Position not found" }, { status: 404 });
+    }
+
+    const body = await request.json();
+    const updates: { name?: string; description?: string | null } = {};
+
+    if (typeof body.name === "string" && body.name.trim()) {
+      updates.name = body.name.trim();
+    }
+    if (body.description !== undefined) {
+      updates.description = body.description?.trim() || null;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return NextResponse.json({ error: "No valid fields to update" }, { status: 400 });
+    }
+
+    await updatePositionMeta(id, updates);
+    const updated = await getPositionById(id);
+    return NextResponse.json(updated);
+  } catch (error) {
+    console.error("Failed to update position:", error);
+    return NextResponse.json(
+      { error: "Failed to update position" },
       { status: 500 }
     );
   }

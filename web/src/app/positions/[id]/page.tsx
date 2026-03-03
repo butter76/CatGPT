@@ -22,10 +22,18 @@ import {
   ExpectedOutcomeBadge,
 } from "@/components/chess/move-annotations";
 import { EngineAnalysisPanel } from "@/components/chess/engine-analysis-panel";
-import { fetchPosition, deletePositionAPI, deleteEngineAnalysisAPI } from "@/lib/store";
+import {
+  fetchPosition,
+  deletePositionAPI,
+  deleteEngineAnalysisAPI,
+  updateAnnotationsAPI,
+  updatePositionMetaAPI,
+} from "@/lib/store";
 import { usePositionStore } from "@/lib/store";
 import { sideToMove, uciToAlgebraic } from "@/lib/chess-utils";
 import type { Position, EngineAnalysis } from "@/lib/types";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import {
   ArrowLeft,
   Zap,
@@ -35,6 +43,7 @@ import {
   RotateCcw,
   Trash2,
   Loader2,
+  Pencil,
 } from "lucide-react";
 
 export default function PositionDetailPage({
@@ -96,48 +105,15 @@ export default function PositionDetailPage({
   return (
     <div className="space-y-6">
       {/* Back + Title */}
-      <div className="flex items-start justify-between gap-4">
-        <div className="space-y-1">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => router.push("/positions")}
-          >
-            <ArrowLeft className="w-4 h-4 mr-1" /> Back
-          </Button>
-          <h1 className="text-2xl font-bold flex items-center gap-2">
-            {position.name}
-            <Badge
-              variant="outline"
-              className={`text-xs ${
-                position.type === "SHARP"
-                  ? "border-amber-500 text-amber-600"
-                  : "border-blue-500 text-blue-600"
-              }`}
-            >
-              {position.type === "SHARP" ? (
-                <Zap className="w-3 h-3 mr-0.5" />
-              ) : (
-                <Castle className="w-3 h-3 mr-0.5" />
-              )}
-              {position.type}
-            </Badge>
-          </h1>
-          {position.description && (
-            <p className="text-sm text-muted-foreground max-w-2xl">
-              {position.description}
-            </p>
-          )}
-        </div>
-        <Button
-          variant="ghost"
-          size="sm"
-          className="text-destructive hover:text-destructive"
-          onClick={handleDelete}
-        >
-          <Trash2 className="w-4 h-4" />
-        </Button>
-      </div>
+      <PositionHeader
+        position={position}
+        onUpdate={async (updates) => {
+          const updated = await updatePositionMetaAPI(position.id, updates);
+          setPosition(updated);
+        }}
+        onDelete={handleDelete}
+        onBack={() => router.push("/positions")}
+      />
 
       {/* Main content: Board + Analysis */}
       <div className="grid grid-cols-1 lg:grid-cols-[auto_1fr] gap-6">
@@ -232,10 +208,15 @@ export default function PositionDetailPage({
               </CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              {position.type === "SHARP" && position.moveAnnotations && (
+              {position.type === "SHARP" && (
                 <MoveAnnotationsList
-                  annotations={position.moveAnnotations}
+                  annotations={position.moveAnnotations ?? []}
                   fen={position.fen}
+                  onSave={async (annotations) => {
+                    await updateAnnotationsAPI(position.id, annotations);
+                    const refreshed = await fetchPosition(id);
+                    if (refreshed) setPosition(refreshed);
+                  }}
                 />
               )}
               {position.type === "FORTRESS" && position.expectedOutcome && (
@@ -315,6 +296,149 @@ export default function PositionDetailPage({
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ─── Editable Position Header ─────────────────────────────────────
+
+function PositionHeader({
+  position,
+  onUpdate,
+  onDelete,
+  onBack,
+}: {
+  position: Position;
+  onUpdate: (updates: { name?: string; description?: string | null }) => Promise<void>;
+  onDelete: () => void;
+  onBack: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(position.name);
+  const [description, setDescription] = useState(position.description ?? "");
+  const [saving, setSaving] = useState(false);
+
+  const startEditing = () => {
+    setName(position.name);
+    setDescription(position.description ?? "");
+    setEditing(true);
+  };
+
+  const cancel = () => {
+    setName(position.name);
+    setDescription(position.description ?? "");
+    setEditing(false);
+  };
+
+  const save = async () => {
+    if (!name.trim()) return;
+    setSaving(true);
+    try {
+      await onUpdate({
+        name: name.trim(),
+        description: description.trim() || null,
+      });
+      setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="flex items-start justify-between gap-4">
+      <div className="space-y-1 flex-1">
+        <Button variant="ghost" size="sm" onClick={onBack}>
+          <ArrowLeft className="w-4 h-4 mr-1" /> Back
+        </Button>
+
+        {editing ? (
+          <div className="space-y-2 max-w-2xl">
+            <Input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="text-xl font-bold h-10"
+              placeholder="Position name"
+              autoFocus
+              onKeyDown={(e) => {
+                if (e.key === "Enter") save();
+                if (e.key === "Escape") cancel();
+              }}
+            />
+            <Textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              className="text-sm resize-none"
+              placeholder="Description (optional)"
+              rows={2}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") cancel();
+              }}
+            />
+            <div className="flex gap-2">
+              <Button size="sm" onClick={save} disabled={!name.trim() || saving}>
+                {saving && <Loader2 className="w-3 h-3 mr-1 animate-spin" />}
+                Save
+              </Button>
+              <Button size="sm" variant="ghost" onClick={cancel} disabled={saving}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="flex items-center gap-2">
+              <h1 className="text-2xl font-bold">{position.name}</h1>
+              <Badge
+                variant="outline"
+                className={`text-xs ${
+                  position.type === "SHARP"
+                    ? "border-amber-500 text-amber-600"
+                    : "border-blue-500 text-blue-600"
+                }`}
+              >
+                {position.type === "SHARP" ? (
+                  <Zap className="w-3 h-3 mr-0.5" />
+                ) : (
+                  <Castle className="w-3 h-3 mr-0.5" />
+                )}
+                {position.type}
+              </Badge>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 w-6 p-0 text-muted-foreground"
+                onClick={startEditing}
+              >
+                <Pencil className="w-3.5 h-3.5" />
+              </Button>
+            </div>
+            {position.description && (
+              <p className="text-sm text-muted-foreground max-w-2xl">
+                {position.description}
+              </p>
+            )}
+            {!position.description && (
+              <button
+                className="text-xs text-muted-foreground hover:text-foreground italic cursor-pointer"
+                onClick={startEditing}
+              >
+                + Add description
+              </button>
+            )}
+          </>
+        )}
+      </div>
+
+      {!editing && (
+        <Button
+          variant="ghost"
+          size="sm"
+          className="text-destructive hover:text-destructive"
+          onClick={onDelete}
+        >
+          <Trash2 className="w-4 h-4" />
+        </Button>
+      )}
     </div>
   );
 }

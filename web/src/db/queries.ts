@@ -125,6 +125,41 @@ export async function createPosition(
   return (await getPositionById(id))!;
 }
 
+export async function setMoveAnnotations(
+  positionId: string,
+  annotations: { move: string; annotation: "correct" | "blunder" }[]
+): Promise<void> {
+  // Delete existing annotations
+  await db.delete(moveAnnotations).where(eq(moveAnnotations.positionId, positionId));
+
+  // Insert new ones
+  if (annotations.length > 0) {
+    await db.insert(moveAnnotations).values(
+      annotations.map((a) => ({
+        positionId,
+        move: a.move,
+        annotation: a.annotation,
+      }))
+    );
+  }
+
+  // Update the position's updatedAt
+  await db
+    .update(positions)
+    .set({ updatedAt: new Date() })
+    .where(eq(positions.id, positionId));
+}
+
+export async function updatePositionMeta(
+  id: string,
+  updates: { name?: string; description?: string | null }
+): Promise<void> {
+  await db
+    .update(positions)
+    .set({ ...updates, updatedAt: new Date() })
+    .where(eq(positions.id, id));
+}
+
 export async function deletePosition(id: string): Promise<boolean> {
   const result = await db.delete(positions).where(eq(positions.id, id));
   // Cascading deletes handle related rows
