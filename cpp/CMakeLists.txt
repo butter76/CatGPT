@@ -1,13 +1,15 @@
 cmake_minimum_required(VERSION 3.22)
+
+# Set compilers to GCC 14 (must be before project())
+set(CMAKE_C_COMPILER gcc-14)
+set(CMAKE_CXX_COMPILER g++-14)
+
 project(ChessEngine VERSION 0.1.0 LANGUAGES C CXX)
 
 # Set C++23 standard
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-
-# Set compiler to g++-14
-set(CMAKE_CXX_COMPILER g++-14)
 
 # Compiler flags for modern C++ and optimization
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
