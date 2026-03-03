@@ -227,7 +227,8 @@ private:
             if (effective_N < static_cast<float>(limit)) co_return;
         }
 
-        float expansion_threshold = effective_N > 0.0f ? 1.0f / effective_N : 1.0f;
+        float expansion_N = N * node->variance * 12.0f;
+        float expansion_threshold = expansion_N > 0.0f ? 1.0f / expansion_N : 1.0f;
         co_await expand_children(node, scratch_board, expansion_threshold);
 
         if (node->children.empty()) co_return;
