@@ -87,18 +87,28 @@ inline void print_catgpt_stats(
     struct Entry {
         std::string move_uci;
         float weight;
+        bool has_q;    // true if this child was expanded (Q is meaningful)
+        float q;       // Q from parent's perspective [-1, 1] (only valid when has_q)
     };
     std::vector<Entry> entries;
     entries.reserve(root->policy_priors.size());
 
     for (const auto& [move, prior] : root->policy_priors) {
         float weight;
+        bool has_q = false;
+        float q = 0.0f;
         auto child_it = root->children.find(move);
-        if (child_it != root->children.end() && !allocations.empty()) {
-            // Expanded child: use search-refined allocation
-            auto alloc_it = allocations.find(move);
-            if (alloc_it != allocations.end() && N_adjusted > 0.0f) {
-                weight = alloc_it->second / N_adjusted;
+        if (child_it != root->children.end()) {
+            has_q = true;
+            q = -(child_it->second.Q);  // negate: child Q is from opponent's perspective
+            if (!allocations.empty()) {
+                // Expanded child: use search-refined allocation
+                auto alloc_it = allocations.find(move);
+                if (alloc_it != allocations.end() && N_adjusted > 0.0f) {
+                    weight = alloc_it->second / N_adjusted;
+                } else {
+                    weight = prior;
+                }
             } else {
                 weight = prior;
             }
@@ -106,7 +116,7 @@ inline void print_catgpt_stats(
             // Unexpanded: raw prior
             weight = prior;
         }
-        entries.push_back({chess::uci::moveToUci(move), weight});
+        entries.push_back({chess::uci::moveToUci(move), weight, has_q, q});
     }
 
     std::sort(entries.begin(), entries.end(),
@@ -116,7 +126,11 @@ inline void print_catgpt_stats(
     for (size_t i = 0; i < entries.size(); ++i) {
         if (i > 0) json << ",";
         json << "{\"move\":\"" << entries[i].move_uci
-             << "\",\"weight\":" << entries[i].weight << "}";
+             << "\",\"weight\":" << entries[i].weight;
+        if (entries[i].has_q) {
+            json << ",\"q\":" << entries[i].q;
+        }
+        json << "}";
     }
     json << "]";
 

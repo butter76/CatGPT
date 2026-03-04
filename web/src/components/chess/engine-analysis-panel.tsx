@@ -55,7 +55,6 @@ export function EngineAnalysisPanel({
     reset,
   } = useEngineAnalysis();
 
-  const { notationFormat } = usePositionStore();
   const [selectedEngine, setSelectedEngine] = useState<EngineKind>("catgpt");
   const [nodes, setNodes] = useState(400);
   const [availableEngines, setAvailableEngines] = useState<string[]>([]);
@@ -82,38 +81,6 @@ export function EngineAnalysisPanel({
       positionId,
     });
   };
-
-  // Format a move for display
-  const fmtMove = (move: string) =>
-    notationFormat === "algebraic" ? uciToAlgebraic(fen, move) : move;
-
-  // Format eval
-  const fmtEval = (info: EngineInfoLine) => {
-    if (info.score.type === "mate") {
-      return `M${info.score.value}`;
-    }
-    const cp = info.score.value / 100;
-    return cp >= 0 ? `+${cp.toFixed(2)}` : cp.toFixed(2);
-  };
-
-  // Format centipawn value
-  const fmtCp = (cp: number) => {
-    const v = cp / 100;
-    return v >= 0 ? `+${v.toFixed(2)}` : v.toFixed(2);
-  };
-
-  // Eval bar position (0 = black winning, 100 = white winning)
-  const evalBarPct = latestInfo
-    ? latestInfo.score.type === "mate"
-      ? latestInfo.score.value > 0
-        ? 95
-        : 5
-      : Math.max(2, Math.min(98, 50 + latestInfo.score.value / 10))
-    : catgptStats
-    ? Math.max(2, Math.min(98, 50 + catgptStats.cp / 10))
-    : 50;
-
-  const isCatGPT = engine === "catgpt" || selectedEngine === "catgpt";
 
   return (
     <Card>
@@ -231,161 +198,12 @@ export function EngineAnalysisPanel({
         {latestInfo && engine !== "catgpt" && (
           <>
             <Separator />
-            {/* Eval display */}
-            <div className="space-y-2">
-              <div className="flex items-baseline justify-between">
-                <span
-                  className={`text-2xl font-bold font-mono ${
-                    latestInfo.score.value >= 0
-                      ? "text-green-600"
-                      : "text-red-600"
-                  }`}
-                >
-                  {fmtEval(latestInfo)}
-                </span>
-                <span className="text-xs text-muted-foreground">
-                  depth {latestInfo.depth}
-                  {latestInfo.seldepth ? `/${latestInfo.seldepth}` : ""} •{" "}
-                  {(latestInfo.nodes / 1000).toFixed(0)}k nodes
-                  {latestInfo.nps
-                    ? ` • ${(latestInfo.nps / 1000).toFixed(0)}k nps`
-                    : ""}
-                </span>
-              </div>
-
-              {/* Eval bar */}
-              <div className="h-3 bg-gray-800 rounded overflow-hidden">
-                <div
-                  className="h-full bg-white rounded transition-all duration-300 ease-out"
-                  style={{ width: `${evalBarPct}%` }}
-                />
-              </div>
-
-              {/* Best move */}
-              {bestMove && (
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-muted-foreground">Best:</span>
-                  <Badge className="font-mono">{fmtMove(bestMove)}</Badge>
-                </div>
-              )}
-
-              {/* PV line */}
-              {latestInfo.pv.length > 0 && (
-                <div className="space-y-1">
-                  <span className="text-xs text-muted-foreground">
-                    Principal Variation:
-                  </span>
-                  <div className="text-xs font-mono text-muted-foreground break-all">
-                    {latestInfo.pv
-                      .slice(0, 12)
-                      .map((m, i) => (
-                        <span key={i}>
-                          {i > 0 && " "}
-                          <span
-                            className={
-                              i === 0
-                                ? "text-foreground font-medium"
-                                : ""
-                            }
-                          >
-                            {notationFormat === "algebraic"
-                              ? m // PV moves need the full position to convert; show UCI
-                              : m}
-                          </span>
-                        </span>
-                      ))}
-                    {latestInfo.pv.length > 12 && " ..."}
-                  </div>
-                </div>
-              )}
-
-              {/* WDL (lc0) */}
-              {latestInfo.wdl && (
-                <div className="space-y-1">
-                  <span className="text-xs text-muted-foreground">WDL:</span>
-                  <div className="flex h-5 rounded overflow-hidden text-[10px] font-medium">
-                    <div
-                      className="bg-green-500 flex items-center justify-center text-white"
-                      style={{ width: `${latestInfo.wdl.win / 10}%` }}
-                    >
-                      {latestInfo.wdl.win > 80 &&
-                        `${(latestInfo.wdl.win / 10).toFixed(0)}%`}
-                    </div>
-                    <div
-                      className="bg-gray-400 flex items-center justify-center text-white"
-                      style={{ width: `${latestInfo.wdl.draw / 10}%` }}
-                    >
-                      {latestInfo.wdl.draw > 80 &&
-                        `${(latestInfo.wdl.draw / 10).toFixed(0)}%`}
-                    </div>
-                    <div
-                      className="bg-red-500 flex items-center justify-center text-white"
-                      style={{ width: `${latestInfo.wdl.loss / 10}%` }}
-                    >
-                      {latestInfo.wdl.loss > 80 &&
-                        `${(latestInfo.wdl.loss / 10).toFixed(0)}%`}
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Depth history table */}
-            {depthHistory.length > 0 && (
-              <>
-                <Separator />
-                <div className="space-y-1">
-                  <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wide">
-                    Depth History
-                  </span>
-                  <div className="max-h-48 overflow-y-auto">
-                    <table className="w-full text-xs font-mono">
-                      <thead className="text-muted-foreground sticky top-0 bg-card">
-                        <tr>
-                          <th className="text-left py-0.5 pr-2">D</th>
-                          <th className="text-right py-0.5 pr-2">Eval</th>
-                          <th className="text-left py-0.5 pr-2">Best</th>
-                          <th className="text-right py-0.5">Nodes</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {depthHistory.map((info, i) => (
-                          <tr
-                            key={i}
-                            className={
-                              i === depthHistory.length - 1
-                                ? "text-foreground font-medium"
-                                : "text-muted-foreground"
-                            }
-                          >
-                            <td className="py-0.5 pr-2">{info.depth}</td>
-                            <td
-                              className={`text-right py-0.5 pr-2 ${
-                                info.score.value >= 0
-                                  ? "text-green-600"
-                                  : "text-red-600"
-                              }`}
-                            >
-                              {info.score.type === "mate"
-                                ? `M${info.score.value}`
-                                : (info.score.value / 100).toFixed(2)}
-                            </td>
-                            <td className="py-0.5 pr-2">
-                              {info.pv[0] ? fmtMove(info.pv[0]) : "-"}
-                            </td>
-                            <td className="text-right py-0.5">
-                              {info.nodes >= 1000
-                                ? `${(info.nodes / 1000).toFixed(0)}k`
-                                : info.nodes}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              </>
-            )}
+            <UCIStatsDisplay
+              latestInfo={latestInfo}
+              depthHistory={depthHistory}
+              bestMove={bestMove}
+              fen={fen}
+            />
           </>
         )}
 
@@ -509,40 +327,12 @@ function CatGPTStatsDisplay({
       <Separator />
 
       {/* Modified Policy Distribution */}
-      <div className="space-y-1.5">
-        <h4 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
-          Modified Policy
-        </h4>
-        {topPolicy.map((entry) => {
-          const label = fmtMove(entry.move);
-          const pct = (entry.weight * 100).toFixed(1);
-          const barWidth = (entry.weight / maxWeight) * 100;
-          const isBest = entry.move === displayStats.bestMove;
-
-          return (
-            <div key={entry.move} className="flex items-center gap-2">
-              <span
-                className={`w-12 text-right font-mono text-sm ${
-                  isBest ? "font-bold text-foreground" : "font-medium"
-                }`}
-              >
-                {label}
-              </span>
-              <div className="flex-1 h-5 bg-muted rounded overflow-hidden">
-                <div
-                  className={`h-full rounded transition-all duration-300 ${
-                    isBest ? "bg-amber-500" : "bg-blue-500"
-                  }`}
-                  style={{ width: `${barWidth}%` }}
-                />
-              </div>
-              <span className="w-14 text-right text-xs text-muted-foreground font-mono">
-                {pct}%
-              </span>
-            </div>
-          );
-        })}
-      </div>
+      <CatGPTPolicyChart
+        policy={topPolicy}
+        bestMove={displayStats.bestMove}
+        maxWeight={maxWeight}
+        fen={fen}
+      />
 
       <Separator />
 
@@ -620,6 +410,82 @@ function CatGPTStatsDisplay({
 
 // ─── DistQ Mini-Histogram ─────────────────────────────────────────
 
+// ─── Shared CatGPT Policy Chart (with Q values) ──────────────────
+
+function CatGPTPolicyChart({
+  policy,
+  bestMove,
+  maxWeight,
+  fen,
+}: {
+  policy: CatGPTSearchStats["policy"];
+  bestMove: string;
+  maxWeight: number;
+  fen: string;
+}) {
+  const { notationFormat } = usePositionStore();
+  const fmtMove = (move: string) =>
+    notationFormat === "algebraic" ? uciToAlgebraic(fen, move) : move;
+
+  const fmtQ = (q: number) => {
+    const cp = 90 * Math.tan(q * 1.5637541897);
+    const cpStr = cp >= 0 ? `+${(cp / 100).toFixed(2)}` : (cp / 100).toFixed(2);
+    return `${q >= 0 ? "+" : ""}${q.toFixed(3)} (${cpStr})`;
+  };
+
+  return (
+    <div className="space-y-1.5">
+      <h4 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
+        Modified Policy
+      </h4>
+      {policy.map((entry) => {
+        const label = fmtMove(entry.move);
+        const pct = (entry.weight * 100).toFixed(1);
+        const barWidth = (entry.weight / maxWeight) * 100;
+        const isBest = entry.move === bestMove;
+
+        return (
+          <div key={entry.move} className="space-y-0">
+            <div className="flex items-center gap-2">
+              <span
+                className={`w-12 text-right font-mono text-sm ${
+                  isBest ? "font-bold text-foreground" : "font-medium"
+                }`}
+              >
+                {label}
+              </span>
+              <div className="flex-1 h-5 bg-muted rounded overflow-hidden">
+                <div
+                  className={`h-full rounded transition-all duration-300 ${
+                    isBest ? "bg-amber-500" : "bg-blue-500"
+                  }`}
+                  style={{ width: `${barWidth}%` }}
+                />
+              </div>
+              <span className="w-14 text-right text-xs text-muted-foreground font-mono">
+                {pct}%
+              </span>
+            </div>
+            {entry.q != null && (
+              <div className="flex items-center gap-2 ml-14">
+                <span
+                  className={`text-[10px] font-mono ${
+                    entry.q >= 0 ? "text-green-600" : "text-red-600"
+                  }`}
+                >
+                  Q {fmtQ(entry.q)}
+                </span>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── DistQ Mini-Histogram ─────────────────────────────────────────
+
 function DistQHistogram({ distQ }: { distQ: number[] }) {
   const maxProb = useMemo(
     () => Math.max(...distQ, 0.001),
@@ -659,6 +525,228 @@ function DistQHistogram({ distQ }: { distQ: number[] }) {
         <span>Draw</span>
         <span>Win</span>
       </div>
+    </div>
+  );
+}
+
+// ─── UCI Stats Display (Stockfish / Leela) ────────────────────────
+
+function UCIStatsDisplay({
+  latestInfo,
+  depthHistory,
+  bestMove,
+  fen,
+}: {
+  latestInfo: EngineInfoLine;
+  depthHistory: EngineInfoLine[];
+  bestMove: string | null;
+  fen: string;
+}) {
+  const { notationFormat } = usePositionStore();
+  // null = show latest (live); number = pinned to a history entry
+  const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
+
+  const fmtMove = (move: string) =>
+    notationFormat === "algebraic" ? uciToAlgebraic(fen, move) : move;
+
+  const fmtEval = (info: EngineInfoLine) => {
+    if (info.score.type === "mate") return `M${info.score.value}`;
+    const cp = info.score.value / 100;
+    return cp >= 0 ? `+${cp.toFixed(2)}` : cp.toFixed(2);
+  };
+
+  // The info line we're displaying
+  const displayInfo = selectedIdx !== null ? depthHistory[selectedIdx] : latestInfo;
+  const isPinned = selectedIdx !== null;
+
+  const evalBarPct = displayInfo.score.type === "mate"
+    ? displayInfo.score.value > 0 ? 95 : 5
+    : Math.max(2, Math.min(98, 50 + displayInfo.score.value / 10));
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-baseline justify-between">
+        <span
+          className={`text-2xl font-bold font-mono ${
+            displayInfo.score.value >= 0
+              ? "text-green-600"
+              : "text-red-600"
+          }`}
+        >
+          {fmtEval(displayInfo)}
+        </span>
+        <span className="text-xs text-muted-foreground">
+          depth {displayInfo.depth}
+          {displayInfo.seldepth ? `/${displayInfo.seldepth}` : ""} •{" "}
+          {(displayInfo.nodes / 1000).toFixed(0)}k nodes
+          {displayInfo.nps
+            ? ` • ${(displayInfo.nps / 1000).toFixed(0)}k nps`
+            : ""}
+        </span>
+      </div>
+
+      {/* Eval bar */}
+      <div className="h-3 bg-gray-800 rounded overflow-hidden">
+        <div
+          className="h-full bg-white rounded transition-all duration-300 ease-out"
+          style={{ width: `${evalBarPct}%` }}
+        />
+      </div>
+
+      {/* Best move */}
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-muted-foreground">Best:</span>
+        <Badge className="font-mono">
+          {fmtMove(
+            isPinned
+              ? displayInfo.pv[0] ?? "-"
+              : bestMove ?? displayInfo.pv[0] ?? "-"
+          )}
+        </Badge>
+        {isPinned && (
+          <>
+            <Badge variant="outline" className="text-xs font-mono">
+              depth {displayInfo.depth}
+            </Badge>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-5 px-1.5 text-[10px] text-muted-foreground"
+              onClick={() => setSelectedIdx(null)}
+            >
+              ✕ live
+            </Button>
+          </>
+        )}
+      </div>
+
+      {/* PV line */}
+      {displayInfo.pv.length > 0 && (
+        <div className="space-y-1">
+          <span className="text-xs text-muted-foreground">
+            Principal Variation:
+          </span>
+          <div className="text-xs font-mono text-muted-foreground break-all">
+            {displayInfo.pv
+              .slice(0, 12)
+              .map((m, i) => (
+                <span key={i}>
+                  {i > 0 && " "}
+                  <span
+                    className={
+                      i === 0 ? "text-foreground font-medium" : ""
+                    }
+                  >
+                    {m}
+                  </span>
+                </span>
+              ))}
+            {displayInfo.pv.length > 12 && " ..."}
+          </div>
+        </div>
+      )}
+
+      {/* WDL */}
+      {displayInfo.wdl && (
+        <div className="space-y-1">
+          <span className="text-xs text-muted-foreground">WDL:</span>
+          <div className="flex h-5 rounded overflow-hidden text-[10px] font-medium">
+            <div
+              className="bg-green-500 flex items-center justify-center text-white"
+              style={{ width: `${displayInfo.wdl.win / 10}%` }}
+            >
+              {displayInfo.wdl.win > 80 &&
+                `${(displayInfo.wdl.win / 10).toFixed(0)}%`}
+            </div>
+            <div
+              className="bg-gray-400 flex items-center justify-center text-white"
+              style={{ width: `${displayInfo.wdl.draw / 10}%` }}
+            >
+              {displayInfo.wdl.draw > 80 &&
+                `${(displayInfo.wdl.draw / 10).toFixed(0)}%`}
+            </div>
+            <div
+              className="bg-red-500 flex items-center justify-center text-white"
+              style={{ width: `${displayInfo.wdl.loss / 10}%` }}
+            >
+              {displayInfo.wdl.loss > 80 &&
+                `${(displayInfo.wdl.loss / 10).toFixed(0)}%`}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Depth history table */}
+      {depthHistory.length > 0 && (
+        <>
+          <Separator />
+          <div className="space-y-1">
+            <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wide">
+              Depth History
+              <span className="ml-1 font-normal normal-case">(click to inspect)</span>
+            </span>
+            <div className="max-h-48 overflow-y-auto">
+              <table className="w-full text-xs font-mono">
+                <thead className="text-muted-foreground sticky top-0 bg-card">
+                  <tr>
+                    <th className="text-left py-0.5 pr-2">D</th>
+                    <th className="text-right py-0.5 pr-2">Eval</th>
+                    <th className="text-left py-0.5 pr-2">Best</th>
+                    <th className="text-right py-0.5">Nodes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {depthHistory.map((info, i) => {
+                    const prevBest = i > 0 ? depthHistory[i - 1].pv[0] : null;
+                    const bestChanged = prevBest !== null && info.pv[0] !== prevBest;
+                    const isSelected = selectedIdx === i;
+                    return (
+                      <tr
+                        key={i}
+                        className={`cursor-pointer hover:bg-muted/50 ${
+                          isSelected
+                            ? "bg-muted ring-1 ring-blue-500/40 text-foreground font-medium"
+                            : bestChanged
+                            ? "text-amber-500 font-medium"
+                            : i === depthHistory.length - 1
+                            ? "text-foreground font-medium"
+                            : "text-muted-foreground"
+                        }`}
+                        onClick={() =>
+                          setSelectedIdx(isSelected ? null : i)
+                        }
+                      >
+                        <td className="py-0.5 pr-2">{info.depth}</td>
+                        <td
+                          className={`text-right py-0.5 pr-2 ${
+                            info.score.value >= 0
+                              ? "text-green-600"
+                              : "text-red-600"
+                          }`}
+                        >
+                          {info.score.type === "mate"
+                            ? `M${info.score.value}`
+                            : (info.score.value / 100).toFixed(2)}
+                        </td>
+                        <td className="py-0.5 pr-2">
+                          <span className={bestChanged ? "underline" : ""}>
+                            {info.pv[0] ? fmtMove(info.pv[0]) : "-"}
+                          </span>
+                        </td>
+                        <td className="text-right py-0.5">
+                          {info.nodes >= 1000
+                            ? `${(info.nodes / 1000).toFixed(0)}k`
+                            : info.nodes}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }

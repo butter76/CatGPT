@@ -31,7 +31,7 @@ import {
 } from "@/lib/store";
 import { usePositionStore } from "@/lib/store";
 import { sideToMove, uciToAlgebraic } from "@/lib/chess-utils";
-import type { Position, EngineAnalysis, CatGPTSearchStats } from "@/lib/types";
+import type { Position, EngineAnalysis, EngineInfoLine, CatGPTSearchStats } from "@/lib/types";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -454,7 +454,6 @@ function StoredEngineResultCard({
   fen: string;
   onDelete: () => Promise<void>;
 }) {
-  const [expanded, setExpanded] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const { notationFormat } = usePositionStore();
 
@@ -535,79 +534,12 @@ function StoredEngineResultCard({
           </div>
         )}
 
-        {/* UCI Depth History */}
+        {/* UCI Depth History (interactive) */}
         {hasUCIHistory && (
-          <>
-            <Separator />
-            <Button
-              variant="ghost"
-              size="sm"
-              className="w-full text-xs"
-              onClick={() => setExpanded(!expanded)}
-            >
-              {expanded ? "Hide" : "Show"} depth history ({ea.depthHistory!.length} entries)
-            </Button>
-            {expanded && (
-              <div className="max-h-64 overflow-y-auto">
-                <table className="w-full text-xs font-mono">
-                  <thead className="text-muted-foreground sticky top-0 bg-card">
-                    <tr>
-                      <th className="text-left py-1 pr-2">Depth</th>
-                      <th className="text-right py-1 pr-2">Eval</th>
-                      <th className="text-left py-1 pr-2">Best</th>
-                      <th className="text-left py-1 pr-2">PV</th>
-                      <th className="text-right py-1">Nodes</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {ea.depthHistory!.map((info, i) => {
-                      const prevBest =
-                        i > 0 ? ea.depthHistory![i - 1].pv[0] : null;
-                      const bestChanged =
-                        prevBest !== null && info.pv[0] !== prevBest;
-                      return (
-                        <tr
-                          key={i}
-                          className={
-                            bestChanged
-                              ? "text-amber-500 font-medium"
-                              : i === ea.depthHistory!.length - 1
-                              ? "text-foreground font-medium"
-                              : "text-muted-foreground"
-                          }
-                        >
-                          <td className="py-0.5 pr-2">{info.depth}</td>
-                          <td
-                            className={`text-right py-0.5 pr-2 ${
-                              info.score.value >= 0
-                                ? "text-green-600"
-                                : "text-red-600"
-                            }`}
-                          >
-                            {fmtEval(info.score.type, info.score.value)}
-                          </td>
-                          <td className="py-0.5 pr-2">
-                            <span className={bestChanged ? "underline" : ""}>
-                              {info.pv[0] ? fmtMove(info.pv[0]) : "-"}
-                            </span>
-                          </td>
-                          <td className="py-0.5 pr-2 text-muted-foreground truncate max-w-[160px]">
-                            {info.pv.slice(1, 5).join(" ")}
-                            {info.pv.length > 5 && " …"}
-                          </td>
-                          <td className="text-right py-0.5">
-                            {info.nodes >= 1000
-                              ? `${(info.nodes / 1000).toFixed(0)}k`
-                              : info.nodes}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </>
+          <StoredUCIHistoryViewer
+            history={ea.depthHistory!}
+            fen={fen}
+          />
         )}
 
         {/* CatGPT: Interactive search history + details viewer */}
@@ -619,6 +551,195 @@ function StoredEngineResultCard({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+// ─── Stored UCI history viewer (selectable snapshots) ─────────────
+
+function StoredUCIHistoryViewer({
+  history,
+  fen,
+}: {
+  history: EngineInfoLine[];
+  fen: string;
+}) {
+  // Default to the last entry (deepest search)
+  const [selectedIdx, setSelectedIdx] = useState(history.length - 1);
+  const { notationFormat } = usePositionStore();
+  const fmtMove = (move: string) =>
+    notationFormat === "algebraic" ? uciToAlgebraic(fen, move) : move;
+
+  const fmtEval = (scoreType: string, value: number) => {
+    if (scoreType === "mate") return `M${value}`;
+    const cp = value / 100;
+    return cp >= 0 ? `+${cp.toFixed(2)}` : cp.toFixed(2);
+  };
+
+  const displayInfo = history[selectedIdx];
+  if (!displayInfo) return null;
+
+  return (
+    <div className="space-y-3">
+      <Separator />
+
+      {/* Viewing indicator */}
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-muted-foreground">Viewing:</span>
+        <Badge variant="outline" className="text-xs font-mono">
+          depth {displayInfo.depth} ({selectedIdx + 1}/{history.length})
+        </Badge>
+        <span className="text-xs text-muted-foreground">
+          {displayInfo.nodes >= 1000
+            ? `${(displayInfo.nodes / 1000).toFixed(0)}k`
+            : displayInfo.nodes}{" "}
+          nodes
+          {displayInfo.nps
+            ? ` • ${(displayInfo.nps / 1000).toFixed(0)}k nps`
+            : ""}
+          {displayInfo.time != null
+            ? ` • ${(displayInfo.time / 1000).toFixed(1)}s`
+            : ""}
+        </span>
+      </div>
+
+      {/* PV for selected depth */}
+      {displayInfo.pv.length > 0 && (
+        <div className="space-y-1">
+          <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wide">
+            Principal Variation
+          </span>
+          <div className="text-xs font-mono text-muted-foreground break-all">
+            {displayInfo.pv.slice(0, 16).map((m, i) => (
+              <span key={i}>
+                {i > 0 && " "}
+                <span
+                  className={i === 0 ? "text-foreground font-medium" : ""}
+                >
+                  {m}
+                </span>
+              </span>
+            ))}
+            {displayInfo.pv.length > 16 && " …"}
+          </div>
+        </div>
+      )}
+
+      {/* WDL for selected depth (Leela) */}
+      {displayInfo.wdl && (
+        <div className="space-y-1">
+          <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wide">
+            WDL
+          </span>
+          <div className="flex h-5 rounded overflow-hidden text-[10px] font-medium">
+            <div
+              className="bg-green-500 flex items-center justify-center text-white"
+              style={{ width: `${displayInfo.wdl.win / 10}%` }}
+            >
+              {displayInfo.wdl.win > 80 &&
+                `${(displayInfo.wdl.win / 10).toFixed(0)}%`}
+            </div>
+            <div
+              className="bg-gray-400 flex items-center justify-center text-white"
+              style={{ width: `${displayInfo.wdl.draw / 10}%` }}
+            >
+              {displayInfo.wdl.draw > 80 &&
+                `${(displayInfo.wdl.draw / 10).toFixed(0)}%`}
+            </div>
+            <div
+              className="bg-red-500 flex items-center justify-center text-white"
+              style={{ width: `${displayInfo.wdl.loss / 10}%` }}
+            >
+              {displayInfo.wdl.loss > 80 &&
+                `${(displayInfo.wdl.loss / 10).toFixed(0)}%`}
+            </div>
+          </div>
+          <div className="flex justify-between text-[10px] text-muted-foreground">
+            <span className="text-green-600">
+              W {(displayInfo.wdl.win / 10).toFixed(1)}%
+            </span>
+            <span>D {(displayInfo.wdl.draw / 10).toFixed(1)}%</span>
+            <span className="text-red-600">
+              L {(displayInfo.wdl.loss / 10).toFixed(1)}%
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Clickable depth history table */}
+      {history.length > 1 && (
+        <>
+          <Separator />
+          <div className="space-y-1">
+            <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wide">
+              Depth History
+              <span className="ml-1 font-normal normal-case">(click to inspect)</span>
+            </span>
+            <div className="max-h-48 overflow-y-auto">
+              <table className="w-full text-xs font-mono">
+                <thead className="text-muted-foreground sticky top-0 bg-card">
+                  <tr>
+                    <th className="text-left py-1 pr-2">Depth</th>
+                    <th className="text-right py-1 pr-2">Eval</th>
+                    <th className="text-left py-1 pr-2">Best</th>
+                    <th className="text-left py-1 pr-2">PV</th>
+                    <th className="text-right py-1">Nodes</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.map((info, i) => {
+                    const prevBest =
+                      i > 0 ? history[i - 1].pv[0] : null;
+                    const bestChanged =
+                      prevBest !== null && info.pv[0] !== prevBest;
+                    const isSelected = selectedIdx === i;
+                    return (
+                      <tr
+                        key={i}
+                        className={`cursor-pointer hover:bg-muted/50 ${
+                          isSelected
+                            ? "bg-muted ring-1 ring-blue-500/40 text-foreground font-medium"
+                            : bestChanged
+                            ? "text-amber-500 font-medium"
+                            : i === history.length - 1
+                            ? "text-foreground font-medium"
+                            : "text-muted-foreground"
+                        }`}
+                        onClick={() => setSelectedIdx(i)}
+                      >
+                        <td className="py-0.5 pr-2">{info.depth}</td>
+                        <td
+                          className={`text-right py-0.5 pr-2 ${
+                            info.score.value >= 0
+                              ? "text-green-600"
+                              : "text-red-600"
+                          }`}
+                        >
+                          {fmtEval(info.score.type, info.score.value)}
+                        </td>
+                        <td className="py-0.5 pr-2">
+                          <span className={bestChanged ? "underline" : ""}>
+                            {info.pv[0] ? fmtMove(info.pv[0]) : "-"}
+                          </span>
+                        </td>
+                        <td className="py-0.5 pr-2 text-muted-foreground truncate max-w-[160px]">
+                          {info.pv.slice(1, 5).join(" ")}
+                          {info.pv.length > 5 && " …"}
+                        </td>
+                        <td className="text-right py-0.5">
+                          {info.nodes >= 1000
+                            ? `${(info.nodes / 1000).toFixed(0)}k`
+                            : info.nodes}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -663,7 +784,7 @@ function StoredCatGPTHistoryViewer({
         </span>
       </div>
 
-      {/* Modified Policy */}
+      {/* Modified Policy with Q values */}
       <div className="space-y-1.5">
         <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wide">
           Modified Policy
@@ -674,25 +795,41 @@ function StoredCatGPTHistoryViewer({
           const barWidth = (entry.weight / maxWeight) * 100;
           const isBest = entry.move === displayStats.bestMove;
           return (
-            <div key={entry.move} className="flex items-center gap-2">
-              <span
-                className={`w-12 text-right font-mono text-xs ${
-                  isBest ? "font-bold text-foreground" : ""
-                }`}
-              >
-                {label}
-              </span>
-              <div className="flex-1 h-4 bg-muted rounded overflow-hidden">
-                <div
-                  className={`h-full rounded transition-all ${
-                    isBest ? "bg-amber-500" : "bg-blue-500"
+            <div key={entry.move} className="space-y-0">
+              <div className="flex items-center gap-2">
+                <span
+                  className={`w-12 text-right font-mono text-xs ${
+                    isBest ? "font-bold text-foreground" : ""
                   }`}
-                  style={{ width: `${barWidth}%` }}
-                />
+                >
+                  {label}
+                </span>
+                <div className="flex-1 h-4 bg-muted rounded overflow-hidden">
+                  <div
+                    className={`h-full rounded transition-all ${
+                      isBest ? "bg-amber-500" : "bg-blue-500"
+                    }`}
+                    style={{ width: `${barWidth}%` }}
+                  />
+                </div>
+                <span className="w-12 text-right text-[10px] text-muted-foreground font-mono">
+                  {pct}%
+                </span>
               </div>
-              <span className="w-12 text-right text-[10px] text-muted-foreground font-mono">
-                {pct}%
-              </span>
+              {entry.q != null && (
+                <div className="flex items-center gap-2 ml-14">
+                  <span
+                    className={`text-[10px] font-mono ${
+                      entry.q >= 0 ? "text-green-600" : "text-red-600"
+                    }`}
+                  >
+                    Q {entry.q >= 0 ? "+" : ""}{entry.q.toFixed(3)} ({(() => {
+                      const cp = 90 * Math.tan(entry.q * 1.5637541897);
+                      return cp >= 0 ? `+${(cp/100).toFixed(2)}` : (cp/100).toFixed(2);
+                    })()})
+                  </span>
+                </div>
+              )}
             </div>
           );
         })}
