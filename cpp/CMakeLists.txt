@@ -139,6 +139,28 @@ set_target_properties(catgpt_analyze PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
 
+# === CatGPT Search Binary (standalone Fractional MCTS for web UI) ===
+add_executable(catgpt_search
+    src/catgpt_search_main.cpp
+)
+
+target_include_directories(catgpt_search PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+)
+
+target_link_libraries(catgpt_search PRIVATE
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    pthread
+)
+
+set_target_properties(catgpt_search PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+)
+
 # === Fathom (Syzygy tablebase probing, C library) ===
 set(FATHOM_SRC_DIR "${CMAKE_SOURCE_DIR}/external/fathom/src")
 add_library(fathom STATIC
@@ -189,4 +211,5 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(catgpt_fractional_mcts PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_analyze PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_selfplay PRIVATE -fdiagnostics-color=always)
+    target_compile_options(catgpt_search PRIVATE -fdiagnostics-color=always)
 endif()

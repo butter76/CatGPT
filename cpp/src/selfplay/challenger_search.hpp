@@ -27,6 +27,7 @@
 #include "../../external/chess-library/include/chess.hpp"
 #include "../engine/fractional_mcts/config.hpp"
 #include "../engine/fractional_mcts/node.hpp"
+#include "../engine/fractional_mcts/search_stats.hpp"
 #include "../engine/policy.hpp"
 #include "../engine/search_result.hpp"
 #include "../tokenizer.hpp"
@@ -44,10 +45,12 @@ namespace catgpt {
  */
 class     ChallengerSearch {
 public:
-    ChallengerSearch(BatchEvaluator& evaluator, const FractionalMCTSConfig& config)
+    ChallengerSearch(BatchEvaluator& evaluator, const FractionalMCTSConfig& config,
+                     std::ostream* stats_out = nullptr)
         : evaluator_(evaluator)
         , config_(config)
         , total_gpu_evals_(0)
+        , stats_out_(stats_out)
     {}
 
     /**
@@ -81,6 +84,22 @@ public:
         auto root = std::make_unique<FractionalNode>();
         co_await evaluate_node(root.get(), board);
 
+        // ── Stats: root_eval ──
+        if (stats_out_) {
+            chess::Move initial_best = chess::Move::NO_MOVE;
+            float best_prior = -1.0f;
+            for (const auto& [move, prior] : root->policy_priors) {
+                if (prior > best_prior) {
+                    best_prior = prior;
+                    initial_best = move;
+                }
+            }
+            int root_cp = static_cast<int>(90.0f * std::tan(root->Q * 1.5637541897f));
+            std::unordered_map<chess::Move, float, MoveHash> empty_allocs;
+            print_catgpt_stats(*stats_out_, "root_eval", root.get(), empty_allocs, 0.0f,
+                              initial_best, root_cp, total_gpu_evals_, 0);
+        }
+
         // Determine target evals
         int target_evals = config_.min_total_evals;
 
@@ -88,6 +107,7 @@ public:
         float N = config_.initial_budget;
         float last_used_N = N;
         int iteration = 0;
+        chess::Move stats_prev_best = chess::Move::NO_MOVE;
 
         while (total_gpu_evals_ < target_evals && iteration < 10000) {
             last_used_N = N;
@@ -95,6 +115,27 @@ public:
             int alpha = std::max(0, median);
             int beta  = std::min(VALUE_NUM_BINS - 1, median);
             co_await recursive_search(root.get(), board, N, alpha, beta);
+
+            // ── Stats: check if best move changed ──
+            if (stats_out_ && !root->children.empty()) {
+                std::unordered_map<chess::Move, float, MoveHash> allocs;
+                float N_adj = 0.0f;
+                compute_root_stats_allocations(
+                    root.get(), N,
+                    [this](FractionalNode* node, float budget) {
+                        return compute_allocations(node, budget);
+                    },
+                    allocs, N_adj);
+
+                chess::Move current_best = best_move_from_allocations(allocs);
+                if (current_best != stats_prev_best && current_best != chess::Move::NO_MOVE) {
+                    stats_prev_best = current_best;
+                    int cp = child_q_to_cp(root->children.at(current_best).Q);
+                    print_catgpt_stats(*stats_out_, "search_update", root.get(), allocs, N_adj,
+                                      current_best, cp, total_gpu_evals_, iteration);
+                }
+            }
+
             N += 1.0f;
             ++iteration;
         }
@@ -117,6 +158,20 @@ public:
             auto& chosen_child = root->children.at(best_move);
             float q = -chosen_child.Q;
             result.cp_score = static_cast<int>(90.0f * std::tan(q * 1.5637541897f));
+
+            // ── Stats: search_complete ──
+            if (stats_out_) {
+                std::unordered_map<chess::Move, float, MoveHash> allocs;
+                float N_adj = 0.0f;
+                compute_root_stats_allocations(
+                    root.get(), last_used_N,
+                    [this](FractionalNode* node, float budget) {
+                        return compute_allocations(node, budget);
+                    },
+                    allocs, N_adj);
+                print_catgpt_stats(*stats_out_, "search_complete", root.get(), allocs, N_adj,
+                                  best_move, result.cp_score, total_gpu_evals_, iteration);
+            }
         } else {
             result.best_move = moves[0];
         }
@@ -414,6 +469,7 @@ private:
     FractionalMCTSConfig config_;
     int total_gpu_evals_;
     std::unordered_map<uint64_t, RawNNOutput> eval_cache_;
+    std::ostream* stats_out_;  // If non-null, JSON stats lines are written here during search
 };
 
 }  // namespace catgpt

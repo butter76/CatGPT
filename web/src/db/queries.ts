@@ -7,7 +7,7 @@ import {
   policyEntries,
   engineAnalyses,
 } from "./schema";
-import type { Position, SharpMoveAnnotation, NetworkAnalysis, PolicyEntry, EngineAnalysis, EngineInfoLine } from "@/lib/types";
+import type { Position, SharpMoveAnnotation, NetworkAnalysis, PolicyEntry, EngineAnalysis, EngineInfoLine, CatGPTSearchStats } from "@/lib/types";
 
 // ─── Helpers to assemble full Position objects ────────────────────
 
@@ -214,15 +214,21 @@ export async function createNetworkAnalysis(
 export async function createEngineAnalysisRecord(
   positionId: string,
   data: {
-    engine: "leela" | "stockfish";
+    engine: "leela" | "stockfish" | "catgpt";
     bestMove: string;
     evaluation: number;
     depth: number;
     nodes: number;
     pv: string[];
     depthHistory?: EngineInfoLine[];
+    catgptHistory?: CatGPTSearchStats[];
   }
 ): Promise<void> {
+  // For CatGPT, store catgptHistory in the depthHistory jsonb column
+  const historyPayload = data.engine === "catgpt"
+    ? (data.catgptHistory ?? [])
+    : (data.depthHistory ?? []);
+
   await db.insert(engineAnalyses).values({
     positionId,
     engine: data.engine,
@@ -231,7 +237,7 @@ export async function createEngineAnalysisRecord(
     depth: data.depth,
     nodes: data.nodes,
     pv: data.pv,
-    depthHistory: data.depthHistory ?? [],
+    depthHistory: historyPayload,
   });
 
   // Update the position's updatedAt
@@ -274,17 +280,28 @@ function assemblePosition(
     };
   }
 
-  const engineAnalysesData: EngineAnalysis[] = eas.map((ea) => ({
-    id: ea.id,
-    engine: ea.engine,
-    bestMove: ea.bestMove,
-    evaluation: ea.evaluation,
-    depth: ea.depth,
-    nodes: ea.nodes,
-    pv: ea.pv ?? [],
-    depthHistory: (ea.depthHistory as EngineInfoLine[]) ?? [],
-    timestamp: ea.createdAt.toISOString(),
-  }));
+  const engineAnalysesData: EngineAnalysis[] = eas.map((ea) => {
+    const base = {
+      id: ea.id,
+      engine: ea.engine,
+      bestMove: ea.bestMove,
+      evaluation: ea.evaluation,
+      depth: ea.depth,
+      nodes: ea.nodes,
+      pv: ea.pv ?? [],
+      timestamp: ea.createdAt.toISOString(),
+    };
+    if (ea.engine === "catgpt") {
+      return {
+        ...base,
+        catgptHistory: (ea.depthHistory as unknown as CatGPTSearchStats[]) ?? [],
+      };
+    }
+    return {
+      ...base,
+      depthHistory: (ea.depthHistory as EngineInfoLine[]) ?? [],
+    };
+  });
 
   const moveAnnotationsData: SharpMoveAnnotation[] = anns.map((a) => ({
     move: a.move,

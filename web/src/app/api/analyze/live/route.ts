@@ -1,5 +1,6 @@
 import { type NextRequest } from "next/server";
 import { runEngineAnalysis } from "@/lib/uci-engine";
+import { runCatGPTAnalysis, type CatGPTSearchStats } from "@/lib/catgpt-engine";
 import { isValidFEN } from "@/lib/chess-utils";
 import type { EngineInfoLine } from "@/lib/types";
 
@@ -29,8 +30,8 @@ export async function GET(request: NextRequest) {
     });
   }
 
-  if (!["stockfish", "leela"].includes(engine)) {
-    return new Response(JSON.stringify({ error: "engine must be stockfish or leela" }), {
+  if (!["stockfish", "leela", "catgpt"].includes(engine)) {
+    return new Response(JSON.stringify({ error: "engine must be stockfish, leela, or catgpt" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
@@ -54,53 +55,99 @@ export async function GET(request: NextRequest) {
       }
 
       try {
-        // Collect all info lines for depth history
-        const depthHistory: EngineInfoLine[] = [];
-        let lastInfo: EngineInfoLine | null = null;
+        if (engine === "catgpt") {
+          // ── CatGPT: JSON stats protocol ──
+          const catgptHistory: CatGPTSearchStats[] = [];
+          let lastStats: CatGPTSearchStats | null = null;
 
-        for await (const event of runEngineAnalysis({
-          engine: engine as "stockfish" | "leela",
-          fen,
-          nodes,
-        })) {
-          switch (event.type) {
-            case "info": {
-              const info = event.data as EngineInfoLine;
-              depthHistory.push(info);
-              lastInfo = info;
-              send("info", event.data);
-              break;
-            }
-            case "bestmove":
-              send("bestmove", event.data);
-              // If positionId provided, persist the final result with full depth history
-              if (positionId && lastInfo) {
-                try {
-                  const { createEngineAnalysisRecord } = await import("@/db/queries");
-                  const bm = event.data as { bestMove: string };
-                  await createEngineAnalysisRecord(positionId, {
-                    engine: engine as "leela" | "stockfish",
-                    bestMove: bm.bestMove,
-                    evaluation: lastInfo.score?.value ?? 0,
-                    depth: lastInfo.depth ?? 0,
-                    nodes: lastInfo.nodes ?? nodes,
-                    pv: lastInfo.pv ?? [bm.bestMove],
-                    depthHistory,
-                  });
-                  send("saved", { positionId });
-                } catch (err) {
-                  send("error", {
-                    message: `Analysis complete but failed to save: ${err}`,
-                  });
+          for await (const event of runCatGPTAnalysis({ fen, nodes })) {
+            switch (event.type) {
+              case "stats":
+                catgptHistory.push(event.data);
+                lastStats = event.data;
+                send("catgpt_stats", event.data);
+                break;
+              case "bestmove":
+                send("bestmove", event.data);
+                // Persist to DB if positionId provided
+                if (positionId && lastStats) {
+                  try {
+                    const { createEngineAnalysisRecord } = await import("@/db/queries");
+                    const bm = event.data as { bestMove: string };
+                    await createEngineAnalysisRecord(positionId, {
+                      engine: "catgpt",
+                      bestMove: bm.bestMove,
+                      evaluation: lastStats.cp,
+                      depth: lastStats.iteration,
+                      nodes: lastStats.nodes,
+                      pv: [bm.bestMove],
+                      catgptHistory,
+                    });
+                    send("saved", { positionId });
+                  } catch (err) {
+                    send("error", {
+                      message: `Analysis complete but failed to save: ${err}`,
+                    });
+                  }
                 }
+                break;
+              case "error":
+                send("error", event.data);
+                break;
+              case "done":
+                send("done", {});
+                break;
+            }
+          }
+        } else {
+          // ── UCI engines: Stockfish / Leela ──
+          const depthHistory: EngineInfoLine[] = [];
+          let lastInfo: EngineInfoLine | null = null;
+
+          for await (const event of runEngineAnalysis({
+            engine: engine as "stockfish" | "leela",
+            fen,
+            nodes,
+          })) {
+            switch (event.type) {
+              case "info": {
+                const info = event.data as EngineInfoLine;
+                depthHistory.push(info);
+                lastInfo = info;
+                send("info", event.data);
+                break;
               }
-              break;
-            case "error":
-              send("error", event.data);
-              break;
-            case "done":
-              send("done", {});
-              break;
+              case "bestmove":
+                send("bestmove", event.data);
+                // If positionId provided, persist the final result with full depth history
+                if (positionId && lastInfo) {
+                  try {
+                    const { createEngineAnalysisRecord } = await import("@/db/queries");
+                    const bm = event.data as { bestMove: string };
+                    await createEngineAnalysisRecord(positionId, {
+                      engine: engine as "leela" | "stockfish",
+                      bestMove: bm.bestMove,
+                      evaluation: lastInfo.score?.value ?? 0,
+                      depth: lastInfo.depth ?? 0,
+                      nodes: lastInfo.nodes ?? nodes,
+                      pv: lastInfo.pv ?? [bm.bestMove],
+                      depthHistory,
+                    });
+                    send("saved", { positionId });
+                  } catch (err) {
+                    send("error", {
+                      message: `Analysis complete but failed to save: ${err}`,
+                    });
+                  }
+                }
+                break;
+              case "error":
+                send("error", event.data);
+                break;
+              case "done":
+                send("done", {});
+                break;
+            }
           }
         }
       } catch (err) {

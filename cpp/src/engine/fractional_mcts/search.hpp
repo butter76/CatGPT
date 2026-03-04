@@ -39,6 +39,7 @@
 #include "../trt_evaluator.hpp"
 #include "config.hpp"
 #include "node.hpp"
+#include "search_stats.hpp"
 
 namespace catgpt {
 
@@ -59,7 +60,16 @@ public:
         , board_(STARTPOS_FEN)
         , stop_flag_(false)
         , total_gpu_evals_(0)
+        , stats_out_(nullptr)
     {}
+
+    /**
+     * Enable search stats printing.
+     * When set, JSON stats lines are written to `out` during search().
+     */
+    void set_stats_output(std::ostream& out) {
+        stats_out_ = &out;
+    }
 
     void reset(std::string_view fen = STARTPOS_FEN) override {
         board_ = chess::Board(fen);
@@ -108,6 +118,23 @@ public:
         root_ = std::make_unique<FractionalNode>();
         evaluate_node(root_.get(), board_);
 
+        // ── Stats: root_eval (initial NN evaluation, raw policy) ──
+        if (stats_out_) {
+            // Best move = highest prior (no search yet)
+            chess::Move initial_best = chess::Move::NO_MOVE;
+            float best_prior = -1.0f;
+            for (const auto& [move, prior] : root_->policy_priors) {
+                if (prior > best_prior) {
+                    best_prior = prior;
+                    initial_best = move;
+                }
+            }
+            int root_cp = static_cast<int>(90.0f * std::tan(root_->Q * 1.5637541897f));
+            std::unordered_map<chess::Move, float, MoveHash> empty_allocs;
+            print_catgpt_stats(*stats_out_, "root_eval", root_.get(), empty_allocs, 0.0f,
+                              initial_best, root_cp, total_gpu_evals_, 0);
+        }
+
         // Determine target evals (can be limited by search limits)
         int target_evals = config_.min_total_evals;
         if (limits.nodes.has_value()) {
@@ -118,6 +145,7 @@ public:
         float N = config_.initial_budget;
         float last_used_N = N;
         int iteration = 0;
+        chess::Move stats_prev_best = chess::Move::NO_MOVE;
 
         while (total_gpu_evals_ < target_evals && iteration < 10000) {
             if (stop_flag_.load(std::memory_order_relaxed)) {
@@ -137,8 +165,41 @@ public:
             int alpha = compute_percentile_bin(root_->distQ, 0.16f);
             int beta  = compute_percentile_bin(root_->distQ, 0.84f);
             recursive_search(root_.get(), board_, N, alpha, beta);
+
+            // ── Stats: check if best move changed ──
+            if (stats_out_ && !root_->children.empty()) {
+                std::unordered_map<chess::Move, float, MoveHash> allocs;
+                float N_adj = 0.0f;
+                compute_root_stats_allocations(
+                    root_.get(), N,
+                    [this](FractionalNode* node, float budget) {
+                        return compute_allocations(node, budget);
+                    },
+                    allocs, N_adj);
+
+                chess::Move current_best = best_move_from_allocations(allocs);
+                if (current_best != stats_prev_best && current_best != chess::Move::NO_MOVE) {
+                    stats_prev_best = current_best;
+                    int cp = child_q_to_cp(root_->children.at(current_best).Q);
+                    print_catgpt_stats(*stats_out_, "search_update", root_.get(), allocs, N_adj,
+                                      current_best, cp, total_gpu_evals_, iteration);
+                }
+            }
+
             N += 1.0f;
             ++iteration;
+        }
+
+        // ── Stats: search_complete ──
+        float stats_N_adj_final = 0.0f;
+        std::unordered_map<chess::Move, float, MoveHash> stats_allocs_final;
+        if (stats_out_ && !root_->children.empty()) {
+            compute_root_stats_allocations(
+                root_.get(), last_used_N,
+                [this](FractionalNode* node, float budget) {
+                    return compute_allocations(node, budget);
+                },
+                stats_allocs_final, stats_N_adj_final);
         }
 
         // Select best move by allocation (using the last N that was actually used)
@@ -162,6 +223,13 @@ public:
             // Convert Q from [-1, 1] to centipawns using tangent scaling
             int cp = static_cast<int>(90.0f * std::tan(q * 1.5637541897f));
             result.score = Score::cp(cp);
+
+            // ── Stats: search_complete ──
+            if (stats_out_) {
+                print_catgpt_stats(*stats_out_, "search_complete", root_.get(),
+                                  stats_allocs_final, stats_N_adj_final,
+                                  best_move, cp, total_gpu_evals_, iteration);
+            }
         } else {
             // Fallback (shouldn't happen)
             result.best_move = moves[0];
@@ -572,6 +640,7 @@ private:
     std::unique_ptr<FractionalNode> root_;
     std::atomic<bool> stop_flag_;
     int total_gpu_evals_;
+    std::ostream* stats_out_;  // If non-null, JSON stats lines are written here during search
 };
 
 }  // namespace catgpt

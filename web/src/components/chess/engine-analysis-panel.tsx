@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -17,7 +17,7 @@ import { Separator } from "@/components/ui/separator";
 import { useEngineAnalysis } from "@/lib/use-engine-analysis";
 import { usePositionStore } from "@/lib/store";
 import { uciToAlgebraic } from "@/lib/chess-utils";
-import type { EngineInfoLine, EngineKind } from "@/lib/types";
+import type { EngineInfoLine, EngineKind, CatGPTSearchStats } from "@/lib/types";
 import {
   Play,
   Square,
@@ -48,20 +48,22 @@ export function EngineAnalysisPanel({
     bestMove,
     saved,
     error,
+    catgptStats,
+    catgptHistory,
     startAnalysis,
     stopAnalysis,
     reset,
   } = useEngineAnalysis();
 
   const { notationFormat } = usePositionStore();
-  const [selectedEngine, setSelectedEngine] = useState<EngineKind>("stockfish");
-  const [nodes, setNodes] = useState(500000);
+  const [selectedEngine, setSelectedEngine] = useState<EngineKind>("catgpt");
+  const [nodes, setNodes] = useState(400);
   const [availableEngines, setAvailableEngines] = useState<string[]>([]);
 
-  // Default nodes: 500k for Stockfish (CPU-cheap), 5k for GPU engines
+  // Default nodes: 500k for Stockfish (CPU-cheap), 400 for CatGPT, 5k for Leela
   const handleEngineChange = (eng: EngineKind) => {
     setSelectedEngine(eng);
-    setNodes(eng === "stockfish" ? 500000 : 5000);
+    setNodes(eng === "stockfish" ? 500000 : eng === "catgpt" ? 400 : 5000);
   };
 
   // Fetch available engines
@@ -94,6 +96,12 @@ export function EngineAnalysisPanel({
     return cp >= 0 ? `+${cp.toFixed(2)}` : cp.toFixed(2);
   };
 
+  // Format centipawn value
+  const fmtCp = (cp: number) => {
+    const v = cp / 100;
+    return v >= 0 ? `+${v.toFixed(2)}` : v.toFixed(2);
+  };
+
   // Eval bar position (0 = black winning, 100 = white winning)
   const evalBarPct = latestInfo
     ? latestInfo.score.type === "mate"
@@ -101,7 +109,11 @@ export function EngineAnalysisPanel({
         ? 95
         : 5
       : Math.max(2, Math.min(98, 50 + latestInfo.score.value / 10))
+    : catgptStats
+    ? Math.max(2, Math.min(98, 50 + catgptStats.cp / 10))
     : 50;
+
+  const isCatGPT = engine === "catgpt" || selectedEngine === "catgpt";
 
   return (
     <Card>
@@ -138,6 +150,12 @@ export function EngineAnalysisPanel({
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem
+                      value="catgpt"
+                      disabled={!availableEngines.includes("catgpt")}
+                    >
+                      🐱 CatGPT
+                    </SelectItem>
+                    <SelectItem
                       value="stockfish"
                       disabled={!availableEngines.includes("stockfish")}
                     >
@@ -153,15 +171,17 @@ export function EngineAnalysisPanel({
                 </Select>
               </div>
               <div className="space-y-1">
-                <Label className="text-xs">Nodes</Label>
+                <Label className="text-xs">
+                  {selectedEngine === "catgpt" ? "GPU Evals" : "Nodes"}
+                </Label>
                 <Input
                   type="number"
                   value={nodes}
                   onChange={(e) => setNodes(parseInt(e.target.value) || 1)}
                   className="h-8 text-xs font-mono"
-                  min={100}
-                  max={100000000}
-                  step={100000}
+                  min={selectedEngine === "catgpt" ? 10 : 100}
+                  max={selectedEngine === "catgpt" ? 10000 : 100000000}
+                  step={selectedEngine === "catgpt" ? 100 : 100000}
                 />
               </div>
             </div>
@@ -170,7 +190,7 @@ export function EngineAnalysisPanel({
                 <Play className="w-4 h-4 mr-1" />
                 Analyze
               </Button>
-              {bestMove && (
+              {(bestMove || catgptStats) && (
                 <Button onClick={reset} variant="outline" size="sm">
                   Reset
                 </Button>
@@ -194,8 +214,21 @@ export function EngineAnalysisPanel({
           </div>
         )}
 
-        {/* Live eval */}
-        {latestInfo && (
+        {/* ── CatGPT Analysis Display ── */}
+        {catgptStats && engine === "catgpt" && (
+          <>
+            <Separator />
+            <CatGPTStatsDisplay
+              stats={catgptStats}
+              history={catgptHistory}
+              bestMove={bestMove}
+              fen={fen}
+            />
+          </>
+        )}
+
+        {/* ── UCI Engine Display (Stockfish / Leela) ── */}
+        {latestInfo && engine !== "catgpt" && (
           <>
             <Separator />
             {/* Eval display */}
@@ -353,19 +386,19 @@ export function EngineAnalysisPanel({
                 </div>
               </>
             )}
-
-            {/* Saved indicator */}
-            {saved && (
-              <div className="flex items-center gap-1.5 text-xs text-green-600">
-                <Save className="w-3 h-3" />
-                Analysis saved to database
-              </div>
-            )}
           </>
         )}
 
+        {/* Saved indicator */}
+        {saved && (
+          <div className="flex items-center gap-1.5 text-xs text-green-600">
+            <Save className="w-3 h-3" />
+            Analysis saved to database
+          </div>
+        )}
+
         {/* Empty state */}
-        {!running && !latestInfo && !error && (
+        {!running && !latestInfo && !catgptStats && !error && (
           <p className="text-xs text-muted-foreground text-center py-2">
             {availableEngines.length === 0
               ? "No engines available on this server"
@@ -374,5 +407,258 @@ export function EngineAnalysisPanel({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+// ─── CatGPT Stats Display ─────────────────────────────────────────
+
+function CatGPTStatsDisplay({
+  stats,
+  history,
+  bestMove,
+  fen,
+}: {
+  stats: CatGPTSearchStats;
+  history: CatGPTSearchStats[];
+  bestMove: string | null;
+  fen: string;
+}) {
+  const { notationFormat } = usePositionStore();
+  // null = show latest (live); number = pinned to a history entry
+  const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
+
+  const fmtMove = (move: string) =>
+    notationFormat === "algebraic" ? uciToAlgebraic(fen, move) : move;
+
+  // The snapshot we're displaying: either the pinned one or the latest
+  const displayStats = selectedIdx !== null ? history[selectedIdx] : stats;
+  const isPinned = selectedIdx !== null;
+
+  const cpDisplay = useMemo(() => {
+    const v = displayStats.cp / 100;
+    return v >= 0 ? `+${v.toFixed(2)}` : v.toFixed(2);
+  }, [displayStats.cp]);
+
+  const evalBarPct = Math.max(2, Math.min(98, 50 + displayStats.cp / 10));
+
+  // Top policy entries sorted by weight
+  const topPolicy = useMemo(
+    () =>
+      [...displayStats.policy]
+        .sort((a, b) => b.weight - a.weight)
+        .slice(0, 10),
+    [displayStats.policy]
+  );
+  const maxWeight = topPolicy.length > 0 ? topPolicy[0].weight : 1;
+
+  const typeLabel = (t: string) =>
+    t === "root_eval" ? "root" : t === "search_update" ? "update" : "done";
+
+  return (
+    <div className="space-y-3">
+      {/* Eval + meta */}
+      <div className="flex items-baseline justify-between">
+        <span
+          className={`text-2xl font-bold font-mono ${
+            displayStats.cp >= 0 ? "text-green-600" : "text-red-600"
+          }`}
+        >
+          {cpDisplay}
+        </span>
+        <span className="text-xs text-muted-foreground">
+          {displayStats.nodes} evals • iter {displayStats.iteration}
+          {displayStats.type === "search_complete" && " • done"}
+        </span>
+      </div>
+
+      {/* Eval bar */}
+      <div className="h-3 bg-gray-800 rounded overflow-hidden">
+        <div
+          className="h-full bg-white rounded transition-all duration-300 ease-out"
+          style={{ width: `${evalBarPct}%` }}
+        />
+      </div>
+
+      {/* Best move */}
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-muted-foreground">Best:</span>
+        <Badge className="font-mono">
+          {fmtMove(isPinned ? displayStats.bestMove : (bestMove ?? displayStats.bestMove))}
+        </Badge>
+        <Badge variant="outline" className="text-xs font-mono">
+          {isPinned
+            ? `${typeLabel(displayStats.type)} #${selectedIdx! + 1}`
+            : displayStats.type === "root_eval"
+            ? "NN prior"
+            : displayStats.type === "search_update"
+            ? "searching…"
+            : "final"}
+        </Badge>
+        {isPinned && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-5 px-1.5 text-[10px] text-muted-foreground"
+            onClick={() => setSelectedIdx(null)}
+          >
+            ✕ live
+          </Button>
+        )}
+      </div>
+
+      <Separator />
+
+      {/* Modified Policy Distribution */}
+      <div className="space-y-1.5">
+        <h4 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
+          Modified Policy
+        </h4>
+        {topPolicy.map((entry) => {
+          const label = fmtMove(entry.move);
+          const pct = (entry.weight * 100).toFixed(1);
+          const barWidth = (entry.weight / maxWeight) * 100;
+          const isBest = entry.move === displayStats.bestMove;
+
+          return (
+            <div key={entry.move} className="flex items-center gap-2">
+              <span
+                className={`w-12 text-right font-mono text-sm ${
+                  isBest ? "font-bold text-foreground" : "font-medium"
+                }`}
+              >
+                {label}
+              </span>
+              <div className="flex-1 h-5 bg-muted rounded overflow-hidden">
+                <div
+                  className={`h-full rounded transition-all duration-300 ${
+                    isBest ? "bg-amber-500" : "bg-blue-500"
+                  }`}
+                  style={{ width: `${barWidth}%` }}
+                />
+              </div>
+              <span className="w-14 text-right text-xs text-muted-foreground font-mono">
+                {pct}%
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      <Separator />
+
+      {/* DistQ Mini-Histogram */}
+      <DistQHistogram distQ={displayStats.distQ} />
+
+      {/* Search history table */}
+      {history.length > 1 && (
+        <>
+          <Separator />
+          <div className="space-y-1">
+            <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wide">
+              Search History
+              <span className="ml-1 font-normal normal-case">(click to inspect)</span>
+            </span>
+            <div className="max-h-48 overflow-y-auto">
+              <table className="w-full text-xs font-mono">
+                <thead className="text-muted-foreground sticky top-0 bg-card">
+                  <tr>
+                    <th className="text-left py-0.5 pr-2">Type</th>
+                    <th className="text-right py-0.5 pr-2">Eval</th>
+                    <th className="text-left py-0.5 pr-2">Best</th>
+                    <th className="text-right py-0.5">Evals</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.map((s, i) => {
+                    const prevBest = i > 0 ? history[i - 1].bestMove : null;
+                    const changed = prevBest !== null && s.bestMove !== prevBest;
+                    const isSelected = selectedIdx === i;
+                    return (
+                      <tr
+                        key={i}
+                        className={`cursor-pointer hover:bg-muted/50 ${
+                          isSelected
+                            ? "bg-muted ring-1 ring-blue-500/40 text-foreground font-medium"
+                            : changed
+                            ? "text-amber-500 font-medium"
+                            : i === history.length - 1
+                            ? "text-foreground font-medium"
+                            : "text-muted-foreground"
+                        }`}
+                        onClick={() =>
+                          setSelectedIdx(isSelected ? null : i)
+                        }
+                      >
+                        <td className="py-0.5 pr-2 text-xs">
+                          {typeLabel(s.type)}
+                        </td>
+                        <td
+                          className={`text-right py-0.5 pr-2 ${
+                            s.cp >= 0 ? "text-green-600" : "text-red-600"
+                          }`}
+                        >
+                          {(s.cp / 100).toFixed(2)}
+                        </td>
+                        <td className="py-0.5 pr-2">
+                          <span className={changed ? "underline" : ""}>
+                            {fmtMove(s.bestMove)}
+                          </span>
+                        </td>
+                        <td className="text-right py-0.5">{s.nodes}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── DistQ Mini-Histogram ─────────────────────────────────────────
+
+function DistQHistogram({ distQ }: { distQ: number[] }) {
+  const maxProb = useMemo(
+    () => Math.max(...distQ, 0.001),
+    [distQ]
+  );
+
+  // Show a compact 81-bar histogram
+  return (
+    <div className="space-y-1.5">
+      <h4 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
+        Value Distribution (distQ)
+      </h4>
+      <div className="flex items-end gap-px h-16 bg-muted/30 rounded p-1">
+        {distQ.map((prob, i) => {
+          const height = (prob / maxProb) * 100;
+          // Color: red (loss) → gray (draw) → green (win)
+          const t = i / Math.max(distQ.length - 1, 1); // 0 to 1
+          const r = Math.round(239 * (1 - t) + 34 * t);
+          const g = Math.round(68 * (1 - t) + 197 * t);
+          const b = Math.round(68 * (1 - t) + 94 * t);
+          return (
+            <div
+              key={i}
+              className="flex-1 rounded-t transition-all duration-300"
+              style={{
+                height: `${Math.max(height, 1)}%`,
+                backgroundColor: `rgb(${r},${g},${b})`,
+                opacity: prob > 0.001 ? 1 : 0.2,
+              }}
+              title={`Bin ${i}: ${(prob * 100).toFixed(1)}%`}
+            />
+          );
+        })}
+      </div>
+      <div className="flex justify-between text-[10px] text-muted-foreground font-mono">
+        <span>Loss</span>
+        <span>Draw</span>
+        <span>Win</span>
+      </div>
+    </div>
   );
 }

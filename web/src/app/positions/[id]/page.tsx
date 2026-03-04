@@ -31,7 +31,7 @@ import {
 } from "@/lib/store";
 import { usePositionStore } from "@/lib/store";
 import { sideToMove, uciToAlgebraic } from "@/lib/chess-utils";
-import type { Position, EngineAnalysis } from "@/lib/types";
+import type { Position, EngineAnalysis, CatGPTSearchStats } from "@/lib/types";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -467,15 +467,21 @@ function StoredEngineResultCard({
     return cp >= 0 ? `+${cp.toFixed(2)}` : cp.toFixed(2);
   };
 
-  const hasHistory = ea.depthHistory && ea.depthHistory.length > 0;
+  const engineLabel =
+    ea.engine === "catgpt"
+      ? "🐱 CatGPT"
+      : ea.engine === "stockfish"
+      ? "Stockfish"
+      : "Leela Chess Zero";
+
+  const hasUCIHistory = ea.depthHistory && ea.depthHistory.length > 0;
+  const hasCatGPTHistory = ea.catgptHistory && ea.catgptHistory.length > 0;
 
   return (
     <Card>
       <CardHeader className="pb-3">
         <CardTitle className="text-base flex items-center justify-between">
-          <span>
-            📊 {ea.engine === "stockfish" ? "Stockfish" : "Leela Chess Zero"}
-          </span>
+          <span>📊 {engineLabel}</span>
           <div className="flex items-center gap-2">
             <span className="text-xs text-muted-foreground font-normal">
               {new Date(ea.timestamp).toLocaleDateString()}
@@ -496,7 +502,9 @@ function StoredEngineResultCard({
           </div>
         </CardTitle>
         <p className="text-xs text-muted-foreground">
-          depth {ea.depth} • {ea.nodes.toLocaleString()} nodes
+          {ea.engine === "catgpt"
+            ? `${ea.nodes.toLocaleString()} evals • iter ${ea.depth}`
+            : `depth ${ea.depth} • ${ea.nodes.toLocaleString()} nodes`}
         </p>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -516,8 +524,8 @@ function StoredEngineResultCard({
           </div>
         </div>
 
-        {/* PV */}
-        {ea.pv.length > 0 && (
+        {/* PV (UCI engines only) */}
+        {ea.engine !== "catgpt" && ea.pv.length > 0 && (
           <div className="text-xs font-mono text-muted-foreground break-all">
             <span className="text-foreground font-medium">{fmtMove(ea.pv[0])}</span>
             {ea.pv.slice(1, 10).map((m, i) => (
@@ -527,8 +535,8 @@ function StoredEngineResultCard({
           </div>
         )}
 
-        {/* Depth History */}
-        {hasHistory && (
+        {/* UCI Depth History */}
+        {hasUCIHistory && (
           <>
             <Separator />
             <Button
@@ -601,7 +609,198 @@ function StoredEngineResultCard({
             )}
           </>
         )}
+
+        {/* CatGPT: Interactive search history + details viewer */}
+        {hasCatGPTHistory && (
+          <StoredCatGPTHistoryViewer
+            history={ea.catgptHistory!}
+            fen={fen}
+          />
+        )}
       </CardContent>
     </Card>
+  );
+}
+
+// ─── Stored CatGPT history viewer (selectable snapshots) ──────────
+
+function StoredCatGPTHistoryViewer({
+  history,
+  fen,
+}: {
+  history: CatGPTSearchStats[];
+  fen: string;
+}) {
+  // Default to the last entry (final search result)
+  const [selectedIdx, setSelectedIdx] = useState(history.length - 1);
+  const { notationFormat } = usePositionStore();
+  const fmtMove = (move: string) =>
+    notationFormat === "algebraic" ? uciToAlgebraic(fen, move) : move;
+
+  const displayStats = history[selectedIdx];
+  if (!displayStats) return null;
+
+  const typeLabel = (t: string) =>
+    t === "root_eval" ? "root" : t === "search_update" ? "update" : "done";
+
+  const topPolicy = [...displayStats.policy]
+    .sort((a, b) => b.weight - a.weight)
+    .slice(0, 8);
+  const maxWeight = topPolicy.length > 0 ? topPolicy[0].weight : 1;
+
+  return (
+    <div className="space-y-3">
+      <Separator />
+
+      {/* Viewing indicator */}
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-muted-foreground">Viewing:</span>
+        <Badge variant="outline" className="text-xs font-mono">
+          {typeLabel(displayStats.type)} #{selectedIdx + 1}/{history.length}
+        </Badge>
+        <span className="text-xs text-muted-foreground">
+          {displayStats.nodes} evals • iter {displayStats.iteration}
+        </span>
+      </div>
+
+      {/* Modified Policy */}
+      <div className="space-y-1.5">
+        <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wide">
+          Modified Policy
+        </span>
+        {topPolicy.map((entry) => {
+          const label = fmtMove(entry.move);
+          const pct = (entry.weight * 100).toFixed(1);
+          const barWidth = (entry.weight / maxWeight) * 100;
+          const isBest = entry.move === displayStats.bestMove;
+          return (
+            <div key={entry.move} className="flex items-center gap-2">
+              <span
+                className={`w-12 text-right font-mono text-xs ${
+                  isBest ? "font-bold text-foreground" : ""
+                }`}
+              >
+                {label}
+              </span>
+              <div className="flex-1 h-4 bg-muted rounded overflow-hidden">
+                <div
+                  className={`h-full rounded transition-all ${
+                    isBest ? "bg-amber-500" : "bg-blue-500"
+                  }`}
+                  style={{ width: `${barWidth}%` }}
+                />
+              </div>
+              <span className="w-12 text-right text-[10px] text-muted-foreground font-mono">
+                {pct}%
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* DistQ mini histogram */}
+      {displayStats.distQ && displayStats.distQ.length > 0 && (
+        <div className="space-y-1">
+          <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wide">
+            Value Distribution
+          </span>
+          <div className="flex items-end gap-px h-12 bg-muted/30 rounded p-1">
+            {(() => {
+              const maxProb = Math.max(...displayStats.distQ, 0.001);
+              return displayStats.distQ.map((prob, i) => {
+                const height = (prob / maxProb) * 100;
+                const t = i / Math.max(displayStats.distQ.length - 1, 1);
+                const r = Math.round(239 * (1 - t) + 34 * t);
+                const g = Math.round(68 * (1 - t) + 197 * t);
+                const b = Math.round(68 * (1 - t) + 94 * t);
+                return (
+                  <div
+                    key={i}
+                    className="flex-1 rounded-t"
+                    style={{
+                      height: `${Math.max(height, 1)}%`,
+                      backgroundColor: `rgb(${r},${g},${b})`,
+                      opacity: prob > 0.001 ? 1 : 0.2,
+                    }}
+                    title={`Bin ${i}: ${(prob * 100).toFixed(1)}%`}
+                  />
+                );
+              });
+            })()}
+          </div>
+          <div className="flex justify-between text-[10px] text-muted-foreground font-mono">
+            <span>Loss</span>
+            <span>Draw</span>
+            <span>Win</span>
+          </div>
+        </div>
+      )}
+
+      {/* Search history table (clickable) */}
+      {history.length > 1 && (
+        <>
+          <Separator />
+          <div className="space-y-1">
+            <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wide">
+              Search History
+              <span className="ml-1 font-normal normal-case">(click to inspect)</span>
+            </span>
+            <div className="max-h-48 overflow-y-auto">
+              <table className="w-full text-xs font-mono">
+                <thead className="text-muted-foreground sticky top-0 bg-card">
+                  <tr>
+                    <th className="text-left py-1 pr-2">Type</th>
+                    <th className="text-right py-1 pr-2">Eval</th>
+                    <th className="text-left py-1 pr-2">Best</th>
+                    <th className="text-right py-1">Evals</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {history.map((s, i) => {
+                    const prevBest =
+                      i > 0 ? history[i - 1].bestMove : null;
+                    const changed =
+                      prevBest !== null && s.bestMove !== prevBest;
+                    const isSelected = selectedIdx === i;
+                    return (
+                      <tr
+                        key={i}
+                        className={`cursor-pointer hover:bg-muted/50 ${
+                          isSelected
+                            ? "bg-muted ring-1 ring-blue-500/40 text-foreground font-medium"
+                            : changed
+                            ? "text-amber-500 font-medium"
+                            : i === history.length - 1
+                            ? "text-foreground font-medium"
+                            : "text-muted-foreground"
+                        }`}
+                        onClick={() => setSelectedIdx(i)}
+                      >
+                        <td className="py-0.5 pr-2 text-xs">
+                          {typeLabel(s.type)}
+                        </td>
+                        <td
+                          className={`text-right py-0.5 pr-2 ${
+                            s.cp >= 0 ? "text-green-600" : "text-red-600"
+                          }`}
+                        >
+                          {(s.cp / 100).toFixed(2)}
+                        </td>
+                        <td className="py-0.5 pr-2">
+                          <span className={changed ? "underline" : ""}>
+                            {fmtMove(s.bestMove)}
+                          </span>
+                        </td>
+                        <td className="text-right py-0.5">{s.nodes}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
   );
 }
