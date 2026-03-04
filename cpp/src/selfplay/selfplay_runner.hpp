@@ -40,6 +40,7 @@
 #include "coroutine_search.hpp"
 #include "game_slot.hpp"
 #include "selfplay_config.hpp"
+#include "stockfish_pool.hpp"
 #include "syzygy.hpp"
 
 namespace catgpt {
@@ -112,6 +113,17 @@ public:
         evaluator_ = std::make_unique<BatchEvaluator>(
             config_.engine_path, pool_, config_.max_batch_size);
 
+        // Initialize Stockfish pool (if using Stockfish as opponent)
+        if (config_.use_stockfish) {
+            stockfish_pool_ = std::make_unique<StockfishPool>(
+                config_.stockfish_path,
+                config_.stockfish_processes,
+                config_.stockfish_nodes,
+                config_.stockfish_threads,
+                config_.stockfish_hash,
+                pool_);
+        }
+
         // Initialize Syzygy tablebases
         if (!config_.syzygy_path.empty()) {
             syzygy_ = std::make_unique<SyzygyProber>(config_.syzygy_path);
@@ -128,6 +140,7 @@ public:
     }
 
     ~SelfPlayRunner() {
+        if (stockfish_pool_) stockfish_pool_->shutdown();
         if (evaluator_) evaluator_->shutdown();
         if (pool_) pool_->shutdown();
     }
@@ -240,7 +253,13 @@ private:
      * Play one game.  On each move, the current side-to-move determines
      * which search engine is used.
      *
-     * @param challenger_is_white  If true, ChallengerSearch plays White.
+     * In normal mode:
+     *   Challenger = ChallengerSearch, Baseline = CoroutineSearch
+     *
+     * In Stockfish mode:
+     *   Challenger = CoroutineSearch (CatGPT), Baseline = Stockfish
+     *
+     * @param challenger_is_white  If true, the challenger plays White.
      */
     coro::task<GameRecord> play_one_game(const std::string& opening_fen,
                                          bool challenger_is_white) {
@@ -256,11 +275,25 @@ private:
 
             MoveResult move_result;
             if (challenger_to_move) {
-                ChallengerSearch search(*evaluator_, config_.challenger_config);
-                move_result = co_await search.search_move(slot.board());
+                if (config_.use_stockfish) {
+                    // Stockfish mode: CatGPT (CoroutineSearch) is the challenger
+                    CoroutineSearch search(*evaluator_, config_.challenger_config);
+                    move_result = co_await search.search_move(slot.board());
+                } else {
+                    // Normal mode: ChallengerSearch is the challenger
+                    ChallengerSearch search(*evaluator_, config_.challenger_config);
+                    move_result = co_await search.search_move(slot.board());
+                }
             } else {
-                CoroutineSearch search(*evaluator_, config_.baseline_config);
-                move_result = co_await search.search_move(slot.board());
+                if (config_.use_stockfish) {
+                    // Stockfish mode: Stockfish is the baseline
+                    // co_await suspends → SF I/O thread handles it → resumes here
+                    move_result = co_await StockfishAwaitable(*stockfish_pool_, slot.board());
+                } else {
+                    // Normal mode: CoroutineSearch is the baseline
+                    CoroutineSearch search(*evaluator_, config_.baseline_config);
+                    move_result = co_await search.search_move(slot.board());
+                }
             }
 
             if (move_result.best_move == chess::Move::NO_MOVE) {
@@ -459,6 +492,7 @@ private:
 
     std::shared_ptr<coro::thread_pool> pool_;
     std::unique_ptr<BatchEvaluator> evaluator_;
+    std::unique_ptr<StockfishPool> stockfish_pool_;
     std::unique_ptr<SyzygyProber> syzygy_;
 
     // PGN output

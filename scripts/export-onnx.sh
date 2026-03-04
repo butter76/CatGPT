@@ -16,7 +16,7 @@
 set -e
 
 uv run python scripts/export_onnx.py \
-    --checkpoint ./checkpoints_jax/WDL_main/best \
+    --checkpoint ./checkpoints_jax/WDL_main/final \
     --output-path sample.onnx \
     --output-keys wdl_value bestq_probs wdl_probs policy_logit \
     --dynamic-batch \

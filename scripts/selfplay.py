@@ -109,6 +109,16 @@ def build_command(cfg: DictConfig, project_root: Path, pgn_path: Path) -> list[s
     else:
         logger.warning(f"Openings file not found: {openings_path}, using startpos")
 
+    # Stockfish opponent
+    if cfg.stockfish.enabled:
+        cmd += ["--stockfish"]
+        cmd += ["--stockfish-nodes", str(cfg.stockfish.nodes)]
+        cmd += ["--stockfish-processes", str(cfg.stockfish.processes)]
+        cmd += ["--stockfish-threads", str(cfg.stockfish.threads_per_process)]
+        cmd += ["--stockfish-hash", str(cfg.stockfish.hash_mb)]
+        if cfg.stockfish.path != "stockfish":
+            cmd += ["--stockfish-path", cfg.stockfish.path]
+
     # Syzygy tablebase path (explicit config or $SYZYGY_HOME handled by C++ binary)
     if cfg.syzygy_path is not None:
         syzygy = project_root / cfg.syzygy_path if not Path(cfg.syzygy_path).is_absolute() else Path(cfg.syzygy_path)
@@ -205,33 +215,40 @@ def main(cfg: DictConfig) -> None:
                 logger.info(f"Clean working tree at commit {git_commit}")
 
             # Track search source files so each run records exactly what code was used
-            baseline_path = project_root / "cpp" / "src" / "selfplay" / "coroutine_search.hpp"
-            challenger_path = project_root / "cpp" / "src" / "selfplay" / "challenger_search.hpp"
+            if cfg.stockfish.enabled:
+                # Stockfish mode: only the CatGPT search file matters
+                catgpt_path = project_root / "cpp" / "src" / "selfplay" / "coroutine_search.hpp"
+                if catgpt_path.exists():
+                    wb.save(str(catgpt_path), base_path=str(project_root), policy="now")
+                    logger.info(f"W&B tracking: {catgpt_path.relative_to(project_root)}")
+            else:
+                baseline_path = project_root / "cpp" / "src" / "selfplay" / "coroutine_search.hpp"
+                challenger_path = project_root / "cpp" / "src" / "selfplay" / "challenger_search.hpp"
 
-            for f in [baseline_path, challenger_path]:
-                if f.exists():
-                    wb.save(str(f), base_path=str(project_root), policy="now")
-                    logger.info(f"W&B tracking: {f.relative_to(project_root)}")
+                for f in [baseline_path, challenger_path]:
+                    if f.exists():
+                        wb.save(str(f), base_path=str(project_root), policy="now")
+                        logger.info(f"W&B tracking: {f.relative_to(project_root)}")
 
-            # Generate and upload a unified diff between baseline and challenger
-            if baseline_path.exists() and challenger_path.exists():
-                baseline_lines = baseline_path.read_text().splitlines(keepends=True)
-                challenger_lines = challenger_path.read_text().splitlines(keepends=True)
-                diff = difflib.unified_diff(
-                    baseline_lines,
-                    challenger_lines,
-                    fromfile="coroutine_search.hpp (baseline)",
-                    tofile="challenger_search.hpp (challenger)",
-                )
-                diff_text = "".join(diff)
-                if diff_text:
-                    diff_path = project_root / "outputs" / f"challenger_diff_{run_name}.patch"
-                    diff_path.parent.mkdir(parents=True, exist_ok=True)
-                    diff_path.write_text(diff_text)
-                    wb.save(str(diff_path), base_path=str(project_root), policy="now")
-                    logger.info(f"W&B tracking diff: {diff_path.relative_to(project_root)}")
-                else:
-                    logger.info("Baseline and challenger are identical — no diff to upload")
+                # Generate and upload a unified diff between baseline and challenger
+                if baseline_path.exists() and challenger_path.exists():
+                    baseline_lines = baseline_path.read_text().splitlines(keepends=True)
+                    challenger_lines = challenger_path.read_text().splitlines(keepends=True)
+                    diff = difflib.unified_diff(
+                        baseline_lines,
+                        challenger_lines,
+                        fromfile="coroutine_search.hpp (baseline)",
+                        tofile="challenger_search.hpp (challenger)",
+                    )
+                    diff_text = "".join(diff)
+                    if diff_text:
+                        diff_path = project_root / "outputs" / f"challenger_diff_{run_name}.patch"
+                        diff_path.parent.mkdir(parents=True, exist_ok=True)
+                        diff_path.write_text(diff_text)
+                        wb.save(str(diff_path), base_path=str(project_root), policy="now")
+                        logger.info(f"W&B tracking diff: {diff_path.relative_to(project_root)}")
+                    else:
+                        logger.info("Baseline and challenger are identical — no diff to upload")
 
         except ImportError:
             logger.warning("wandb not installed, skipping W&B logging")

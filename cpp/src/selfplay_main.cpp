@@ -1,9 +1,15 @@
 /**
  * CatGPT Self-Play Tournament — Main Entry Point
  *
- * Runs batched tournament games between two search algorithms:
+ * Runs batched tournament games in two modes:
+ *
+ * Mode 1 — Search-vs-Search (default):
  *   - Baseline  (CoroutineSearch)   — the control
  *   - Challenger (ChallengerSearch)  — your variation to test
+ *
+ * Mode 2 — CatGPT-vs-Stockfish (--stockfish):
+ *   - Challenger (CoroutineSearch)   — CatGPT
+ *   - Baseline   (Stockfish)         — fixed-node UCI opponent
  *
  * Each opening is played twice with colors swapped.
  * Statistics are reported from the Challenger's perspective.
@@ -26,6 +32,12 @@
  *   --pgn PATH           Output PGN file
  *   --baseline-name S    Label for baseline (default: Baseline)
  *   --challenger-name S  Label for challenger (default: Challenger)
+ *   --stockfish          Enable Stockfish-as-baseline mode
+ *   --stockfish-path S   Path to Stockfish binary (default: stockfish)
+ *   --stockfish-nodes N  Fixed node count (default: 10000)
+ *   --stockfish-processes N  Concurrent Stockfish subprocesses (default: 8)
+ *   --stockfish-threads N    UCI Threads per process (default: 1)
+ *   --stockfish-hash N       UCI Hash MB per process (default: 16)
  */
 
 #include <cstdlib>
@@ -64,6 +76,14 @@ void print_usage(const char* argv0) {
     std::println(stderr, "  --pgn PATH           Output PGN file");
     std::println(stderr, "  --syzygy PATH        Syzygy tablebase directory (or $SYZYGY_HOME)");
     std::println(stderr, "  --json-metrics       Emit JSON-lines metrics to stdout");
+    std::println(stderr, "");
+    std::println(stderr, "Stockfish opponent (replaces baseline with Stockfish):");
+    std::println(stderr, "  --stockfish          Enable Stockfish-as-baseline mode");
+    std::println(stderr, "  --stockfish-path S   Path to Stockfish binary (default: stockfish)");
+    std::println(stderr, "  --stockfish-nodes N  Fixed node count (default: 10000)");
+    std::println(stderr, "  --stockfish-processes N  Concurrent SF subprocesses (default: 8)");
+    std::println(stderr, "  --stockfish-threads N    UCI Threads per SF process (default: 1)");
+    std::println(stderr, "  --stockfish-hash N       UCI Hash MB per SF process (default: 16)");
 }
 
 int main(int argc, char* argv[]) {
@@ -166,6 +186,18 @@ int main(int argc, char* argv[]) {
             config.syzygy_path = next_string();
         } else if (arg == "--json-metrics") {
             config.json_metrics = true;
+        } else if (arg == "--stockfish") {
+            config.use_stockfish = true;
+        } else if (arg == "--stockfish-path") {
+            config.stockfish_path = next_string();
+        } else if (arg == "--stockfish-nodes") {
+            config.stockfish_nodes = next_int();
+        } else if (arg == "--stockfish-processes") {
+            config.stockfish_processes = next_int();
+        } else if (arg == "--stockfish-threads") {
+            config.stockfish_threads = next_int();
+        } else if (arg == "--stockfish-hash") {
+            config.stockfish_hash = next_int();
         } else {
             std::println(stderr, "Unknown option: {}", arg);
             print_usage(argv[0]);
@@ -193,6 +225,17 @@ int main(int argc, char* argv[]) {
     }
     if (challenger_cpuct_set) {
         config.challenger_config.c_puct = challenger_cpuct;
+    }
+
+    // Stockfish mode: set sensible defaults for names if not overridden
+    if (config.use_stockfish) {
+        // Default names for Stockfish mode (only if user didn't set them)
+        if (config.challenger_name == "Challenger") {
+            config.challenger_name = "CatGPT";
+        }
+        if (config.baseline_name == "Baseline") {
+            config.baseline_name = "Stockfish";
+        }
     }
 
     // Syzygy: fall back to $SYZYGY_HOME if --syzygy not provided
@@ -265,9 +308,16 @@ int main(int argc, char* argv[]) {
     std::println(stderr, "  {} (challenger):", config.challenger_name);
     std::println(stderr, "    evals={}, cpuct={:.2f}",
                  config.challenger_config.min_total_evals, config.challenger_config.c_puct);
-    std::println(stderr, "  {} (baseline):", config.baseline_name);
-    std::println(stderr, "    evals={}, cpuct={:.2f}",
-                 config.baseline_config.min_total_evals, config.baseline_config.c_puct);
+    if (config.use_stockfish) {
+        std::println(stderr, "  {} (baseline):", config.baseline_name);
+        std::println(stderr, "    nodes={}, processes={}, threads={}, hash={}MB",
+                     config.stockfish_nodes, config.stockfish_processes,
+                     config.stockfish_threads, config.stockfish_hash);
+    } else {
+        std::println(stderr, "  {} (baseline):", config.baseline_name);
+        std::println(stderr, "    evals={}, cpuct={:.2f}",
+                     config.baseline_config.min_total_evals, config.baseline_config.c_puct);
+    }
     std::println(stderr, "");
 
     try {

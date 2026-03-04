@@ -90,6 +90,26 @@ struct SelfPlayConfig {
 
     /** If true, emit JSON-lines metrics to stdout after each game. */
     bool json_metrics = false;
+
+    // === Stockfish opponent ===
+
+    /** If true, replace the baseline engine with Stockfish. */
+    bool use_stockfish = false;
+
+    /** Path to the Stockfish binary (or just "stockfish" if on PATH). */
+    std::string stockfish_path = "stockfish";
+
+    /** Fixed node count for Stockfish (`go nodes X`). */
+    int stockfish_nodes = 10000;
+
+    /** Number of concurrent Stockfish subprocesses. */
+    int stockfish_processes = 8;
+
+    /** UCI Threads option per Stockfish process. */
+    int stockfish_threads = 1;
+
+    /** UCI Hash option (MB) per Stockfish process. */
+    int stockfish_hash = 16;
 };
 
 }  // namespace catgpt

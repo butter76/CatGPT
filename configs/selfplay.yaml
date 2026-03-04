@@ -26,7 +26,7 @@ openings: "openings/UHO_2024/UHO_2024_+100_+109/UHO_2024_6mvs_+100_+109.epd"
 # Tournament settings
 pairs: 0            # 0 = one pair per opening
 concurrent: 64      # Concurrent game slots
-threads: 8          # Search worker threads
+threads: 6          # Search worker threads
 batch: 64           # Max GPU batch size
 
 # Search settings (apply to both engines unless overridden)
@@ -42,6 +42,15 @@ challenger_cpuct: null
 # Engine labels
 baseline_name: "Baseline"
 challenger_name: "Challenger"
+
+# Stockfish opponent (replaces baseline with Stockfish when enabled)
+stockfish:
+  enabled: false
+  path: "stockfish"          # Binary path (or just name if on PATH)
+  nodes: 100000               # Fixed node count for `go nodes`
+  processes: 4               # Concurrent Stockfish subprocesses
+  threads_per_process: 1     # UCI Threads option per process
+  hash_mb: 16                # UCI Hash option (MB) per process
 
 # Syzygy tablebase adjudication
 # Set to null to use $SYZYGY_HOME env var, or provide explicit path
