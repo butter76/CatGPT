@@ -132,12 +132,24 @@ private:
     /**
      * Evaluate a position via the GPU.
      * Suspends the coroutine until batched inference completes.
+     * Results are cached by zobrist hash to avoid redundant GPU evals.
      */
     coro::task<void> evaluate_node(FractionalNode* node, const chess::Board& pos) {
-        auto tokens = tokenize<TrtEvaluator::SEQ_LENGTH>(pos, NO_HALFMOVE_CONFIG);
+        uint64_t hash = pos.hash();
 
-        // co_await suspends here → GPU thread batches & evaluates
-        RawNNOutput raw = co_await EvalAwaitable(evaluator_, tokens);
+        // Check eval cache — reuse previous GPU result for the same position
+        auto cache_it = eval_cache_.find(hash);
+        RawNNOutput raw;
+        if (cache_it != eval_cache_.end()) {
+            raw = cache_it->second;
+        } else {
+            auto tokens = tokenize<TrtEvaluator::SEQ_LENGTH>(pos, NO_HALFMOVE_CONFIG);
+
+            // co_await suspends here → GPU thread batches & evaluates
+            raw = co_await EvalAwaitable(evaluator_, tokens);
+            eval_cache_[hash] = raw;
+            ++total_gpu_evals_;
+        }
 
         // Post-process: convert value from [0,1] to [-1,1]
         float value = 2.0f * raw.value - 1.0f;
@@ -180,7 +192,6 @@ private:
         node->value_probs = raw.value_probs;
         node->distQ = raw.value_probs;
         node->compute_variance();
-        ++total_gpu_evals_;
     }
 
     // ─── Recursive search (identical logic to FractionalMCTSSearch) ─────
@@ -304,11 +315,14 @@ private:
 
             scratch_board.makeMove<true>(move);
 
+            // Treat 2-fold repetition as a draw (isGameOver only checks 3-fold)
+            bool is_twofold = scratch_board.isRepetition(1);
             auto [reason, game_result] = scratch_board.isGameOver();
-            if (game_result != chess::GameResult::NONE) {
+
+            if (is_twofold || game_result != chess::GameResult::NONE) {
                 child.is_terminal = true;
                 child.distQ.fill(0.0f);
-                if (game_result == chess::GameResult::LOSE) {
+                if (!is_twofold && game_result == chess::GameResult::LOSE) {
                     child.Q = -1.0f;
                     child.distQ[0] = 1.0f;
                 } else {
@@ -399,6 +413,7 @@ private:
     BatchEvaluator& evaluator_;
     FractionalMCTSConfig config_;
     int total_gpu_evals_;
+    std::unordered_map<uint64_t, RawNNOutput> eval_cache_;
 };
 
 }  // namespace catgpt
