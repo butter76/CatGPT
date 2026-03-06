@@ -258,22 +258,7 @@ private:
         if (N <= node->max_N) co_return;
         node->max_N = N;
 
-        // Depth reduction via variance
-        constexpr float bin_width = 2.0f / VALUE_NUM_BINS;
-        float vp_mean = 0.0f;
-        for (int i = 0; i < VALUE_NUM_BINS; ++i) {
-            float center = -1.0f + (static_cast<float>(i) + 0.5f) * bin_width;
-            vp_mean += node->value_probs[i] * center;
-        }
-        float alt_variance = 0.0f;
-        for (int i = alpha; i < VALUE_NUM_BINS; ++i) {
-            float center = -1.0f + (static_cast<float>(i) + 0.5f) * bin_width;
-            float diff = center - vp_mean;
-            alt_variance += node->value_probs[i] * diff * diff;
-        }
-        alt_variance *= 2.0f;
-
-        float effective_variance = std::min(node->variance, alt_variance);
+        float effective_variance = node->variance;
         float N_reduction = effective_variance * 12.0f;
         float effective_N = N * N_reduction;
 
