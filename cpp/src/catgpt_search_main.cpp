@@ -26,11 +26,37 @@
 #include <print>
 #include <string>
 
+#include <coro/sync_wait.hpp>
+#include <coro/task.hpp>
+#include <coro/thread_pool.hpp>
+
 #include "../external/chess-library/include/chess.hpp"
-#include "engine/fractional_mcts/search.hpp"
-#include "engine/trt_evaluator.hpp"
+#include "engine/fractional_mcts/config.hpp"
+#include "selfplay/batch_evaluator.hpp"
+#include "selfplay/coroutine_search.hpp"
 
 namespace fs = std::filesystem;
+
+/**
+ * Wrapper coroutine that schedules onto the thread pool and runs the search.
+ * This bridges the sync main() with the async CoroutineSearch.
+ */
+coro::task<catgpt::MoveResult> run_search(
+    std::shared_ptr<coro::thread_pool> pool,
+    catgpt::BatchEvaluator& evaluator,
+    const catgpt::FractionalMCTSConfig& config,
+    const std::string& fen)
+{
+    // Schedule onto the worker thread pool
+    co_await pool->schedule();
+
+    // Create search instance with stats output to stdout
+    catgpt::CoroutineSearch search(evaluator, config, &std::cout);
+
+    // Parse FEN and run search
+    chess::Board board(fen);
+    co_return co_await search.search_move(board);
+}
 
 int main(int argc, char* argv[]) {
     // Disable stdio synchronization for better performance
@@ -60,32 +86,35 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        // Load TRT engine (status to stderr so stdout stays clean for JSON)
+        // Create thread pool (1 thread is sufficient for single-position search)
+        auto pool = coro::thread_pool::make_shared(coro::thread_pool::options{
+            .thread_count = 1,
+        });
+
+        // Create batch evaluator (starts GPU thread internally)
+        // Batch size 1 is fine for single search — no batching benefit, but correct behavior
         std::println(stderr, "Loading TensorRT engine: {}", engine_path.string());
-        auto evaluator = std::make_shared<catgpt::TrtEvaluator>(engine_path);
+        catgpt::BatchEvaluator evaluator(engine_path, pool, /*max_batch_size=*/1);
         std::println(stderr, "Engine loaded successfully");
         std::cerr.flush();
 
-        // Create search with stats output to stdout
+        // Configure search
         catgpt::FractionalMCTSConfig config;
         config.min_total_evals = target_nodes;
-        catgpt::FractionalMCTSSearch search(evaluator, config);
-        search.set_stats_output(std::cout);
 
-        // Set position
-        search.reset(fen);
-
-        // Run search with node limit
-        catgpt::SearchLimits limits;
-        limits.nodes = target_nodes;
-        auto result = search.search(limits);
+        // Run search synchronously via sync_wait
+        auto result = coro::sync_wait(run_search(pool, evaluator, config, fen));
 
         // Print bestmove line (protocol compatibility)
-        if (result.has_move()) {
+        if (result.best_move != chess::Move::NO_MOVE) {
             std::cout << "bestmove " << chess::uci::moveToUci(result.best_move) << std::endl;
         } else {
             std::cout << "bestmove 0000" << std::endl;
         }
+
+        // Shutdown evaluator gracefully (BatchEvaluator destructor handles this,
+        // but explicit shutdown ensures clean exit before pool destruction)
+        evaluator.shutdown();
 
     } catch (const std::exception& e) {
         std::println(stderr, "Fatal error: {}", e.what());

@@ -140,6 +140,7 @@ set_target_properties(catgpt_analyze PROPERTIES
 )
 
 # === CatGPT Search Binary (standalone Fractional MCTS for web UI) ===
+# Uses CoroutineSearch (same algorithm as selfplay) with coroutine infrastructure
 add_executable(catgpt_search
     src/catgpt_search_main.cpp
 )
@@ -148,17 +149,22 @@ target_include_directories(catgpt_search PRIVATE
     ${CHESS_LIBRARY_INCLUDE_DIR}
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
+    ${LIBCORO_INCLUDE_DIR}
 )
 
 target_link_libraries(catgpt_search PRIVATE
     ${NVINFER_LIB}
     ${CUDART_LIB}
+    ${LIBCORO_LIB}
     pthread
 )
 
+# libcoro requires -fcoroutines on GCC
+target_compile_options(catgpt_search PRIVATE -fcoroutines)
+
 set_target_properties(catgpt_search PROPERTIES
-    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
 
 # === Fathom (Syzygy tablebase probing, C library) ===
