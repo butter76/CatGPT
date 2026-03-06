@@ -31,9 +31,16 @@ import {
 } from "@/lib/store";
 import { usePositionStore } from "@/lib/store";
 import { sideToMove, uciToAlgebraic } from "@/lib/chess-utils";
-import type { Position, EngineAnalysis, EngineInfoLine, CatGPTSearchStats } from "@/lib/types";
+import type { Position, EngineAnalysis, EngineInfoLine, CatGPTSearchStats, BlunderTag } from "@/lib/types";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   ArrowLeft,
   Zap,
@@ -44,6 +51,7 @@ import {
   Trash2,
   Loader2,
   Pencil,
+  Tag,
 } from "lucide-react";
 
 export default function PositionDetailPage({
@@ -309,7 +317,7 @@ function PositionHeader({
   onBack,
 }: {
   position: Position;
-  onUpdate: (updates: { name?: string; description?: string | null }) => Promise<void>;
+  onUpdate: (updates: { name?: string; description?: string | null; blunderTag?: BlunderTag | null }) => Promise<void>;
   onDelete: () => void;
   onBack: () => void;
 }) {
@@ -425,6 +433,11 @@ function PositionHeader({
                 + Add description
               </button>
             )}
+            {/* Blunder Tag Selector */}
+            <BlunderTagSelector
+              value={position.blunderTag}
+              onChange={(tag) => onUpdate({ blunderTag: tag })}
+            />
           </>
         )}
       </div>
@@ -438,6 +451,56 @@ function PositionHeader({
         >
           <Trash2 className="w-4 h-4" />
         </Button>
+      )}
+    </div>
+  );
+}
+
+// ─── Blunder Tag Selector ─────────────────────────────────────────
+
+const BLUNDER_TAG_OPTIONS: { value: BlunderTag; label: string; color: string }[] = [
+  { value: "catgpt", label: "🐱 CatGPT Blunder", color: "border-orange-500 text-orange-600 bg-orange-50" },
+  { value: "stockfish", label: "🐟 Stockfish Blunder", color: "border-green-500 text-green-600 bg-green-50" },
+  { value: "leela", label: "♟️ Leela Blunder", color: "border-purple-500 text-purple-600 bg-purple-50" },
+];
+
+function BlunderTagSelector({
+  value,
+  onChange,
+}: {
+  value?: BlunderTag;
+  onChange: (tag: BlunderTag | null) => void;
+}) {
+  return (
+    <div className="flex items-center gap-2 mt-2">
+      <Tag className="w-3.5 h-3.5 text-muted-foreground" />
+      <Select
+        value={value ?? "none"}
+        onValueChange={(v) => onChange(v === "none" ? null : (v as BlunderTag))}
+      >
+        <SelectTrigger className="h-7 w-[180px] text-xs">
+          <SelectValue placeholder="Tag as blunder..." />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="none" className="text-xs text-muted-foreground">
+            No tag
+          </SelectItem>
+          {BLUNDER_TAG_OPTIONS.map((opt) => (
+            <SelectItem key={opt.value} value={opt.value} className="text-xs">
+              {opt.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      {value && (
+        <Badge
+          variant="outline"
+          className={`text-xs ${
+            BLUNDER_TAG_OPTIONS.find((o) => o.value === value)?.color ?? ""
+          }`}
+        >
+          {BLUNDER_TAG_OPTIONS.find((o) => o.value === value)?.label}
+        </Badge>
       )}
     </div>
   );

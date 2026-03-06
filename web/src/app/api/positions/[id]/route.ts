@@ -35,13 +35,19 @@ export async function PATCH(
     }
 
     const body = await request.json();
-    const updates: { name?: string; description?: string | null } = {};
+    const updates: { name?: string; description?: string | null; blunderTag?: "catgpt" | "stockfish" | "leela" | null } = {};
 
     if (typeof body.name === "string" && body.name.trim()) {
       updates.name = body.name.trim();
     }
     if (body.description !== undefined) {
       updates.description = body.description?.trim() || null;
+    }
+    if (body.blunderTag !== undefined) {
+      const validTags = ["catgpt", "stockfish", "leela", null];
+      if (validTags.includes(body.blunderTag)) {
+        updates.blunderTag = body.blunderTag;
+      }
     }
 
     if (Object.keys(updates).length === 0) {

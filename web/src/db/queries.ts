@@ -152,7 +152,7 @@ export async function setMoveAnnotations(
 
 export async function updatePositionMeta(
   id: string,
-  updates: { name?: string; description?: string | null }
+  updates: { name?: string; description?: string | null; blunderTag?: "catgpt" | "stockfish" | "leela" | null }
 ): Promise<void> {
   await db
     .update(positions)
@@ -315,6 +315,7 @@ function assemblePosition(
     type: row.type,
     fen: row.fen,
     expectedOutcome: row.expectedOutcome ?? undefined,
+    blunderTag: row.blunderTag ?? undefined,
     moveAnnotations: moveAnnotationsData.length > 0 ? moveAnnotationsData : undefined,
     networkAnalysis,
     engineAnalyses: engineAnalysesData.length > 0 ? engineAnalysesData : undefined,

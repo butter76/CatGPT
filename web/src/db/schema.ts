@@ -19,6 +19,7 @@ export const moveAnnotationKindEnum = pgEnum("move_annotation_kind", [
   "correct",
 ]);
 export const engineKindEnum = pgEnum("engine_kind", ["leela", "stockfish", "catgpt"]);
+export const blunderTagEnum = pgEnum("blunder_tag", ["catgpt", "stockfish", "leela"]);
 
 // ─── Tables ───────────────────────────────────────────────────────
 
@@ -29,6 +30,7 @@ export const positions = pgTable("positions", {
   type: positionTypeEnum("type").notNull(),
   fen: text("fen").notNull(),
   expectedOutcome: outcomeEnum("expected_outcome"),
+  blunderTag: blunderTagEnum("blunder_tag"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });

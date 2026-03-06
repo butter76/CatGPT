@@ -10,7 +10,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { CompactBoard } from "@/components/chess/analysis-board";
 import { AddPositionDialog } from "@/components/chess/add-position-dialog";
 import { fetchPositions } from "@/lib/store";
-import type { Position, PositionType, Outcome } from "@/lib/types";
+import type { Position, PositionType, Outcome, BlunderTag } from "@/lib/types";
 import {
   Plus,
   Search,
@@ -21,9 +21,18 @@ import {
   Skull,
   ArrowRight,
   Loader2,
+  Tag,
+  X,
 } from "lucide-react";
 
 type FilterType = "ALL" | PositionType;
+type BlunderFilterType = "ALL" | BlunderTag;
+
+const BLUNDER_TAG_CONFIG: Record<BlunderTag, { label: string; color: string }> = {
+  catgpt: { label: "🐱 CatGPT", color: "border-orange-500 text-orange-600 bg-orange-50" },
+  stockfish: { label: "🐟 Stockfish", color: "border-green-500 text-green-600 bg-green-50" },
+  leela: { label: "♟️ Leela", color: "border-purple-500 text-purple-600 bg-purple-50" },
+};
 
 const OUTCOME_ICONS: Record<Outcome, React.ReactNode> = {
   win: <Trophy className="w-3 h-3 text-green-500" />,
@@ -35,6 +44,7 @@ export default function PositionsPage() {
   const [positions, setPositions] = useState<Position[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<FilterType>("ALL");
+  const [blunderFilter, setBlunderFilter] = useState<BlunderFilterType>("ALL");
   const [search, setSearch] = useState("");
 
   const loadPositions = useCallback(() => {
@@ -53,6 +63,9 @@ export default function PositionsPage() {
     if (filter !== "ALL") {
       result = result.filter((p) => p.type === filter);
     }
+    if (blunderFilter !== "ALL") {
+      result = result.filter((p) => p.blunderTag === blunderFilter);
+    }
     if (search.trim()) {
       const q = search.toLowerCase();
       result = result.filter(
@@ -63,7 +76,19 @@ export default function PositionsPage() {
       );
     }
     return result;
-  }, [positions, filter, search]);
+  }, [positions, filter, blunderFilter, search]);
+
+  // Count positions by blunder tag for filter badges
+  const blunderCounts = useMemo(() => {
+    const counts: Record<BlunderTag | "tagged", number> = { catgpt: 0, stockfish: 0, leela: 0, tagged: 0 };
+    for (const p of positions) {
+      if (p.blunderTag) {
+        counts[p.blunderTag]++;
+        counts.tagged++;
+      }
+    }
+    return counts;
+  }, [positions]);
 
   return (
     <div className="space-y-6">
@@ -85,30 +110,67 @@ export default function PositionsPage() {
       </div>
 
       {/* Filters */}
-      <div className="flex flex-col sm:flex-row gap-3">
-        <div className="relative flex-1 max-w-sm">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-          <Input
-            placeholder="Search positions..."
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            className="pl-9"
-          />
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-col sm:flex-row gap-3">
+          <div className="relative flex-1 max-w-sm">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <Input
+              placeholder="Search positions..."
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="pl-9"
+            />
+          </div>
+          <Tabs
+            value={filter}
+            onValueChange={(v) => setFilter(v as FilterType)}
+          >
+            <TabsList>
+              <TabsTrigger value="ALL">All</TabsTrigger>
+              <TabsTrigger value="SHARP" className="gap-1">
+                <Zap className="w-3.5 h-3.5" /> Sharp
+              </TabsTrigger>
+              <TabsTrigger value="FORTRESS" className="gap-1">
+                <Castle className="w-3.5 h-3.5" /> Fortress
+              </TabsTrigger>
+            </TabsList>
+          </Tabs>
         </div>
-        <Tabs
-          value={filter}
-          onValueChange={(v) => setFilter(v as FilterType)}
-        >
-          <TabsList>
-            <TabsTrigger value="ALL">All</TabsTrigger>
-            <TabsTrigger value="SHARP" className="gap-1">
-              <Zap className="w-3.5 h-3.5" /> Sharp
-            </TabsTrigger>
-            <TabsTrigger value="FORTRESS" className="gap-1">
-              <Castle className="w-3.5 h-3.5" /> Fortress
-            </TabsTrigger>
-          </TabsList>
-        </Tabs>
+
+        {/* Blunder Tag Filter */}
+        {blunderCounts.tagged > 0 && (
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs text-muted-foreground flex items-center gap-1">
+              <Tag className="w-3 h-3" /> Blunder tags:
+            </span>
+            <Button
+              variant={blunderFilter === "ALL" ? "secondary" : "ghost"}
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() => setBlunderFilter("ALL")}
+            >
+              All ({positions.length})
+            </Button>
+            {(Object.keys(BLUNDER_TAG_CONFIG) as BlunderTag[]).map((tag) =>
+              blunderCounts[tag] > 0 ? (
+                <Button
+                  key={tag}
+                  variant={blunderFilter === tag ? "secondary" : "ghost"}
+                  size="sm"
+                  className={`h-7 text-xs ${
+                    blunderFilter === tag ? BLUNDER_TAG_CONFIG[tag].color : ""
+                  }`}
+                  onClick={() => setBlunderFilter(blunderFilter === tag ? "ALL" : tag)}
+                >
+                  {BLUNDER_TAG_CONFIG[tag].label} ({blunderCounts[tag]})
+                  {blunderFilter === tag && (
+                    <X className="w-3 h-3 ml-1" />
+                  )}
+                </Button>
+              ) : null
+            )}
+          </div>
+        )}
       </div>
 
       {/* Loading */}
@@ -207,6 +269,16 @@ export default function PositionsPage() {
                         </div>
                         <ArrowRight className="w-4 h-4 text-muted-foreground group-hover:text-primary transition-colors" />
                       </div>
+
+                      {/* Blunder tag */}
+                      {position.blunderTag && (
+                        <Badge
+                          variant="outline"
+                          className={`text-[10px] w-fit ${BLUNDER_TAG_CONFIG[position.blunderTag].color}`}
+                        >
+                          {BLUNDER_TAG_CONFIG[position.blunderTag].label} Blunder
+                        </Badge>
+                      )}
 
                       {/* Analysis indicator */}
                       {position.networkAnalysis && (

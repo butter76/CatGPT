@@ -117,7 +117,7 @@ public:
         float N = config_.initial_budget;
         float last_used_N = N;
         int iteration = 0;
-        chess::Move stats_prev_best = chess::Move::NO_MOVE;
+        int last_stats_iteration = 0;  // Track when we last printed stats
 
         while (total_gpu_evals_ < target_evals && iteration < 25 * target_evals) {
             last_used_N = N;
@@ -126,8 +126,9 @@ public:
             int beta  = std::min(VALUE_NUM_BINS - 1, median);
             co_await recursive_search(root.get(), board, N, alpha, beta);
 
-            // ── Stats: check if best move changed ──
-            if (stats_out_ && !root->children.empty()) {
+            // ── Stats: print at iterations 0, 5, 12, 23, 39, ... (1.5x + 5 progression) ──
+            int next_stats_threshold = static_cast<int>(1.5f * last_stats_iteration + 5);
+            if (stats_out_ && !root->children.empty() && iteration >= next_stats_threshold) {
                 std::unordered_map<chess::Move, float, MoveHash> allocs;
                 float N_adj = 0.0f;
                 compute_root_stats_allocations(
@@ -138,11 +139,11 @@ public:
                     allocs, N_adj);
 
                 chess::Move current_best = best_move_from_allocations(allocs);
-                if (current_best != stats_prev_best && current_best != chess::Move::NO_MOVE) {
-                    stats_prev_best = current_best;
+                if (current_best != chess::Move::NO_MOVE) {
                     int cp = child_q_to_cp(root->children.at(current_best).Q);
                     print_catgpt_stats(*stats_out_, "search_update", root.get(), allocs, N_adj,
                                       current_best, cp, total_gpu_evals_, iteration);
+                    last_stats_iteration = iteration;
                 }
             }
 
