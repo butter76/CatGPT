@@ -18,7 +18,7 @@
 #   uv run python scripts/evaluate_jax.py benchmark.max_puzzles=100
 
 # Checkpoint to evaluate
-checkpoint: "checkpoints_jax/WDL_head/final"
+checkpoint: "checkpoints_jax/uncertainty/step_8000"
 
 # Engine configuration
 engine:

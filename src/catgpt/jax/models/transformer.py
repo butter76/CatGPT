@@ -772,6 +772,36 @@ class BidirectionalTransformer(nn.Module):
             opt_policy_logits_flat = opt_policy_logits.reshape(batch_size, -1)
             outputs["optimistic_policy_logit"] = opt_policy_logits_flat
 
+        # Uncertainty head: per-move value variance prediction
+        # Same Q·K^T attention architecture as policy head but predicts non-negative
+        # variance (via softplus) for each possible move. Trained on teacher-generated
+        # per-child bestQ distribution variances from generate_move_values.py.
+        if head_config.uncertainty_head:
+            if head_config.policy_attention_head:
+                # Q·K^T attention for 64x64 main move variances
+                qk_dim = head_config.policy_qk_dim
+                unc_query = nn.Dense(qk_dim, dtype=jnp.float32, name="uncertainty_query")(hidden)
+                unc_key = nn.Dense(qk_dim, dtype=jnp.float32, name="uncertainty_key")(hidden)
+                unc_main = jnp.matmul(unc_query, jnp.transpose(unc_key, (0, 2, 1)))
+
+                unc_underpromo = nn.Dense(
+                    9, dtype=jnp.float32, name="uncertainty_underpromo"
+                )(hidden)
+                unc_underpromo = unc_underpromo * jnp.sqrt(qk_dim).astype(jnp.float32)
+
+                unc_raw = jnp.concatenate([unc_main, unc_underpromo], axis=-1)
+            else:
+                # Simple projection fallback
+                unc_raw = nn.Dense(
+                    _POLICY_TO_DIM,
+                    dtype=jnp.float32,
+                    name="uncertainty_head",
+                )(hidden)
+
+            # Softplus for non-negative variance output
+            unc_values = jax.nn.softplus(unc_raw)
+            outputs["uncertainty"] = unc_values.reshape(batch_size, -1)  # (batch, 4672)
+
         return outputs
 
     @classmethod

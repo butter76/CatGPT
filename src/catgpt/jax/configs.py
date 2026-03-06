@@ -78,6 +78,13 @@ class JaxOutputHeadConfig:
     # Shares the value MLP with 3 extra output logits (W, D, L).
     wdl_weight: float = 0.05  # Loss weight (noisy target, keep low)
 
+    # Uncertainty head: per-move value variance prediction
+    # Uses Q·K^T attention (same architecture as policy head) with softplus activation
+    # to predict non-negative variance for each legal move. Trained on teacher-generated
+    # per-child bestQ distribution variances from generate_move_values.py.
+    uncertainty_head: bool = False  # Enable per-move variance prediction
+    uncertainty_weight: float = 1.0  # Loss weight for MSE variance loss
+
     # HL-Gauss configuration for value head
     # Converts scalar win probability (0-1) to categorical distribution
     value_num_bins: int = 81  # Number of bins for value distribution
