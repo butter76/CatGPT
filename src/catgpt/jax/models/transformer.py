@@ -772,13 +772,15 @@ class BidirectionalTransformer(nn.Module):
             opt_policy_logits_flat = opt_policy_logits.reshape(batch_size, -1)
             outputs["optimistic_policy_logit"] = opt_policy_logits_flat
 
-        # Uncertainty head: per-move value variance prediction
-        # Same Q·K^T attention architecture as policy head but predicts non-negative
-        # variance (via softplus) for each possible move. Trained on teacher-generated
-        # per-child bestQ distribution variances from generate_move_values.py.
+        # Uncertainty head: per-move log-variance prediction
+        # Same Q·K^T attention architecture as policy head but predicts
+        # log(variance) for each possible move, clamped to [-9, 0].
+        # Trained on teacher-generated per-child bestQ distribution variances
+        # from generate_move_values.py. Log-space targets emphasize order of
+        # magnitude rather than absolute value.
         if head_config.uncertainty_head:
             if head_config.policy_attention_head:
-                # Q·K^T attention for 64x64 main move variances
+                # Q·K^T attention for 64x64 main move log-variances
                 qk_dim = head_config.policy_qk_dim
                 unc_query = nn.Dense(qk_dim, dtype=jnp.float32, name="uncertainty_query")(hidden)
                 unc_key = nn.Dense(qk_dim, dtype=jnp.float32, name="uncertainty_key")(hidden)
@@ -798,9 +800,9 @@ class BidirectionalTransformer(nn.Module):
                     name="uncertainty_head",
                 )(hidden)
 
-            # Softplus for non-negative variance output
-            unc_values = jax.nn.softplus(unc_raw)
-            outputs["uncertainty"] = unc_values.reshape(batch_size, -1)  # (batch, 4672)
+            # Clamp to [-9, 0] log-variance range
+            unc_log_var = jnp.clip(unc_raw, -9.0, 0.0)
+            outputs["uncertainty"] = unc_log_var.reshape(batch_size, -1)  # (batch, 4672)
 
         return outputs
 

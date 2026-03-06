@@ -70,17 +70,25 @@ _UNDERPROMO_PIECE_OFFSET = {"n": 0, "b": 1, "r": 2}
 
 
 class ConvertEnrichedBagToUncertainty(pygrain.MapTransform):
-    """Convert enriched .bag data to (tokens, variance_target, variance_mask).
+    """Convert enriched .bag data to (tokens, log_variance_target, variance_mask).
 
     Reads the 'child_evals' field from enriched .bag files and computes
-    per-move variance targets in [-1, 1] Q-space.
+    per-move log-variance targets in [-1, 1] Q-space, clamped to [-9, 0].
+
+    Log-space targets emphasize order of magnitude rather than absolute value,
+    preventing high-variance moves from dominating the loss.
 
     Variance computation per child move:
         bin_centers_q = 2*(i+0.5)/num_bins - 1   for i in [0, num_bins)
         E[Q]   = sum(probs * bin_centers_q)
         E[Q^2] = sum(probs * bin_centers_q^2)
         Var(Q) = E[Q^2] - E[Q]^2
+        target = clamp(log(Var(Q)), -9, 0)
     """
+
+    # Log-variance clamp range
+    LOG_VAR_MIN = -9.0
+    LOG_VAR_MAX = 0.0
 
     def __init__(
         self,
@@ -98,13 +106,14 @@ class ConvertEnrichedBagToUncertainty(pygrain.MapTransform):
         self._bin_centers_sq = (self._bin_centers**2).astype(np.float32)
 
     def map(self, element: bytes):
-        """Map enriched .bag record to (tokens, variance_target, variance_mask).
+        """Map enriched .bag record to (tokens, log_variance_target, variance_mask).
 
         Args:
             element: Raw msgpack bytes from .bag file.
 
         Returns:
-            Tuple of (tokens, variance_target_flat, variance_mask_flat).
+            Tuple of (tokens, log_variance_target_flat, variance_mask_flat).
+            Log-variance targets are clamped to [-9, 0].
         """
         data = msgpack.unpackb(element, raw=False)
 
@@ -115,7 +124,7 @@ class ConvertEnrichedBagToUncertainty(pygrain.MapTransform):
         tokens = tokenize(fen, self._tok_config)
 
         # Initialize targets: (64, 73) = (from_square, to_plane)
-        variance_target = np.zeros((64, 73), dtype=np.float32)
+        log_var_target = np.full((64, 73), self.LOG_VAR_MIN, dtype=np.float32)
         variance_mask = np.zeros((64, 73), dtype=np.float32)
 
         child_evals = data.get("child_evals", [])
@@ -126,7 +135,10 @@ class ConvertEnrichedBagToUncertainty(pygrain.MapTransform):
             # Compute variance in [-1, 1] space
             e_q = np.dot(probs, self._bin_centers)
             e_q2 = np.dot(probs, self._bin_centers_sq)
-            var = max(e_q2 - e_q**2, 0.0)  # Clamp for numerical safety
+            var = max(e_q2 - e_q**2, 1e-12)  # Floor to avoid log(0)
+
+            # Log-variance clamped to [-9, 0]
+            log_var = float(np.clip(np.log(var), self.LOG_VAR_MIN, self.LOG_VAR_MAX))
 
             # Encode move to (from_idx, to_idx) matching policy tensor layout
             from_sq, to_sq, promo = parse_uci_move(move_uci)
@@ -141,10 +153,10 @@ class ConvertEnrichedBagToUncertainty(pygrain.MapTransform):
             else:
                 to_idx = parse_square(to_sq)
 
-            variance_target[from_idx, to_idx] = var
+            log_var_target[from_idx, to_idx] = log_var
             variance_mask[from_idx, to_idx] = 1.0
 
-        return tokens, variance_target.reshape(-1), variance_mask.reshape(-1)
+        return tokens, log_var_target.reshape(-1), variance_mask.reshape(-1)
 
 
 class BatchToDict(pygrain.MapTransform):
@@ -292,6 +304,7 @@ def create_post_train_optimizer(
     params: dict,
     head_lr: float,
     freeze_steps: int,
+    total_steps: int,
     backbone_lr_ratio: float = 0.01,
     weight_decay: float = 0.01,
     warmup_steps: int = 500,
@@ -299,13 +312,15 @@ def create_post_train_optimizer(
 ) -> tuple[optax.GradientTransformation, callable]:
     """Create AdamW with differential LR and freeze/unfreeze schedule.
 
-    Phase 1 (step < freeze_steps): backbone LR = 0, head LR = head_lr (with warmup)
+    Phase 1 (step < freeze_steps): backbone LR = 0, head LR = warmup → head_lr
     Phase 2 (step >= freeze_steps): backbone LR = head_lr * backbone_lr_ratio
+    Both decay linearly to 0 by total_steps.
 
     Args:
         params: Model parameters (for structure-based labeling).
-        head_lr: Learning rate for the uncertainty head.
+        head_lr: Peak learning rate for the uncertainty head.
         freeze_steps: Number of steps to keep backbone frozen.
+        total_steps: Total training steps (LR reaches 0 here).
         backbone_lr_ratio: Backbone LR as fraction of head_lr after unfreezing.
         weight_decay: Weight decay for AdamW.
         warmup_steps: Linear warmup steps for head LR.
@@ -315,17 +330,19 @@ def create_post_train_optimizer(
         Tuple of (optimizer, lr_schedule_fn) where lr_schedule_fn maps step to head LR.
     """
 
-    # Head schedule: linear warmup then constant
+    # Head schedule: linear warmup → linear decay to 0 at total_steps
     def head_schedule(step):
         step = jnp.asarray(step, dtype=jnp.float32)
         warmup_factor = jnp.minimum(step / jnp.maximum(warmup_steps, 1), 1.0)
-        return head_lr * warmup_factor
+        decay_factor = jnp.maximum(1.0 - step / jnp.maximum(total_steps, 1), 0.0)
+        return head_lr * jnp.minimum(warmup_factor, decay_factor)
 
-    # Backbone schedule: zero during freeze, then head_lr * ratio
+    # Backbone schedule: zero during freeze, then head_lr * ratio, decaying to 0
     def backbone_schedule(step):
         step = jnp.asarray(step, dtype=jnp.float32)
         unfrozen = jnp.where(step >= freeze_steps, 1.0, 0.0)
-        return head_lr * backbone_lr_ratio * unfrozen
+        decay_factor = jnp.maximum(1.0 - step / jnp.maximum(total_steps, 1), 0.0)
+        return head_lr * backbone_lr_ratio * unfrozen * decay_factor
 
     # Label function: uncertainty_* → "head", everything else → "backbone"
     def label_fn(params):
@@ -346,7 +363,9 @@ def create_post_train_optimizer(
             ),
             "backbone": optax.chain(
                 optax.clip_by_global_norm(gradient_clip),
-                optax.adamw(backbone_schedule, weight_decay=weight_decay),
+                # No weight decay on backbone — pretrained weights are already
+                # well-regularized, and decay would erode them toward zero
+                optax.adamw(backbone_schedule, weight_decay=0.0),
             ),
         },
         param_labels=label_fn,
@@ -382,10 +401,10 @@ def make_train_step(model, compute_dtype):
         state: TrainState,
         batch: dict[str, jax.Array],
     ) -> tuple[TrainState, dict[str, jax.Array]]:
-        """Single training step: forward + uncertainty MSE loss + backward.
+        """Single training step: forward + MSE on log-variance + backward.
 
-        Loss: mean squared error between predicted and target variance,
-        averaged over legal moves only.
+        Loss: mean squared error between predicted and target log-variance
+        (both clamped to [-9, 0]), averaged over legal moves only.
         """
 
         def loss_fn(params):
@@ -396,6 +415,7 @@ def make_train_step(model, compute_dtype):
                 compute_dtype=compute_dtype,
             )
 
+            # Both pred and target are in log-variance space, clamped to [-9, 0]
             pred = outputs["uncertainty"].astype(jnp.float32)  # (batch, 4672)
             target = batch["uncertainty_target"].astype(jnp.float32)
             mask = batch["uncertainty_mask"].astype(jnp.float32)
@@ -407,14 +427,11 @@ def make_train_step(model, compute_dtype):
             loss = masked_sq_err.sum() / jnp.maximum(mask.sum(), 1.0)
 
             # Auxiliary metrics
-            # Mean absolute error on legal moves
             mae = (jnp.abs(pred - target) * mask).sum() / jnp.maximum(mask.sum(), 1.0)
-
-            # Mean predicted variance (on legal moves)
             mean_pred = (pred * mask).sum() / jnp.maximum(mask.sum(), 1.0)
             mean_target = (target * mask).sum() / jnp.maximum(mask.sum(), 1.0)
 
-            return loss, {"mae": mae, "mean_pred": mean_pred, "mean_target": mean_target}
+            return loss, {"mae": mae, "mean_log_var_pred": mean_pred, "mean_log_var_target": mean_target}
 
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
         (loss, aux_metrics), grads = grad_fn(state.params)
@@ -444,6 +461,7 @@ def make_eval_step(model, compute_dtype):
             compute_dtype=compute_dtype,
         )
 
+        # Both pred and target are in log-variance space, clamped to [-9, 0]
         pred = outputs["uncertainty"].astype(jnp.float32)
         target = batch["uncertainty_target"].astype(jnp.float32)
         mask = batch["uncertainty_mask"].astype(jnp.float32)
@@ -458,8 +476,8 @@ def make_eval_step(model, compute_dtype):
         return {
             "loss": loss,
             "mae": mae,
-            "mean_pred": mean_pred,
-            "mean_target": mean_target,
+            "mean_log_var_pred": mean_pred,
+            "mean_log_var_target": mean_target,
         }
 
     return eval_step
@@ -655,6 +673,7 @@ def main() -> None:
         params,
         head_lr=args.head_lr,
         freeze_steps=args.freeze_steps,
+        total_steps=args.max_steps,
         backbone_lr_ratio=args.backbone_lr_ratio,
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
@@ -746,7 +765,7 @@ def main() -> None:
             logger.info(
                 f"[{phase}] step={global_step}/{args.max_steps} | "
                 f"loss={avg_loss:.6f} | mae={float(metrics['mae']):.6f} | "
-                f"pred={float(metrics['mean_pred']):.6f} tgt={float(metrics['mean_target']):.6f} | "
+                f"pred={float(metrics['mean_log_var_pred']):.4f} tgt={float(metrics['mean_log_var_target']):.4f} | "
                 f"lr={current_lr:.2e} | grad={float(metrics['grad_norm']):.4f} | "
                 f"{steps_per_sec:.1f} steps/s"
             )
@@ -758,8 +777,8 @@ def main() -> None:
                     {
                         "train/loss": avg_loss,
                         "train/mae": float(metrics["mae"]),
-                        "train/mean_pred": float(metrics["mean_pred"]),
-                        "train/mean_target": float(metrics["mean_target"]),
+                        "train/mean_log_var_pred": float(metrics["mean_log_var_pred"]),
+                        "train/mean_log_var_target": float(metrics["mean_log_var_target"]),
                         "train/grad_norm": float(metrics["grad_norm"]),
                         "train/head_lr": current_lr,
                         "train/phase": 0 if global_step < args.freeze_steps else 1,
