@@ -119,6 +119,17 @@ def build_command(cfg: DictConfig, project_root: Path, pgn_path: Path) -> list[s
         if cfg.stockfish.path != "stockfish":
             cmd += ["--stockfish-path", cfg.stockfish.path]
 
+    # Lc0 opponent
+    if cfg.lc0.enabled:
+        cmd += ["--lc0"]
+        cmd += ["--lc0-weights", str(cfg.lc0.weights)]
+        cmd += ["--lc0-nodes", str(cfg.lc0.nodes)]
+        cmd += ["--lc0-processes", str(cfg.lc0.processes)]
+        cmd += ["--lc0-threads", str(cfg.lc0.threads_per_process)]
+        cmd += ["--lc0-backend", str(cfg.lc0.backend)]
+        cmd += ["--lc0-minibatch", str(cfg.lc0.minibatch_size)]
+        cmd += ["--lc0-path", str(cfg.lc0.path)]
+
     # Syzygy tablebase path (explicit config or $SYZYGY_HOME handled by C++ binary)
     if cfg.syzygy_path is not None:
         syzygy = project_root / cfg.syzygy_path if not Path(cfg.syzygy_path).is_absolute() else Path(cfg.syzygy_path)
@@ -145,6 +156,12 @@ def main(cfg: DictConfig) -> None:
     project_root = Path(hydra.utils.get_original_cwd())
 
     setup_logging(cfg.verbose)
+
+    # Mutual exclusion: Stockfish and Lc0 cannot both be enabled
+    if cfg.stockfish.enabled and cfg.lc0.enabled:
+        logger.error("stockfish.enabled and lc0.enabled are mutually exclusive")
+        raise SystemExit(1)
+
     logger.info("Starting CatGPT Selfplay Tournament")
     logger.info(f"Run name: {run_name}")
     if run_description:
@@ -215,8 +232,8 @@ def main(cfg: DictConfig) -> None:
                 logger.info(f"Clean working tree at commit {git_commit}")
 
             # Track search source files so each run records exactly what code was used
-            if cfg.stockfish.enabled:
-                # Stockfish mode: only the CatGPT search file matters
+            if cfg.stockfish.enabled or cfg.lc0.enabled:
+                # External engine mode: only the CatGPT search file matters
                 catgpt_path = project_root / "cpp" / "src" / "selfplay" / "coroutine_search.hpp"
                 if catgpt_path.exists():
                     wb.save(str(catgpt_path), base_path=str(project_root), policy="now")

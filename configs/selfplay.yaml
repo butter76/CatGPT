@@ -52,6 +52,17 @@ stockfish:
   threads_per_process: 1     # UCI Threads option per process
   hash_mb: 16                # UCI Hash option (MB) per process
 
+# Lc0 opponent (replaces baseline with Lc0 when enabled; mutually exclusive with Stockfish)
+lc0:
+  enabled: false
+  path: "/home/shadeform/lc0/build/release/lc0"
+  weights: "/home/shadeform/lc0/build/release/BT3-768x15x24h-swa-2790000.pb.gz"
+  nodes: 400                 # Fixed node count (MCTS playouts) for `go nodes`
+  processes: 4               # Concurrent Lc0 subprocesses
+  threads_per_process: 1     # UCI Threads option per process
+  backend: "cuda-auto"       # Neural-net backend (cuda-auto, eigen, etc.)
+  minibatch_size: 4          # NN minibatch size (0 = backend default)
+
 # Syzygy tablebase adjudication
 # Set to null to use $SYZYGY_HOME env var, or provide explicit path
 syzygy_path: null

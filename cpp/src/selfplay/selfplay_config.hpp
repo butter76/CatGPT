@@ -110,6 +110,32 @@ struct SelfPlayConfig {
 
     /** UCI Hash option (MB) per Stockfish process. */
     int stockfish_hash = 16;
+
+    // === Lc0 opponent ===
+
+    /** If true, replace the baseline engine with Lc0. Mutually exclusive with use_stockfish. */
+    bool use_lc0 = false;
+
+    /** Path to the Lc0 binary. */
+    std::string lc0_path = "/home/shadeform/lc0/build/release/lc0";
+
+    /** Path to Lc0 neural network weights file (.pb.gz). Required when use_lc0 is true. */
+    std::string lc0_weights;
+
+    /** Fixed node count (MCTS playouts) for Lc0 (`go nodes X`). */
+    int lc0_nodes = 800;
+
+    /** Number of concurrent Lc0 subprocesses. */
+    int lc0_processes = 4;
+
+    /** UCI Threads option per Lc0 process. */
+    int lc0_threads = 1;
+
+    /** Neural-net backend for Lc0 (e.g. "cuda-auto", "eigen"). */
+    std::string lc0_backend = "cuda-auto";
+
+    /** MinibatchSize for Lc0 NN computation (0 = backend default). */
+    int lc0_minibatch_size = 0;
 };
 
 }  // namespace catgpt

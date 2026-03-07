@@ -1,0 +1,148 @@
+/**
+ * MCTS Node data structure.
+ *
+ * Each node represents a position reached by playing a move from the parent.
+ * The root node has move=NO_MOVE and parent=nullptr.
+ */
+
+#ifndef CATGPT_ENGINE_MCTS_NODE_HPP
+#define CATGPT_ENGINE_MCTS_NODE_HPP
+
+#include <array>
+#include <memory>
+#include <optional>
+#include <unordered_map>
+#include <vector>
+
+#include "../../../external/chess-library/include/chess.hpp"
+#include "../move_hash.hpp"
+#include "../trt_evaluator.hpp"
+
+namespace catgpt {
+
+/**
+ * A node in the MCTS search tree.
+ *
+ * Statistics:
+ *   N: Visit count - how many times this node was visited during search.
+ *   origQ: Original NN evaluation or terminal value (set once when expanded).
+ *   cached_Q: Computed Q value from recursive formula.
+ *   P: Prior probability - from policy network, used in PUCT formula.
+ *
+ * Q is computed recursively as:
+ *   Q = (origQ * 1 + sum(-child.Q * child.N)) / N
+ */
+class MCTSNode {
+public:
+    MCTSNode() = default;
+
+    explicit MCTSNode(float prior) : P(prior) {}
+
+    /**
+     * Mean value (expected outcome from this position).
+     * Returns cached_Q which is computed by calcQ() after each simulation.
+     */
+    [[nodiscard]] float Q() const noexcept {
+        return cached_Q;
+    }
+
+    /**
+     * Whether this node has been expanded (children created).
+     */
+    [[nodiscard]] bool is_expanded() const noexcept {
+        return !children.empty();
+    }
+
+    /**
+     * Return the child with the highest visit count.
+     * Returns nullopt if no children.
+     */
+    [[nodiscard]] std::optional<std::pair<chess::Move, MCTSNode*>> best_child_by_visits() {
+        if (children.empty()) {
+            return std::nullopt;
+        }
+
+        chess::Move best_move = chess::Move::NO_MOVE;
+        MCTSNode* best_child = nullptr;
+        int best_visits = -1;
+
+        for (auto& [move, child] : children) {
+            if (child.N > best_visits) {
+                best_visits = child.N;
+                best_move = move;
+                best_child = &child;
+            }
+        }
+
+        return std::make_pair(best_move, best_child);
+    }
+
+    /**
+     * Get normalized visit counts (policy after search).
+     */
+    [[nodiscard]] std::unordered_map<chess::Move, float, MoveHash> get_visit_distribution() const {
+        std::unordered_map<chess::Move, float, MoveHash> dist;
+
+        if (children.empty()) {
+            return dist;
+        }
+
+        int total_visits = 0;
+        for (const auto& [move, child] : children) {
+            total_visits += child.N;
+        }
+
+        if (total_visits == 0) {
+            for (const auto& [move, child] : children) {
+                dist[move] = 0.0f;
+            }
+            return dist;
+        }
+
+        for (const auto& [move, child] : children) {
+            dist[move] = static_cast<float>(child.N) / static_cast<float>(total_visits);
+        }
+
+        return dist;
+    }
+
+    /**
+     * Get principal variation (most visited path from this node).
+     */
+    [[nodiscard]] std::vector<chess::Move> get_pv(int max_depth = 10) {
+        std::vector<chess::Move> pv;
+        MCTSNode* node = this;
+
+        for (int i = 0; i < max_depth; ++i) {
+            auto best = node->best_child_by_visits();
+            if (!best.has_value()) {
+                break;
+            }
+            auto [move, child] = best.value();
+            pv.push_back(move);
+            node = child;
+        }
+
+        return pv;
+    }
+
+    // Statistics
+    int N = 0;            // Visit count
+    float origQ = 0.0f;   // Original NN evaluation or terminal value
+    float cached_Q = 0.0f; // Computed Q from recursive formula
+    float P = 0.0f;       // Prior probability
+
+    // Value distribution from HL-Gauss head (81 bins over [0, 1])
+    std::array<float, VALUE_NUM_BINS> value_probs{};
+
+    // Terminal state info
+    bool is_terminal = false;
+    std::optional<float> terminal_value;  // -1=loss, 0=draw, 1=win (from this node's side-to-move)
+
+    // Children ordered by decreasing policy (highest P first)
+    std::vector<std::pair<chess::Move, MCTSNode>> children;
+};
+
+}  // namespace catgpt
+
+#endif  // CATGPT_ENGINE_MCTS_NODE_HPP

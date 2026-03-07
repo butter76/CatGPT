@@ -40,6 +40,7 @@
 #include "coroutine_search.hpp"
 #include "game_slot.hpp"
 #include "selfplay_config.hpp"
+#include "lc0_pool.hpp"
 #include "stockfish_pool.hpp"
 #include "syzygy.hpp"
 
@@ -124,6 +125,19 @@ public:
                 pool_);
         }
 
+        // Initialize Lc0 pool (if using Lc0 as opponent)
+        if (config_.use_lc0) {
+            lc0_pool_ = std::make_unique<Lc0Pool>(
+                config_.lc0_path,
+                config_.lc0_weights,
+                config_.lc0_processes,
+                config_.lc0_nodes,
+                config_.lc0_threads,
+                config_.lc0_backend,
+                config_.lc0_minibatch_size,
+                pool_);
+        }
+
         // Initialize Syzygy tablebases
         if (!config_.syzygy_path.empty()) {
             syzygy_ = std::make_unique<SyzygyProber>(config_.syzygy_path);
@@ -140,6 +154,7 @@ public:
     }
 
     ~SelfPlayRunner() {
+        if (lc0_pool_) lc0_pool_->shutdown();
         if (stockfish_pool_) stockfish_pool_->shutdown();
         if (evaluator_) evaluator_->shutdown();
         if (pool_) pool_->shutdown();
@@ -259,6 +274,9 @@ private:
      * In Stockfish mode:
      *   Challenger = CoroutineSearch (CatGPT), Baseline = Stockfish
      *
+     * In Lc0 mode:
+     *   Challenger = CoroutineSearch (CatGPT), Baseline = Lc0
+     *
      * @param challenger_is_white  If true, the challenger plays White.
      */
     coro::task<GameRecord> play_one_game(const std::string& opening_fen,
@@ -269,14 +287,17 @@ private:
         // baseline_white is the opposite of challenger_is_white
         bool baseline_white = !challenger_is_white;
 
+        // Determine mode once (mutually exclusive)
+        bool external_baseline = config_.use_stockfish || config_.use_lc0;
+
         while (!slot.is_terminated()) {
             bool white_to_move = slot.board().sideToMove() == chess::Color::WHITE;
             bool challenger_to_move = (white_to_move == challenger_is_white);
 
             MoveResult move_result;
             if (challenger_to_move) {
-                if (config_.use_stockfish) {
-                    // Stockfish mode: CatGPT (CoroutineSearch) is the challenger
+                if (external_baseline) {
+                    // External engine mode: CatGPT (CoroutineSearch) is the challenger
                     CoroutineSearch search(*evaluator_, config_.challenger_config);
                     move_result = co_await search.search_move(slot.board());
                 } else {
@@ -287,8 +308,10 @@ private:
             } else {
                 if (config_.use_stockfish) {
                     // Stockfish mode: Stockfish is the baseline
-                    // co_await suspends → SF I/O thread handles it → resumes here
                     move_result = co_await StockfishAwaitable(*stockfish_pool_, slot.board());
+                } else if (config_.use_lc0) {
+                    // Lc0 mode: Lc0 is the baseline
+                    move_result = co_await Lc0Awaitable(*lc0_pool_, slot.board());
                 } else {
                     // Normal mode: CoroutineSearch is the baseline
                     CoroutineSearch search(*evaluator_, config_.baseline_config);
@@ -493,6 +516,7 @@ private:
     std::shared_ptr<coro::thread_pool> pool_;
     std::unique_ptr<BatchEvaluator> evaluator_;
     std::unique_ptr<StockfishPool> stockfish_pool_;
+    std::unique_ptr<Lc0Pool> lc0_pool_;
     std::unique_ptr<SyzygyProber> syzygy_;
 
     // PGN output

@@ -1,7 +1,7 @@
 /**
  * CatGPT Self-Play Tournament — Main Entry Point
  *
- * Runs batched tournament games in two modes:
+ * Runs batched tournament games in three modes:
  *
  * Mode 1 — Search-vs-Search (default):
  *   - Baseline  (CoroutineSearch)   — the control
@@ -10,6 +10,10 @@
  * Mode 2 — CatGPT-vs-Stockfish (--stockfish):
  *   - Challenger (CoroutineSearch)   — CatGPT
  *   - Baseline   (Stockfish)         — fixed-node UCI opponent
+ *
+ * Mode 3 — CatGPT-vs-Lc0 (--lc0):
+ *   - Challenger (CoroutineSearch)   — CatGPT
+ *   - Baseline   (Lc0)              — fixed-node MCTS opponent
  *
  * Each opening is played twice with colors swapped.
  * Statistics are reported from the Challenger's perspective.
@@ -38,6 +42,14 @@
  *   --stockfish-processes N  Concurrent Stockfish subprocesses (default: 8)
  *   --stockfish-threads N    UCI Threads per process (default: 1)
  *   --stockfish-hash N       UCI Hash MB per process (default: 16)
+ *   --lc0               Enable Lc0-as-baseline mode
+ *   --lc0-path S         Path to Lc0 binary
+ *   --lc0-weights S      Path to Lc0 weights file (.pb.gz) [required with --lc0]
+ *   --lc0-nodes N        Fixed node count / playouts (default: 800)
+ *   --lc0-processes N    Concurrent Lc0 subprocesses (default: 4)
+ *   --lc0-threads N      UCI Threads per Lc0 process (default: 1)
+ *   --lc0-backend S      Neural-net backend (default: cuda-auto)
+ *   --lc0-minibatch N   MinibatchSize for NN computation (default: 0 = backend default)
  */
 
 #include <cstdlib>
@@ -84,6 +96,16 @@ void print_usage(const char* argv0) {
     std::println(stderr, "  --stockfish-processes N  Concurrent SF subprocesses (default: 8)");
     std::println(stderr, "  --stockfish-threads N    UCI Threads per SF process (default: 1)");
     std::println(stderr, "  --stockfish-hash N       UCI Hash MB per SF process (default: 16)");
+    std::println(stderr, "");
+    std::println(stderr, "Lc0 opponent (replaces baseline with Lc0):");
+    std::println(stderr, "  --lc0                Enable Lc0-as-baseline mode");
+    std::println(stderr, "  --lc0-path S         Path to Lc0 binary");
+    std::println(stderr, "  --lc0-weights S      Path to Lc0 weights file (.pb.gz) [required]");
+    std::println(stderr, "  --lc0-nodes N        Fixed node count / playouts (default: 800)");
+    std::println(stderr, "  --lc0-processes N    Concurrent Lc0 subprocesses (default: 4)");
+    std::println(stderr, "  --lc0-threads N      UCI Threads per Lc0 process (default: 1)");
+    std::println(stderr, "  --lc0-backend S      Neural-net backend (default: cuda-auto)");
+    std::println(stderr, "  --lc0-minibatch N    MinibatchSize for NN computation (default: 0 = backend default)");
 }
 
 int main(int argc, char* argv[]) {
@@ -198,6 +220,22 @@ int main(int argc, char* argv[]) {
             config.stockfish_threads = next_int();
         } else if (arg == "--stockfish-hash") {
             config.stockfish_hash = next_int();
+        } else if (arg == "--lc0") {
+            config.use_lc0 = true;
+        } else if (arg == "--lc0-path") {
+            config.lc0_path = next_string();
+        } else if (arg == "--lc0-weights") {
+            config.lc0_weights = next_string();
+        } else if (arg == "--lc0-nodes") {
+            config.lc0_nodes = next_int();
+        } else if (arg == "--lc0-processes") {
+            config.lc0_processes = next_int();
+        } else if (arg == "--lc0-threads") {
+            config.lc0_threads = next_int();
+        } else if (arg == "--lc0-backend") {
+            config.lc0_backend = next_string();
+        } else if (arg == "--lc0-minibatch") {
+            config.lc0_minibatch_size = next_int();
         } else {
             std::println(stderr, "Unknown option: {}", arg);
             print_usage(argv[0]);
@@ -227,14 +265,35 @@ int main(int argc, char* argv[]) {
         config.challenger_config.c_puct = challenger_cpuct;
     }
 
+    // Mutual exclusion: cannot use both Stockfish and Lc0 as baseline
+    if (config.use_stockfish && config.use_lc0) {
+        std::println(stderr, "Error: --stockfish and --lc0 are mutually exclusive");
+        return 1;
+    }
+
+    // Lc0 mode: validate weights path is provided
+    if (config.use_lc0 && config.lc0_weights.empty()) {
+        std::println(stderr, "Error: --lc0-weights is required when using --lc0");
+        return 1;
+    }
+
     // Stockfish mode: set sensible defaults for names if not overridden
     if (config.use_stockfish) {
-        // Default names for Stockfish mode (only if user didn't set them)
         if (config.challenger_name == "Challenger") {
             config.challenger_name = "CatGPT";
         }
         if (config.baseline_name == "Baseline") {
             config.baseline_name = "Stockfish";
+        }
+    }
+
+    // Lc0 mode: set sensible defaults for names if not overridden
+    if (config.use_lc0) {
+        if (config.challenger_name == "Challenger") {
+            config.challenger_name = "CatGPT";
+        }
+        if (config.baseline_name == "Baseline") {
+            config.baseline_name = "Lc0";
         }
     }
 
@@ -313,6 +372,12 @@ int main(int argc, char* argv[]) {
         std::println(stderr, "    nodes={}, processes={}, threads={}, hash={}MB",
                      config.stockfish_nodes, config.stockfish_processes,
                      config.stockfish_threads, config.stockfish_hash);
+    } else if (config.use_lc0) {
+        std::println(stderr, "  {} (baseline):", config.baseline_name);
+        std::println(stderr, "    nodes={}, processes={}, threads={}, backend={}",
+                     config.lc0_nodes, config.lc0_processes,
+                     config.lc0_threads, config.lc0_backend);
+        std::println(stderr, "    weights={}", config.lc0_weights);
     } else {
         std::println(stderr, "  {} (baseline):", config.baseline_name);
         std::println(stderr, "    evals={}, cpuct={:.2f}",
