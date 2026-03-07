@@ -31,8 +31,7 @@ engine:
   # Fractional MCTS settings (only used when type=fractional_mcts)
   fractional_mcts:
     c_puct: 1.75
-    policy_coverage_threshold: 0.80
-    min_total_evals: 400
+    min_total_evals: 640
     initial_budget: 1.0
     budget_multiplier: 1.2
 
@@ -40,7 +39,7 @@ engine:
   timeout: 120.0
 
   # Parallel workers (each loads own engine instance)
-  num_workers: 2  # Use >1 for parallel evaluation
+  num_workers: 1  # Use >1 for parallel evaluation
 
 # Benchmark configuration
 benchmark:

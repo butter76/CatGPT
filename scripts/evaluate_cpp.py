@@ -30,7 +30,9 @@ Usage:
 """
 
 import csv
+import json
 import multiprocessing as mp
+import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -579,6 +581,150 @@ def run_benchmark_parallel(
     )
 
 
+def run_benchmark_batched(
+    cfg: DictConfig,
+    project_root: Path,
+    puzzle_csv: Path,
+    name: str,
+    *,
+    show_progress: bool = True,
+) -> BenchmarkResult:
+    """Run puzzle evaluation using the batched C++ binary.
+
+    This uses catgpt_puzzle_eval which runs many puzzles concurrently with
+    coroutine-based batched GPU inference — much faster than the UCI path.
+
+    Args:
+        cfg: Hydra configuration.
+        project_root: Path to the project root directory.
+        puzzle_csv: Path to the puzzle CSV file.
+        name: Benchmark name.
+        show_progress: Whether to show a progress bar.
+
+    Returns:
+        BenchmarkResult with accuracy metrics and per-puzzle details.
+    """
+    cpp_build_dir = project_root / cfg.cpp_build_dir
+    binary_path = cpp_build_dir / "catgpt_puzzle_eval"
+    trt_engine = project_root / cfg.trt_engine
+
+    if not binary_path.exists():
+        raise FileNotFoundError(
+            f"Batched puzzle eval binary not found: {binary_path}\n"
+            f"Build with: cd cpp/build && cmake .. && make catgpt_puzzle_eval -j$(nproc)"
+        )
+
+    fmcts = cfg.engine.fractional_mcts
+    cmd = [
+        str(binary_path),
+        str(trt_engine),
+        str(puzzle_csv),
+        "--evals", str(fmcts.min_total_evals),
+        "--cpuct", str(fmcts.c_puct),
+        "--concurrent", "128",
+        "--threads", "8",
+        "--batch", "64",
+    ]
+
+    max_puzzles = cfg.benchmark.max_puzzles
+    if max_puzzles is not None:
+        cmd.extend(["--max-puzzles", str(max_puzzles)])
+
+    logger.info(f"Running batched puzzle eval: {' '.join(cmd)}")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    results: list[PuzzleResult] = []
+    summary_data: dict[str, Any] = {}
+
+    pbar = None
+    if show_progress:
+        total = max_puzzles if max_puzzles else None
+        pbar = tqdm(desc=f"Evaluating {name} (batched)", unit="puzzle", total=total)
+
+    total_solved = 0
+    total_moves_correct = 0
+    total_moves = 0
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if data.get("type") == "puzzle":
+            result = PuzzleResult(
+                puzzle_id=data["id"],
+                rating=data["rating"],
+                solved=data["solved"],
+                moves_correct=data["moves_correct"],
+                moves_total=data["moves_total"],
+                predicted_moves=[],
+                expected_moves=[],
+            )
+            results.append(result)
+
+            if result.solved:
+                total_solved += 1
+            total_moves_correct += result.moves_correct
+            total_moves += result.moves_total
+
+            if pbar is not None:
+                pbar.update(1)
+                n_puzzles = len(results)
+                solve_rate = total_solved / n_puzzles if n_puzzles > 0 else 0.0
+                accuracy = total_moves_correct / total_moves if total_moves > 0 else 0.0
+                pbar.set_postfix(
+                    acc=f"{accuracy:.1%}",
+                    solve=f"{solve_rate:.1%}",
+                    solved=f"{total_solved}/{n_puzzles}",
+                )
+
+        elif data.get("type") == "summary":
+            summary_data = data
+
+    if pbar is not None:
+        pbar.close()
+
+    # Log stderr output
+    assert proc.stderr is not None
+    stderr_output = proc.stderr.read()
+    if stderr_output.strip():
+        for stderr_line in stderr_output.strip().split("\n"):
+            logger.info(f"[C++] {stderr_line}")
+
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"catgpt_puzzle_eval exited with code {proc.returncode}"
+        )
+
+    # Compute metrics from collected results
+    metrics = compute_metrics(results)
+    bucket_metrics = compute_rating_buckets(results)
+    metrics.update(bucket_metrics)
+
+    if summary_data:
+        metrics["total_gpu_evals"] = float(summary_data.get("total_gpu_evals", 0))
+        metrics["puzzles_per_sec"] = float(summary_data.get("puzzles_per_sec", 0))
+
+    return BenchmarkResult(
+        name=name,
+        metrics=metrics,
+        details=[asdict(r) for r in results],
+        metadata={"num_puzzles": len(results), "batched": True},
+    )
+
+
 def _get_benchmark_path(cfg: DictConfig, name: str) -> Path:
     """Get the file path for a benchmark by name."""
     if name == "puzzles":
@@ -732,9 +878,13 @@ def main(cfg: DictConfig) -> None:
     elif cfg.engine.type == "fractional_mcts":
         logger.info(f"Fractional MCTS min_evals: {cfg.engine.fractional_mcts.min_total_evals}")
 
+    use_batched = cfg.engine.type == "fractional_mcts"
     num_workers = cfg.engine.num_workers
-    use_parallel = num_workers > 1
-    logger.info(f"Workers: {num_workers}" + (" (parallel)" if use_parallel else ""))
+    use_parallel = num_workers > 1 and not use_batched
+    if use_batched:
+        logger.info("Using batched C++ puzzle evaluation (coroutine + TRT)")
+    else:
+        logger.info(f"Workers: {num_workers}" + (" (parallel)" if use_parallel else ""))
 
     # Initialize W&B if requested
     wandb_run = None
@@ -773,10 +923,10 @@ def main(cfg: DictConfig) -> None:
         benchmarks[name] = puzzles
         logger.info(f"Loaded {len(puzzles)} puzzles for {name}")
 
-    # Create engine only for single-worker mode
-    # (parallel mode creates engines in worker processes)
+    # Create engine only for single-worker UCI mode
+    # (parallel mode creates engines in worker processes, batched mode uses C++ binary)
     engine = None
-    if not use_parallel:
+    if not use_parallel and not use_batched:
         try:
             engine = create_engine(cfg, project_root)
         except Exception as e:
@@ -785,7 +935,9 @@ def main(cfg: DictConfig) -> None:
 
     try:
         # Determine engine name for display
-        if use_parallel:
+        if use_batched:
+            engine_name = f"FractionalMCTS(evals={cfg.engine.fractional_mcts.min_total_evals}, batched)"
+        elif use_parallel:
             engine_name = f"{cfg.engine.type.upper()}(workers={num_workers})"
             if cfg.engine.type == "mcts":
                 engine_name = f"MCTS(nodes={cfg.engine.mcts.num_simulations}, workers={num_workers})"
@@ -805,7 +957,16 @@ def main(cfg: DictConfig) -> None:
         for bench_name, puzzles in benchmarks.items():
             logger.info(f"\nRunning {bench_name} ({len(puzzles)} puzzles)...")
 
-            if use_parallel:
+            if use_batched:
+                csv_path = project_root / _get_benchmark_path(cfg, bench_name)
+                result = run_benchmark_batched(
+                    cfg,
+                    project_root,
+                    csv_path,
+                    bench_name,
+                    show_progress=True,
+                )
+            elif use_parallel:
                 result = run_benchmark_parallel(
                     cfg,
                     project_root,

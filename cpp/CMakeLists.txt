@@ -209,6 +209,32 @@ set_target_properties(catgpt_selfplay PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
 
+# === CatGPT Batched Puzzle Evaluation (coroutines + TensorRT) ===
+add_executable(catgpt_puzzle_eval
+    src/puzzle_eval_main.cpp
+)
+
+target_include_directories(catgpt_puzzle_eval PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+    ${LIBCORO_INCLUDE_DIR}
+)
+
+target_link_libraries(catgpt_puzzle_eval PRIVATE
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    ${LIBCORO_LIB}
+    pthread
+)
+
+target_compile_options(catgpt_puzzle_eval PRIVATE -fcoroutines)
+
+set_target_properties(catgpt_puzzle_eval PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
+)
+
 # Enable colored output
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)
@@ -218,4 +244,5 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(catgpt_analyze PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_selfplay PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_search PRIVATE -fdiagnostics-color=always)
+    target_compile_options(catgpt_puzzle_eval PRIVATE -fdiagnostics-color=always)
 endif()
