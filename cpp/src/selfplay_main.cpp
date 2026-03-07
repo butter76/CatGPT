@@ -1,7 +1,7 @@
 /**
  * CatGPT Self-Play Tournament — Main Entry Point
  *
- * Runs batched tournament games in three modes:
+ * Runs batched tournament games in four modes:
  *
  * Mode 1 — Search-vs-Search (default):
  *   - Baseline  (CoroutineSearch)   — the control
@@ -15,11 +15,16 @@
  *   - Challenger (CoroutineSearch)   — CatGPT
  *   - Baseline   (Lc0)              — fixed-node MCTS opponent
  *
+ * Mode 4 — Lc0-vs-Stockfish (--lc0 --stockfish):
+ *   - Challenger (Lc0)              — fixed-node MCTS
+ *   - Baseline   (Stockfish)         — fixed-node UCI opponent
+ *   (No GPU / TRT engine required)
+ *
  * Each opening is played twice with colors swapped.
  * Statistics are reported from the Challenger's perspective.
  *
  * Usage:
- *   catgpt_selfplay <engine_path> [options]
+ *   catgpt_selfplay [engine_path] [options]
  *
  * Options:
  *   --pairs N            Game pairs to play (default: 500, each pair = 2 games)
@@ -63,7 +68,8 @@
 namespace fs = std::filesystem;
 
 void print_usage(const char* argv0) {
-    std::println(stderr, "Usage: {} <engine_path> [options]", argv0);
+    std::println(stderr, "Usage: {} [engine_path] [options]", argv0);
+    std::println(stderr, "       engine_path is required unless both --stockfish and --lc0 are used");
     std::println(stderr, "");
     std::println(stderr, "Tournament options:");
     std::println(stderr, "  --pairs N            Game pairs (default: one per opening, each pair = 2 games)");
@@ -124,7 +130,14 @@ int main(int argc, char* argv[]) {
     }
 
     catgpt::SelfPlayConfig config;
-    config.engine_path = argv[1];
+
+    // Determine if argv[1] is the engine path or an option flag.
+    // If it starts with "--" it's an option; otherwise it's the engine path.
+    int first_opt = 1;
+    if (argc >= 2 && std::string(argv[1]).substr(0, 2) != "--") {
+        config.engine_path = argv[1];
+        first_opt = 2;
+    }
 
     // Track shared values so we can apply them to both engines
     bool shared_evals_set = false;
@@ -143,7 +156,7 @@ int main(int argc, char* argv[]) {
     float challenger_cpuct = 0.0f;
 
     // Parse optional arguments
-    for (int i = 2; i < argc; ++i) {
+    for (int i = first_opt; i < argc; ++i) {
         std::string arg = argv[i];
 
         auto next_int = [&]() -> int {
@@ -265,9 +278,14 @@ int main(int argc, char* argv[]) {
         config.challenger_config.c_puct = challenger_cpuct;
     }
 
-    // Mutual exclusion: cannot use both Stockfish and Lc0 as baseline
-    if (config.use_stockfish && config.use_lc0) {
-        std::println(stderr, "Error: --stockfish and --lc0 are mutually exclusive");
+    // Determine if we need GPU (TRT engine)
+    bool both_external = config.use_stockfish && config.use_lc0;
+    bool needs_gpu = !both_external;
+
+    // Validate engine path (required unless both external engines are used)
+    if (needs_gpu && config.engine_path.empty()) {
+        std::println(stderr, "Error: engine_path is required unless both --stockfish and --lc0 are used");
+        print_usage(argv[0]);
         return 1;
     }
 
@@ -277,18 +295,24 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Stockfish mode: set sensible defaults for names if not overridden
-    if (config.use_stockfish) {
+    // Mode 4: Lc0 vs Stockfish — set sensible defaults
+    if (both_external) {
+        if (config.challenger_name == "Challenger") {
+            config.challenger_name = "Lc0";
+        }
+        if (config.baseline_name == "Baseline") {
+            config.baseline_name = "Stockfish";
+        }
+    } else if (config.use_stockfish) {
+        // Mode 2: CatGPT vs Stockfish
         if (config.challenger_name == "Challenger") {
             config.challenger_name = "CatGPT";
         }
         if (config.baseline_name == "Baseline") {
             config.baseline_name = "Stockfish";
         }
-    }
-
-    // Lc0 mode: set sensible defaults for names if not overridden
-    if (config.use_lc0) {
+    } else if (config.use_lc0) {
+        // Mode 3: CatGPT vs Lc0
         if (config.challenger_name == "Challenger") {
             config.challenger_name = "CatGPT";
         }
@@ -304,8 +328,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Validate engine path
-    if (!fs::exists(config.engine_path)) {
+    // Validate engine path (only needed when GPU search is used)
+    if (needs_gpu && !fs::exists(config.engine_path)) {
         std::println(stderr, "Error: TensorRT engine not found: {}", config.engine_path);
         return 1;
     }
@@ -351,7 +375,11 @@ int main(int argc, char* argv[]) {
     std::println(stderr, "║       CatGPT Batched Tournament               ║");
     std::println(stderr, "╚════════════════════════════════════════════════╝");
     std::println(stderr, "");
-    std::println(stderr, "  Engine:       {}", config.engine_path);
+    if (needs_gpu) {
+        std::println(stderr, "  Engine:       {}", config.engine_path);
+    } else {
+        std::println(stderr, "  Engine:       (none — external-vs-external mode)");
+    }
     if (config.total_pairs > 0) {
         std::println(stderr, "  Pairs:        {} ({} games)", config.total_pairs, config.total_pairs * 2);
     } else {
@@ -359,14 +387,29 @@ int main(int argc, char* argv[]) {
     }
     std::println(stderr, "  Concurrent:   {}", config.num_concurrent_games);
     std::println(stderr, "  Threads:      {}", config.num_search_threads);
-    std::println(stderr, "  Batch size:   {}", config.max_batch_size);
+    if (needs_gpu) {
+        std::println(stderr, "  Batch size:   {}", config.max_batch_size);
+    }
     std::println(stderr, "  Openings:     {}", config.openings_path.empty() ? "(startpos)" : config.openings_path);
     std::println(stderr, "  Syzygy:       {}", config.syzygy_path.empty() ? "(disabled)" : config.syzygy_path);
     std::println(stderr, "  PGN output:   {}", config.output_pgn.empty() ? "(none)" : config.output_pgn);
     std::println(stderr, "");
-    std::println(stderr, "  {} (challenger):", config.challenger_name);
-    std::println(stderr, "    evals={}, cpuct={:.2f}",
-                 config.challenger_config.min_total_evals, config.challenger_config.c_puct);
+
+    // Challenger info
+    if (both_external) {
+        // Mode 4: Lc0 is the challenger
+        std::println(stderr, "  {} (challenger):", config.challenger_name);
+        std::println(stderr, "    nodes={}, processes={}, threads={}, backend={}",
+                     config.lc0_nodes, config.lc0_processes,
+                     config.lc0_threads, config.lc0_backend);
+        std::println(stderr, "    weights={}", config.lc0_weights);
+    } else {
+        std::println(stderr, "  {} (challenger):", config.challenger_name);
+        std::println(stderr, "    evals={}, cpuct={:.2f}",
+                     config.challenger_config.min_total_evals, config.challenger_config.c_puct);
+    }
+
+    // Baseline info
     if (config.use_stockfish) {
         std::println(stderr, "  {} (baseline):", config.baseline_name);
         std::println(stderr, "    nodes={}, processes={}, threads={}, hash={}MB",

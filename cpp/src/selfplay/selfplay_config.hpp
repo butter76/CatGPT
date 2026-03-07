@@ -113,7 +113,8 @@ struct SelfPlayConfig {
 
     // === Lc0 opponent ===
 
-    /** If true, replace the baseline engine with Lc0. Mutually exclusive with use_stockfish. */
+    /** If true, use Lc0 as an opponent.
+     *  When use_stockfish is also true, runs Lc0 (challenger) vs Stockfish (baseline). */
     bool use_lc0 = false;
 
     /** Path to the Lc0 binary. */

@@ -71,22 +71,29 @@ def build_command(cfg: DictConfig, project_root: Path, pgn_path: Path) -> list[s
             "Build with: cd cpp/build && cmake .. && make catgpt_selfplay -j$(nproc)"
         )
 
-    trt_engine = project_root / cfg.trt_engine
-    if not trt_engine.exists():
-        raise FileNotFoundError(f"TensorRT engine not found: {trt_engine}")
+    # External-vs-external mode (Lc0 vs Stockfish) does not need TRT
+    both_external = cfg.stockfish.enabled and cfg.lc0.enabled
 
-    cmd = [str(binary), str(trt_engine)]
+    if both_external:
+        cmd = [str(binary)]
+    else:
+        trt_engine = project_root / cfg.trt_engine
+        if not trt_engine.exists():
+            raise FileNotFoundError(f"TensorRT engine not found: {trt_engine}")
+        cmd = [str(binary), str(trt_engine)]
 
     # Tournament settings
     if cfg.pairs:
         cmd += ["--pairs", str(cfg.pairs)]
     cmd += ["--concurrent", str(cfg.concurrent)]
     cmd += ["--threads", str(cfg.threads)]
-    cmd += ["--batch", str(cfg.batch)]
+    if not both_external:
+        cmd += ["--batch", str(cfg.batch)]
 
-    # Search settings (shared)
-    cmd += ["--evals", str(cfg.evals)]
-    cmd += ["--cpuct", str(cfg.cpuct)]
+    # Search settings (shared) — only relevant when GPU search is used
+    if not both_external:
+        cmd += ["--evals", str(cfg.evals)]
+        cmd += ["--cpuct", str(cfg.cpuct)]
 
     # Per-engine overrides
     if cfg.baseline_evals is not None:
@@ -156,11 +163,6 @@ def main(cfg: DictConfig) -> None:
     project_root = Path(hydra.utils.get_original_cwd())
 
     setup_logging(cfg.verbose)
-
-    # Mutual exclusion: Stockfish and Lc0 cannot both be enabled
-    if cfg.stockfish.enabled and cfg.lc0.enabled:
-        logger.error("stockfish.enabled and lc0.enabled are mutually exclusive")
-        raise SystemExit(1)
 
     logger.info("Starting CatGPT Selfplay Tournament")
     logger.info(f"Run name: {run_name}")
@@ -232,7 +234,11 @@ def main(cfg: DictConfig) -> None:
                 logger.info(f"Clean working tree at commit {git_commit}")
 
             # Track search source files so each run records exactly what code was used
-            if cfg.stockfish.enabled or cfg.lc0.enabled:
+            both_ext = cfg.stockfish.enabled and cfg.lc0.enabled
+            if both_ext:
+                # External-vs-external mode: no CatGPT search files involved
+                logger.info("Lc0 vs Stockfish mode — no CatGPT search files to track")
+            elif cfg.stockfish.enabled or cfg.lc0.enabled:
                 # External engine mode: only the CatGPT search file matters
                 catgpt_path = project_root / "cpp" / "src" / "selfplay" / "coroutine_search.hpp"
                 if catgpt_path.exists():

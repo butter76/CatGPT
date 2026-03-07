@@ -13,7 +13,7 @@
  * Architecture:
  *   Main thread   → runs the event loop (spawn/collect game pairs)
  *   Thread pool   → runs search coroutines (N worker threads)
- *   GPU thread    → batches and runs TRT inference
+ *   GPU thread    → batches and runs TRT inference (skipped in external-vs-external mode)
  */
 
 #ifndef CATGPT_SELFPLAY_SELFPLAY_RUNNER_HPP
@@ -110,9 +110,12 @@ public:
             .thread_count = static_cast<uint32_t>(config_.num_search_threads),
         });
 
-        // Create batch evaluator (starts GPU thread)
-        evaluator_ = std::make_unique<BatchEvaluator>(
-            config_.engine_path, pool_, config_.max_batch_size);
+        // Create batch evaluator (starts GPU thread) — skipped in external-vs-external mode
+        bool needs_gpu = !(config_.use_stockfish && config_.use_lc0);
+        if (needs_gpu) {
+            evaluator_ = std::make_unique<BatchEvaluator>(
+                config_.engine_path, pool_, config_.max_batch_size);
+        }
 
         // Initialize Stockfish pool (if using Stockfish as opponent)
         if (config_.use_stockfish) {
@@ -182,9 +185,11 @@ public:
         int completed = games_completed_.load();
         std::println(stderr, "\n[SelfPlay] Done: {} games in {:.1f}s ({:.1f} games/sec)",
                      completed, secs, completed / secs);
-        std::println(stderr, "[SelfPlay] GPU evals: {} ({:.0f} evals/sec)",
-                     evaluator_->total_evals(),
-                     evaluator_->total_evals() / secs);
+        if (evaluator_) {
+            std::println(stderr, "[SelfPlay] GPU evals: {} ({:.0f} evals/sec)",
+                         evaluator_->total_evals(),
+                         evaluator_->total_evals() / secs);
+        }
         print_stats();
 
         // JSON summary
@@ -194,6 +199,8 @@ public:
             float elo = estimate_elo(challenger_wins_, draws_, challenger_losses_);
             float avg_moves = total > 0 ? static_cast<float>(stats_total_moves_) / total : 0.0f;
             float avg_evals = total > 0 ? static_cast<float>(stats_total_evals_) / total : 0.0f;
+            long long total_gpu_evals = evaluator_ ? static_cast<long long>(evaluator_->total_evals()) : 0LL;
+            double gpu_evals_per_sec = (evaluator_ && secs > 0) ? evaluator_->total_evals() / secs : 0.0;
             std::printf(
                 "{\"type\":\"summary\",\"games\":%d,"
                 "\"challenger_wins\":%d,\"draws\":%d,\"challenger_losses\":%d,"
@@ -204,8 +211,8 @@ public:
                 challenger_wins_, draws_, challenger_losses_,
                 elo, avg_moves, avg_evals,
                 secs, total > 0 ? completed / secs : 0.0,
-                static_cast<long long>(evaluator_->total_evals()),
-                secs > 0 ? evaluator_->total_evals() / secs : 0.0);
+                total_gpu_evals,
+                gpu_evals_per_sec);
             std::fflush(stdout);
         }
     }
@@ -268,14 +275,17 @@ private:
      * Play one game.  On each move, the current side-to-move determines
      * which search engine is used.
      *
-     * In normal mode:
+     * Mode 1 (normal):
      *   Challenger = ChallengerSearch, Baseline = CoroutineSearch
      *
-     * In Stockfish mode:
+     * Mode 2 (Stockfish):
      *   Challenger = CoroutineSearch (CatGPT), Baseline = Stockfish
      *
-     * In Lc0 mode:
+     * Mode 3 (Lc0):
      *   Challenger = CoroutineSearch (CatGPT), Baseline = Lc0
+     *
+     * Mode 4 (Lc0 vs Stockfish):
+     *   Challenger = Lc0, Baseline = Stockfish
      *
      * @param challenger_is_white  If true, the challenger plays White.
      */
@@ -287,16 +297,24 @@ private:
         // baseline_white is the opposite of challenger_is_white
         bool baseline_white = !challenger_is_white;
 
-        // Determine mode once (mutually exclusive)
-        bool external_baseline = config_.use_stockfish || config_.use_lc0;
+        // Determine mode once
+        bool both_external = config_.use_stockfish && config_.use_lc0;
+        bool single_external = !both_external && (config_.use_stockfish || config_.use_lc0);
 
         while (!slot.is_terminated()) {
             bool white_to_move = slot.board().sideToMove() == chess::Color::WHITE;
             bool challenger_to_move = (white_to_move == challenger_is_white);
 
             MoveResult move_result;
-            if (challenger_to_move) {
-                if (external_baseline) {
+            if (both_external) {
+                // Mode 4: Lc0 (challenger) vs Stockfish (baseline)
+                if (challenger_to_move) {
+                    move_result = co_await Lc0Awaitable(*lc0_pool_, slot.board());
+                } else {
+                    move_result = co_await StockfishAwaitable(*stockfish_pool_, slot.board());
+                }
+            } else if (challenger_to_move) {
+                if (single_external) {
                     // External engine mode: CatGPT (CoroutineSearch) is the challenger
                     CoroutineSearch search(*evaluator_, config_.challenger_config);
                     move_result = co_await search.search_move(slot.board());

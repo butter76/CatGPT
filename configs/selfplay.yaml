@@ -52,7 +52,8 @@ stockfish:
   threads_per_process: 1     # UCI Threads option per process
   hash_mb: 16                # UCI Hash option (MB) per process
 
-# Lc0 opponent (replaces baseline with Lc0 when enabled; mutually exclusive with Stockfish)
+# Lc0 opponent (replaces baseline with Lc0 when enabled)
+# When both lc0.enabled and stockfish.enabled, runs Lc0 (challenger) vs Stockfish (baseline)
 lc0:
   enabled: false
   path: "/home/shadeform/lc0/build/release/lc0"
