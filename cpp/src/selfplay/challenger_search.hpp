@@ -151,7 +151,7 @@ public:
                 }
             }
 
-            N += 1.0f;
+            N = std::max(root->max_N, 1.0f) + 1.0f;
             ++iteration;
         }
 
@@ -299,22 +299,44 @@ private:
         for (const auto& [move, child] : node->children) {
             total_child_weight += child.P;
         }
+        float origN = N;
         N *= total_child_weight;
-
-        auto allocations = compute_allocations(node, N);
 
         int child_alpha = (VALUE_NUM_BINS - 1) - beta;
         int child_beta  = (VALUE_NUM_BINS - 1) - alpha;
 
-        // Recurse into children
-        for (auto& [move, child] : node->children) {
-            auto it = allocations.find(move);
-            if (it != allocations.end() && it->second > 0.0f) {
-                float N_i = it->second;
-                scratch_board.makeMove<true>(move);
-                co_await recursive_search(&child, scratch_board, N_i, child_alpha, child_beta);
-                scratch_board.unmakeMove(move);
+        // Recurse into children with clamped allocation loop.
+        // If any child's allocation exceeds its limit we cap it, recurse,
+        // then recompute allocations (Q values and max_N have changed) and
+        // repeat until allocations stabilise or we hit the iteration cap.
+        std::unordered_map<chess::Move, float, MoveHash> first_allocations;
+        for (int clamp_iter = 0; clamp_iter < 100; ++clamp_iter) {
+            auto allocations = compute_allocations(node, N);
+            first_allocations = allocations;
+
+            bool any_clamped = false;
+            for (auto& [move, child] : node->children) {
+                auto it = allocations.find(move);
+                if (it == allocations.end() || it->second <= 0.0f) continue;
+
+                float limit = std::max(child.max_N, 1.0f) * 1.1f + 1.0f;
+                if (it->second > limit) {
+                    it->second = limit;
+                    any_clamped = true;
+                }
             }
+
+            for (auto& [move, child] : node->children) {
+                auto it = allocations.find(move);
+                if (it != allocations.end() && it->second > 0.0f) {
+                    float N_i = it->second;
+                    scratch_board.makeMove<true>(move);
+                    co_await recursive_search(&child, scratch_board, N_i, child_alpha, child_beta);
+                    scratch_board.unmakeMove(move);
+                }
+            }
+
+            if (!any_clamped) break;
         }
 
         // Recompute allocations after recursion
@@ -345,6 +367,20 @@ private:
                 node->distQ[j] = weighted_distQ[j] * inv_weight;
             }
         }
+
+        // Recompute max_N: for each move in the policy, sum up a conservative
+        // estimate of the budget actually consumed at this node.
+        float new_max_N = 0.0f;
+        for (const auto& [move, prior] : node->policy_priors) {
+            if (node->children.count(move) == 0) {
+                new_max_N += prior * origN;
+            } else {
+                float first = first_allocations.count(move) ? first_allocations[move] : 0.0f;
+                float second = second_allocations.count(move) ? second_allocations[move] : 0.0f;
+                new_max_N += std::min(first, second);
+            }
+        }
+        node->max_N = new_max_N;
     }
 
     // ─── Child expansion ────────────────────────────────────────────────

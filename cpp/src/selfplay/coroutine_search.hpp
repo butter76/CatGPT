@@ -310,20 +310,39 @@ private:
         }
         N *= total_child_weight;
 
-        auto allocations = compute_allocations(node, N);
-
         int child_alpha = (VALUE_NUM_BINS - 1) - beta;
         int child_beta  = (VALUE_NUM_BINS - 1) - alpha;
 
-        // Recurse into children
-        for (auto& [move, child] : node->children) {
-            auto it = allocations.find(move);
-            if (it != allocations.end() && it->second > 0.0f) {
-                float N_i = it->second;
-                scratch_board.makeMove<true>(move);
-                co_await recursive_search(&child, scratch_board, N_i, child_alpha, child_beta);
-                scratch_board.unmakeMove(move);
+        // Recurse into children with clamped allocation loop.
+        // If any child's allocation exceeds its limit we cap it, recurse,
+        // then recompute allocations (Q values and max_N have changed) and
+        // repeat until allocations stabilise or we hit the iteration cap.
+        for (int clamp_iter = 0; clamp_iter < 100; ++clamp_iter) {
+            auto allocations = compute_allocations(node, N);
+
+            bool any_clamped = false;
+            for (auto& [move, child] : node->children) {
+                auto it = allocations.find(move);
+                if (it == allocations.end() || it->second <= 0.0f) continue;
+
+                float limit = std::max(child.max_N, 1.0f) * 1.1f + 1.0f;
+                if (it->second > limit) {
+                    it->second = limit;
+                    any_clamped = true;
+                }
             }
+
+            for (auto& [move, child] : node->children) {
+                auto it = allocations.find(move);
+                if (it != allocations.end() && it->second > 0.0f) {
+                    float N_i = it->second;
+                    scratch_board.makeMove<true>(move);
+                    co_await recursive_search(&child, scratch_board, N_i, child_alpha, child_beta);
+                    scratch_board.unmakeMove(move);
+                }
+            }
+
+            if (!any_clamped) break;
         }
 
         // Recompute allocations after recursion
