@@ -36,6 +36,7 @@
 
 #include "../../external/chess-library/include/chess.hpp"
 #include "batch_evaluator.hpp"
+#include "challenger_mcts.hpp"
 #include "challenger_search.hpp"
 #include "coroutine_mcts.hpp"
 #include "coroutine_search.hpp"
@@ -320,8 +321,12 @@ private:
                     move_result = co_await search_catgpt(
                         config_.challenger_config, config_.challenger_mcts_config,
                         slot.board());
+                } else if (config_.search_type == SearchType::MCTS) {
+                    // Normal MCTS mode: ChallengerMCTS is the challenger
+                    ChallengerMCTS search(*evaluator_, config_.challenger_mcts_config);
+                    move_result = co_await search.search_move(slot.board());
                 } else {
-                    // Normal mode: ChallengerSearch is the challenger
+                    // Normal fractional mode: ChallengerSearch is the challenger
                     ChallengerSearch search(*evaluator_, config_.challenger_config);
                     move_result = co_await search.search_move(slot.board());
                 }

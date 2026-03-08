@@ -52,7 +52,7 @@ challenger_name: "Challenger"
 
 # Stockfish opponent (replaces baseline with Stockfish when enabled)
 stockfish:
-  enabled: true
+  enabled: false
   path: "stockfish"          # Binary path (or just name if on PATH)
   nodes: 60000               # Fixed node count for `go nodes`
   processes: 4               # Concurrent Stockfish subprocesses
