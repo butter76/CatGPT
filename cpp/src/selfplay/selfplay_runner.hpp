@@ -518,7 +518,24 @@ private:
                 pgn_file_ << move_num << "... ";
             }
 
-            pgn_file_ << chess::uci::moveToSan(board, record.moves[i]) << " ";
+            pgn_file_ << chess::uci::moveToSan(board, record.moves[i]);
+
+            // Annotate with eval and GPU evals used
+            if (i < record.cp_scores_per_move.size() || i < record.gpu_evals_per_move.size()) {
+                pgn_file_ << " {";
+                bool need_sep = false;
+                if (i < record.cp_scores_per_move.size()) {
+                    pgn_file_ << "cp=" << record.cp_scores_per_move[i];
+                    need_sep = true;
+                }
+                if (i < record.gpu_evals_per_move.size()) {
+                    if (need_sep) pgn_file_ << ", ";
+                    pgn_file_ << "evals=" << record.gpu_evals_per_move[i];
+                }
+                pgn_file_ << "}";
+            }
+
+            pgn_file_ << " ";
 
             board.makeMove<true>(record.moves[i]);
             if (!white_to_move) ++move_num;

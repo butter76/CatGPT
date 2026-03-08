@@ -51,6 +51,8 @@ enum class GameOutcome {
 struct GameRecord {
     std::string opening_fen;
     std::vector<chess::Move> moves;
+    std::vector<int> gpu_evals_per_move;   // GPU evals used for each move
+    std::vector<int> cp_scores_per_move;   // Centipawn eval (side-to-move) for each move
     GameTermination termination = GameTermination::ONGOING;
     GameOutcome outcome = GameOutcome::DRAW;
     int total_gpu_evals = 0;
@@ -94,6 +96,8 @@ public:
         board_ = chess::Board(opening_fen);
         opening_fen_ = opening_fen;
         moves_.clear();
+        gpu_evals_per_move_.clear();
+        cp_scores_per_move_.clear();
         total_gpu_evals_ = 0;
         consecutive_draw_scores_ = 0;
         consecutive_resign_scores_ = 0;
@@ -106,6 +110,8 @@ public:
     void apply_move(chess::Move move, int cp_score, int gpu_evals) {
         board_.makeMove<true>(move);
         moves_.push_back(move);
+        gpu_evals_per_move_.push_back(gpu_evals);
+        cp_scores_per_move_.push_back(cp_score);
         total_gpu_evals_ += gpu_evals;
 
         // Update draw adjudication counter
@@ -236,6 +242,8 @@ public:
         return GameRecord{
             .opening_fen = opening_fen_,
             .moves = moves_,
+            .gpu_evals_per_move = gpu_evals_per_move_,
+            .cp_scores_per_move = cp_scores_per_move_,
             .termination = termination_,
             .outcome = outcome_,
             .total_gpu_evals = total_gpu_evals_,
@@ -260,6 +268,8 @@ private:
     chess::Board board_;
     std::string opening_fen_;
     std::vector<chess::Move> moves_;
+    std::vector<int> gpu_evals_per_move_;
+    std::vector<int> cp_scores_per_move_;
     int total_gpu_evals_ = 0;
 
     // Adjudication state
