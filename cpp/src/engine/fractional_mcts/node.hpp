@@ -16,18 +16,10 @@
 #include <vector>
 
 #include "../../../external/chess-library/include/chess.hpp"
+#include "../move_hash.hpp"
 #include "../trt_evaluator.hpp"  // For VALUE_NUM_BINS
 
 namespace catgpt {
-
-/**
- * Hash function for chess::Move so it can be used as an unordered_map key.
- */
-struct MoveHash {
-    std::size_t operator()(const chess::Move& move) const noexcept {
-        return std::hash<std::uint16_t>{}(move.move());
-    }
-};
 
 /**
  * A node in the Fractional MCTS search tree.

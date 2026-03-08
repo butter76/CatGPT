@@ -37,6 +37,7 @@
 #include "../../external/chess-library/include/chess.hpp"
 #include "batch_evaluator.hpp"
 #include "challenger_search.hpp"
+#include "coroutine_mcts.hpp"
 #include "coroutine_search.hpp"
 #include "game_slot.hpp"
 #include "selfplay_config.hpp"
@@ -315,9 +316,10 @@ private:
                 }
             } else if (challenger_to_move) {
                 if (single_external) {
-                    // External engine mode: CatGPT (CoroutineSearch) is the challenger
-                    CoroutineSearch search(*evaluator_, config_.challenger_config);
-                    move_result = co_await search.search_move(slot.board());
+                    // External engine mode: CatGPT is the challenger
+                    move_result = co_await search_catgpt(
+                        config_.challenger_config, config_.challenger_mcts_config,
+                        slot.board());
                 } else {
                     // Normal mode: ChallengerSearch is the challenger
                     ChallengerSearch search(*evaluator_, config_.challenger_config);
@@ -331,9 +333,10 @@ private:
                     // Lc0 mode: Lc0 is the baseline
                     move_result = co_await Lc0Awaitable(*lc0_pool_, slot.board());
                 } else {
-                    // Normal mode: CoroutineSearch is the baseline
-                    CoroutineSearch search(*evaluator_, config_.baseline_config);
-                    move_result = co_await search.search_move(slot.board());
+                    // Normal mode: CoroutineSearch or CoroutineMCTS is the baseline
+                    move_result = co_await search_catgpt(
+                        config_.baseline_config, config_.baseline_mcts_config,
+                        slot.board());
                 }
             }
 
@@ -348,6 +351,23 @@ private:
         auto record = slot.to_record();
         record.baseline_white = baseline_white;
         co_return record;
+    }
+
+    // ─── CatGPT search dispatch ────────────────────────────────────────
+
+    /**
+     * Run CatGPT search using the configured algorithm (Fractional MCTS or MCTS).
+     */
+    coro::task<MoveResult> search_catgpt(const FractionalMCTSConfig& frac_config,
+                                         const MCTSConfig& mcts_config,
+                                         const chess::Board& board) {
+        if (config_.search_type == SearchType::MCTS) {
+            CoroutineMCTS search(*evaluator_, mcts_config);
+            co_return co_await search.search_move(board);
+        } else {
+            CoroutineSearch search(*evaluator_, frac_config);
+            co_return co_await search.search_move(board);
+        }
     }
 
     // ─── Elo estimation ──────────────────────────────────────────────────

@@ -29,9 +29,16 @@ concurrent: 64      # Concurrent game slots
 threads: 6          # Search worker threads
 batch: 64           # Max GPU batch size
 
+# Search algorithm: "fractional" (default) or "mcts"
+search_type: "mcts"
+
 # Search settings (apply to both engines unless overridden)
 evals: 400          # Min GPU evals per move
 cpuct: 1.75         # PUCT exploration constant
+
+# MCTS-specific settings (only used when search_type=mcts)
+fpu: null               # FPU reduction (default: 0.003)
+max_simulations: null    # Max MCTS simulations per move (default: 10000)
 
 # Per-engine overrides (null = use shared value above)
 baseline_evals: null
@@ -45,9 +52,9 @@ challenger_name: "Challenger"
 
 # Stockfish opponent (replaces baseline with Stockfish when enabled)
 stockfish:
-  enabled: false
+  enabled: true
   path: "stockfish"          # Binary path (or just name if on PATH)
-  nodes: 100000               # Fixed node count for `go nodes`
+  nodes: 60000               # Fixed node count for `go nodes`
   processes: 4               # Concurrent Stockfish subprocesses
   threads_per_process: 1     # UCI Threads option per process
   hash_mb: 16                # UCI Hash option (MB) per process

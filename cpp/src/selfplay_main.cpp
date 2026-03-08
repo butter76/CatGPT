@@ -55,6 +55,9 @@
  *   --lc0-threads N      UCI Threads per Lc0 process (default: 1)
  *   --lc0-backend S      Neural-net backend (default: cuda-auto)
  *   --lc0-minibatch N   MinibatchSize for NN computation (default: 0 = backend default)
+ *   --search-type S     Search algorithm: "fractional" (default) or "mcts"
+ *   --fpu F             FPU reduction for MCTS mode (default: 0.003)
+ *   --max-simulations N Max MCTS simulations (default: 10000)
  */
 
 #include <cstdlib>
@@ -112,6 +115,11 @@ void print_usage(const char* argv0) {
     std::println(stderr, "  --lc0-threads N      UCI Threads per Lc0 process (default: 1)");
     std::println(stderr, "  --lc0-backend S      Neural-net backend (default: cuda-auto)");
     std::println(stderr, "  --lc0-minibatch N    MinibatchSize for NN computation (default: 0 = backend default)");
+    std::println(stderr, "");
+    std::println(stderr, "Search algorithm:");
+    std::println(stderr, "  --search-type S      Search algorithm: \"fractional\" (default) or \"mcts\"");
+    std::println(stderr, "  --fpu F              FPU reduction for MCTS mode (default: 0.003)");
+    std::println(stderr, "  --max-simulations N  Max MCTS simulations per move (default: 10000)");
 }
 
 int main(int argc, char* argv[]) {
@@ -249,6 +257,24 @@ int main(int argc, char* argv[]) {
             config.lc0_backend = next_string();
         } else if (arg == "--lc0-minibatch") {
             config.lc0_minibatch_size = next_int();
+        } else if (arg == "--search-type") {
+            std::string type = next_string();
+            if (type == "mcts") {
+                config.search_type = catgpt::SearchType::MCTS;
+            } else if (type == "fractional") {
+                config.search_type = catgpt::SearchType::FRACTIONAL_MCTS;
+            } else {
+                std::println(stderr, "Error: --search-type must be 'fractional' or 'mcts', got '{}'", type);
+                return 1;
+            }
+        } else if (arg == "--fpu") {
+            float fpu = next_float();
+            config.baseline_mcts_config.fpu_reduction = fpu;
+            config.challenger_mcts_config.fpu_reduction = fpu;
+        } else if (arg == "--max-simulations") {
+            int max_sims = next_int();
+            config.baseline_mcts_config.max_simulations = max_sims;
+            config.challenger_mcts_config.max_simulations = max_sims;
         } else {
             std::println(stderr, "Unknown option: {}", arg);
             print_usage(argv[0]);
@@ -257,25 +283,34 @@ int main(int argc, char* argv[]) {
     }
 
     // Apply shared values first, then per-engine overrides
+    // (applies to both Fractional MCTS and MCTS configs)
     if (shared_evals_set) {
         config.baseline_config.min_total_evals = shared_evals;
         config.challenger_config.min_total_evals = shared_evals;
+        config.baseline_mcts_config.min_total_evals = shared_evals;
+        config.challenger_mcts_config.min_total_evals = shared_evals;
     }
     if (shared_cpuct_set) {
         config.baseline_config.c_puct = shared_cpuct;
         config.challenger_config.c_puct = shared_cpuct;
+        config.baseline_mcts_config.c_puct = shared_cpuct;
+        config.challenger_mcts_config.c_puct = shared_cpuct;
     }
     if (baseline_evals_set) {
         config.baseline_config.min_total_evals = baseline_evals;
+        config.baseline_mcts_config.min_total_evals = baseline_evals;
     }
     if (challenger_evals_set) {
         config.challenger_config.min_total_evals = challenger_evals;
+        config.challenger_mcts_config.min_total_evals = challenger_evals;
     }
     if (baseline_cpuct_set) {
         config.baseline_config.c_puct = baseline_cpuct;
+        config.baseline_mcts_config.c_puct = baseline_cpuct;
     }
     if (challenger_cpuct_set) {
         config.challenger_config.c_puct = challenger_cpuct;
+        config.challenger_mcts_config.c_puct = challenger_cpuct;
     }
 
     // Determine if we need GPU (TRT engine)
@@ -393,6 +428,8 @@ int main(int argc, char* argv[]) {
     std::println(stderr, "  Openings:     {}", config.openings_path.empty() ? "(startpos)" : config.openings_path);
     std::println(stderr, "  Syzygy:       {}", config.syzygy_path.empty() ? "(disabled)" : config.syzygy_path);
     std::println(stderr, "  PGN output:   {}", config.output_pgn.empty() ? "(none)" : config.output_pgn);
+    std::println(stderr, "  Search type:  {}",
+                 config.search_type == catgpt::SearchType::MCTS ? "mcts" : "fractional");
     std::println(stderr, "");
 
     // Challenger info
@@ -405,8 +442,16 @@ int main(int argc, char* argv[]) {
         std::println(stderr, "    weights={}", config.lc0_weights);
     } else {
         std::println(stderr, "  {} (challenger):", config.challenger_name);
-        std::println(stderr, "    evals={}, cpuct={:.2f}",
-                     config.challenger_config.min_total_evals, config.challenger_config.c_puct);
+        if (config.search_type == catgpt::SearchType::MCTS) {
+            std::println(stderr, "    evals={}, cpuct={:.2f}, fpu={:.4f}, max_sims={}",
+                         config.challenger_mcts_config.min_total_evals,
+                         config.challenger_mcts_config.c_puct,
+                         config.challenger_mcts_config.fpu_reduction,
+                         config.challenger_mcts_config.max_simulations);
+        } else {
+            std::println(stderr, "    evals={}, cpuct={:.2f}",
+                         config.challenger_config.min_total_evals, config.challenger_config.c_puct);
+        }
     }
 
     // Baseline info
@@ -423,8 +468,16 @@ int main(int argc, char* argv[]) {
         std::println(stderr, "    weights={}", config.lc0_weights);
     } else {
         std::println(stderr, "  {} (baseline):", config.baseline_name);
-        std::println(stderr, "    evals={}, cpuct={:.2f}",
-                     config.baseline_config.min_total_evals, config.baseline_config.c_puct);
+        if (config.search_type == catgpt::SearchType::MCTS) {
+            std::println(stderr, "    evals={}, cpuct={:.2f}, fpu={:.4f}, max_sims={}",
+                         config.baseline_mcts_config.min_total_evals,
+                         config.baseline_mcts_config.c_puct,
+                         config.baseline_mcts_config.fpu_reduction,
+                         config.baseline_mcts_config.max_simulations);
+        } else {
+            std::println(stderr, "    evals={}, cpuct={:.2f}",
+                         config.baseline_config.min_total_evals, config.baseline_config.c_puct);
+        }
     }
     std::println(stderr, "");
 

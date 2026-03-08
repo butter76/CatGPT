@@ -5,7 +5,7 @@
  * GPU batching, search parameters, and game adjudication.
  *
  * Two search configs are provided:
- *   - baseline_config:    the control (CoroutineSearch)
+ *   - baseline_config:    the control (CoroutineSearch / CoroutineMCTS)
  *   - challenger_config:  the variation being tested (ChallengerSearch)
  *
  * Each opening is played twice with colors swapped so that engine
@@ -18,8 +18,17 @@
 #include <string>
 
 #include "../engine/fractional_mcts/config.hpp"
+#include "../engine/mcts/config.hpp"
 
 namespace catgpt {
+
+/**
+ * Which search algorithm to use for the CatGPT engines.
+ */
+enum class SearchType {
+    FRACTIONAL_MCTS,  // Default: iterative deepening fractional MCTS (CoroutineSearch)
+    MCTS,             // Traditional MCTS with PUCT selection (CoroutineMCTS)
+};
 
 /**
  * Configuration for the batched self-play runner.
@@ -61,13 +70,26 @@ struct SelfPlayConfig {
     /** Centipawn threshold for resign adjudication. */
     int resign_cp_threshold = 400;
 
-    // === Search (two engines) ===
+    // === Search Algorithm ===
+
+    /** Which search algorithm to use for CatGPT engines. */
+    SearchType search_type = SearchType::FRACTIONAL_MCTS;
+
+    // === Search (two engines) — Fractional MCTS ===
 
     /** Baseline search configuration (CoroutineSearch — the control). */
     FractionalMCTSConfig baseline_config{};
 
     /** Challenger search configuration (ChallengerSearch — your variation). */
     FractionalMCTSConfig challenger_config{};
+
+    // === Search (MCTS mode) ===
+
+    /** Baseline MCTS configuration (used when search_type == MCTS). */
+    MCTSConfig baseline_mcts_config{};
+
+    /** Challenger MCTS configuration (used when search_type == MCTS). */
+    MCTSConfig challenger_mcts_config{};
 
     // === Engine Labels (for PGN + logging) ===
 

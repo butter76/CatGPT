@@ -137,6 +137,15 @@ def build_command(cfg: DictConfig, project_root: Path, pgn_path: Path) -> list[s
         cmd += ["--lc0-minibatch", str(cfg.lc0.minibatch_size)]
         cmd += ["--lc0-path", str(cfg.lc0.path)]
 
+    # Search algorithm
+    search_type = cfg.get("search_type", "fractional")
+    if search_type != "fractional":
+        cmd += ["--search-type", str(search_type)]
+    if cfg.get("fpu") is not None:
+        cmd += ["--fpu", str(cfg.fpu)]
+    if cfg.get("max_simulations") is not None:
+        cmd += ["--max-simulations", str(cfg.max_simulations)]
+
     # Syzygy tablebase path (explicit config or $SYZYGY_HOME handled by C++ binary)
     if cfg.syzygy_path is not None:
         syzygy = project_root / cfg.syzygy_path if not Path(cfg.syzygy_path).is_absolute() else Path(cfg.syzygy_path)
