@@ -148,11 +148,8 @@ private:
         }
         // Terminal nodes already have origQ set when created
 
-        // BACKPROPAGATE: update visit counts
-        backpropagate(path);
-
-        // CALC Q: recursively recompute Q values for entire tree
-        calc_q(root);
+        // BACKPROPAGATE + UPDATE Q: walk leaf→root, increment N and recompute cached_Q
+        backpropagate_and_update_q(path);
     }
 
     // ─── PUCT selection ─────────────────────────────────────────────────
@@ -336,51 +333,37 @@ private:
         co_return EvalResult{std::move(policy_priors), value, raw.value_probs};
     }
 
-    // ─── Backpropagation ────────────────────────────────────────────────
+    // ─── Backpropagation + Q update (merged) ──────────────────────────
 
     /**
-     * Update visit counts along the path from leaf to root.
+     * Walk the path from leaf to root, incrementing N and recomputing
+     * cached_Q at each node.
+     *
+     * Only nodes on the path have a changed N, so only their cached_Q
+     * values are stale.  Processing leaf→root ensures the child on the
+     * path is already up-to-date before its parent is recomputed.
+     *
+     * Complexity: O(path_length × avg_branching_factor) per simulation,
+     * instead of O(tree_size) for the old recursive calc_q.
      */
-    static void backpropagate(std::vector<MCTSNode*>& path) {
-        for (MCTSNode* node : path) {
+    static void backpropagate_and_update_q(std::vector<MCTSNode*>& path) {
+        for (int i = static_cast<int>(path.size()) - 1; i >= 0; --i) {
+            MCTSNode* node = path[i];
             node->N += 1;
-        }
-    }
 
-    // ─── Recursive Q computation ────────────────────────────────────────
-
-    /**
-     * Recursively compute Q values for the entire tree.
-     *
-     * Q(node) = (origQ * 1 + sum(-child.Q * child.N)) / N
-     *
-     * This is called after each simulation to update cached_Q values.
-     */
-    static void calc_q(MCTSNode* node) {
-        // Terminal nodes: Q is just the terminal value
-        if (node->is_terminal) {
-            node->cached_Q = node->terminal_value.value();
-            return;
+            if (node->is_terminal) {
+                node->cached_Q = node->terminal_value.value();
+            } else if (!node->is_expanded()) {
+                node->cached_Q = node->origQ;
+            } else {
+                // Q = (origQ * 1 + sum(-child.cached_Q * child.N)) / N
+                float sum = node->origQ;
+                for (const auto& [move, child] : node->children) {
+                    sum += -child.cached_Q * static_cast<float>(child.N);
+                }
+                node->cached_Q = sum / static_cast<float>(node->N);
+            }
         }
-
-        // Unexpanded leaf: Q is just origQ
-        if (!node->is_expanded()) {
-            node->cached_Q = node->origQ;
-            return;
-        }
-
-        // Recursively compute Q for all children first
-        for (auto& [move, child] : node->children) {
-            calc_q(&child);
-        }
-
-        // Compute weighted average:
-        // Q = (origQ * 1 + sum(-child.Q * child.N)) / N
-        float sum = node->origQ;  // Weight 1 for own evaluation
-        for (const auto& [move, child] : node->children) {
-            sum += -child.cached_Q * static_cast<float>(child.N);
-        }
-        node->cached_Q = sum / static_cast<float>(node->N);
     }
 
     // ─── Members ────────────────────────────────────────────────────────
