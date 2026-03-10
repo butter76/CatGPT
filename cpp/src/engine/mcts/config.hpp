@@ -38,6 +38,13 @@ struct MCTSConfig {
     float fpu_reduction = 0.003f;
 
     /**
+     * Temperature applied to policy logits before softmax.
+     * Values > 1 flatten the distribution (more exploration),
+     * values < 1 sharpen it (more exploitation). 1.0 = no effect.
+     */
+    float policy_temperature = 1.3f;
+
+    /**
      * Maximum number of simulations to run regardless of GPU eval count.
      * Prevents infinite loops when repeatedly hitting terminal nodes.
      */

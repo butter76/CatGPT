@@ -1,9 +1,9 @@
 /**
  * Coroutine-based Fractional MCTS Search.
  *
- * This is the async version of FractionalMCTSSearch.  The algorithm
- * is identical — PUCT budget allocation, iterative deepening, binary
- * search for K — but every GPU evaluation point is a coroutine
+ * Coroutine-based Fractional MCTS using PUCT budget allocation,
+ * iterative deepening, and binary search for K.  Every GPU
+ * evaluation point is a coroutine
  * suspension.  When evaluate_node() needs the neural network it
  * `co_await`s an EvalAwaitable, suspending the coroutine so the
  * worker thread can run a different game's search.  The GPU thread
@@ -260,7 +260,7 @@ private:
         node->compute_variance();
     }
 
-    // ─── Recursive search (identical logic to FractionalMCTSSearch) ─────
+    // ─── Recursive search ─────────────────────────────────────────────
 
     coro::task<void> recursive_search(FractionalNode* node, chess::Board& scratch_board,
                                       float N, int alpha, int beta) {

@@ -1,15 +1,14 @@
 /**
- * CatGPT Fractional MCTS UCI Engine - Main Entry Point
+ * CatGPT MCTS UCI Engine - Main Entry Point
  *
- * Uses CoroutineSearch (the selfplay algorithm) backed by a BatchEvaluator
+ * Uses CoroutineMCTS (AlphaZero/Leela-style MCTS) backed by a BatchEvaluator
  * for GPU inference.  A thin SearchAlgo adapter bridges the coroutine-based
  * search into the synchronous UCI interface via coro::sync_wait.
  *
- * Usage: catgpt_fractional_mcts [engine_path]
+ * Usage: catgpt_mcts [engine_path]
  *   engine_path: Path to TensorRT engine file (default: ./catgpt.trt)
  */
 
-#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -21,10 +20,10 @@
 #include <coro/thread_pool.hpp>
 
 #include "../external/chess-library/include/chess.hpp"
-#include "engine/fractional_mcts/config.hpp"
+#include "engine/mcts/config.hpp"
 #include "engine/search_algo.hpp"
 #include "selfplay/batch_evaluator.hpp"
-#include "selfplay/coroutine_search.hpp"
+#include "selfplay/coroutine_mcts.hpp"
 #include "uci/uci_handler.hpp"
 
 namespace fs = std::filesystem;
@@ -32,18 +31,18 @@ namespace fs = std::filesystem;
 namespace catgpt {
 
 /**
- * SearchAlgo adapter for CoroutineSearch.
+ * SearchAlgo adapter for CoroutineMCTS.
  *
- * Wraps the coroutine-based CoroutineSearch into the synchronous SearchAlgo
+ * Wraps the coroutine-based CoroutineMCTS into the synchronous SearchAlgo
  * interface used by UCIHandler.  Each search() call creates a fresh
- * CoroutineSearch, runs it to completion via coro::sync_wait, and converts
+ * CoroutineMCTS, runs it to completion via coro::sync_wait, and converts
  * the MoveResult into a SearchResult.
  */
-class CoroutineSearchAdapter : public SearchAlgo {
+class CoroutineMCTSAdapter : public SearchAlgo {
 public:
-    CoroutineSearchAdapter(std::shared_ptr<coro::thread_pool> pool,
-                           std::shared_ptr<BatchEvaluator> evaluator,
-                           FractionalMCTSConfig config = {})
+    CoroutineMCTSAdapter(std::shared_ptr<coro::thread_pool> pool,
+                         std::shared_ptr<BatchEvaluator> evaluator,
+                         MCTSConfig config = {})
         : pool_(std::move(pool))
         , evaluator_(std::move(evaluator))
         , config_(config)
@@ -62,7 +61,7 @@ public:
         auto start_time = std::chrono::steady_clock::now();
 
         // Apply node limit if specified, otherwise use config default
-        FractionalMCTSConfig search_config = config_;
+        MCTSConfig search_config = config_;
         if (limits.nodes.has_value()) {
             search_config.min_total_evals = static_cast<int>(limits.nodes.value());
         }
@@ -89,9 +88,8 @@ public:
     }
 
     void stop() override {
-        // CoroutineSearch doesn't support early termination — the search
-        // runs to completion based on min_total_evals.  This is fine for
-        // fixed-node searches; time management can be added later.
+        // CoroutineMCTS doesn't support early termination — the search
+        // runs to completion based on min_total_evals.
     }
 
     [[nodiscard]] const chess::Board& board() const override {
@@ -105,17 +103,17 @@ private:
     static coro::task<MoveResult> run_search(
         std::shared_ptr<coro::thread_pool> pool,
         BatchEvaluator& evaluator,
-        const FractionalMCTSConfig& config,
+        const MCTSConfig& config,
         chess::Board board)
     {
         co_await pool->schedule();
-        CoroutineSearch search(evaluator, config, &std::cerr);
+        CoroutineMCTS search(evaluator, config);
         co_return co_await search.search_move(board);
     }
 
     std::shared_ptr<coro::thread_pool> pool_;
     std::shared_ptr<BatchEvaluator> evaluator_;
-    FractionalMCTSConfig config_;
+    MCTSConfig config_;
     chess::Board board_;
 };
 
@@ -151,9 +149,9 @@ int main(int argc, char* argv[]) {
             engine_path, pool, /*max_batch_size=*/1);
         std::println(stderr, "Engine loaded successfully");
 
-        // Create UCI handler with CoroutineSearch adapter
+        // Create UCI handler with CoroutineMCTS adapter
         catgpt::UCIHandler handler([pool, evaluator]() {
-            return std::make_unique<catgpt::CoroutineSearchAdapter>(
+            return std::make_unique<catgpt::CoroutineMCTSAdapter>(
                 pool, evaluator);
         });
 

@@ -250,7 +250,7 @@ private:
         node->compute_variance();
     }
 
-    // ─── Recursive search (identical logic to FractionalMCTSSearch) ─────
+    // ─── Recursive search ─────────────────────────────────────────────
 
     coro::task<void> recursive_search(FractionalNode* node, chess::Board& scratch_board,
                                       float N, int alpha, int beta) {

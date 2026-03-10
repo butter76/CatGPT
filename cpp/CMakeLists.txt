@@ -95,7 +95,7 @@ set_target_properties(trt_benchmark PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
 
-# === CatGPT Fractional MCTS UCI Engine (with TensorRT) ===
+# === CatGPT Fractional MCTS UCI Engine (coroutines + TensorRT) ===
 add_executable(catgpt_fractional_mcts
     src/fractional_mcts_uci_main.cpp
 )
@@ -104,17 +104,49 @@ target_include_directories(catgpt_fractional_mcts PRIVATE
     ${CHESS_LIBRARY_INCLUDE_DIR}
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
+    ${LIBCORO_INCLUDE_DIR}
 )
 
 target_link_libraries(catgpt_fractional_mcts PRIVATE
     ${NVINFER_LIB}
     ${CUDART_LIB}
+    ${LIBCORO_LIB}
     pthread
 )
 
+# libcoro requires -fcoroutines on GCC
+target_compile_options(catgpt_fractional_mcts PRIVATE -fcoroutines)
+
 set_target_properties(catgpt_fractional_mcts PROPERTIES
-    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
+)
+
+# === CatGPT MCTS UCI Engine (coroutines + TensorRT) ===
+add_executable(catgpt_mcts
+    src/mcts_uci_main.cpp
+)
+
+target_include_directories(catgpt_mcts PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+    ${LIBCORO_INCLUDE_DIR}
+)
+
+target_link_libraries(catgpt_mcts PRIVATE
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    ${LIBCORO_LIB}
+    pthread
+)
+
+# libcoro requires -fcoroutines on GCC
+target_compile_options(catgpt_mcts PRIVATE -fcoroutines)
+
+set_target_properties(catgpt_mcts PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
 
 # === CatGPT FEN Analyzer (with TensorRT) ===
@@ -241,6 +273,7 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(trt_benchmark PRIVATE -fdiagnostics-color=always)
     target_compile_options(chess_lib_tests PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_fractional_mcts PRIVATE -fdiagnostics-color=always)
+    target_compile_options(catgpt_mcts PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_analyze PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_selfplay PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_search PRIVATE -fdiagnostics-color=always)

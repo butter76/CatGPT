@@ -57,6 +57,7 @@
  *   --lc0-minibatch N   MinibatchSize for NN computation (default: 0 = backend default)
  *   --search-type S     Search algorithm: "fractional" (default) or "mcts"
  *   --fpu F             FPU reduction for MCTS mode (default: 0.003)
+ *   --policy-temp F     Policy temperature for MCTS mode (default: 1.3)
  *   --max-simulations N Max MCTS simulations (default: 10000)
  */
 
@@ -119,6 +120,7 @@ void print_usage(const char* argv0) {
     std::println(stderr, "Search algorithm:");
     std::println(stderr, "  --search-type S      Search algorithm: \"fractional\" (default) or \"mcts\"");
     std::println(stderr, "  --fpu F              FPU reduction for MCTS mode (default: 0.003)");
+    std::println(stderr, "  --policy-temp F      Policy temperature for MCTS mode (default: 1.3)");
     std::println(stderr, "  --max-simulations N  Max MCTS simulations per move (default: 10000)");
 }
 
@@ -271,6 +273,10 @@ int main(int argc, char* argv[]) {
             float fpu = next_float();
             config.baseline_mcts_config.fpu_reduction = fpu;
             config.challenger_mcts_config.fpu_reduction = fpu;
+        } else if (arg == "--policy-temp") {
+            float pt = next_float();
+            config.baseline_mcts_config.policy_temperature = pt;
+            config.challenger_mcts_config.policy_temperature = pt;
         } else if (arg == "--max-simulations") {
             int max_sims = next_int();
             config.baseline_mcts_config.max_simulations = max_sims;
@@ -443,10 +449,11 @@ int main(int argc, char* argv[]) {
     } else {
         std::println(stderr, "  {} (challenger):", config.challenger_name);
         if (config.search_type == catgpt::SearchType::MCTS) {
-            std::println(stderr, "    evals={}, cpuct={:.2f}, fpu={:.4f}, max_sims={}",
+            std::println(stderr, "    evals={}, cpuct={:.2f}, fpu={:.4f}, policy_temp={:.2f}, max_sims={}",
                          config.challenger_mcts_config.min_total_evals,
                          config.challenger_mcts_config.c_puct,
                          config.challenger_mcts_config.fpu_reduction,
+                         config.challenger_mcts_config.policy_temperature,
                          config.challenger_mcts_config.max_simulations);
         } else {
             std::println(stderr, "    evals={}, cpuct={:.2f}",
@@ -469,10 +476,11 @@ int main(int argc, char* argv[]) {
     } else {
         std::println(stderr, "  {} (baseline):", config.baseline_name);
         if (config.search_type == catgpt::SearchType::MCTS) {
-            std::println(stderr, "    evals={}, cpuct={:.2f}, fpu={:.4f}, max_sims={}",
+            std::println(stderr, "    evals={}, cpuct={:.2f}, fpu={:.4f}, policy_temp={:.2f}, max_sims={}",
                          config.baseline_mcts_config.min_total_evals,
                          config.baseline_mcts_config.c_puct,
                          config.baseline_mcts_config.fpu_reduction,
+                         config.baseline_mcts_config.policy_temperature,
                          config.baseline_mcts_config.max_simulations);
         } else {
             std::println(stderr, "    evals={}, cpuct={:.2f}",

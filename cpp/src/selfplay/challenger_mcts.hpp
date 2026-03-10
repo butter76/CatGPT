@@ -319,9 +319,10 @@ private:
             max_logit = std::max(max_logit, logit);
         }
 
+        float inv_temp = 1.0f / config_.policy_temperature;
         float sum_exp = 0.0f;
         for (auto& [move, logit] : move_logits) {
-            logit = std::exp(logit - max_logit);  // Numerical stability
+            logit = std::exp((logit - max_logit) * inv_temp);
             sum_exp += logit;
         }
 

@@ -143,6 +143,8 @@ def build_command(cfg: DictConfig, project_root: Path, pgn_path: Path) -> list[s
         cmd += ["--search-type", str(search_type)]
     if cfg.get("fpu") is not None:
         cmd += ["--fpu", str(cfg.fpu)]
+    if cfg.get("policy_temp") is not None:
+        cmd += ["--policy-temp", str(cfg.policy_temp)]
     if cfg.get("max_simulations") is not None:
         cmd += ["--max-simulations", str(cfg.max_simulations)]
 
