@@ -57,7 +57,8 @@ inline void print_catgpt_stats(
     chess::Move best_move,
     int cp,
     int nodes,
-    int iteration
+    int iteration,
+    const std::vector<chess::Move>& pv = {}
 ) {
     std::ostringstream json;
     json << std::setprecision(6);
@@ -134,6 +135,16 @@ inline void print_catgpt_stats(
     }
     json << "]";
 
+    // ── PV (principal variation) ─────────────────────────────────
+    if (!pv.empty()) {
+        json << ",\"pv\":[";
+        for (size_t i = 0; i < pv.size(); ++i) {
+            if (i > 0) json << ",";
+            json << "\"" << chess::uci::moveToUci(pv[i]) << "\"";
+        }
+        json << "]";
+    }
+
     json << "}";
 
     out << json.str() << "\n";
@@ -188,7 +199,7 @@ inline chess::Move best_move_from_allocations(
  */
 inline int child_q_to_cp(float child_Q) {
     float q = -child_Q;  // negate: child's Q is from opponent's perspective
-    return static_cast<int>(90.0f * std::tan(q * 1.5637541897f));
+    return static_cast<int>(100.7066f * std::tan(q * 1.5637541897f));
 }
 
 }  // namespace catgpt

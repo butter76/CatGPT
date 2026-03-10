@@ -887,7 +887,7 @@ function StoredCatGPTHistoryViewer({
                     }`}
                   >
                     Q {entry.q >= 0 ? "+" : ""}{entry.q.toFixed(3)} ({(() => {
-                      const cp = 90 * Math.tan(entry.q * 1.5637541897);
+                      const cp = 100.7066 * Math.tan(entry.q * 1.5637541897);
                       return cp >= 0 ? `+${(cp/100).toFixed(2)}` : (cp/100).toFixed(2);
                     })()})
                   </span>

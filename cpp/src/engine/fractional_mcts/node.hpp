@@ -132,20 +132,46 @@ public:
     }
 
     /**
-     * Get principal variation (best path by Q from this node).
+     * Get principal variation using allocation-based move selection.
+     *
+     * At each depth, computes PUCT allocations (the same mechanism used for
+     * actual move selection) and follows the highest-allocation child.
+     *
+     * @param compute_allocs_fn  A callable(FractionalNode*, float) -> allocations map.
+     *                           Typically the search class's compute_allocations method.
+     * @param max_depth          Maximum PV length.
      */
-    [[nodiscard]] std::vector<chess::Move> get_pv(int max_depth = 10) {
+    template <typename AllocFn>
+    [[nodiscard]] std::vector<chess::Move> get_pv(AllocFn&& compute_allocs_fn, int max_depth = 10) {
         std::vector<chess::Move> pv;
         FractionalNode* node = this;
 
         for (int i = 0; i < max_depth; ++i) {
-            auto best = node->best_child_by_q();
-            if (!best.has_value()) {
-                break;
+            if (node->children.empty() || node->max_N <= 0.0f) break;
+
+            // Replicate the budget scaling from recursive_search:
+            // N_adjusted = max_N * sum(child.P for expanded children)
+            float total_child_weight = 0.0f;
+            for (const auto& [move, child] : node->children) {
+                total_child_weight += child.P;
             }
-            auto [move, child] = best.value();
-            pv.push_back(move);
-            node = child;
+            float N_adjusted = node->max_N * total_child_weight;
+            if (N_adjusted <= 0.0f) break;
+
+            auto allocs = compute_allocs_fn(node, N_adjusted);
+
+            chess::Move best = chess::Move::NO_MOVE;
+            float best_alloc = -1.0f;
+            for (const auto& [move, alloc] : allocs) {
+                if (alloc > best_alloc) {
+                    best_alloc = alloc;
+                    best = move;
+                }
+            }
+            if (best == chess::Move::NO_MOVE) break;
+
+            pv.push_back(best);
+            node = &node->children.at(best);
         }
 
         return pv;

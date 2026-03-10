@@ -372,7 +372,7 @@ int main(int argc, char* argv[]) {
 
         // Q value from WDL (converted to [-1, 1])
         float q_11 = 2.0f * wdl_value - 1.0f;
-        int cp = static_cast<int>(90.0f * std::tan(q_11 * 1.5637541897f));
+        int cp = static_cast<int>(100.7066f * std::tan(q_11 * 1.5637541897f));
         std::cout << "  Q (WDL): " << std::showpos << std::setprecision(3) << q_11
                   << std::noshowpos << "  (" << interpret_value(wdl_value) << ", "
                   << std::showpos << cp << std::noshowpos << " cp)\n\n";

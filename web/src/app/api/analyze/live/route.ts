@@ -80,7 +80,7 @@ export async function GET(request: NextRequest) {
                       evaluation: lastStats.cp,
                       depth: lastStats.iteration,
                       nodes: lastStats.nodes,
-                      pv: [bm.bestMove],
+                      pv: lastStats.pv?.length ? lastStats.pv : [bm.bestMove],
                       catgptHistory,
                     });
                     send("saved", { positionId });

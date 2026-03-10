@@ -324,6 +324,32 @@ function CatGPTStatsDisplay({
         )}
       </div>
 
+      {/* PV line */}
+      {displayStats.pv && displayStats.pv.length > 0 && (
+        <div className="space-y-1">
+          <span className="text-xs text-muted-foreground">
+            Principal Variation:
+          </span>
+          <div className="text-xs font-mono text-muted-foreground break-all">
+            {displayStats.pv
+              .slice(0, 12)
+              .map((m, i) => (
+                <span key={i}>
+                  {i > 0 && " "}
+                  <span
+                    className={
+                      i === 0 ? "text-foreground font-medium" : ""
+                    }
+                  >
+                    {fmtMove(m)}
+                  </span>
+                </span>
+              ))}
+            {displayStats.pv.length > 12 && " ..."}
+          </div>
+        </div>
+      )}
+
       <Separator />
 
       {/* Modified Policy Distribution */}
@@ -428,7 +454,7 @@ function CatGPTPolicyChart({
     notationFormat === "algebraic" ? uciToAlgebraic(fen, move) : move;
 
   const fmtQ = (q: number) => {
-    const cp = 90 * Math.tan(q * 1.5637541897);
+    const cp = 100.7066 * Math.tan(q * 1.5637541897);
     const cpStr = cp >= 0 ? `+${(cp / 100).toFixed(2)}` : (cp / 100).toFixed(2);
     return `${q >= 0 ? "+" : ""}${q.toFixed(3)} (${cpStr})`;
   };

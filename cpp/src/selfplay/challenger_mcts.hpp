@@ -112,7 +112,7 @@ public:
             // Q from root's perspective (negate child's Q since it's opponent's view)
             float q = -best->second->Q();
             // Convert Q from [-1, 1] to centipawns using tangent scaling
-            result.cp_score = static_cast<int>(90.0f * std::tan(q * 1.5637541897f));
+            result.cp_score = static_cast<int>(100.7066f * std::tan(q * 1.5637541897f));
         } else {
             // Fallback (shouldn't happen)
             result.best_move = moves[0];

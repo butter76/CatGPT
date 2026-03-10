@@ -94,7 +94,7 @@ public:
                     initial_best = move;
                 }
             }
-            int root_cp = static_cast<int>(90.0f * std::tan(root->Q * 1.5637541897f));
+            int root_cp = static_cast<int>(100.7066f * std::tan(root->Q * 1.5637541897f));
             std::unordered_map<chess::Move, float, MoveHash> empty_allocs;
             print_catgpt_stats(*stats_out_, "root_eval", root.get(), empty_allocs, 0.0f,
                               initial_best, root_cp, total_gpu_evals_, 0);
@@ -131,8 +131,12 @@ public:
                 chess::Move current_best = best_move_from_allocations(allocs);
                 if (current_best != chess::Move::NO_MOVE) {
                     int cp = child_q_to_cp(root->children.at(current_best).Q);
+                    auto pv = root->get_pv(
+                        [this](FractionalNode* node, float budget) {
+                            return compute_allocations(node, budget);
+                        });
                     print_catgpt_stats(*stats_out_, "search_update", root.get(), allocs, N_adj,
-                                      current_best, cp, total_gpu_evals_, iteration);
+                                      current_best, cp, total_gpu_evals_, iteration, pv);
                     last_stats_iteration = iteration;
                 }
             }
@@ -158,7 +162,7 @@ public:
 
             auto& chosen_child = root->children.at(best_move);
             float q = -chosen_child.Q;
-            result.cp_score = static_cast<int>(90.0f * std::tan(q * 1.5637541897f));
+            result.cp_score = static_cast<int>(100.7066f * std::tan(q * 1.5637541897f));
 
             // ── Stats: search_complete ──
             if (stats_out_) {
@@ -170,8 +174,12 @@ public:
                         return compute_allocations(node, budget);
                     },
                     allocs, N_adj);
+                auto pv = root->get_pv(
+                    [this](FractionalNode* node, float budget) {
+                        return compute_allocations(node, budget);
+                    });
                 print_catgpt_stats(*stats_out_, "search_complete", root.get(), allocs, N_adj,
-                                  best_move, result.cp_score, total_gpu_evals_, iteration);
+                                  best_move, result.cp_score, total_gpu_evals_, iteration, pv);
             }
         } else {
             result.best_move = moves[0];
