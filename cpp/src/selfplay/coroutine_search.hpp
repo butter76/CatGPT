@@ -317,10 +317,12 @@ private:
         // If any child's allocation exceeds its limit we cap it, recurse,
         // then recompute allocations (Q values and max_N have changed) and
         // repeat until allocations stabilise or we hit the iteration cap.
+        // After the first iteration, only recurse into children that would be clamped.
         for (int clamp_iter = 0; clamp_iter < 100; ++clamp_iter) {
             auto allocations = compute_allocations(node, N);
 
-            bool any_clamped = false;
+            // Identify which children would be clamped and apply the clamp
+            std::vector<chess::Move> clamped_moves;
             for (auto& [move, child] : node->children) {
                 auto it = allocations.find(move);
                 if (it == allocations.end() || it->second <= 0.0f) continue;
@@ -328,21 +330,33 @@ private:
                 float limit = std::max(child.max_N, 1.0f) * 1.1f + 1.0f;
                 if (it->second > limit) {
                     it->second = limit;
-                    any_clamped = true;
+                    clamped_moves.push_back(move);
                 }
             }
 
-            for (auto& [move, child] : node->children) {
-                auto it = allocations.find(move);
-                if (it != allocations.end() && it->second > 0.0f) {
-                    float N_i = it->second;
+            if (clamp_iter == 0) {
+                // First iteration: recurse into all children
+                for (auto& [move, child] : node->children) {
+                    auto it = allocations.find(move);
+                    if (it != allocations.end() && it->second > 0.0f) {
+                        float N_i = it->second;
+                        scratch_board.makeMove<true>(move);
+                        co_await recursive_search(&child, scratch_board, N_i, child_alpha, child_beta);
+                        scratch_board.unmakeMove(move);
+                    }
+                }
+            } else {
+                // Subsequent iterations: only recurse into clamped children
+                if (clamped_moves.empty()) break;
+
+                for (const auto& move : clamped_moves) {
+                    auto& child = node->children.at(move);
+                    float N_i = allocations.at(move);
                     scratch_board.makeMove<true>(move);
                     co_await recursive_search(&child, scratch_board, N_i, child_alpha, child_beta);
                     scratch_board.unmakeMove(move);
                 }
             }
-
-            if (!any_clamped) break;
         }
 
         // Recompute allocations after recursion
