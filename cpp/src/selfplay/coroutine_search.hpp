@@ -18,6 +18,7 @@
 #define CATGPT_SELFPLAY_COROUTINE_SEARCH_HPP
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <unordered_map>
@@ -118,6 +119,7 @@ public:
         float last_used_N = N;
         int iteration = 0;
         int last_stats_iteration = 0;  // Track when we last printed stats
+        auto last_stats_time = std::chrono::steady_clock::now();  // Track time since last stats
 
         while (total_gpu_evals_ < target_evals && iteration < 25 * target_evals) {
             last_used_N = N;
@@ -126,9 +128,16 @@ public:
             int beta  = std::min(VALUE_NUM_BINS - 1, median);
             co_await recursive_search(root.get(), board, N, alpha, beta);
 
-            // ── Stats: print at iterations 0, 5, 12, 23, 39, ... (1.5x + 5 progression) ──
+            // ── Stats: print at iterations 0, 5, 12, 23, 39, ... (1.5x + 5 progression)
+            //           OR every 5 seconds minimum to prevent web timeouts ──
             int next_stats_threshold = static_cast<int>(1.5f * last_stats_iteration + 5);
-            if (stats_out_ && !root->children.empty() && iteration >= next_stats_threshold) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                now - last_stats_time).count();
+            bool time_triggered = elapsed_seconds >= 5;
+
+            if (stats_out_ && !root->children.empty() &&
+                (iteration >= next_stats_threshold || time_triggered)) {
                 std::unordered_map<chess::Move, float, MoveHash> allocs;
                 float N_adj = 0.0f;
                 compute_root_stats_allocations(
@@ -148,6 +157,7 @@ public:
                     print_catgpt_stats(*stats_out_, "search_update", root.get(), allocs, N_adj,
                                       current_best, cp, total_gpu_evals_, iteration, pv);
                     last_stats_iteration = iteration;
+                    last_stats_time = now;
                 }
             }
 
