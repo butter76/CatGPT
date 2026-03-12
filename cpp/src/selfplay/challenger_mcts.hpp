@@ -22,7 +22,8 @@
  * Q values are computed as:
  *   Q(node) = (origQ * 1 + sum(-child.Q * child.N)) / N
  *
- * After search, the move with highest visit count is selected.
+ * After search, the move is selected by PUCT budget allocation
+ * (balancing Q values and policy priors via binary search for K).
  */
 
 #ifndef CATGPT_SELFPLAY_CHALLENGER_MCTS_HPP
@@ -104,17 +105,31 @@ public:
             ++total_simulations;
         }
 
-        // Select move with highest visit count
-        auto best = root->best_child_by_visits();
-        if (best.has_value()) {
-            result.best_move = best->first;
+        // Select best move by PUCT allocation (balances Q and policy)
+        auto final_allocations = compute_allocations(root.get(),
+                                                     static_cast<float>(root->N));
 
-            // Q from root's perspective (negate child's Q since it's opponent's view)
-            float q = -best->second->Q();
-            // Convert Q from [-1, 1] to centipawns using tangent scaling
-            result.cp_score = static_cast<int>(100.7066f * std::tan(q * 1.5637541897f));
+        chess::Move best_move = chess::Move::NO_MOVE;
+        float best_allocation = -1.0f;
+        for (const auto& [move, alloc] : final_allocations) {
+            if (alloc > best_allocation) {
+                best_allocation = alloc;
+                best_move = move;
+            }
+        }
+
+        if (best_move != chess::Move::NO_MOVE) {
+            result.best_move = best_move;
+
+            // Find the chosen child to get its Q
+            for (const auto& [move, child] : root->children) {
+                if (move == best_move) {
+                    float q = -child.Q();
+                    result.cp_score = static_cast<int>(100.7066f * std::tan(q * 1.5637541897f));
+                    break;
+                }
+            }
         } else {
-            // Fallback (shouldn't happen)
             result.best_move = moves[0];
         }
 
@@ -365,6 +380,69 @@ private:
                 node->cached_Q = sum / static_cast<float>(node->N);
             }
         }
+    }
+
+    // ─── PUCT budget allocation (for final move selection) ─────────────
+
+    std::unordered_map<chess::Move, float, MoveHash>
+    compute_allocations(MCTSNode* node, float N) {
+        std::unordered_map<chess::Move, float, MoveHash> allocations;
+        if (node->children.empty()) return allocations;
+
+        float c_puct = config_.c_puct;
+        float sqrt_N = std::sqrt(N);
+
+        std::vector<std::pair<chess::Move, MCTSNode*>> children_vec;
+        children_vec.reserve(node->children.size());
+        for (auto& [move, child] : node->children) {
+            if (child.N > 0 || child.is_terminal) {
+                children_vec.emplace_back(move, &child);
+            }
+        }
+        if (children_vec.empty()) return allocations;
+
+        auto compute_allocation = [c_puct, sqrt_N](MCTSNode* child, float K) -> float {
+            float denominator = K - (-child->Q());
+            if (denominator <= 0.0f) return std::numeric_limits<float>::infinity();
+            return c_puct * child->P * sqrt_N / denominator;
+        };
+
+        auto sum_allocations = [&children_vec, &compute_allocation](float K) -> float {
+            float total = 0.0f;
+            for (const auto& [move, child] : children_vec) {
+                float alloc = compute_allocation(child, K);
+                if (std::isinf(alloc)) return std::numeric_limits<float>::infinity();
+                total += alloc;
+            }
+            return total;
+        };
+
+        float max_q = -std::numeric_limits<float>::infinity();
+        for (const auto& [move, child] : children_vec) {
+            max_q = std::max(max_q, -child->Q());
+        }
+        float K_low = max_q + 1e-9f;
+        float K_high = K_low + 10.0f;
+
+        for (int i = 0; i < 100; ++i) {
+            if (sum_allocations(K_high) <= N) break;
+            K_high *= 2.0f;
+        }
+
+        for (int i = 0; i < 64; ++i) {
+            float K_mid = (K_low + K_high) / 2.0f;
+            if (sum_allocations(K_mid) > N) {
+                K_low = K_mid;
+            } else {
+                K_high = K_mid;
+            }
+        }
+
+        float K = (K_low + K_high) / 2.0f;
+        for (const auto& [move, child] : children_vec) {
+            allocations[move] = compute_allocation(child, K);
+        }
+        return allocations;
     }
 
     // ─── Members ────────────────────────────────────────────────────────
