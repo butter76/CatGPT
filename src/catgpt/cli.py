@@ -4,12 +4,14 @@ import typer
 from rich.console import Console
 
 from catgpt import __version__
+from catgpt.computer_use.cli import app as computer_use_app
 
 app = typer.Typer(
     name="catgpt",
     help="CatGPT: ML research toolkit",
     add_completion=False,
 )
+app.add_typer(computer_use_app, name="computer-use")
 console = Console()
 
 
