@@ -254,24 +254,49 @@ private:
             move_logits.emplace_back(move, logit);
         }
 
-        // Softmax
+        // Softmax at temp 1.0 (standard)
         float max_logit = -std::numeric_limits<float>::infinity();
         for (const auto& [move, logit] : move_logits) {
             max_logit = std::max(max_logit, logit);
         }
-        float sum_exp = 0.0f;
-        for (auto& [move, logit] : move_logits) {
-            logit = std::exp(logit - max_logit);
-            sum_exp += logit;
-        }
 
         std::unordered_map<chess::Move, float, MoveHash> policy_priors;
-        for (const auto& [move, exp_logit] : move_logits) {
-            policy_priors[move] = exp_logit / sum_exp;
+        {
+            float sum_exp = 0.0f;
+            std::vector<std::pair<chess::Move, float>> exps;
+            exps.reserve(move_logits.size());
+            for (const auto& [move, logit] : move_logits) {
+                float e = std::exp(logit - max_logit);
+                exps.emplace_back(move, e);
+                sum_exp += e;
+            }
+            for (const auto& [move, e] : exps) {
+                policy_priors[move] = e / sum_exp;
+            }
+        }
+
+        // Softmax at temp 1.3 (warmer — used only for PUCT allocation)
+        constexpr float alloc_temp = 1.3f;
+        constexpr float inv_alloc_temp = 1.0f / alloc_temp;
+        std::unordered_map<chess::Move, float, MoveHash> policy_priors_alloc;
+        {
+            float max_scaled = max_logit * inv_alloc_temp;
+            float sum_exp = 0.0f;
+            std::vector<std::pair<chess::Move, float>> exps;
+            exps.reserve(move_logits.size());
+            for (const auto& [move, logit] : move_logits) {
+                float e = std::exp(logit * inv_alloc_temp - max_scaled);
+                exps.emplace_back(move, e);
+                sum_exp += e;
+            }
+            for (const auto& [move, e] : exps) {
+                policy_priors_alloc[move] = e / sum_exp;
+            }
         }
 
         // Write into node
         node->policy_priors = std::move(policy_priors);
+        node->policy_priors_alloc = std::move(policy_priors_alloc);
         node->Q = value;
         node->value_probs = raw.value_probs;
         node->distQ = raw.value_probs;
@@ -412,7 +437,12 @@ private:
             bool in_limit = static_cast<int>(i) < limit;
             if (prior < threshold && !in_limit) continue;
 
-            FractionalNode child(prior);
+            float prior_alloc = prior;
+            auto alloc_it = node->policy_priors_alloc.find(move);
+            if (alloc_it != node->policy_priors_alloc.end()) {
+                prior_alloc = alloc_it->second;
+            }
+            FractionalNode child(prior, prior_alloc);
 
             scratch_board.makeMove<true>(move);
 
@@ -468,7 +498,7 @@ private:
         auto compute_allocation = [c_puct, sqrt_N](FractionalNode* child, float K) -> float {
             float denominator = K - (-child->Q);
             if (denominator <= 0.0f) return std::numeric_limits<float>::infinity();
-            return c_puct * child->P * sqrt_N / denominator;
+            return c_puct * child->P_alloc * sqrt_N / denominator;
         };
 
         auto sum_allocations = [&children_vec, &compute_allocation](float K) -> float {

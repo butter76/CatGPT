@@ -36,7 +36,8 @@ class FractionalNode {
 public:
     FractionalNode() = default;
 
-    explicit FractionalNode(float prior) : P(prior) {}
+    explicit FractionalNode(float prior, float prior_alloc = 0.0f)
+        : P(prior), P_alloc(prior_alloc) {}
 
     /**
      * Compute how many children cover the given fraction of policy mass.
@@ -181,8 +182,16 @@ public:
     // Maps legal moves to their prior probabilities (sums to 1.0)
     std::unordered_map<chess::Move, float, MoveHash> policy_priors;
 
+    // Warm policy priors (higher temperature) used only for PUCT allocation.
+    // Empty when not used (baseline search ignores this).
+    std::unordered_map<chess::Move, float, MoveHash> policy_priors_alloc;
+
     // Prior probability of this move (from parent's policy output)
     float P = 0.0f;
+
+    // Warm prior for PUCT allocation (from parent's policy_priors_alloc).
+    // Falls back to P when not explicitly set.
+    float P_alloc = 0.0f;
 
     // Q value: initially from NN evaluation, updated after recursion
     // Range: [-1, 1] where -1=loss, 0=draw, 1=win (from this node's perspective)
