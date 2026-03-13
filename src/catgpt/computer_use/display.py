@@ -55,8 +55,7 @@ def get_display_info() -> DisplayInfo:
     """
     if platform.system() != "Darwin":
         raise RuntimeError(
-            "Display detection is only supported on macOS. "
-            f"Current platform: {platform.system()}"
+            f"Display detection is only supported on macOS. Current platform: {platform.system()}"
         )
 
     try:
@@ -211,7 +210,7 @@ class ScreenshotManager:
         """Map coordinates from Claude's coordinate space to screen logical coordinates.
 
         Claude operates in the coordinate space of the downscaled screenshot
-        (target_width × target_height). We need to map these back to the
+        (target_width x target_height). We need to map these back to the
         actual screen's logical pixel coordinates.
 
         Args:
@@ -247,4 +246,4 @@ class ScreenshotManager:
             screen_x = phys_x / self.display_info.scale_factor
             screen_y = phys_y / self.display_info.scale_factor
 
-        return int(round(screen_x)), int(round(screen_y))
+        return round(screen_x), round(screen_y)

@@ -258,8 +258,7 @@ class ComputerUseHarness:
                     params = {k: v for k, v in block.input.items() if k != "action"}
 
                     console.print(
-                        f"  [yellow]Action:[/yellow] {action} "
-                        f"[dim]{_format_params(params)}[/dim]"
+                        f"  [yellow]Action:[/yellow] {action} [dim]{_format_params(params)}[/dim]"
                     )
 
                     # Safety confirmation
@@ -404,7 +403,7 @@ class ComputerUseHarness:
 
         # Keep first message (task + initial screenshot) and recent messages
         first_msg = messages[0]
-        recent = messages[-(MAX_MESSAGE_PAIRS * 2):]
+        recent = messages[-(MAX_MESSAGE_PAIRS * 2) :]
 
         # Strip screenshots from the first message if it's getting old
         # (the task text is still valuable, but the initial screenshot may be stale)
@@ -421,16 +420,16 @@ def _strip_images_from_message(message: dict[str, Any]) -> dict[str, Any]:
     new_content = []
     for block in message["content"]:
         if isinstance(block, dict) and block.get("type") == "image":
-            new_content.append({"type": "text", "text": "[screenshot removed for context management]"})
+            new_content.append(
+                {"type": "text", "text": "[screenshot removed for context management]"}
+            )
         elif isinstance(block, dict) and block.get("type") == "tool_result":
             # Strip images from tool results too
             if isinstance(block.get("content"), list):
                 new_inner = []
                 for inner in block["content"]:
                     if isinstance(inner, dict) and inner.get("type") == "image":
-                        new_inner.append(
-                            {"type": "text", "text": "[screenshot removed]"}
-                        )
+                        new_inner.append({"type": "text", "text": "[screenshot removed]"})
                     else:
                         new_inner.append(inner)
                 block = {**block, "content": new_inner}

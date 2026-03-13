@@ -112,13 +112,13 @@ def run(
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user.[/yellow]")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
     except ValueError as e:
         console.print(f"\n[red]Configuration error:[/red] {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from e
     except Exception as e:
         console.print(f"\n[red]Error:[/red] {e}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from e
 
 
 @app.command()
@@ -190,8 +190,7 @@ def check() -> None:
         "[green]PASS[/green]" if deps_ok else "[red]FAIL[/red]",
         "All required packages installed"
         if deps_ok
-        else f"Missing: {', '.join(missing_deps)}. "
-        "Run: [bold]uv sync --extra computer-use[/bold]",
+        else f"Missing: {', '.join(missing_deps)}. Run: [bold]uv sync --extra computer-use[/bold]",
     )
     if not deps_ok:
         all_ok = False
@@ -243,8 +242,7 @@ def check() -> None:
 
     if all_ok:
         console.print(
-            "\n[bold green]All checks passed![/bold green] "
-            "You're ready to use Claude Computer Use."
+            "\n[bold green]All checks passed![/bold green] You're ready to use Claude Computer Use."
         )
     else:
         console.print(

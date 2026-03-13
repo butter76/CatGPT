@@ -10,14 +10,15 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from catgpt.computer_use.computer import ToolResult
+if TYPE_CHECKING:
+    from catgpt.computer_use.computer import ToolResult
 
 console = Console()
 
@@ -56,7 +57,7 @@ class ActionLog:
         # Append to log file
         assert self.log_path is not None
         try:
-            with open(self.log_path, "a") as f:
+            with self.log_path.open("a") as f:
                 f.write(json.dumps(entry) + "\n")
         except OSError as e:
             logger.warning(f"Failed to write action log: {e}")

@@ -15,11 +15,12 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from catgpt.computer_use.display import ScreenshotManager
+if TYPE_CHECKING:
+    from catgpt.computer_use.display import ScreenshotManager
 
 
 @dataclass
@@ -265,8 +266,8 @@ class ComputerTool:
                 text=True,
                 timeout=5,
             )
-        except subprocess.TimeoutExpired:
-            raise ToolError("Middle click timed out")
+        except subprocess.TimeoutExpired as e:
+            raise ToolError("Middle click timed out") from e
 
         return ToolResult(output=f"Middle clicked at ({sx}, {sy})")
 
@@ -462,9 +463,7 @@ class ComputerTool:
             if result.returncode != 0:
                 raise ToolError(f"cliclick failed: {result.stderr.strip()}")
             return result.stdout
-        except subprocess.TimeoutExpired:
-            raise ToolError(f"cliclick command timed out: {' '.join(commands)}")
-        except FileNotFoundError:
-            raise ToolError(
-                "cliclick not found. Install with: brew install cliclick"
-            )
+        except subprocess.TimeoutExpired as e:
+            raise ToolError(f"cliclick command timed out: {' '.join(commands)}") from e
+        except FileNotFoundError as e:
+            raise ToolError("cliclick not found. Install with: brew install cliclick") from e
