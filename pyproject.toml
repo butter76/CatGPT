@@ -44,9 +44,9 @@ jax = [
     "optax>=0.2.0",
     "orbax-checkpoint>=0.5.0",
 ]
-# JAX with CUDA support
+# JAX with CUDA 13 support
 jax-cuda = [
-    "jax[cuda12]>=0.4.20",
+    "jax[cuda13]>=0.8.2",
     "flax>=0.8.0",
     "optax>=0.2.0",
     "orbax-checkpoint>=0.5.0",
