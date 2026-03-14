@@ -19,7 +19,7 @@ Takes compressed .bagz files (where each record is a game/list of positions)
 and converts them to uncompressed .bag files (where each record is a single
 position), applying:
 1. Game verification (standard start, move connectivity, legal move matching)
-2. Position subsampling: select positions at indices i % 3 == cycle_index
+2. Half-move clock filter (excludes positions with clock > 90)
 3. FEN-based deduplication (ignoring half-move and full-move counters)
 4. Field stripping: only keep essential fields for training
 """
@@ -407,7 +407,7 @@ def convert_bagz_to_bag(
     1. Verify full game integrity (standard start, move connectivity, legal moves,
        invariance flags)
     2. Compute game result from terminal evaluation
-    3. Sub-select positions where index % 3 == cycle_index (cycling 0,1,2)
+    3. Filter positions with half-move clock > 90 (near 50-move draw)
     4. Deduplicate by FEN (ignoring half-move and full-move counters)
     5. Write individual positions with only training-essential fields
 
@@ -445,7 +445,6 @@ def convert_bagz_to_bag(
     games_processed = 0
     positions_before_dedup = 0
     positions_written = 0
-    cycle_index = 0  # Cycles through 0, 1, 2 for each game
 
     with BagWriter(str(output_path), compress=False) as writer:
         for game_idx in range(num_games):
@@ -462,17 +461,12 @@ def convert_bagz_to_bag(
             best_qs = [pos.best_q for pos in game_positions]
             st_qs = compute_st_q(best_qs)
 
-            # Sub-select positions: keep only those where pos_idx % 3 == cycle_index
-            # and where the half-move clock is at most 90 (avoids near-draw positions)
+            # Filter positions: exclude those with half-move clock > 90 (near 50-move draw)
             selected_positions = [
                 (pos_idx, pos, game_results[pos_idx], st_qs[pos_idx])
                 for pos_idx, pos in enumerate(game_positions)
-                if pos_idx % 3 == cycle_index
-                and int(pos.fen.split()[4]) <= 90
+                if int(pos.fen.split()[4]) <= 90
             ]
-
-            # Advance cycle for next game
-            cycle_index = (cycle_index + 1) % 3
 
             positions_before_dedup += len(selected_positions)
 
@@ -512,7 +506,7 @@ def convert_bagz_to_bag(
     if verbose:
         dedup_removed = positions_before_dedup - positions_written
         print(f"✓ Processed {games_processed} games")
-        print(f"  Positions selected (after mod 3): {positions_before_dedup}")
+        print(f"  Positions selected (after clock filter): {positions_before_dedup}")
         print(f"  Duplicates removed: {dedup_removed}")
         print(f"  Unique positions written: {positions_written}")
         print(f"  Output: {output_path}")
@@ -539,7 +533,7 @@ if __name__ == "__main__":
         print("     - Legal moves match python-chess exactly")
         print("     - No dangerous invariance flags")
         print("  2. Computes game_result from terminal evaluation")
-        print("  3. Sub-selects positions where index % 3 == cycle (cycling 0,1,2 per game)")
+        print("  3. Filters positions with half-move clock > 90 (near 50-move draw)")
         print("  4. Deduplicates by FEN (ignoring half-move and full-move counters)")
         print()
         print("Arguments:")
