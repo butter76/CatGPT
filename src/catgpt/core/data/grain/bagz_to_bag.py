@@ -24,6 +24,7 @@ position), applying:
 4. Field stripping: only keep essential fields for training
 """
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -400,12 +401,15 @@ def convert_bagz_to_bag(
     output_path: str | Path | None = None,
     *,
     verbose: bool = False,
+    profile: bool = False,
+    max_games: int | None = None,
+    skip_verify: bool = False,
 ) -> tuple[int, int, int]:
     """Convert a .bagz file to .bag format for training.
 
     Each game in the input is processed to:
     1. Verify full game integrity (standard start, move connectivity, legal moves,
-       invariance flags)
+       invariance flags) - can be skipped with skip_verify
     2. Compute game result from terminal evaluation
     3. Filter positions with half-move clock > 90 (near 50-move draw)
     4. Deduplicate by FEN (ignoring half-move and full-move counters)
@@ -415,6 +419,9 @@ def convert_bagz_to_bag(
         bagz_path: Path to input .bagz file containing games.
         output_path: Path for output .bag file. If None, replaces .bagz with .bag.
         verbose: If True, print progress information.
+        profile: If True, print detailed timing breakdown.
+        max_games: If set, process at most this many games (for testing).
+        skip_verify: If True, skip game integrity verification (faster but trusts data).
 
     Returns:
         Tuple of (games_processed, positions_before_dedup, positions_written).
@@ -435,9 +442,11 @@ def convert_bagz_to_bag(
 
     reader = BagReader(str(bagz_path))
     num_games = len(reader)
+    if max_games is not None:
+        num_games = min(num_games, max_games)
 
     if verbose:
-        print(f"Processing {num_games} games from {bagz_path}")
+        print(f"Processing {num_games} games from {bagz_path}", flush=True)
 
     # Track seen FENs for deduplication (within this file)
     seen_fens: set[str] = set()
@@ -446,20 +455,47 @@ def convert_bagz_to_bag(
     positions_before_dedup = 0
     positions_written = 0
 
+    # Timing accumulators (in seconds)
+    time_read = 0.0
+    time_decode = 0.0
+    time_verify = 0.0
+    time_game_result = 0.0
+    time_st_q = 0.0
+    time_filter = 0.0
+    time_dedup_write = 0.0
+    total_positions = 0
+
+    overall_start = time.perf_counter()
+
     with BagWriter(str(output_path), compress=False) as writer:
         for game_idx in range(num_games):
+            t0 = time.perf_counter()
             encoded_game = reader[game_idx]
+            t1 = time.perf_counter()
+            time_read += t1 - t0
+
             game_positions = decode_game(encoded_game)
+            t2 = time.perf_counter()
+            time_decode += t2 - t1
+
+            total_positions += len(game_positions)
 
             # Verify full game integrity (start pos, connectivity, legal moves, invariance)
-            verify_game_integrity(game_positions, game_idx)
+            if not skip_verify:
+                verify_game_integrity(game_positions, game_idx)
+            t3 = time.perf_counter()
+            time_verify += t3 - t2
 
             # Compute game result for all positions
             game_results = compute_game_result(game_positions)
+            t4 = time.perf_counter()
+            time_game_result += t4 - t3
 
             # Compute short-term Q values from bestQ across the game
             best_qs = [pos.best_q for pos in game_positions]
             st_qs = compute_st_q(best_qs)
+            t5 = time.perf_counter()
+            time_st_q += t5 - t4
 
             # Filter positions: exclude those with half-move clock > 90 (near 50-move draw)
             selected_positions = [
@@ -467,6 +503,8 @@ def convert_bagz_to_bag(
                 for pos_idx, pos in enumerate(game_positions)
                 if int(pos.fen.split()[4]) <= 90
             ]
+            t6 = time.perf_counter()
+            time_filter += t6 - t5
 
             positions_before_dedup += len(selected_positions)
 
@@ -495,13 +533,19 @@ def convert_bagz_to_bag(
                 writer.write(encoded)
                 positions_written += 1
 
+            t7 = time.perf_counter()
+            time_dedup_write += t7 - t6
+
             games_processed += 1
 
             if verbose and games_processed % 1000 == 0:
                 print(
                     f"Processed {games_processed}/{num_games} games, "
-                    f"{positions_written} unique positions written..."
+                    f"{positions_written} unique positions written...",
+                    flush=True,
                 )
+
+    overall_elapsed = time.perf_counter() - overall_start
 
     if verbose:
         dedup_removed = positions_before_dedup - positions_written
@@ -510,6 +554,27 @@ def convert_bagz_to_bag(
         print(f"  Duplicates removed: {dedup_removed}")
         print(f"  Unique positions written: {positions_written}")
         print(f"  Output: {output_path}")
+
+    if profile:
+        print(f"\n{'='*60}")
+        print("PERFORMANCE PROFILE")
+        print(f"{'='*60}")
+        print(f"Total time:           {overall_elapsed:8.2f}s")
+        print(f"Total games:          {games_processed:8d}")
+        print(f"Total positions:      {total_positions:8d}")
+        print(f"Games/sec:            {games_processed / overall_elapsed:8.1f}")
+        print(f"Positions/sec:        {total_positions / overall_elapsed:8.1f}")
+        print(f"\nTime breakdown:")
+        print(f"  read:               {time_read:8.2f}s ({100*time_read/overall_elapsed:5.1f}%)")
+        print(f"  decode:             {time_decode:8.2f}s ({100*time_decode/overall_elapsed:5.1f}%)")
+        print(f"  verify:             {time_verify:8.2f}s ({100*time_verify/overall_elapsed:5.1f}%)")
+        print(f"  game_result:        {time_game_result:8.2f}s ({100*time_game_result/overall_elapsed:5.1f}%)")
+        print(f"  st_q:               {time_st_q:8.2f}s ({100*time_st_q/overall_elapsed:5.1f}%)")
+        print(f"  filter:             {time_filter:8.2f}s ({100*time_filter/overall_elapsed:5.1f}%)")
+        print(f"  dedup_write:        {time_dedup_write:8.2f}s ({100*time_dedup_write/overall_elapsed:5.1f}%)")
+        accounted = time_read + time_decode + time_verify + time_game_result + time_st_q + time_filter + time_dedup_write
+        print(f"  (unaccounted):      {overall_elapsed - accounted:8.2f}s ({100*(overall_elapsed - accounted)/overall_elapsed:5.1f}%)")
+        print(f"{'='*60}")
 
     return games_processed, positions_before_dedup, positions_written
 
@@ -542,12 +607,17 @@ if __name__ == "__main__":
         print("Options:")
         print("  --output PATH      Output .bag file path (default: input.bag)")
         print("  --verbose, -v      Print progress information")
+        print("  --profile          Print detailed timing breakdown")
+        print("  --max-games N      Process at most N games (for testing)")
+        print("  --skip-verify      Skip game integrity verification (faster)")
         sys.exit(0 if "--help" in sys.argv or "-h" in sys.argv else 1)
 
     input_bagz = sys.argv[1]
 
     # Parse arguments
     verbose = "--verbose" in sys.argv or "-v" in sys.argv
+    profile = "--profile" in sys.argv
+    skip_verify = "--skip-verify" in sys.argv
 
     output_path = None
     if "--output" in sys.argv:
@@ -555,11 +625,20 @@ if __name__ == "__main__":
         if idx + 1 < len(sys.argv):
             output_path = sys.argv[idx + 1]
 
+    max_games = None
+    if "--max-games" in sys.argv:
+        idx = sys.argv.index("--max-games")
+        if idx + 1 < len(sys.argv):
+            max_games = int(sys.argv[idx + 1])
+
     games, before, after = convert_bagz_to_bag(
         input_bagz,
         output_path=output_path,
         verbose=verbose,
+        profile=profile,
+        max_games=max_games,
+        skip_verify=skip_verify,
     )
 
-    if not verbose:
+    if not verbose and not profile:
         print(f"Converted {games} games -> {after} unique positions from {input_bagz}")
