@@ -295,7 +295,6 @@ class JaxTrainingConfig:
 
     # JAX-specific
     jit_compile: bool = True  # JIT compile the training step
-    use_pmap: bool = False  # Use pmap for multi-device training
     donate_argnums: bool = True  # Donate buffers for memory efficiency
 
     # Mixed precision settings

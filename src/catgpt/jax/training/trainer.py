@@ -13,6 +13,7 @@ import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import train_state
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from loguru import logger
 from omegaconf import OmegaConf
 from tqdm import tqdm
@@ -176,10 +177,17 @@ class Trainer:
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
 
-        # Device setup
-        self.num_devices = 1
+        # Device setup for data parallelism
+        self.num_devices = jax.device_count()
         self.local_devices = jax.local_devices()
-        logger.info(f"JAX devices: {self.num_devices} ({self.local_devices})")
+        self.mesh = Mesh(jax.devices(), axis_names=("data",))
+        self.replicated_sharding = NamedSharding(self.mesh, P())
+
+        if training_config.batch_size % self.num_devices != 0:
+            raise ValueError(
+                f"batch_size ({training_config.batch_size}) must be divisible "
+                f"by number of devices ({self.num_devices})"
+            )
 
         # Mixed precision setup
         self.mixed_precision = training_config.mixed_precision
@@ -202,13 +210,14 @@ class Trainer:
             rng = jax.random.key(0)
         self.rng = rng
 
-        # Create train state
+        # Create train state and replicate across all devices
         self.state = TrainState.create(
             apply_fn=model.apply,
             params=params,
             tx=optimizer,
             rng=rng,
         )
+        self.state = jax.device_put(self.state, self.replicated_sharding)
 
         # Training state tracking
         self.global_step = 0
@@ -216,7 +225,8 @@ class Trainer:
 
         # JIT compile training and evaluation steps
         if training_config.jit_compile:
-            self._train_step = jax.jit(self._train_step_impl)
+            donate = (0,) if training_config.donate_argnums else ()
+            self._train_step = jax.jit(self._train_step_impl, donate_argnums=donate)
             self._eval_step = jax.jit(self._eval_step_impl)
         else:
             self._train_step = self._train_step_impl
@@ -231,8 +241,12 @@ class Trainer:
         checkpoint_config.dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(
-            f"Trainer initialized with {self.num_devices} device(s), "
-            f"JIT={training_config.jit_compile}"
+            f"Trainer initialized: {self.num_devices} device(s), "
+            f"mesh={self.mesh.shape}, "
+            f"batch={training_config.batch_size} global "
+            f"({training_config.batch_size // self.num_devices}/device), "
+            f"JIT={training_config.jit_compile}, "
+            f"donate={training_config.donate_argnums}"
         )
 
     @property
@@ -268,6 +282,31 @@ class Trainer:
         """Create an infinite iterator over the training dataloader."""
         while True:
             yield from self.train_dataloader
+
+    def _shard_batch(self, batch: dict[str, np.ndarray]) -> dict[str, jax.Array]:
+        """Convert numpy batch to sharded JAX arrays across the data-parallel mesh.
+
+        Each array's batch dimension (axis 0) is partitioned across devices.
+        If the batch size is not divisible by num_devices, zero-pads to the
+        next multiple (only relevant for validation's last incomplete batch).
+
+        Args:
+            batch: Dictionary of numpy arrays from the dataloader.
+
+        Returns:
+            Dictionary of sharded JAX arrays.
+        """
+        result = {}
+        for k, v in batch.items():
+            arr = jnp.asarray(v)
+            remainder = arr.shape[0] % self.num_devices
+            if remainder != 0:
+                pad_size = self.num_devices - remainder
+                pad_widths = [(0, pad_size)] + [(0, 0)] * (arr.ndim - 1)
+                arr = jnp.pad(arr, pad_widths)
+            spec = P("data", *((None,) * (arr.ndim - 1)))
+            result[k] = jax.device_put(arr, NamedSharding(self.mesh, spec))
+        return result
 
     def _train_step_impl(
         self,
@@ -904,11 +943,9 @@ class Trainer:
         accumulation_count = 0
 
         while self.global_step < max_steps:
-            # Get next batch
+            # Get next batch and shard across devices
             batch = next(data_iter)
-
-            # Convert to JAX arrays
-            batch = {k: jnp.array(v) for k, v in batch.items()}
+            batch = self._shard_batch(batch)
 
             # Training step
             self.state, metrics, head_losses = self._train_step(self.state, batch)
@@ -1085,8 +1122,8 @@ class Trainer:
             if max_eval_steps is not None and step_idx >= max_eval_steps:
                 break
 
-            # Convert to JAX arrays
-            batch = {k: jnp.array(v) for k, v in batch.items()}
+            # Shard batch across devices for data parallelism
+            batch = self._shard_batch(batch)
 
             metrics = self._eval_step(eval_state, batch)
 
@@ -1356,6 +1393,9 @@ class Trainer:
                 state = json.load(f)
             self.global_step = state.get("global_step", 0)
             self.best_val_loss = state.get("best_val_loss", float("inf"))
+
+        # Replicate restored state across all devices
+        self.state = jax.device_put(self.state, self.replicated_sharding)
 
         logger.info(
             f"Loaded checkpoint from {path} (step {self.global_step}, epoch {self.current_epoch})"

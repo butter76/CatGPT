@@ -107,7 +107,6 @@ training:
   max_eval_steps: 200  # Max validation steps (prevents infinite loop)
   # JAX-specific options
   jit_compile: true  # JIT compile train/eval steps
-  use_pmap: false  # Use pmap for multi-device (experimental)
   donate_argnums: true  # Donate buffers for memory efficiency
   # Mixed precision settings
   mixed_precision: true  # Enable bfloat16 mixed precision

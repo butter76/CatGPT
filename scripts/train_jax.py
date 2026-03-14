@@ -173,6 +173,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     # Create data loaders
+    # Dataloaders load full global batches; the Trainer handles device sharding
     logger.info("Creating data loaders...")
     num_devices = 1
 
