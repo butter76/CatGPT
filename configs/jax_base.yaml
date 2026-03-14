@@ -101,7 +101,7 @@ scheduler:
 training:
   max_steps: 120000  # Total training steps
   steps_per_epoch: 6000  # Steps per pseudo-epoch (validation interval)
-  batch_size: 1024
+  batch_size: 3072
   gradient_clip: 1.0
   gradient_accumulation_steps: 1
   max_eval_steps: 200  # Max validation steps (prevents infinite loop)
@@ -115,7 +115,7 @@ training:
 
 # Data loading
 data:
-  train_path: "~/sample_training_data/shard-*-training-run1-test80-20240405-*.bag"
+  train_path: "~/sample_training_data/shard-*-training-run1-test80-20240*.bag"
   val_path: "~/sample_training_data/shard-0-training-run1-test80-20240401-0117.bag"
   num_workers: 4
   prefetch_factor: 10
