@@ -30,7 +30,7 @@ threads: 9          # Search worker threads
 batch: 64           # Max GPU batch size
 
 # Search algorithm: "fractional" (default) or "mcts"
-search_type: "mcts"
+search_type: "fractional"
 
 # Search settings (apply to both engines unless overridden)
 evals: 400          # Min GPU evals per move
