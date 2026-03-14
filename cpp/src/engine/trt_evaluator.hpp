@@ -59,17 +59,20 @@ constexpr int VALUE_NUM_BINS = 81;
 /**
  * Result of neural network evaluation.
  *
- * The model exports four heads:
- *   value       — WDL-derived Q value P(W)+0.5*P(D) in [0, 1]
- *   value_probs — BestQ HL-Gauss distribution (81 bins over [0, 1])
- *   wdl         — Win/Draw/Loss probabilities [W, D, L]
- *   policy      — Move distribution logits (64 * 73 = 4672)
+ * The model exports five heads:
+ *   value            — WDL-derived Q value P(W)+0.5*P(D) in [0, 1]
+ *   value_probs      — BestQ HL-Gauss distribution (81 bins over [0, 1])
+ *   wdl              — Win/Draw/Loss probabilities [W, D, L]
+ *   policy           — Move distribution logits (64 * 73 = 4672)
+ *   optimistic_policy — Optimistic policy logits (64 * 73 = 4672), trained with value-surprise weighting
  */
 struct NNOutput {
     float value;                                    // WDL-derived Q value [0, 1]
     std::array<float, VALUE_NUM_BINS> value_probs;  // BestQ distribution (81 bins over [0, 1])
     std::array<float, 3> wdl;                       // Win/Draw/Loss probabilities [W, D, L]
     std::array<float, POLICY_SIZE> policy;          // Policy logits (64 * 73 = 4672)
+    std::array<float, POLICY_SIZE> optimistic_policy;  // Optimistic policy logits (64 * 73 = 4672)
+    bool has_optimistic_policy = false;             // Whether optimistic policy is available
 };
 
 /**
@@ -101,11 +104,13 @@ public:
         if (d_value_probs_) cudaFree(d_value_probs_);
         if (d_wdl_) cudaFree(d_wdl_);
         if (d_policy_) cudaFree(d_policy_);
+        if (d_optimistic_policy_) cudaFree(d_optimistic_policy_);
         if (h_input_) cudaFreeHost(h_input_);
         if (h_value_) cudaFreeHost(h_value_);
         if (h_value_probs_) cudaFreeHost(h_value_probs_);
         if (h_wdl_) cudaFreeHost(h_wdl_);
         if (h_policy_) cudaFreeHost(h_policy_);
+        if (h_optimistic_policy_) cudaFreeHost(h_optimistic_policy_);
     }
 
     // Non-copyable, non-movable
@@ -140,6 +145,10 @@ public:
             output.wdl = {0.0f, 1.0f, 0.0f};  // Default to draw if WDL not available
         }
         std::memcpy(output.policy.data(), h_policy_, POLICY_SIZE * sizeof(float));
+        if (h_optimistic_policy_) {
+            std::memcpy(output.optimistic_policy.data(), h_optimistic_policy_, POLICY_SIZE * sizeof(float));
+            output.has_optimistic_policy = true;
+        }
 
         return output;
     }
@@ -180,6 +189,9 @@ private:
     void setup_io() {
         int num_io = engine_->getNbIOTensors();
 
+        // Collect all policy-shaped outputs (shape batch x 4672)
+        std::vector<std::string> policy_outputs;
+
         for (int i = 0; i < num_io; ++i) {
             const char* name = engine_->getIOTensorName(i);
             auto mode = engine_->getTensorIOMode(name);
@@ -208,6 +220,8 @@ private:
             } else if (name_str.find("value") != std::string::npos ||
                        name_str.find("Value") != std::string::npos) {
                 value_output_name_ = name;
+            } else if (name_str.find("optimistic_policy") != std::string::npos) {
+                optimistic_policy_output_name_ = name;
             } else if (name_str.find("policy") != std::string::npos ||
                        name_str.find("Policy") != std::string::npos) {
                 policy_output_name_ = name;
@@ -225,8 +239,18 @@ private:
                 } else if (dims.nbDims == 2 && dims.d[1] == 3) {
                     if (wdl_output_name_.empty()) wdl_output_name_ = name;
                 } else if (dims.nbDims == 2 && dims.d[1] == POLICY_SIZE) {
-                    if (policy_output_name_.empty()) policy_output_name_ = name;
+                    // Collect policy-shaped outputs for later assignment
+                    policy_outputs.push_back(name_str);
                 }
+            }
+        }
+
+        // Assign policy-shaped outputs: first is vanilla policy, second is optimistic
+        for (const auto& pname : policy_outputs) {
+            if (policy_output_name_.empty()) {
+                policy_output_name_ = pname;
+            } else if (optimistic_policy_output_name_.empty()) {
+                optimistic_policy_output_name_ = pname;
             }
         }
 
@@ -238,6 +262,9 @@ private:
         }
         if (wdl_output_name_.empty()) {
             std::println(stderr, "[TRT WARNING] wdl_probs output not found - using defaults");
+        }
+        if (!optimistic_policy_output_name_.empty()) {
+            std::println(stderr, "[TRT INFO] Optimistic policy head detected: {}", optimistic_policy_output_name_);
         }
     }
 
@@ -251,6 +278,9 @@ private:
         CATGPT_CUDA_CHECK(cudaMalloc(&d_value_probs_, VALUE_NUM_BINS * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_wdl_, 3 * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_policy_, POLICY_SIZE * sizeof(float)));
+        if (!optimistic_policy_output_name_.empty()) {
+            CATGPT_CUDA_CHECK(cudaMalloc(&d_optimistic_policy_, POLICY_SIZE * sizeof(float)));
+        }
 
         // Allocate pinned host buffers for async transfers
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_input_, SEQ_LENGTH * sizeof(std::int32_t)));
@@ -258,6 +288,9 @@ private:
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_value_probs_, VALUE_NUM_BINS * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_wdl_, 3 * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_policy_, POLICY_SIZE * sizeof(float)));
+        if (!optimistic_policy_output_name_.empty()) {
+            CATGPT_CUDA_CHECK(cudaMallocHost(&h_optimistic_policy_, POLICY_SIZE * sizeof(float)));
+        }
     }
 
     void capture_cuda_graph() {
@@ -271,6 +304,9 @@ private:
             context_->setTensorAddress(wdl_output_name_.c_str(), d_wdl_);
         }
         context_->setTensorAddress(policy_output_name_.c_str(), d_policy_);
+        if (!optimistic_policy_output_name_.empty()) {
+            context_->setTensorAddress(optimistic_policy_output_name_.c_str(), d_optimistic_policy_);
+        }
 
         // Set input shape (batch size 1)
         nvinfer1::Dims input_dims;
@@ -311,6 +347,11 @@ private:
         CATGPT_CUDA_CHECK(cudaMemcpyAsync(
             h_policy_, d_policy_, POLICY_SIZE * sizeof(float),
             cudaMemcpyDeviceToHost, stream_));
+        if (!optimistic_policy_output_name_.empty()) {
+            CATGPT_CUDA_CHECK(cudaMemcpyAsync(
+                h_optimistic_policy_, d_optimistic_policy_, POLICY_SIZE * sizeof(float),
+                cudaMemcpyDeviceToHost, stream_));
+        }
 
         // End capture and instantiate
         cudaGraph_t graph;
@@ -329,6 +370,7 @@ private:
     std::string value_probs_output_name_;
     std::string wdl_output_name_;
     std::string policy_output_name_;
+    std::string optimistic_policy_output_name_;
 
     cudaStream_t stream_ = nullptr;
     cudaGraphExec_t graph_exec_ = nullptr;
@@ -339,6 +381,7 @@ private:
     float* d_value_probs_ = nullptr;
     float* d_wdl_ = nullptr;
     float* d_policy_ = nullptr;
+    float* d_optimistic_policy_ = nullptr;
 
     // Pinned host buffers
     std::int32_t* h_input_ = nullptr;
@@ -346,6 +389,7 @@ private:
     float* h_value_probs_ = nullptr;
     float* h_wdl_ = nullptr;
     float* h_policy_ = nullptr;
+    float* h_optimistic_policy_ = nullptr;
 };
 
 }  // namespace catgpt

@@ -393,20 +393,52 @@ int main(int argc, char* argv[]) {
 
         auto move_probs = get_move_probabilities(board, output.policy);
 
-        std::cout << "All legal moves (sorted by probability):\n\n";
+        if (output.has_optimistic_policy) {
+            auto opt_move_probs = get_move_probabilities(board, output.optimistic_policy);
 
-        std::cout << "  Rank │  Move  │  Prob  │ Visual\n";
-        std::cout << "  ─────┼────────┼────────┼────────────────────────\n";
+            std::cout << "All legal moves (sorted by vanilla policy probability):\n\n";
+            std::cout << "  Rank │  Move  │ Policy │ OptPol │ Visual (Policy / OptPol)\n";
+            std::cout << "  ─────┼────────┼────────┼────────┼─────────────────────────────────────────────\n";
 
-        for (int i = 0; i < static_cast<int>(move_probs.size()); ++i) {
-            const auto& [move, prob] = move_probs[i];
+            for (int i = 0; i < static_cast<int>(move_probs.size()); ++i) {
+                const auto& [move, prob] = move_probs[i];
 
-            std::cout << "  " << std::setw(4) << (i + 1) << " │ ";
-            std::cout << std::setw(6) << format_move_uci(move) << " │ ";
-            std::cout << std::setw(6) << std::fixed << std::setprecision(2)
-                      << (prob * 100.0f) << "% │ ";
-            print_prob_bar(prob, 20);
-            std::cout << "\n";
+                // Find this move in the optimistic policy results
+                float opt_prob = 0.0f;
+                for (const auto& [opt_move, opt_p] : opt_move_probs) {
+                    if (opt_move == move) {
+                        opt_prob = opt_p;
+                        break;
+                    }
+                }
+
+                std::cout << "  " << std::setw(4) << (i + 1) << " │ ";
+                std::cout << std::setw(6) << format_move_uci(move) << " │ ";
+                std::cout << std::setw(6) << std::fixed << std::setprecision(2)
+                          << (prob * 100.0f) << "% │ ";
+                std::cout << std::setw(6) << std::fixed << std::setprecision(2)
+                          << (opt_prob * 100.0f) << "% │ ";
+                print_prob_bar(prob, 15);
+                std::cout << " ";
+                print_prob_bar(opt_prob, 15);
+                std::cout << "\n";
+            }
+        } else {
+            std::cout << "All legal moves (sorted by probability):\n\n";
+
+            std::cout << "  Rank │  Move  │  Prob  │ Visual\n";
+            std::cout << "  ─────┼────────┼────────┼────────────────────────\n";
+
+            for (int i = 0; i < static_cast<int>(move_probs.size()); ++i) {
+                const auto& [move, prob] = move_probs[i];
+
+                std::cout << "  " << std::setw(4) << (i + 1) << " │ ";
+                std::cout << std::setw(6) << format_move_uci(move) << " │ ";
+                std::cout << std::setw(6) << std::fixed << std::setprecision(2)
+                          << (prob * 100.0f) << "% │ ";
+                print_prob_bar(prob, 20);
+                std::cout << "\n";
+            }
         }
 
         std::cout << "\nTotal legal moves: " << move_probs.size() << "\n";
