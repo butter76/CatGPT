@@ -116,8 +116,8 @@ training:
 
 # Data loading
 data:
-  train_path: "~/training_bag_opt/training-run1-test80-202507*.bag"
-  val_path: "~/training_bag_opt/training-run1-test80-202508*.bag"
+  train_path: "~/sample_training_data/shard-*-training-run1-test80-20240405-*.bag"
+  val_path: "~/sample_training_data/shard-0-training-run1-test80-20240401-0117.bag"
   num_workers: 4
   prefetch_factor: 10
   seed: 42
@@ -132,7 +132,7 @@ checkpoint:
 
 # Weights & Biases logging
 wandb:
-  enabled: true
+  enabled: false
   project: "catgpt-leela"
   entity: null  # Your W&B username or team
   run_name: null  # Auto-generated if null

@@ -177,7 +177,7 @@ class Trainer:
         self.val_dataloader = val_dataloader
 
         # Device setup
-        self.num_devices = jax.device_count()
+        self.num_devices = 1
         self.local_devices = jax.local_devices()
         logger.info(f"JAX devices: {self.num_devices} ({self.local_devices})")
 

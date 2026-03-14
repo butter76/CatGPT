@@ -174,7 +174,7 @@ def main(cfg: DictConfig) -> None:
 
     # Create data loaders
     logger.info("Creating data loaders...")
-    num_devices = len(devices)
+    num_devices = 1
 
     train_dataloader = create_dataloader(
         experiment_config.data,
