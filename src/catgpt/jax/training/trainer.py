@@ -1,7 +1,9 @@
 """JAX training loop with W&B logging and multi-device support."""
 
 import json
+import queue
 import shutil
+import threading
 from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
@@ -307,6 +309,42 @@ class Trainer:
             spec = P("data", *((None,) * (arr.ndim - 1)))
             result[k] = jax.device_put(arr, NamedSharding(self.mesh, spec))
         return result
+
+    def _prefetching_dataloader(
+        self, data_iter: Iterator[dict[str, np.ndarray]], prefetch_size: int = 2
+    ) -> Iterator[dict[str, jax.Array]]:
+        """Wrap a data iterator with background device prefetching.
+
+        A daemon thread reads batches from `data_iter`, shards them onto
+        the correct devices via `_shard_batch`, and queues them ahead of
+        consumption.  This overlaps host-to-device transfer with GPU compute.
+
+        Args:
+            data_iter: Source iterator yielding CPU numpy batches.
+            prefetch_size: Number of batches to buffer on-device.
+
+        Yields:
+            Sharded JAX arrays ready for the training step.
+        """
+        buf: queue.Queue[dict[str, jax.Array] | Exception] = queue.Queue(
+            maxsize=prefetch_size
+        )
+
+        def _producer() -> None:
+            try:
+                for batch in data_iter:
+                    buf.put(self._shard_batch(batch))
+            except Exception as exc:
+                buf.put(exc)
+
+        thread = threading.Thread(target=_producer, daemon=True)
+        thread.start()
+
+        while True:
+            item = buf.get()
+            if isinstance(item, Exception):
+                raise item
+            yield item
 
     def _train_step_impl(
         self,
@@ -926,6 +964,10 @@ class Trainer:
                 next(data_iter)
             logger.info("Dataloader fast-forward complete.")
 
+        # Wrap with device prefetching (after fast-forward so skipped
+        # batches never touch the GPU)
+        prefetch_iter = self._prefetching_dataloader(data_iter)
+
         epoch_loss = 0.0
         epoch_batches = 0
         last_epoch = self.current_epoch
@@ -943,9 +985,7 @@ class Trainer:
         accumulation_count = 0
 
         while self.global_step < max_steps:
-            # Get next batch and shard across devices
-            batch = next(data_iter)
-            batch = self._shard_batch(batch)
+            batch = next(prefetch_iter)
 
             # Training step
             self.state, metrics, head_losses = self._train_step(self.state, batch)
