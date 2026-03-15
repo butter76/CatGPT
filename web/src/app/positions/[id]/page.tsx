@@ -531,7 +531,9 @@ function StoredEngineResultCard({
 
   const engineLabel =
     ea.engine === "catgpt"
-      ? "🐱 CatGPT"
+      ? "🐱 CatGPT (Fractional)"
+      : ea.engine === "catgpt_mcts"
+      ? "🐱 CatGPT (MCTS)"
       : ea.engine === "stockfish"
       ? "Stockfish"
       : "Leela Chess Zero";
@@ -564,7 +566,7 @@ function StoredEngineResultCard({
           </div>
         </CardTitle>
         <p className="text-xs text-muted-foreground">
-          {ea.engine === "catgpt"
+          {ea.engine === "catgpt" || ea.engine === "catgpt_mcts"
             ? `${ea.nodes.toLocaleString()} evals • iter ${ea.depth}`
             : `depth ${ea.depth} • ${ea.nodes.toLocaleString()} nodes`}
         </p>
@@ -587,7 +589,7 @@ function StoredEngineResultCard({
         </div>
 
         {/* PV (UCI engines only) */}
-        {ea.engine !== "catgpt" && ea.pv.length > 0 && (
+        {ea.engine !== "catgpt" && ea.engine !== "catgpt_mcts" && ea.pv.length > 0 && (
           <div className="text-xs font-mono text-muted-foreground break-all">
             <span className="text-foreground font-medium">{fmtMove(ea.pv[0])}</span>
             {ea.pv.slice(1, 10).map((m, i) => (

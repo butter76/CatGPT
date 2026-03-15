@@ -18,7 +18,7 @@ export const moveAnnotationKindEnum = pgEnum("move_annotation_kind", [
   "blunder",
   "correct",
 ]);
-export const engineKindEnum = pgEnum("engine_kind", ["leela", "stockfish", "catgpt"]);
+export const engineKindEnum = pgEnum("engine_kind", ["leela", "stockfish", "catgpt", "catgpt_mcts"]);
 export const blunderTagEnum = pgEnum("blunder_tag", ["catgpt", "stockfish", "leela"]);
 
 // ─── Tables ───────────────────────────────────────────────────────

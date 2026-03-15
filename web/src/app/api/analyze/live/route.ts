@@ -30,8 +30,8 @@ export async function GET(request: NextRequest) {
     });
   }
 
-  if (!["stockfish", "leela", "catgpt"].includes(engine)) {
-    return new Response(JSON.stringify({ error: "engine must be stockfish, leela, or catgpt" }), {
+  if (!["stockfish", "leela", "catgpt", "catgpt_mcts"].includes(engine)) {
+    return new Response(JSON.stringify({ error: "engine must be stockfish, leela, catgpt, or catgpt_mcts" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
@@ -55,12 +55,12 @@ export async function GET(request: NextRequest) {
       }
 
       try {
-        if (engine === "catgpt") {
-          // ── CatGPT: JSON stats protocol ──
+        if (engine === "catgpt" || engine === "catgpt_mcts") {
+          // ── CatGPT: JSON stats protocol (Fractional MCTS or standard MCTS) ──
           const catgptHistory: CatGPTSearchStats[] = [];
           let lastStats: CatGPTSearchStats | null = null;
 
-          for await (const event of runCatGPTAnalysis({ fen, nodes })) {
+          for await (const event of runCatGPTAnalysis({ fen, nodes, mcts: engine === "catgpt_mcts" })) {
             switch (event.type) {
               case "stats":
                 catgptHistory.push(event.data);
@@ -75,7 +75,7 @@ export async function GET(request: NextRequest) {
                     const { createEngineAnalysisRecord } = await import("@/db/queries");
                     const bm = event.data as { bestMove: string };
                     await createEngineAnalysisRecord(positionId, {
-                      engine: "catgpt",
+                      engine: engine as "catgpt" | "catgpt_mcts",
                       bestMove: bm.bestMove,
                       evaluation: lastStats.cp,
                       depth: lastStats.iteration,

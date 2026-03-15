@@ -29,6 +29,7 @@
 #define CATGPT_SELFPLAY_COROUTINE_MCTS_HPP
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <unordered_map>
@@ -45,6 +46,7 @@
 #include "batch_evaluator.hpp"
 #include "coroutine_search.hpp"  // For MoveResult
 #include "eval_request.hpp"
+#include "../engine/mcts/search_stats.hpp"
 
 namespace catgpt {
 
@@ -56,10 +58,12 @@ namespace catgpt {
  */
 class CoroutineMCTS {
 public:
-    CoroutineMCTS(BatchEvaluator& evaluator, const MCTSConfig& config)
+    CoroutineMCTS(BatchEvaluator& evaluator, const MCTSConfig& config,
+                  std::ostream* stats_out = nullptr)
         : evaluator_(evaluator)
         , config_(config)
         , total_gpu_evals_(0)
+        , stats_out_(stats_out)
     {}
 
     /**
@@ -98,10 +102,67 @@ public:
 
         // Run simulations until we reach the minimum GPU evaluations
         int total_simulations = 0;
+        int last_stats_iteration = 0;
+        auto last_stats_time = std::chrono::steady_clock::now();
+        bool root_eval_emitted = false;
+
         while (total_gpu_evals_ < target_evals &&
                total_simulations < 25 * target_evals) {
             co_await run_simulation(root.get(), board);
             ++total_simulations;
+
+            // Emit root_eval after first expansion
+            if (stats_out_ && !root_eval_emitted && root->is_expanded()) {
+                root_eval_emitted = true;
+                chess::Move initial_best = chess::Move::NO_MOVE;
+                float best_prior = -1.0f;
+                for (const auto& [move, child] : root->children) {
+                    if (child.P > best_prior) {
+                        best_prior = child.P;
+                        initial_best = move;
+                    }
+                }
+                int root_cp = static_cast<int>(100.7066f * std::tan(root->Q() * 1.5637541897f));
+                std::unordered_map<chess::Move, float, MoveHash> empty_allocs;
+                print_mcts_stats(*stats_out_, "root_eval", root.get(), empty_allocs,
+                                initial_best, root_cp, total_gpu_evals_, 0);
+            }
+
+            // Periodic search_update (same progression as CoroutineSearch)
+            int next_stats_threshold = static_cast<int>(1.5f * last_stats_iteration + 5);
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                now - last_stats_time).count();
+            bool time_triggered = elapsed_seconds >= 5;
+
+            if (stats_out_ && root->is_expanded() &&
+                (total_simulations >= next_stats_threshold || time_triggered)) {
+                auto allocs = compute_allocations(root.get(),
+                                                  static_cast<float>(root->N));
+                chess::Move current_best = chess::Move::NO_MOVE;
+                float best_alloc = -1.0f;
+                for (const auto& [move, alloc] : allocs) {
+                    if (alloc > best_alloc) {
+                        best_alloc = alloc;
+                        current_best = move;
+                    }
+                }
+                if (current_best != chess::Move::NO_MOVE) {
+                    float child_q = 0.0f;
+                    for (const auto& [move, child] : root->children) {
+                        if (move == current_best) {
+                            child_q = -child.Q();
+                            break;
+                        }
+                    }
+                    int cp = static_cast<int>(100.7066f * std::tan(child_q * 1.5637541897f));
+                    auto pv = root->get_pv();
+                    print_mcts_stats(*stats_out_, "search_update", root.get(), allocs,
+                                    current_best, cp, total_gpu_evals_, total_simulations, pv);
+                    last_stats_iteration = total_simulations;
+                    last_stats_time = now;
+                }
+            }
         }
 
         // Select best move by PUCT allocation (balances Q and policy)
@@ -127,6 +188,14 @@ public:
                     result.cp_score = static_cast<int>(100.7066f * std::tan(q * 1.5637541897f));
                     break;
                 }
+            }
+
+            // Emit search_complete
+            if (stats_out_) {
+                auto pv = root->get_pv();
+                print_mcts_stats(*stats_out_, "search_complete", root.get(), final_allocations,
+                                best_move, result.cp_score, total_gpu_evals_,
+                                total_simulations, pv);
             }
         } else {
             result.best_move = moves[0];
@@ -496,6 +565,7 @@ private:
     MCTSConfig config_;
     int total_gpu_evals_;
     std::unordered_map<uint64_t, RawNNOutput> eval_cache_;
+    std::ostream* stats_out_;
 };
 
 }  // namespace catgpt

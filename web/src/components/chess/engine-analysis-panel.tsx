@@ -59,10 +59,11 @@ export function EngineAnalysisPanel({
   const [nodes, setNodes] = useState(400);
   const [availableEngines, setAvailableEngines] = useState<string[]>([]);
 
-  // Default nodes: 500k for Stockfish (CPU-cheap), 400 for CatGPT, 5k for Leela
+  const isCatGPTEngine = (eng: EngineKind) => eng === "catgpt" || eng === "catgpt_mcts";
+
   const handleEngineChange = (eng: EngineKind) => {
     setSelectedEngine(eng);
-    setNodes(eng === "stockfish" ? 500000 : eng === "catgpt" ? 400 : 5000);
+    setNodes(eng === "stockfish" ? 500000 : isCatGPTEngine(eng) ? 400 : 5000);
   };
 
   // Fetch available engines
@@ -120,7 +121,13 @@ export function EngineAnalysisPanel({
                       value="catgpt"
                       disabled={!availableEngines.includes("catgpt")}
                     >
-                      🐱 CatGPT
+                      🐱 CatGPT (Fractional)
+                    </SelectItem>
+                    <SelectItem
+                      value="catgpt_mcts"
+                      disabled={!availableEngines.includes("catgpt_mcts")}
+                    >
+                      🐱 CatGPT (MCTS)
                     </SelectItem>
                     <SelectItem
                       value="stockfish"
@@ -139,16 +146,16 @@ export function EngineAnalysisPanel({
               </div>
               <div className="space-y-1">
                 <Label className="text-xs">
-                  {selectedEngine === "catgpt" ? "GPU Evals" : "Nodes"}
+                  {isCatGPTEngine(selectedEngine) ? "GPU Evals" : "Nodes"}
                 </Label>
                 <Input
                   type="number"
                   value={nodes}
                   onChange={(e) => setNodes(parseInt(e.target.value) || 1)}
                   className="h-8 text-xs font-mono"
-                  min={selectedEngine === "catgpt" ? 10 : 100}
-                  max={selectedEngine === "catgpt" ? 10000 : 100000000}
-                  step={selectedEngine === "catgpt" ? 100 : 100000}
+                  min={isCatGPTEngine(selectedEngine) ? 10 : 100}
+                  max={isCatGPTEngine(selectedEngine) ? 10000 : 100000000}
+                  step={isCatGPTEngine(selectedEngine) ? 100 : 100000}
                 />
               </div>
             </div>
@@ -182,7 +189,7 @@ export function EngineAnalysisPanel({
         )}
 
         {/* ── CatGPT Analysis Display ── */}
-        {catgptStats && engine === "catgpt" && (
+        {catgptStats && (engine === "catgpt" || engine === "catgpt_mcts") && (
           <>
             <Separator />
             <CatGPTStatsDisplay
@@ -195,7 +202,7 @@ export function EngineAnalysisPanel({
         )}
 
         {/* ── UCI Engine Display (Stockfish / Leela) ── */}
-        {latestInfo && engine !== "catgpt" && (
+        {latestInfo && engine !== "catgpt" && engine !== "catgpt_mcts" && (
           <>
             <Separator />
             <UCIStatsDisplay
