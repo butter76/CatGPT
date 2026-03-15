@@ -13,7 +13,7 @@ import {
 // ─── Enums ────────────────────────────────────────────────────────
 
 export const positionTypeEnum = pgEnum("position_type", ["SHARP", "FORTRESS"]);
-export const outcomeEnum = pgEnum("outcome", ["win", "loss", "draw"]);
+export const outcomeEnum = pgEnum("outcome", ["win", "loss", "draw", "unknown"]);
 export const moveAnnotationKindEnum = pgEnum("move_annotation_kind", [
   "blunder",
   "correct",

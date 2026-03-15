@@ -13,6 +13,7 @@ import {
   Trophy,
   Minus,
   Skull,
+  HelpCircle,
   Pencil,
   X,
   Plus,
@@ -223,6 +224,11 @@ export function ExpectedOutcomeBadge({ outcome }: ExpectedOutcomeBadgeProps) {
       icon: Minus,
       label: "Drawn",
       className: "border-gray-500 text-gray-700 bg-gray-50 dark:bg-gray-800 dark:text-gray-300",
+    },
+    unknown: {
+      icon: HelpCircle,
+      label: "Unknown",
+      className: "border-yellow-500 text-yellow-700 bg-yellow-50 dark:bg-yellow-950 dark:text-yellow-400",
     },
   }[outcome];
 

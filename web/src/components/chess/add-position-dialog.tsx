@@ -280,6 +280,7 @@ export function AddPositionDialog({
                   <SelectItem value="win">🏆 Decisive — Win</SelectItem>
                   <SelectItem value="loss">💀 Decisive — Loss</SelectItem>
                   <SelectItem value="draw">➖ Drawn</SelectItem>
+                  <SelectItem value="unknown">❓ Unknown</SelectItem>
                 </SelectContent>
               </Select>
             </div>

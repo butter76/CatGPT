@@ -19,6 +19,7 @@ import {
   Trophy,
   Minus,
   Skull,
+  HelpCircle,
   ArrowRight,
   Loader2,
   Tag,
@@ -38,6 +39,7 @@ const OUTCOME_ICONS: Record<Outcome, React.ReactNode> = {
   win: <Trophy className="w-3 h-3 text-green-500" />,
   loss: <Skull className="w-3 h-3 text-red-500" />,
   draw: <Minus className="w-3 h-3 text-gray-400" />,
+  unknown: <HelpCircle className="w-3 h-3 text-yellow-500" />,
 };
 
 export default function PositionsPage() {
@@ -263,6 +265,8 @@ export default function PositionsPage() {
                                   ? "Drawn"
                                   : position.expectedOutcome === "win"
                                   ? "Decisive (Win)"
+                                  : position.expectedOutcome === "unknown"
+                                  ? "Unknown"
                                   : "Decisive (Loss)"}
                               </span>
                             )}
