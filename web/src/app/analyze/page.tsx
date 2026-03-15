@@ -13,12 +13,13 @@ import {
 import { Chessboard } from "react-chessboard";
 import { AddPositionDialog } from "@/components/chess/add-position-dialog";
 import { EngineAnalysisPanel } from "@/components/chess/engine-analysis-panel";
-import { isValidFEN, sideToMove } from "@/lib/chess-utils";
+import { isValidFEN, sideToMove, lichessAnalysisUrl } from "@/lib/chess-utils";
 import {
   FlaskConical,
   RotateCcw,
   Save,
   AlertCircle,
+  ExternalLink,
 } from "lucide-react";
 
 const STARTING_FEN =
@@ -139,6 +140,21 @@ export default function AnalyzePage() {
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>Flip board</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button variant="outline" size="sm" asChild>
+                    <a
+                      href={lichessAnalysisUrl(fen)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      <ExternalLink className="w-4 h-4" />
+                    </a>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Open in Lichess</TooltipContent>
               </Tooltip>
 
               <div className="flex-1" />

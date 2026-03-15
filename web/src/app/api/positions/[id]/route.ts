@@ -35,7 +35,13 @@ export async function PATCH(
     }
 
     const body = await request.json();
-    const updates: { name?: string; description?: string | null; blunderTag?: "catgpt" | "stockfish" | "leela" | null } = {};
+    const updates: {
+      name?: string;
+      description?: string | null;
+      blunderTag?: "catgpt" | "stockfish" | "leela" | null;
+      type?: "SHARP" | "FORTRESS";
+      expectedOutcome?: "win" | "loss" | "draw" | "unknown" | null;
+    } = {};
 
     if (typeof body.name === "string" && body.name.trim()) {
       updates.name = body.name.trim();
@@ -47,6 +53,18 @@ export async function PATCH(
       const validTags = ["catgpt", "stockfish", "leela", null];
       if (validTags.includes(body.blunderTag)) {
         updates.blunderTag = body.blunderTag;
+      }
+    }
+    if (body.type !== undefined) {
+      const validTypes = ["SHARP", "FORTRESS"];
+      if (validTypes.includes(body.type)) {
+        updates.type = body.type;
+      }
+    }
+    if (body.expectedOutcome !== undefined) {
+      const validOutcomes = ["win", "loss", "draw", "unknown", null];
+      if (validOutcomes.includes(body.expectedOutcome)) {
+        updates.expectedOutcome = body.expectedOutcome;
       }
     }
 

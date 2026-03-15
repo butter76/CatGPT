@@ -30,8 +30,8 @@ import {
   updatePositionMetaAPI,
 } from "@/lib/store";
 import { usePositionStore } from "@/lib/store";
-import { sideToMove, uciToAlgebraic } from "@/lib/chess-utils";
-import type { Position, EngineAnalysis, EngineInfoLine, CatGPTSearchStats, BlunderTag } from "@/lib/types";
+import { sideToMove, uciToAlgebraic, lichessAnalysisUrl } from "@/lib/chess-utils";
+import type { Position, PositionType, Outcome, EngineAnalysis, EngineInfoLine, CatGPTSearchStats, BlunderTag } from "@/lib/types";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -52,6 +52,7 @@ import {
   Loader2,
   Pencil,
   Tag,
+  ExternalLink,
 } from "lucide-react";
 
 export default function PositionDetailPage({
@@ -121,6 +122,22 @@ export default function PositionDetailPage({
         }}
         onDelete={handleDelete}
         onBack={() => router.push("/positions")}
+      />
+
+      {/* Position Type & Fortress Outcome */}
+      <PositionTypeSelector
+        type={position.type}
+        expectedOutcome={position.expectedOutcome}
+        onChangeType={async (type) => {
+          const updates: { type: PositionType; expectedOutcome?: null } = { type };
+          if (type === "SHARP") updates.expectedOutcome = null;
+          const updated = await updatePositionMetaAPI(position.id, updates);
+          setPosition(updated);
+        }}
+        onChangeOutcome={async (outcome) => {
+          const updated = await updatePositionMetaAPI(position.id, { expectedOutcome: outcome });
+          setPosition(updated);
+        }}
       />
 
       {/* Main content: Board + Analysis */}
@@ -198,6 +215,24 @@ export default function PositionDetailPage({
                     </Button>
                   </TooltipTrigger>
                   <TooltipContent>Copy FEN</TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      asChild
+                    >
+                      <a
+                        href={lichessAnalysisUrl(position.fen)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        <ExternalLink className="w-4 h-4" />
+                      </a>
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Open in Lichess</TooltipContent>
                 </Tooltip>
               </CardContent>
             </Card>
@@ -317,7 +352,7 @@ function PositionHeader({
   onBack,
 }: {
   position: Position;
-  onUpdate: (updates: { name?: string; description?: string | null; blunderTag?: BlunderTag | null }) => Promise<void>;
+  onUpdate: (updates: { name?: string; description?: string | null; blunderTag?: BlunderTag | null; type?: PositionType; expectedOutcome?: Outcome | null }) => Promise<void>;
   onDelete: () => void;
   onBack: () => void;
 }) {
@@ -501,6 +536,75 @@ function BlunderTagSelector({
         >
           {BLUNDER_TAG_OPTIONS.find((o) => o.value === value)?.label}
         </Badge>
+      )}
+    </div>
+  );
+}
+
+// ─── Position Type Selector ───────────────────────────────────────
+
+const OUTCOME_OPTIONS: { value: Outcome; label: string }[] = [
+  { value: "win", label: "Win" },
+  { value: "draw", label: "Draw" },
+  { value: "loss", label: "Loss" },
+  { value: "unknown", label: "Unknown" },
+];
+
+function PositionTypeSelector({
+  type,
+  expectedOutcome,
+  onChangeType,
+  onChangeOutcome,
+}: {
+  type: PositionType;
+  expectedOutcome?: Outcome;
+  onChangeType: (type: PositionType) => void;
+  onChangeOutcome: (outcome: Outcome | null) => void;
+}) {
+  return (
+    <div className="flex items-center gap-3 flex-wrap">
+      <div className="flex items-center gap-2">
+        <span className="text-xs text-muted-foreground font-medium">Type</span>
+        <Select
+          value={type}
+          onValueChange={(v) => onChangeType(v as PositionType)}
+        >
+          <SelectTrigger className="h-7 w-[140px] text-xs">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="SHARP" className="text-xs">
+              ⚡ Sharp
+            </SelectItem>
+            <SelectItem value="FORTRESS" className="text-xs">
+              🏰 Fortress
+            </SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      {type === "FORTRESS" && (
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-muted-foreground font-medium">Expected Outcome</span>
+          <Select
+            value={expectedOutcome ?? "none"}
+            onValueChange={(v) => onChangeOutcome(v === "none" ? null : (v as Outcome))}
+          >
+            <SelectTrigger className="h-7 w-[130px] text-xs">
+              <SelectValue placeholder="Set outcome..." />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="none" className="text-xs text-muted-foreground">
+                Not set
+              </SelectItem>
+              {OUTCOME_OPTIONS.map((opt) => (
+                <SelectItem key={opt.value} value={opt.value} className="text-xs">
+                  {opt.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
       )}
     </div>
   );
