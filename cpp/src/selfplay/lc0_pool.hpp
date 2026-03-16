@@ -9,7 +9,8 @@
  * Protocol per move (no tree reuse):
  *   ucinewgame
  *   isready         → wait for readyok
- *   position fen <FEN>
+ *   position startpos moves <UCI move list>   (when history available)
+ *   position fen <FEN>                        (fallback for EPD openings)
  *   go nodes <N>    → read until bestmove
  *
  * During the UCI handshake we set:
@@ -66,6 +67,7 @@ namespace catgpt {
 struct Lc0Request {
     // --- Input (written by coroutine before suspend) ---
     std::string fen;
+    std::vector<std::string> uci_moves;  // Full move list from startpos (empty = use FEN)
     int nodes = 0;
 
     // --- Board reference for parsing the UCI move ---
@@ -93,10 +95,12 @@ class Lc0Pool;
  */
 class Lc0Awaitable {
 public:
-    Lc0Awaitable(Lc0Pool& pool, const chess::Board& board)
+    Lc0Awaitable(Lc0Pool& pool, const chess::Board& board,
+                 const std::vector<std::string>& uci_moves = {})
         : pool_(pool)
     {
         request_.fen = board.getFen();
+        request_.uci_moves = uci_moves;
         request_.board = board;
     }
 
@@ -146,7 +150,10 @@ public:
      * Execute one search: ucinewgame → isready → position → go nodes → bestmove.
      * Blocks the calling thread until Lc0 returns bestmove.
      */
-    MoveResult search(const std::string& fen, int nodes, const chess::Board& board) {
+    MoveResult search(const std::string& fen,
+                      const std::vector<std::string>& uci_moves,
+                      int nodes,
+                      const chess::Board& board) {
         MoveResult result;
 
         // Clear the tree
@@ -154,8 +161,17 @@ public:
         send_line("isready");
         wait_for("readyok");
 
-        // Set position
-        send_line("position fen " + fen);
+        // Set position — prefer full move history for proper repetition detection
+        if (!uci_moves.empty()) {
+            std::string cmd = "position startpos moves";
+            for (const auto& m : uci_moves) {
+                cmd += ' ';
+                cmd += m;
+            }
+            send_line(cmd);
+        } else {
+            send_line("position fen " + fen);
+        }
 
         // Start search
         send_line("go nodes " + std::to_string(nodes));
@@ -522,7 +538,8 @@ private:
             // Execute the search (blocks this thread on Lc0 I/O — that's fine,
             // this is a dedicated worker thread, not a coroutine thread-pool thread)
             try {
-                request->result = lc0->search(request->fen, request->nodes, request->board);
+                request->result = lc0->search(request->fen, request->uci_moves,
+                                              request->nodes, request->board);
             } catch (const std::exception& e) {
                 std::println(stderr, "[Lc0Pool] Worker {} search error: {}",
                              worker_id, e.what());

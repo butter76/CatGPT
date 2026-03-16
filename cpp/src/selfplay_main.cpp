@@ -37,7 +37,7 @@
  *   --cpuct F            PUCT constant for BOTH engines (default: 1.75)
  *   --baseline-cpuct F   Override cpuct for baseline only
  *   --challenger-cpuct F Override cpuct for challenger only
- *   --openings PATH      Opening book file (EPD/FEN)
+ *   --openings PATH      Opening book file (EPD/FEN or PGN)
  *   --pgn PATH           Output PGN file
  *   --baseline-name S    Label for baseline (default: Baseline)
  *   --challenger-name S  Label for challenger (default: Challenger)
@@ -94,7 +94,7 @@ void print_usage(const char* argv0) {
     std::println(stderr, "  --challenger-name S  Label for challenger (default: Challenger)");
     std::println(stderr, "");
     std::println(stderr, "I/O options:");
-    std::println(stderr, "  --openings PATH      Opening book file (EPD/FEN)");
+    std::println(stderr, "  --openings PATH      Opening book file (EPD/FEN or PGN)");
     std::println(stderr, "  --pgn PATH           Output PGN file");
     std::println(stderr, "  --syzygy PATH        Syzygy tablebase directory (or $SYZYGY_HOME)");
     std::println(stderr, "  --json-metrics       Emit JSON-lines metrics to stdout");

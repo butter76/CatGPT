@@ -91,10 +91,16 @@ public:
 
     /**
      * Start a new game from the given opening position.
+     *
+     * @param opening_fen   FEN of the position to start from.
+     * @param opening_uci   UCI move list from startpos that reaches opening_fen
+     *                      (empty when loaded from EPD/FEN).
      */
-    void start(const std::string& opening_fen) {
+    void start(const std::string& opening_fen,
+               const std::vector<std::string>& opening_uci = {}) {
         board_ = chess::Board(opening_fen);
         opening_fen_ = opening_fen;
+        uci_history_ = opening_uci;
         moves_.clear();
         gpu_evals_per_move_.clear();
         cp_scores_per_move_.clear();
@@ -108,6 +114,7 @@ public:
 
     /** Apply a move and update adjudication state. */
     void apply_move(chess::Move move, int cp_score, int gpu_evals) {
+        uci_history_.push_back(chess::uci::moveToUci(move));
         board_.makeMove<true>(move);
         moves_.push_back(move);
         gpu_evals_per_move_.push_back(gpu_evals);
@@ -257,6 +264,7 @@ public:
     [[nodiscard]] bool is_terminated() const { return terminated_; }
     [[nodiscard]] const std::string& opening_fen() const { return opening_fen_; }
     [[nodiscard]] int total_gpu_evals() const { return total_gpu_evals_; }
+    [[nodiscard]] const std::vector<std::string>& uci_history() const { return uci_history_; }
 
 private:
     void set_result(GameTermination term, GameOutcome out) {
@@ -267,6 +275,7 @@ private:
 
     chess::Board board_;
     std::string opening_fen_;
+    std::vector<std::string> uci_history_;  // Full UCI move list from startpos
     std::vector<chess::Move> moves_;
     std::vector<int> gpu_evals_per_move_;
     std::vector<int> cp_scores_per_move_;

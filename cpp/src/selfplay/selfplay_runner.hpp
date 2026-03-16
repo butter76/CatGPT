@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <fstream>
 #include <memory>
+#include <sstream>
 #include <mutex>
 #include <print>
 #include <string>
@@ -49,11 +50,27 @@
 namespace catgpt {
 
 /**
+ * An opening position with optional move history.
+ *
+ * When loaded from PGN, `uci_moves` contains the UCI move sequence from
+ * startpos that leads to `fen`.  This lets external UCI engines (Stockfish,
+ * Lc0) receive `position startpos moves ...` so they can properly detect
+ * repetitions against earlier game positions.
+ *
+ * When loaded from EPD/FEN, `uci_moves` is empty and engines fall back to
+ * `position fen <fen>`.
+ */
+struct Opening {
+    std::string fen;
+    std::vector<std::string> uci_moves;
+};
+
+/**
  * Load opening positions from a FEN/EPD file.
  * Each line is treated as a FEN string (ignoring empty lines and comments).
  */
-inline std::vector<std::string> load_openings(const std::string& path) {
-    std::vector<std::string> openings;
+inline std::vector<Opening> load_openings_epd(const std::string& path) {
+    std::vector<Opening> openings;
     std::ifstream file(path);
     if (!file) {
         throw std::runtime_error("Failed to open openings file: " + path);
@@ -61,30 +78,145 @@ inline std::vector<std::string> load_openings(const std::string& path) {
 
     std::string line;
     while (std::getline(file, line)) {
-        // Trim whitespace
         auto start = line.find_first_not_of(" \t\r\n");
         if (start == std::string::npos) continue;
         auto end = line.find_last_not_of(" \t\r\n");
         line = line.substr(start, end - start + 1);
 
-        // Skip comments
         if (line.empty() || line[0] == '#') continue;
 
-        // For EPD format: take first 4 fields and add default halfmove/fullmove
-        // if they're missing (EPD has 4 fields, FEN has 6)
+        // EPD has 4 fields, FEN has 6 — add defaults if needed
         auto parts_count = 0;
         for (auto c : line) {
             if (c == ' ') ++parts_count;
         }
         if (parts_count < 4) {
-            // Looks like it needs halfmove + fullmove
             line += " 0 1";
         }
 
-        openings.push_back(line);
+        openings.push_back(Opening{.fen = line, .uci_moves = {}});
     }
 
     return openings;
+}
+
+/**
+ * Load openings from a PGN file.
+ *
+ * Each game's moves are replayed from startpos to produce:
+ *   - The final position FEN (used for CatGPT's board + search)
+ *   - The full UCI move list from startpos (sent to external engines)
+ *
+ * Only the movetext is used; headers are skipped.  Supports standard PGN
+ * with move numbers, comments in {}, and result tokens.
+ */
+inline std::vector<Opening> load_openings_pgn(const std::string& path) {
+    std::vector<Opening> openings;
+    std::ifstream file(path);
+    if (!file) {
+        throw std::runtime_error("Failed to open PGN openings file: " + path);
+    }
+
+    std::string line;
+    std::string movetext;
+
+    auto flush_game = [&]() {
+        if (movetext.empty()) return;
+
+        // Tokenise the movetext into SAN moves
+        chess::Board board;
+        std::vector<std::string> uci_moves;
+
+        std::istringstream iss(movetext);
+        std::string token;
+        while (iss >> token) {
+            // Skip move numbers ("1." "12..." etc.)
+            if (!token.empty() && (std::isdigit(static_cast<unsigned char>(token[0])) ||
+                                   token[0] == '.')) {
+                // Could be "1." or "12..." — skip if it looks like a move number
+                bool is_move_num = true;
+                for (char c : token) {
+                    if (c != '.' && !std::isdigit(static_cast<unsigned char>(c))) {
+                        is_move_num = false;
+                        break;
+                    }
+                }
+                if (is_move_num) continue;
+            }
+
+            // Skip result tokens
+            if (token == "1-0" || token == "0-1" || token == "1/2-1/2" || token == "*") continue;
+
+            // Skip comments (already stripped braces, but just in case)
+            if (token[0] == '{' || token[0] == '(') continue;
+
+            // Parse SAN
+            try {
+                auto move = chess::uci::parseSan(board, token);
+                if (move == chess::Move::NO_MOVE) break;
+                uci_moves.push_back(chess::uci::moveToUci(move));
+                board.makeMove<true>(move);
+            } catch (...) {
+                // Unparseable token — stop processing this game
+                break;
+            }
+        }
+
+        if (!uci_moves.empty()) {
+            openings.push_back(Opening{
+                .fen = board.getFen(),
+                .uci_moves = std::move(uci_moves),
+            });
+        }
+
+        movetext.clear();
+    };
+
+    while (std::getline(file, line)) {
+        // Trim
+        auto start = line.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos) {
+            // Blank line — could separate headers from movetext
+            continue;
+        }
+        auto end = line.find_last_not_of(" \t\r\n");
+        line = line.substr(start, end - start + 1);
+
+        // Header line: [Tag "value"]
+        if (line[0] == '[') {
+            flush_game();
+            continue;
+        }
+
+        // Strip PGN comments { ... } inline
+        std::string cleaned;
+        int brace_depth = 0;
+        for (char c : line) {
+            if (c == '{') { ++brace_depth; continue; }
+            if (c == '}') { if (brace_depth > 0) --brace_depth; continue; }
+            if (brace_depth == 0) cleaned += c;
+        }
+
+        if (!cleaned.empty()) {
+            if (!movetext.empty()) movetext += ' ';
+            movetext += cleaned;
+        }
+    }
+
+    // Flush last game
+    flush_game();
+
+    return openings;
+}
+
+/**
+ * Load openings from either PGN or EPD/FEN, auto-detected by extension.
+ */
+inline std::vector<Opening> load_openings(const std::string& path) {
+    if (path.size() >= 4 && path.substr(path.size() - 4) == ".pgn") {
+        return load_openings_pgn(path);
+    }
+    return load_openings_epd(path);
 }
 
 class SelfPlayRunner {
@@ -95,10 +227,16 @@ public:
         // Load openings
         if (!config_.openings_path.empty()) {
             openings_ = load_openings(config_.openings_path);
-            std::println(stderr, "[SelfPlay] Loaded {} openings", openings_.size());
+            bool has_history = !openings_.empty() && !openings_[0].uci_moves.empty();
+            std::println(stderr, "[SelfPlay] Loaded {} openings ({})",
+                         openings_.size(),
+                         has_history ? "PGN with move history" : "EPD/FEN positions");
         }
         if (openings_.empty()) {
-            openings_.push_back("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+            openings_.push_back(Opening{
+                .fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                .uci_moves = {},
+            });
         }
 
         // Default total_pairs to number of openings (one pair per opening)
@@ -257,18 +395,16 @@ private:
 
             const auto& opening = openings_[pair_num % openings_.size()];
 
-            // Alternate starting color across pairs so the challenger
-            // doesn't always get the first move in game 1.
             bool challenger_white_first = (pair_num % 2 == 0);
 
             // Game 1
             GameRecord game1 = co_await play_one_game(
-                opening, /*challenger_is_white=*/challenger_white_first);
+                opening, challenger_white_first);
             on_game_complete(game1, pair_num * 2, slot_id);
 
             // Game 2: colors swapped
             GameRecord game2 = co_await play_one_game(
-                opening, /*challenger_is_white=*/!challenger_white_first);
+                opening, !challenger_white_first);
             on_game_complete(game2, pair_num * 2 + 1, slot_id);
         }
     }
@@ -291,10 +427,10 @@ private:
      *
      * @param challenger_is_white  If true, the challenger plays White.
      */
-    coro::task<GameRecord> play_one_game(const std::string& opening_fen,
+    coro::task<GameRecord> play_one_game(const Opening& opening,
                                          bool challenger_is_white) {
         GameSlot slot;
-        slot.start(opening_fen);
+        slot.start(opening.fen, opening.uci_moves);
 
         // baseline_white is the opposite of challenger_is_white
         bool baseline_white = !challenger_is_white;
@@ -311,9 +447,9 @@ private:
             if (both_external) {
                 // Mode 4: Lc0 (challenger) vs Stockfish (baseline)
                 if (challenger_to_move) {
-                    move_result = co_await Lc0Awaitable(*lc0_pool_, slot.board());
+                    move_result = co_await Lc0Awaitable(*lc0_pool_, slot.board(), slot.uci_history());
                 } else {
-                    move_result = co_await StockfishAwaitable(*stockfish_pool_, slot.board());
+                    move_result = co_await StockfishAwaitable(*stockfish_pool_, slot.board(), slot.uci_history());
                 }
             } else if (challenger_to_move) {
                 if (single_external) {
@@ -333,10 +469,10 @@ private:
             } else {
                 if (config_.use_stockfish) {
                     // Stockfish mode: Stockfish is the baseline
-                    move_result = co_await StockfishAwaitable(*stockfish_pool_, slot.board());
+                    move_result = co_await StockfishAwaitable(*stockfish_pool_, slot.board(), slot.uci_history());
                 } else if (config_.use_lc0) {
                     // Lc0 mode: Lc0 is the baseline
-                    move_result = co_await Lc0Awaitable(*lc0_pool_, slot.board());
+                    move_result = co_await Lc0Awaitable(*lc0_pool_, slot.board(), slot.uci_history());
                 } else {
                     // Normal mode: CoroutineSearch or CoroutineMCTS is the baseline
                     move_result = co_await search_catgpt(
@@ -571,7 +707,7 @@ private:
     // ─── Members ────────────────────────────────────────────────────────
 
     SelfPlayConfig config_;
-    std::vector<std::string> openings_;
+    std::vector<Opening> openings_;
 
     std::shared_ptr<coro::thread_pool> pool_;
     std::unique_ptr<BatchEvaluator> evaluator_;
