@@ -111,7 +111,7 @@ public:
         int last_stats_iteration = 0;  // Track when we last printed stats
         auto last_stats_time = std::chrono::steady_clock::now();  // Track time since last stats
 
-        while (total_gpu_evals_ < target_evals && iteration < 25 * target_evals) {
+        while (total_gpu_evals_ < target_evals && N < 250 * target_evals) {
             last_used_N = N;
             int median = compute_percentile_bin(root->distQ, 0.50f);
             int alpha = std::max(0, median);
@@ -151,7 +151,7 @@ public:
                 }
             }
 
-            N += 1.0f;
+            N *= 1.02f;
             ++iteration;
         }
 

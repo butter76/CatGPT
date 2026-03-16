@@ -21,7 +21,7 @@ cpp_build_dir: "cpp/build/bin"
 trt_engine: "sample.trt"
 
 # Opening book
-openings: "openings/UHO_2024/UHO_2024_+100_+109/UHO_2024_6mvs_+100_+109.epd"
+openings: "openings/UHO_2024/UHO_2024_+100_+109/UHO_2024_6mvs_+100_+109.pgn"
 
 # Tournament settings
 pairs: 0            # 0 = one pair per opening
@@ -30,7 +30,7 @@ threads: 9          # Search worker threads
 batch: 64           # Max GPU batch size
 
 # Search algorithm: "fractional" (default) or "mcts"
-search_type: "mcts"
+search_type: "fractional"
 
 # Search settings (apply to both engines unless overridden)
 evals: 400          # Min GPU evals per move

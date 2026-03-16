@@ -101,7 +101,7 @@ struct SelfPlayConfig {
     /** Path to TensorRT engine file. */
     std::string engine_path;
 
-    /** Path to openings file (EPD or FEN format, one position per line). */
+    /** Path to openings file (EPD/FEN or PGN format, auto-detected by extension). */
     std::string openings_path;
 
     /** Path to output PGN file. Empty = no PGN output. */
