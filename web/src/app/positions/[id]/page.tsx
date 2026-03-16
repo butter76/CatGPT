@@ -41,6 +41,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import Link from "next/link";
 import {
   ArrowLeft,
   Zap,
@@ -53,6 +54,7 @@ import {
   Pencil,
   Tag,
   ExternalLink,
+  FlaskConical,
 } from "lucide-react";
 
 export default function PositionDetailPage({
@@ -215,6 +217,22 @@ export default function PositionDetailPage({
                     </Button>
                   </TooltipTrigger>
                   <TooltipContent>Copy FEN</TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      asChild
+                    >
+                      <Link
+                        href={`/analyze?fen=${encodeURIComponent(position.fen)}`}
+                      >
+                        <FlaskConical className="w-4 h-4" />
+                      </Link>
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Open in Quick Analysis</TooltipContent>
                 </Tooltip>
                 <Tooltip>
                   <TooltipTrigger asChild>
