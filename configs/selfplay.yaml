@@ -37,7 +37,7 @@ evals: 400          # Min GPU evals per move
 cpuct: 1.75         # PUCT exploration constant
 
 # MCTS-specific settings (only used when search_type=mcts)
-fpu: 0.330               # FPU reduction (default: 0.003)
+fpu: 0.130               # FPU reduction (default: 0.003)
 policy_temp: 1.3        # Policy temperature (default: 1.3, >1 flattens, <1 sharpens)
 max_simulations: null    # Max MCTS simulations per move (default: 10000)
 

@@ -356,8 +356,7 @@ private:
         }
 
         float expansion_N = N * node->variance * 12.0f;
-        float expansion_threshold = expansion_N > 0.0f ? 1.0f / expansion_N : 1.0f;
-        co_await expand_children(node, scratch_board, expansion_threshold);
+        co_await expand_children(node, scratch_board, expansion_N);
 
         if (node->children.empty()) co_return;
 
@@ -451,41 +450,121 @@ private:
     // ─── Child expansion ────────────────────────────────────────────────
 
     coro::task<void> expand_children(FractionalNode* node, chess::Board& scratch_board,
-                                     float threshold) {
-        std::vector<std::pair<chess::Move, float>> sorted_priors;
-        sorted_priors.reserve(node->policy_priors.size());
-        for (const auto& [move, prior] : node->policy_priors) {
-            sorted_priors.emplace_back(move, prior);
-        }
-        std::sort(sorted_priors.begin(), sorted_priors.end(),
-                  [](const auto& a, const auto& b) { return a.second > b.second; });
+                                     float N) {
+        if (N <= 0.0f) co_return;
 
+        // Build list of ALL legal moves with optimistic policy, sorted descending
+        struct MoveInfo {
+            chess::Move move;
+            float P_optimistic;
+            float Q_effective;
+            bool is_expanded;
+        };
+        std::vector<MoveInfo> all_moves;
+        all_moves.reserve(node->policy_priors.size());
+
+        for (const auto& [move, prior] : node->policy_priors) {
+            float p_opt = prior;
+            auto opt_it = node->policy_priors_optimistic.find(move);
+            if (opt_it != node->policy_priors_optimistic.end()) {
+                p_opt = opt_it->second;
+            }
+            all_moves.push_back({move, p_opt, 0.0f, false});
+        }
+        std::sort(all_moves.begin(), all_moves.end(),
+                  [](const auto& a, const auto& b) { return a.P_optimistic > b.P_optimistic; });
+
+        // Assign Q values: actual Q for expanded, FPU for unexpanded
+        float cumulative_policy = 0.0f;
+        for (auto& info : all_moves) {
+            auto child_it = node->children.find(info.move);
+            if (child_it != node->children.end()) {
+                info.Q_effective = -child_it->second.Q;
+                info.is_expanded = true;
+            } else {
+                info.Q_effective = node->Q - config_.fpu_reduction * std::sqrt(cumulative_policy);
+            }
+            cumulative_policy += info.P_optimistic;
+        }
+
+        // Binary search for K such that sum of allocations = N
+        float c_puct = config_.c_puct;
+        float N_exp = std::sqrt(N);
+
+        auto compute_alloc = [c_puct, N_exp](const MoveInfo& info, float K) -> float {
+            float denom = K - info.Q_effective;
+            if (denom <= 0.0f) return std::numeric_limits<float>::infinity();
+            return c_puct * info.P_optimistic * N_exp / denom;
+        };
+
+        auto sum_allocs = [&all_moves, &compute_alloc](float K) -> float {
+            float total = 0.0f;
+            for (const auto& info : all_moves) {
+                float a = compute_alloc(info, K);
+                if (std::isinf(a)) return std::numeric_limits<float>::infinity();
+                total += a;
+            }
+            return total;
+        };
+
+        float max_q = -std::numeric_limits<float>::infinity();
+        for (const auto& info : all_moves) {
+            max_q = std::max(max_q, info.Q_effective);
+        }
+        float K_low = max_q + 1e-9f;
+        float K_high = K_low + 10.0f;
+
+        for (int i = 0; i < 100; ++i) {
+            if (sum_allocs(K_high) <= N) break;
+            K_high *= 2.0f;
+        }
+        for (int i = 0; i < 64; ++i) {
+            float K_mid = (K_low + K_high) / 2.0f;
+            if (sum_allocs(K_mid) > N) {
+                K_low = K_mid;
+            } else {
+                K_high = K_mid;
+            }
+        }
+        float K = (K_low + K_high) / 2.0f;
+
+        // Determine which moves are in the policy-coverage limit (by standard prior)
         int limit = node->get_limit(config_.policy_coverage_threshold,
                                     config_.single_node_coverage_threshold);
+        std::vector<std::pair<chess::Move, float>> sorted_standard;
+        sorted_standard.reserve(node->policy_priors.size());
+        for (const auto& [move, prior] : node->policy_priors) {
+            sorted_standard.emplace_back(move, prior);
+        }
+        std::sort(sorted_standard.begin(), sorted_standard.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::unordered_map<chess::Move, bool, MoveHash> in_limit;
+        for (int i = 0; i < limit && i < static_cast<int>(sorted_standard.size()); ++i) {
+            in_limit[sorted_standard[i].first] = true;
+        }
 
-        for (size_t i = 0; i < sorted_priors.size(); ++i) {
-            const auto& [move, prior] = sorted_priors[i];
+        // Expand unexpanded children with allocation >= 1, or within the limit
+        for (const auto& info : all_moves) {
+            if (info.is_expanded) continue;
+            bool force = in_limit.count(info.move) > 0;
+            float alloc = compute_alloc(info, K);
+            if (alloc < 1.0f && !force) continue;
 
-            if (node->children.count(move) > 0) continue;
-
-            bool in_limit = static_cast<int>(i) < limit;
-            if (prior < threshold && !in_limit) continue;
-
+            float prior = node->policy_priors.at(info.move);
             float prior_alloc = prior;
-            auto alloc_it = node->policy_priors_alloc.find(move);
+            auto alloc_it = node->policy_priors_alloc.find(info.move);
             if (alloc_it != node->policy_priors_alloc.end()) {
                 prior_alloc = alloc_it->second;
             }
-            float prior_optimistic = prior_alloc;  // fallback to alloc if no optimistic
-            auto opt_it = node->policy_priors_optimistic.find(move);
+            float prior_optimistic = prior_alloc;
+            auto opt_it = node->policy_priors_optimistic.find(info.move);
             if (opt_it != node->policy_priors_optimistic.end()) {
                 prior_optimistic = opt_it->second;
             }
             FractionalNode child(prior, prior_alloc, prior_optimistic);
 
-            scratch_board.makeMove<true>(move);
+            scratch_board.makeMove<true>(info.move);
 
-            // Treat 2-fold repetition as a draw (isGameOver only checks 3-fold)
             bool is_twofold = scratch_board.isRepetition(1);
             auto [reason, game_result] = scratch_board.isGameOver();
 
@@ -503,8 +582,8 @@ private:
                 co_await evaluate_node(&child, scratch_board);
             }
 
-            scratch_board.unmakeMove(move);
-            node->children[move] = std::move(child);
+            scratch_board.unmakeMove(info.move);
+            node->children[info.move] = std::move(child);
         }
     }
 
