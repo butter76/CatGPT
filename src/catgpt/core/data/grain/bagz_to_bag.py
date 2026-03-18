@@ -24,6 +24,7 @@ position), applying:
 4. Field stripping: only keep essential fields for training
 """
 
+import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -404,6 +405,8 @@ def convert_bagz_to_bag(
     profile: bool = False,
     max_games: int | None = None,
     skip_verify: bool = False,
+    num_shards: int = 1,
+    seed: int | None = None,
 ) -> tuple[int, int, int]:
     """Convert a .bagz file to .bag format for training.
 
@@ -417,11 +420,16 @@ def convert_bagz_to_bag(
 
     Args:
         bagz_path: Path to input .bagz file containing games.
-        output_path: Path for output .bag file. If None, replaces .bagz with .bag.
+        output_path: Path for output .bag file (or directory if num_shards > 1).
+            If None, uses input directory. For sharded output, files are named
+            shard-{X}-{filename}.bag.
         verbose: If True, print progress information.
         profile: If True, print detailed timing breakdown.
         max_games: If set, process at most this many games (for testing).
         skip_verify: If True, skip game integrity verification (faster but trusts data).
+        num_shards: Number of shards to split output into. Each position is
+            randomly assigned to one of the shards. Default 1 (no sharding).
+        seed: Random seed for shard assignment. Default None (random).
 
     Returns:
         Tuple of (games_processed, positions_before_dedup, positions_written).
@@ -430,15 +438,28 @@ def convert_bagz_to_bag(
         VerificationError: If any data integrity check fails.
     """
     bagz_path = Path(bagz_path)
+    
+    # Set up random generator for shard assignment
+    rng = random.Random(seed)
 
+    # Determine output directory and base filename
     if output_path is None:
-        # Replace .bagz with .bag
-        if bagz_path.suffix == ".bagz":
-            output_path = bagz_path.with_suffix(".bag")
-        else:
-            output_path = bagz_path.with_name(bagz_path.name + ".bag")
+        output_dir = bagz_path.parent
     else:
-        output_path = Path(output_path)
+        output_dir = Path(output_path)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get base filename without .bagz extension
+    base_name = bagz_path.stem  # e.g., "training-run1-test80-20240401-0017"
+
+    # Create shard output paths
+    if num_shards == 1:
+        shard_paths = [output_dir / f"{base_name}.bag"]
+    else:
+        shard_paths = [
+            output_dir / f"shard-{i}-{base_name}.bag"
+            for i in range(num_shards)
+        ]
 
     reader = BagReader(str(bagz_path))
     num_games = len(reader)
@@ -447,6 +468,8 @@ def convert_bagz_to_bag(
 
     if verbose:
         print(f"Processing {num_games} games from {bagz_path}", flush=True)
+        if num_shards > 1:
+            print(f"Writing to {num_shards} shards in {output_dir}", flush=True)
 
     # Track seen FENs for deduplication (within this file)
     seen_fens: set[str] = set()
@@ -454,6 +477,7 @@ def convert_bagz_to_bag(
     games_processed = 0
     positions_before_dedup = 0
     positions_written = 0
+    positions_per_shard = [0] * num_shards
 
     # Timing accumulators (in seconds)
     time_read = 0.0
@@ -467,7 +491,12 @@ def convert_bagz_to_bag(
 
     overall_start = time.perf_counter()
 
-    with BagWriter(str(output_path), compress=False) as writer:
+    # Open all shard writers
+    writers = [BagWriter(str(p), compress=False) for p in shard_paths]
+    try:
+        for writer in writers:
+            writer.__enter__()
+
         for game_idx in range(num_games):
             t0 = time.perf_counter()
             encoded_game = reader[game_idx]
@@ -530,7 +559,11 @@ def convert_bagz_to_bag(
                 )
 
                 encoded = encode_training_position(training_pos)
-                writer.write(encoded)
+                
+                # Randomly assign to a shard
+                shard_idx = rng.randrange(num_shards)
+                writers[shard_idx].write(encoded)
+                positions_per_shard[shard_idx] += 1
                 positions_written += 1
 
             t7 = time.perf_counter()
@@ -544,6 +577,9 @@ def convert_bagz_to_bag(
                     f"{positions_written} unique positions written...",
                     flush=True,
                 )
+    finally:
+        for writer in writers:
+            writer.__exit__(None, None, None)
 
     overall_elapsed = time.perf_counter() - overall_start
 
@@ -553,7 +589,12 @@ def convert_bagz_to_bag(
         print(f"  Positions selected (after clock filter): {positions_before_dedup}")
         print(f"  Duplicates removed: {dedup_removed}")
         print(f"  Unique positions written: {positions_written}")
-        print(f"  Output: {output_path}")
+        if num_shards > 1:
+            print(f"  Shards: {num_shards}")
+            print(f"  Positions per shard: min={min(positions_per_shard)}, max={max(positions_per_shard)}, avg={positions_written // num_shards}")
+            print(f"  Output directory: {output_dir}")
+        else:
+            print(f"  Output: {shard_paths[0]}")
 
     if profile:
         print(f"\n{'='*60}")
@@ -605,11 +646,14 @@ if __name__ == "__main__":
         print("  input.bagz         Path to input .bagz file containing games")
         print()
         print("Options:")
-        print("  --output PATH      Output .bag file path (default: input.bag)")
+        print("  --output PATH      Output directory (default: same as input)")
         print("  --verbose, -v      Print progress information")
         print("  --profile          Print detailed timing breakdown")
         print("  --max-games N      Process at most N games (for testing)")
         print("  --skip-verify      Skip game integrity verification (faster)")
+        print("  --num-shards N     Split output into N shards (default: 1)")
+        print("                     Output files: shard-{X}-{filename}.bag")
+        print("  --seed N           Random seed for shard assignment")
         sys.exit(0 if "--help" in sys.argv or "-h" in sys.argv else 1)
 
     input_bagz = sys.argv[1]
@@ -631,6 +675,18 @@ if __name__ == "__main__":
         if idx + 1 < len(sys.argv):
             max_games = int(sys.argv[idx + 1])
 
+    num_shards = 1
+    if "--num-shards" in sys.argv:
+        idx = sys.argv.index("--num-shards")
+        if idx + 1 < len(sys.argv):
+            num_shards = int(sys.argv[idx + 1])
+
+    seed = None
+    if "--seed" in sys.argv:
+        idx = sys.argv.index("--seed")
+        if idx + 1 < len(sys.argv):
+            seed = int(sys.argv[idx + 1])
+
     games, before, after = convert_bagz_to_bag(
         input_bagz,
         output_path=output_path,
@@ -638,6 +694,8 @@ if __name__ == "__main__":
         profile=profile,
         max_games=max_games,
         skip_verify=skip_verify,
+        num_shards=num_shards,
+        seed=seed,
     )
 
     if not verbose and not profile:
