@@ -18,7 +18,7 @@
 #   uv run python scripts/evaluate_jax.py benchmark.max_puzzles=100
 
 # Checkpoint to evaluate
-checkpoint: "checkpoints_jax/uncertainty-new2/step_8000"
+checkpoint: "checkpoints_jax/layer24/final"
 
 # Engine configuration
 engine:
@@ -28,7 +28,7 @@ engine:
   # Parallel workers: each worker loads its own engine and processes puzzles independently.
   # Useful for MCTS where evaluation is CPU-bound. Set to number of CPU cores for max throughput.
   # Note: GPU memory usage scales with num_workers (each worker loads model into GPU).
-  num_workers: 2
+  num_workers: 1
 
   # MCTS-specific settings (only used when type=mcts)
   mcts:

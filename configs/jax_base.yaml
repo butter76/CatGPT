@@ -5,7 +5,7 @@
 model:
   name: "transformer"
   hidden_size: 768
-  num_layers: 16
+  num_layers: 42
   num_heads: 48
   ff_dim: 1536  # Defaults to 4 * hidden_size
   attention_dim: null  # Expanded attention dim (null = hidden_size). E.g., 768 with 48 heads for 50% more attention capacity
@@ -39,7 +39,7 @@ model:
   # See: https://arxiv.org/abs/2601.19895
   keel:
     enabled: true        # Enable Keel normalization (replaces Peri-LN)
-    alpha: 6          # Highway scaling factor. null = auto (2 * num_layers = 32)
+    alpha: 16          # Highway scaling factor. null = auto (2 * num_layers = 32)
 
   # Output heads configuration
   output_heads:
@@ -93,14 +93,14 @@ scheduler:
   warmup_steps: 1000
   min_lr_ratio: 0.1  # Final LR = learning_rate * min_lr_ratio
   # DeepSeek schedule phase fractions (of post-warmup steps):
-  stable_fraction: 0.68  # 68% at constant peak LR after warmup
-  cooldown_fraction: 0.07  # 7% at constant min LR at end (remaining 25% = cosine decay)
+  stable_fraction: 0.675  # 67.5% at constant peak LR after warmup
+  cooldown_fraction: 0.075  # 7.5% at constant min LR at end (remaining 25% = cosine decay)
 
 # Training loop configuration
 # Training is step-based with "pseudo-epochs" for validation/checkpointing
 training:
-  max_steps: 120000  # Total training steps
-  steps_per_epoch: 6000  # Steps per pseudo-epoch (validation interval)
+  max_steps: 200000  # Total training steps
+  steps_per_epoch: 2000  # Steps per pseudo-epoch (validation interval)
   batch_size: 3072
   gradient_clip: 1.0
   gradient_accumulation_steps: 1
@@ -117,7 +117,7 @@ training:
 data:
   train_path: "~/sample_training_data/shard-*-training-run1-test80-20240*.bag"
   val_path: "~/sample_training_data/shard-0-training-run1-test80-20240401-0117.bag"
-  num_workers: 4
+  num_workers: 20
   prefetch_factor: 10
   seed: 42
 
@@ -131,7 +131,7 @@ checkpoint:
 
 # Weights & Biases logging
 wandb:
-  enabled: false
+  enabled: true
   project: "catgpt-leela"
   entity: null  # Your W&B username or team
   run_name: null  # Auto-generated if null
