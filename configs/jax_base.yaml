@@ -5,7 +5,7 @@
 model:
   name: "transformer"
   hidden_size: 768
-  num_layers: 42
+  num_layers: 48
   num_heads: 48
   ff_dim: 1536  # Defaults to 4 * hidden_size
   attention_dim: null  # Expanded attention dim (null = hidden_size). E.g., 768 with 48 heads for 50% more attention capacity
@@ -39,7 +39,7 @@ model:
   # See: https://arxiv.org/abs/2601.19895
   keel:
     enabled: true        # Enable Keel normalization (replaces Peri-LN)
-    alpha: 16          # Highway scaling factor. null = auto (2 * num_layers = 32)
+    alpha: 19          # Highway scaling factor. null = auto (2 * num_layers = 32)
 
   # Output heads configuration
   output_heads:
