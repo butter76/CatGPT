@@ -504,11 +504,18 @@ class Trainer:
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
         (total_loss, (outputs, losses)), grads = grad_fn(state.params)
 
-        # Update state
-        state = state.apply_gradients(grads=grads)
+        # Skip optimizer update when loss is non-finite to prevent
+        # permanent corruption of optimizer state (momentum, EMA, etc.)
+        is_finite_loss = jnp.isfinite(total_loss)
+        state = jax.lax.cond(
+            is_finite_loss,
+            lambda s, g: s.apply_gradients(grads=g),
+            lambda s, _: s,
+            state, grads,
+        )
 
         # Compute metrics
-        metrics = {"loss": total_loss}
+        metrics = {"loss": total_loss, "nan_skipped": ~is_finite_loss}
 
         # Per-head losses for logging
         for head_name, head_loss in losses.items():
