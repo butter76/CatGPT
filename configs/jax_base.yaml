@@ -41,6 +41,12 @@ model:
     enabled: true        # Enable Keel normalization (replaces Peri-LN)
     alpha: 19          # Highway scaling factor. null = auto (2 * num_layers = 32)
 
+  # Attention logit soft-capping (Gemma 2 / PaLM 2 method)
+  # Bounds attention logits to (-cap, +cap) via: cap * tanh(logits / cap)
+  # Prevents rare attention logit explosions that cause NaN, with negligible compute cost.
+  # null = disabled.
+  attn_logit_soft_cap: 50.0
+
   # Output heads configuration
   output_heads:
     self_head: true      # Token reconstruction (auxiliary task for stability)
@@ -68,7 +74,7 @@ tokenizer:
 # Optimizer configuration
 optimizer:
   name: "splus"  # Options: "adamw", "splus", "sgd"
-  learning_rate: 0.20
+  learning_rate: 0.24
   weight_decay: 0.01
   # AdamW/SGD specific
   b1: 0.9
@@ -99,9 +105,9 @@ scheduler:
 # Training loop configuration
 # Training is step-based with "pseudo-epochs" for validation/checkpointing
 training:
-  max_steps: 200000  # Total training steps
-  steps_per_epoch: 2000  # Steps per pseudo-epoch (validation interval)
-  batch_size: 3072
+  max_steps: 150000  # Total training steps
+  steps_per_epoch: 6000  # Steps per pseudo-epoch (validation interval)
+  batch_size: 4096
   gradient_clip: 1.0
   gradient_accumulation_steps: 1
   max_eval_steps: 200  # Max validation steps (prevents infinite loop)
@@ -117,7 +123,7 @@ training:
 data:
   train_path: "~/sample_training_data/shard-*-training-run1-test80-20240*.bag"
   val_path: "~/sample_training_data/shard-0-training-run1-test80-20240401-0117.bag"
-  num_workers: 20
+  num_workers: 5
   prefetch_factor: 10
   seed: 42
 

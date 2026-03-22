@@ -152,6 +152,7 @@ def _load_model_config(path: Path) -> JaxModelConfig:
         smolgen=smolgen,
         residual_gates=residual_gates,
         keel=keel,
+        attn_logit_soft_cap=config_dict.get("attn_logit_soft_cap"),
     )
 
 

@@ -18,7 +18,7 @@
 #   uv run python scripts/evaluate_jax.py benchmark.max_puzzles=100
 
 # Checkpoint to evaluate
-checkpoint: "checkpoints_jax/layer24/final"
+checkpoint: "checkpoints_jax/lrsweep-020/epoch_21"
 
 # Engine configuration
 engine:

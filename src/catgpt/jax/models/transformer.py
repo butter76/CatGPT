@@ -51,6 +51,9 @@ class TransformerConfig:
     # Keel: Post-LN with Highway-style connection
     keel: KeelConfig = field(default_factory=KeelConfig)
 
+    # Attention logit soft-capping: cap * tanh(logits / cap) before softmax
+    attn_logit_soft_cap: float | None = None
+
     def __post_init__(self) -> None:
         """Set defaults and validate."""
         if self.ff_dim is None:
@@ -93,6 +96,7 @@ class QKVNormMultiHeadAttention(nn.Module):
     output_features: int | None = None  # Output projection dim (None = qkv_features)
     deterministic: bool = True
     dtype: Dtype = jnp.float32
+    attn_logit_soft_cap: float | None = None
 
     @nn.compact
     def __call__(
@@ -155,6 +159,11 @@ class QKVNormMultiHeadAttention(nn.Module):
         # Add Smolgen bias if provided (dynamic position-dependent attention bias)
         if smolgen_bias is not None:
             attn_logits = attn_logits + smolgen_bias.astype(jnp.float32)
+
+        # Soft-cap attention logits to prevent rare explosions (Gemma 2 / PaLM 2)
+        if self.attn_logit_soft_cap is not None:
+            cap = jnp.float32(self.attn_logit_soft_cap)
+            attn_logits = cap * jnp.tanh(attn_logits / cap)
 
         # Softmax in float32 for numerical stability, then cast back
         attn_weights = jax.nn.softmax(attn_logits, axis=-1).astype(self.dtype)
@@ -292,6 +301,9 @@ class TransformerBlock(nn.Module):
     keel_alpha: float = 1.0  # Highway scaling factor (= 2 * num_layers)
     is_first_block: bool = False  # First block uses Pre-LN (no outer LN, no alpha)
 
+    # Attention logit soft-capping
+    attn_logit_soft_cap: float | None = None
+
     def _get_activation(self) -> callable:
         """Get activation function by name."""
         activations = {
@@ -384,6 +396,7 @@ class TransformerBlock(nn.Module):
             output_features=self.hidden_size,
             deterministic=not train,
             dtype=self.dtype,
+            attn_logit_soft_cap=self.attn_logit_soft_cap,
         )(normed, normed, smolgen_bias=smolgen_bias)
 
         if use_post_ln:
@@ -447,6 +460,7 @@ class TransformerBlock(nn.Module):
             output_features=self.hidden_size,
             deterministic=not train,
             dtype=self.dtype,
+            attn_logit_soft_cap=self.attn_logit_soft_cap,
         )(normed, normed, smolgen_bias=smolgen_bias)
         # Output norm: normalize attention output before residual addition
         attn_out = nn.LayerNorm(dtype=jnp.float32)(attn_out.astype(jnp.float32)).astype(self.dtype)
@@ -611,6 +625,7 @@ class BidirectionalTransformer(nn.Module):
                 keel_enabled=keel_enabled,
                 keel_alpha=keel_alpha if keel_enabled else 1.0,
                 is_first_block=(i == 0),
+                attn_logit_soft_cap=self.config.attn_logit_soft_cap,
                 name=f"block_{i}",
             )(hidden, train=train, smolgen_weight_kernel=smolgen_weight_kernel)
 
@@ -830,6 +845,7 @@ class BidirectionalTransformer(nn.Module):
             smolgen=config.smolgen,
             residual_gates=config.residual_gates,
             keel=config.keel,
+            attn_logit_soft_cap=config.attn_logit_soft_cap,
         )
         return cls(config=transformer_config)
 

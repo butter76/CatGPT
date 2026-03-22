@@ -197,6 +197,12 @@ class JaxModelConfig:
     # Keel: Post-LN with Highway-style connection
     keel: KeelConfig = field(default_factory=KeelConfig)
 
+    # Attention logit soft-capping (Gemma 2 / PaLM 2 method)
+    # Bounds attention logits to (-cap, +cap) via tanh: cap * tanh(logits / cap)
+    # Prevents rare attention logit explosions that cause NaN without the cost of QKV-Norm.
+    # None = disabled. Recommended: 50.0
+    attn_logit_soft_cap: float | None = None
+
     def __post_init__(self) -> None:
         """Set defaults and validate."""
         if self.ff_dim is None:
