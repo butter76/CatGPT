@@ -339,7 +339,7 @@ function CatGPTStatsDisplay({
           </span>
           <div className="text-xs font-mono text-muted-foreground break-all">
             {displayStats.pv
-              .slice(0, 12)
+              .slice(0, 40)
               .map((m, i) => (
                 <span key={i}>
                   {i > 0 && " "}
@@ -352,7 +352,7 @@ function CatGPTStatsDisplay({
                   </span>
                 </span>
               ))}
-            {displayStats.pv.length > 12 && " ..."}
+            {displayStats.pv.length > 40 && " ..."}
           </div>
         </div>
       )}

@@ -13,6 +13,7 @@
 #ifndef CATGPT_UCI_HANDLER_HPP
 #define CATGPT_UCI_HANDLER_HPP
 
+#include <cstdio>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -120,16 +121,14 @@ private:
     void handle_uci() {
         std::println("id name {}", ENGINE_NAME);
         std::println("id author {}", ENGINE_AUTHOR);
-        // TODO: Add UCI options here when needed
         std::println("uciok");
-        std::cout.flush();
+        std::fflush(stdout);
     }
 
     void handle_isready() {
-        // Ensure any pending operations complete
         stop_search();
         std::println("readyok");
-        std::cout.flush();
+        std::fflush(stdout);
     }
 
     void handle_ucinewgame() {
@@ -198,7 +197,7 @@ private:
     void handle_debug() {
         std::cout << search_algo_->board() << '\n';
         std::println("FEN: {}", search_algo_->board().getFen());
-        std::cout.flush();
+        std::fflush(stdout);
     }
 
     void stop_search() {
@@ -240,9 +239,8 @@ private:
 
     void output_bestmove(const SearchResult& result) {
         if (!result.has_move()) {
-            // No legal move (shouldn't happen in normal play)
             std::println("bestmove 0000");
-            std::cout.flush();
+            std::fflush(stdout);
             return;
         }
 
@@ -281,7 +279,7 @@ private:
 
         std::string bestmove_str = chess::uci::moveToUci(result.best_move);
         std::println("bestmove {}", bestmove_str);
-        std::cout.flush();
+        std::fflush(stdout);
     }
 
     static std::vector<std::string> tokenize(std::string_view line) {

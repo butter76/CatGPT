@@ -250,16 +250,24 @@ def _load_params(
 
 
 def _load_params_orbax(params_dir: Path) -> dict:
-    """Load parameters using Orbax checkpointer."""
-    try:
-        import orbax.checkpoint as ocp
+    """Load parameters using Orbax checkpointer.
 
-        checkpointer = ocp.PyTreeCheckpointer()
-        params = checkpointer.restore(params_dir.resolve())
-        return params
-    except ImportError:
-        msg = "Orbax checkpoint found but orbax-checkpoint is not installed"
-        raise ImportError(msg)
+    Handles restoring multi-device sharded checkpoints onto a single device
+    by providing explicit SingleDeviceSharding restore args.
+    """
+    import orbax.checkpoint as ocp
+
+    checkpointer = ocp.PyTreeCheckpointer()
+    resolved = params_dir.resolve()
+
+    param_tree = checkpointer.metadata(resolved).item_metadata.tree
+    device = jax.devices()[0]
+    sharding = jax.sharding.SingleDeviceSharding(device)
+    restore_args = jax.tree_util.tree_map(
+        lambda _: ocp.ArrayRestoreArgs(sharding=sharding),
+        param_tree,
+    )
+    return checkpointer.restore(resolved, restore_args=restore_args)
 
 
 def _load_params_msgpack(
