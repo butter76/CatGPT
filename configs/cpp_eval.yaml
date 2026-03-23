@@ -15,7 +15,7 @@
 #   uv run python scripts/evaluate_cpp.py benchmark.max_puzzles=100
 
 # TensorRT engine path
-trt_engine: "sample.trt"
+trt_engine: "main.trt"
 
 # C++ binary paths (relative to cpp/build/bin/)
 cpp_build_dir: "cpp/build/bin"
@@ -31,9 +31,7 @@ engine:
   # Fractional MCTS settings (only used when type=fractional_mcts)
   fractional_mcts:
     c_puct: 1.75
-    min_total_evals: 640
-    initial_budget: 1.0
-    budget_multiplier: 1.2
+    min_total_evals: 400
 
   # UCI timeout in seconds
   timeout: 120.0

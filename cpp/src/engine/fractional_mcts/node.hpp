@@ -143,7 +143,7 @@ public:
      * @param max_depth          Maximum PV length.
      */
     template <typename AllocFn>
-    [[nodiscard]] std::vector<chess::Move> get_pv(AllocFn&& compute_allocs_fn, int max_depth = 10) {
+    [[nodiscard]] std::vector<chess::Move> get_pv(AllocFn&& compute_allocs_fn, int max_depth = 100) {
         std::vector<chess::Move> pv;
         FractionalNode* node = this;
 

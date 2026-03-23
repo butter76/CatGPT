@@ -110,7 +110,7 @@ public:
     /**
      * Get principal variation (most visited path from this node).
      */
-    [[nodiscard]] std::vector<chess::Move> get_pv(int max_depth = 10) {
+    [[nodiscard]] std::vector<chess::Move> get_pv(int max_depth = 100) {
         std::vector<chess::Move> pv;
         MCTSNode* node = this;
 
