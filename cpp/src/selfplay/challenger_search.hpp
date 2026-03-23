@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <unordered_map>
 #include <vector>
@@ -227,6 +228,17 @@ private:
 
         // Post-process: convert value from [0,1] to [-1,1]
         float value = 2.0f * raw.value - 1.0f;
+
+        // Apply correction history: adjust NN value based on accumulated bias
+        // for positions with similar structure (pawns, kings, material).
+        uint64_t ch = correction_hash(pos);
+        auto corr_it = correction_table_.find(ch);
+        if (corr_it != correction_table_.end() && corr_it->second.weight_sum > 0.0) {
+            float delta = static_cast<float>(
+                corr_it->second.delta_sum / corr_it->second.weight_sum);
+            value -= ch_lambda_ * delta;
+            value = std::clamp(value, -1.0f, 1.0f);
+        }
 
         // Build policy priors via softmax over legal moves
         bool flip = pos.sideToMove() == chess::Color::BLACK;
@@ -445,6 +457,18 @@ private:
             for (int j = 0; j < VALUE_NUM_BINS; ++j) {
                 node->distQ[j] = weighted_distQ[j] * inv_weight;
             }
+
+            // Update correction history: record how wrong the NN was.
+            // nn_original is the raw NN value; node->Q is the search-refined value.
+            auto cache_it = eval_cache_.find(pos_hash);
+            if (cache_it != eval_cache_.end()) {
+                float nn_original = 2.0f * cache_it->second.value - 1.0f;
+                float delta = nn_original - node->Q;
+                uint64_t ch = correction_hash(scratch_board);
+                auto& entry = correction_table_[ch];
+                entry.delta_sum += static_cast<double>(total_weight) * delta;
+                entry.weight_sum += static_cast<double>(total_weight);
+            }
         }
 
         auto& tt_entry = tt_[pos_hash];
@@ -595,6 +619,58 @@ private:
         }
     }
 
+    // ─── Correction history ─────────────────────────────────────────────
+
+    struct CorrHistEntry {
+        double delta_sum = 0.0;
+        double weight_sum = 0.0;
+    };
+
+    static uint64_t bitboard_to_u64(chess::Bitboard bb) {
+        uint64_t val;
+        std::memcpy(&val, &bb, sizeof(uint64_t));
+        return val;
+    }
+
+    /**
+     * Coarse structural hash for correction history bucketing.
+     * Positions with the same pawn placement, king squares, and material
+     * counts share a bucket — even if minor pieces are on different squares.
+     */
+    static uint64_t correction_hash(const chess::Board& board) {
+        uint64_t pw = bitboard_to_u64(
+            board.pieces(chess::PieceType::PAWN, chess::Color::WHITE));
+        uint64_t pb = bitboard_to_u64(
+            board.pieces(chess::PieceType::PAWN, chess::Color::BLACK));
+
+        uint64_t wk = board.kingSq(chess::Color::WHITE).index();
+        uint64_t bk = board.kingSq(chess::Color::BLACK).index();
+
+        int wn = board.pieces(chess::PieceType::KNIGHT, chess::Color::WHITE).count();
+        int bn = board.pieces(chess::PieceType::KNIGHT, chess::Color::BLACK).count();
+        int wb = board.pieces(chess::PieceType::BISHOP, chess::Color::WHITE).count();
+        int bb_ct = board.pieces(chess::PieceType::BISHOP, chess::Color::BLACK).count();
+        int wr = board.pieces(chess::PieceType::ROOK, chess::Color::WHITE).count();
+        int br = board.pieces(chess::PieceType::ROOK, chess::Color::BLACK).count();
+        int wq = board.pieces(chess::PieceType::QUEEN, chess::Color::WHITE).count();
+        int bq = board.pieces(chess::PieceType::QUEEN, chess::Color::BLACK).count();
+
+        uint64_t mat = static_cast<uint64_t>(wn)
+                     | (static_cast<uint64_t>(bn) << 4)
+                     | (static_cast<uint64_t>(wb) << 8)
+                     | (static_cast<uint64_t>(bb_ct) << 12)
+                     | (static_cast<uint64_t>(wr) << 16)
+                     | (static_cast<uint64_t>(br) << 20)
+                     | (static_cast<uint64_t>(wq) << 24)
+                     | (static_cast<uint64_t>(bq) << 28);
+
+        uint64_t h = pw
+                   ^ (pb * 0x9e3779b97f4a7c15ULL)
+                   ^ ((wk | (bk << 6)) * 0x517cc1b727220a95ULL)
+                   ^ (mat * 0x6c62272e07bb0142ULL);
+        return h;
+    }
+
     // ─── PUCT budget allocation (pure CPU, no suspension) ───────────────
 
     [[nodiscard]] static int compute_percentile_bin(
@@ -673,7 +749,10 @@ private:
     int total_gpu_evals_;
     std::unordered_map<uint64_t, RawNNOutput> eval_cache_;
     std::unordered_map<uint64_t, TTEntry> tt_;
-    std::ostream* stats_out_;  // If non-null, JSON stats lines are written here during search
+    std::unordered_map<uint64_t, CorrHistEntry> correction_table_;
+    std::ostream* stats_out_;
+
+    static constexpr float ch_lambda_ = 0.3f;
 };
 
 }  // namespace catgpt
