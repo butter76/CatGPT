@@ -38,6 +38,12 @@
 
 namespace catgpt {
 
+struct TTEntry {
+    float Q = 0.0f;
+    std::array<float, VALUE_NUM_BINS> distQ{};
+    float max_N = -1.0f;
+};
+
 /**
  * Result of a single move search (best move + metadata).
  */
@@ -345,6 +351,17 @@ private:
         if (N <= node->max_N) co_return;
         node->max_N = N;
 
+        uint64_t pos_hash = scratch_board.hash();
+        {
+            auto tt_it = tt_.find(pos_hash);
+            if (tt_it != tt_.end() && tt_it->second.max_N >= N) {
+                node->Q = tt_it->second.Q;
+                node->distQ = tt_it->second.distQ;
+                node->max_N = tt_it->second.max_N;
+                co_return;
+            }
+        }
+
         float effective_variance = node->variance;
         float N_reduction = effective_variance * 12.0f;
         float effective_N = N * N_reduction;
@@ -444,6 +461,13 @@ private:
             for (int j = 0; j < VALUE_NUM_BINS; ++j) {
                 node->distQ[j] = weighted_distQ[j] * inv_weight;
             }
+        }
+
+        auto& tt_entry = tt_[pos_hash];
+        if (node->max_N > tt_entry.max_N) {
+            tt_entry.Q = node->Q;
+            tt_entry.distQ = node->distQ;
+            tt_entry.max_N = node->max_N;
         }
     }
 
@@ -664,6 +688,7 @@ private:
     FractionalMCTSConfig config_;
     int total_gpu_evals_;
     std::unordered_map<uint64_t, RawNNOutput> eval_cache_;
+    std::unordered_map<uint64_t, TTEntry> tt_;
     std::ostream* stats_out_;  // If non-null, JSON stats lines are written here during search
 };
 
