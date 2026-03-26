@@ -386,7 +386,7 @@ private:
                 auto it = allocations.find(move);
                 if (it == allocations.end() || it->second <= 0.0f) continue;
 
-                float limit = std::max(child.max_N, 1.0f) * 1.1f + 1.0f;
+                float limit = std::max(child.max_N, 0.1f) * 1.1f;
                 if (it->second > limit) {
                     it->second = limit;
                     clamped_moves.push_back(move);
