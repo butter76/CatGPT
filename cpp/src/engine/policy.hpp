@@ -94,6 +94,15 @@ inline std::pair<int, int> encode_move_to_policy_index(const chess::Move& move, 
     int from_chess = move.from().index();
     int to_chess = move.to().index();
 
+    // Castling: the chess library stores the rook's square as to(), but the
+    // policy target (trained from UCI) uses the king's landing square (g/c file).
+    if (move.typeOf() == chess::Move::CASTLING) {
+        auto king_to = chess::Square(
+            move.to() > move.from() ? chess::File::FILE_G : chess::File::FILE_C,
+            move.from().rank());
+        to_chess = king_to.index();
+    }
+
     // Convert to policy indices (a8=0 to h1=63)
     int from_idx = detail::chess_sq_to_policy_idx(from_chess);
     int to_idx = detail::chess_sq_to_policy_idx(to_chess);
