@@ -13,6 +13,7 @@ class SPlusState(NamedTuple):
     q_sides: chex.Array
     step: int
     ema_rate: float
+    eigendecomp_skipped: bool
 
 def splus_get_eval_params(state):
     ema_hat = jax.tree.map(lambda e: e / (1 - state.ema_rate ** state.step), state.ema)
@@ -50,7 +51,7 @@ def splus(
                         else None for d in p.shape]
         q_sides = jax.tree.map(qs_decomp, params)
         step = 0
-        return SPlusState(ema, momentum, sides, q_sides, step, ema_rate)
+        return SPlusState(ema, momentum, sides, q_sides, step, ema_rate, jnp.bool_(False))
 
     def update_sides(g, s):
         if len(g.shape) == 2:
@@ -112,9 +113,21 @@ def splus(
 
         # Every `inverse_every` steps, we update the inverse eigendecomposition.
         do_inverse = (step % inverse_every == 0) | (step == 1)
-        q_sides = jax.lax.cond(do_inverse, update_inverse, lambda _ : state.q_sides, sides)
+        new_q_sides = jax.lax.cond(do_inverse, update_inverse, lambda _ : state.q_sides, sides)
 
-        return updates, SPlusState(ema, momentum, sides, q_sides, step, state.ema_rate)
+        # Validate eigendecomposition: reject if eigenvectors contain NaN/Inf
+        q_leaves = jax.tree.leaves(new_q_sides)
+        all_finite = jnp.bool_(True)
+        for leaf in q_leaves:
+            all_finite = all_finite & jnp.all(jnp.isfinite(leaf))
+        eigendecomp_skipped = do_inverse & (~all_finite)
+
+        q_sides = jax.tree.map(
+            lambda new, old: jnp.where(all_finite, new, old),
+            new_q_sides, state.q_sides,
+        )
+
+        return updates, SPlusState(ema, momentum, sides, q_sides, step, state.ema_rate, eigendecomp_skipped)
 
     def shape_scaling(updates, state, params):
         def shape_scale(path, u):

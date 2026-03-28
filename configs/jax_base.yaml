@@ -45,7 +45,7 @@ model:
   # Bounds attention logits to (-cap, +cap) via: cap * tanh(logits / cap)
   # Prevents rare attention logit explosions that cause NaN, with negligible compute cost.
   # null = disabled.
-  attn_logit_soft_cap: 50.0
+  attn_logit_soft_cap: null
 
   # Output heads configuration
   output_heads:
@@ -74,7 +74,7 @@ tokenizer:
 # Optimizer configuration
 optimizer:
   name: "splus"  # Options: "adamw", "splus", "sgd"
-  learning_rate: 0.24
+  learning_rate: 0.27
   weight_decay: 0.01
   # AdamW/SGD specific
   b1: 0.9

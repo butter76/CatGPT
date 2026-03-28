@@ -504,18 +504,46 @@ class Trainer:
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
         (total_loss, (outputs, losses)), grads = grad_fn(state.params)
 
-        # Skip optimizer update when loss is non-finite to prevent
-        # permanent corruption of optimizer state (momentum, EMA, etc.)
+        # Guard 1: Skip optimizer entirely when loss is non-finite
+        # (prevents NaN gradients from corrupting optimizer state)
         is_finite_loss = jnp.isfinite(total_loss)
-        state = jax.lax.cond(
+        new_state = jax.lax.cond(
             is_finite_loss,
             lambda s, g: s.apply_gradients(grads=g),
             lambda s, _: s,
             state, grads,
         )
 
+        # Guard 2: Verify new params are finite after optimizer step
+        # (catches destructive-but-finite-loss updates, e.g. from bad eigendecomposition)
+        all_params_finite = jax.tree_util.tree_reduce(
+            lambda a, b: a & jnp.all(jnp.isfinite(b)),
+            new_state.params,
+            jnp.bool_(True),
+        )
+        update_ok = is_finite_loss & all_params_finite
+        params_rolled_back = is_finite_loss & (~all_params_finite)
+
+        # Extract eigendecomp_skipped from optimizer state (before potential rollback)
+        splus_state = self._find_splus_state(new_state.opt_state)
+        eigendecomp_skipped = (
+            splus_state.eigendecomp_skipped if splus_state is not None
+            else jnp.bool_(False)
+        )
+
+        state = jax.lax.cond(
+            update_ok,
+            lambda: new_state,
+            lambda: state,
+        )
+
         # Compute metrics
-        metrics = {"loss": total_loss, "nan_skipped": ~is_finite_loss}
+        metrics = {
+            "loss": total_loss,
+            "nan_skipped": ~update_ok,
+            "params_rolled_back": params_rolled_back,
+            "eigendecomp_skipped": is_finite_loss & eigendecomp_skipped,
+        }
 
         # Per-head losses for logging
         for head_name, head_loss in losses.items():
@@ -1007,6 +1035,18 @@ class Trainer:
                 self.global_step += 1
                 accumulation_count = 0
 
+                # Warn on training stability events
+                if bool(metrics.get("params_rolled_back", False)):
+                    logger.warning(
+                        f"Step {self.global_step}: params non-finite after optimizer step, "
+                        "rolled back to pre-update state"
+                    )
+                if bool(metrics.get("eigendecomp_skipped", False)):
+                    logger.warning(
+                        f"Step {self.global_step}: eigendecomposition produced non-finite "
+                        "eigenvectors, kept previous preconditioner"
+                    )
+
                 # Compute per-head gradient norms if enabled (expensive, done at lower frequency)
                 if (
                     self.metrics_config.log_head_grad_norms
@@ -1272,6 +1312,14 @@ class Trainer:
                 for key, value in metrics.items():
                     if key.startswith("head_grad_norm/"):
                         log_dict[f"train/{key}"] = float(value)
+
+            # Stability metrics
+            if "nan_skipped" in metrics:
+                log_dict["train/nan_skipped"] = int(bool(metrics["nan_skipped"]))
+            if "params_rolled_back" in metrics:
+                log_dict["train/params_rolled_back"] = int(bool(metrics["params_rolled_back"]))
+            if "eigendecomp_skipped" in metrics:
+                log_dict["train/eigendecomp_skipped"] = int(bool(metrics["eigendecomp_skipped"]))
 
             wandb.log(log_dict, step=self.global_step)
 
