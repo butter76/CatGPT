@@ -5,7 +5,7 @@
 model:
   name: "transformer"
   hidden_size: 768
-  num_layers: 48
+  num_layers: 16
   num_heads: 48
   ff_dim: 1536  # Defaults to 4 * hidden_size
   attention_dim: null  # Expanded attention dim (null = hidden_size). E.g., 768 with 48 heads for 50% more attention capacity
@@ -39,7 +39,7 @@ model:
   # See: https://arxiv.org/abs/2601.19895
   keel:
     enabled: true        # Enable Keel normalization (replaces Peri-LN)
-    alpha: 19          # Highway scaling factor. null = auto (2 * num_layers = 32)
+    alpha: 6          # Highway scaling factor. null = auto (2 * num_layers = 32)
 
   # Output heads configuration
   output_heads:
@@ -68,7 +68,7 @@ tokenizer:
 # Optimizer configuration
 optimizer:
   name: "splus"  # Options: "adamw", "splus", "sgd"
-  learning_rate: 0.20
+  learning_rate: 0.24
   weight_decay: 0.01
   # AdamW/SGD specific
   b1: 0.9
@@ -82,6 +82,7 @@ optimizer:
   splus_max_dim: 10000
   # Nonstandard scaling: params matching these strings (case-insensitive) get constant scaling
   # instead of shape-based scaling (2/(dim0+dim1)). Applies to 2D matrices only.
+  splus_eps: 1.0e-8
   splus_nonstandard_strings: ["layernorm"]
   splus_nonstandard_constant: 0.001
 
@@ -99,9 +100,9 @@ scheduler:
 # Training loop configuration
 # Training is step-based with "pseudo-epochs" for validation/checkpointing
 training:
-  max_steps: 200000  # Total training steps
-  steps_per_epoch: 2000  # Steps per pseudo-epoch (validation interval)
-  batch_size: 3072
+  max_steps: 150000  # Total training steps
+  steps_per_epoch: 6000  # Steps per pseudo-epoch (validation interval)
+  batch_size: 4096
   gradient_clip: 1.0
   gradient_accumulation_steps: 1
   max_eval_steps: 200  # Max validation steps (prevents infinite loop)
@@ -117,7 +118,7 @@ training:
 data:
   train_path: "~/sample_training_data/shard-*-training-run1-test80-20240*.bag"
   val_path: "~/sample_training_data/shard-0-training-run1-test80-20240401-0117.bag"
-  num_workers: 20
+  num_workers: 15
   prefetch_factor: 10
   seed: 42
 

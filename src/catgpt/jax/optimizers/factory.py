@@ -51,6 +51,7 @@ def create_optimizer(
             b1=config.splus_b1,
             b2=config.splus_b2,
             ema_rate=config.splus_ema_rate,
+            eps=config.splus_eps,
             inverse_every=config.splus_inverse_every,
             max_dim=config.splus_max_dim,
             weight_decay=config.weight_decay,
