@@ -35,6 +35,8 @@ import {
   Save,
   AlertCircle,
   ExternalLink,
+  Copy,
+  Check,
   ChevronLeft,
   ChevronRight,
   ChevronsLeft,
@@ -76,6 +78,7 @@ function AnalyzePageContent() {
     from: string;
     to: string;
   } | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const boardContainerRef = useRef<HTMLDivElement>(null);
   const moveListRef = useRef<HTMLDivElement>(null);
@@ -318,6 +321,27 @@ function AnalyzePageContent() {
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>Flip board</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      navigator.clipboard.writeText(currentFen);
+                      setCopied(true);
+                      setTimeout(() => setCopied(false), 2000);
+                    }}
+                  >
+                    {copied ? (
+                      <Check className="w-4 h-4 text-green-500" />
+                    ) : (
+                      <Copy className="w-4 h-4" />
+                    )}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Copy FEN</TooltipContent>
               </Tooltip>
 
               <Tooltip>

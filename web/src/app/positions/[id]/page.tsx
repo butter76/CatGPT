@@ -30,7 +30,7 @@ import {
   updatePositionMetaAPI,
 } from "@/lib/store";
 import { usePositionStore } from "@/lib/store";
-import { sideToMove, uciToAlgebraic, lichessAnalysisUrl } from "@/lib/chess-utils";
+import { sideToMove, uciToAlgebraic, uciSequenceToAlgebraic, lichessAnalysisUrl } from "@/lib/chess-utils";
 import type { Position, PositionType, Outcome, EngineAnalysis, EngineInfoLine, CatGPTSearchStats, BlunderTag } from "@/lib/types";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -712,13 +712,7 @@ function StoredEngineResultCard({
 
         {/* PV (UCI engines only) */}
         {ea.engine !== "catgpt" && ea.engine !== "catgpt_mcts" && ea.pv.length > 0 && (
-          <div className="text-xs font-mono text-muted-foreground break-all">
-            <span className="text-foreground font-medium">{fmtMove(ea.pv[0])}</span>
-            {ea.pv.slice(1, 10).map((m, i) => (
-              <span key={i}>{" "}{m}</span>
-            ))}
-            {ea.pv.length > 10 && " ..."}
-          </div>
+          <StoredPVLine fen={fen} pv={ea.pv} />
         )}
 
         {/* UCI Depth History (interactive) */}
@@ -738,6 +732,54 @@ function StoredEngineResultCard({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+// ─── Shared PV Line Display ───────────────────────────────────────
+
+function StoredPVLine({
+  fen,
+  pv,
+  label,
+}: {
+  fen: string;
+  pv: string[];
+  label?: string;
+}) {
+  const { notationFormat } = usePositionStore();
+  const enriched = uciSequenceToAlgebraic(fen, pv);
+
+  return (
+    <div className="space-y-1">
+      {label && (
+        <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wide">
+          {label}
+        </span>
+      )}
+      <div className="text-xs font-mono text-muted-foreground break-all">
+        {enriched.map((entry, i) => (
+          <span key={i}>
+            {i > 0 && " "}
+            {entry.fenAfter ? (
+              <a
+                href={`/analyze?fen=${encodeURIComponent(entry.fenAfter)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={`hover:underline cursor-pointer ${
+                  i === 0 ? "text-foreground font-medium" : ""
+                }`}
+              >
+                {notationFormat === "algebraic" ? entry.san : pv[i]}
+              </a>
+            ) : (
+              <span className={i === 0 ? "text-foreground font-medium" : ""}>
+                {notationFormat === "algebraic" ? entry.san : pv[i]}
+              </span>
+            )}
+          </span>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -791,24 +833,7 @@ function StoredUCIHistoryViewer({
 
       {/* PV for selected depth */}
       {displayInfo.pv.length > 0 && (
-        <div className="space-y-1">
-          <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wide">
-            Principal Variation
-          </span>
-          <div className="text-xs font-mono text-muted-foreground break-all">
-            {displayInfo.pv.slice(0, 16).map((m, i) => (
-              <span key={i}>
-                {i > 0 && " "}
-                <span
-                  className={i === 0 ? "text-foreground font-medium" : ""}
-                >
-                  {m}
-                </span>
-              </span>
-            ))}
-            {displayInfo.pv.length > 16 && " …"}
-          </div>
-        </div>
+        <StoredPVLine fen={fen} pv={displayInfo.pv} label="Principal Variation" />
       )}
 
       {/* WDL for selected depth (Leela) */}
@@ -909,8 +934,12 @@ function StoredUCIHistoryViewer({
                           </span>
                         </td>
                         <td className="py-0.5 pr-2 text-muted-foreground truncate max-w-[160px]">
-                          {info.pv.slice(1, 5).join(" ")}
-                          {info.pv.length > 5 && " …"}
+                          {(() => {
+                            const seq = uciSequenceToAlgebraic(fen, info.pv);
+                            return seq.slice(1).map((e, j) =>
+                              notationFormat === "algebraic" ? e.san : info.pv[j + 1]
+                            ).join(" ");
+                          })()}
                         </td>
                         <td className="text-right py-0.5">
                           {info.nodes >= 1000

@@ -16,7 +16,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { useEngineAnalysis } from "@/lib/use-engine-analysis";
 import { usePositionStore } from "@/lib/store";
-import { uciToAlgebraic } from "@/lib/chess-utils";
+import { uciToAlgebraic, uciSequenceToAlgebraic } from "@/lib/chess-utils";
 import type { EngineInfoLine, EngineKind, CatGPTSearchStats } from "@/lib/types";
 import {
   Play,
@@ -333,28 +333,7 @@ function CatGPTStatsDisplay({
 
       {/* PV line */}
       {displayStats.pv && displayStats.pv.length > 0 && (
-        <div className="space-y-1">
-          <span className="text-xs text-muted-foreground">
-            Principal Variation:
-          </span>
-          <div className="text-xs font-mono text-muted-foreground break-all">
-            {displayStats.pv
-              .slice(0, 40)
-              .map((m, i) => (
-                <span key={i}>
-                  {i > 0 && " "}
-                  <span
-                    className={
-                      i === 0 ? "text-foreground font-medium" : ""
-                    }
-                  >
-                    {fmtMove(m)}
-                  </span>
-                </span>
-              ))}
-            {displayStats.pv.length > 40 && " ..."}
-          </div>
-        </div>
+        <PVLine fen={fen} pv={displayStats.pv} />
       )}
 
       <Separator />
@@ -562,6 +541,47 @@ function DistQHistogram({ distQ }: { distQ: number[] }) {
   );
 }
 
+// ─── Shared PV Line Display ────────────────────────────────────────
+
+function PVLine({ fen, pv }: { fen: string; pv: string[] }) {
+  const { notationFormat } = usePositionStore();
+  const enriched = useMemo(
+    () => uciSequenceToAlgebraic(fen, pv),
+    [fen, pv]
+  );
+
+  return (
+    <div className="space-y-1">
+      <span className="text-xs text-muted-foreground">
+        Principal Variation:
+      </span>
+      <div className="text-xs font-mono text-muted-foreground break-all">
+        {enriched.map((entry, i) => (
+          <span key={i}>
+            {i > 0 && " "}
+            {entry.fenAfter ? (
+              <a
+                href={`/analyze?fen=${encodeURIComponent(entry.fenAfter)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={`hover:underline cursor-pointer ${
+                  i === 0 ? "text-foreground font-medium" : ""
+                }`}
+              >
+                {notationFormat === "algebraic" ? entry.san : pv[i]}
+              </a>
+            ) : (
+              <span className={i === 0 ? "text-foreground font-medium" : ""}>
+                {notationFormat === "algebraic" ? entry.san : pv[i]}
+              </span>
+            )}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ─── UCI Stats Display (Stockfish / Leela) ────────────────────────
 
 function UCIStatsDisplay({
@@ -655,28 +675,7 @@ function UCIStatsDisplay({
 
       {/* PV line */}
       {displayInfo.pv.length > 0 && (
-        <div className="space-y-1">
-          <span className="text-xs text-muted-foreground">
-            Principal Variation:
-          </span>
-          <div className="text-xs font-mono text-muted-foreground break-all">
-            {displayInfo.pv
-              .slice(0, 12)
-              .map((m, i) => (
-                <span key={i}>
-                  {i > 0 && " "}
-                  <span
-                    className={
-                      i === 0 ? "text-foreground font-medium" : ""
-                    }
-                  >
-                    {m}
-                  </span>
-                </span>
-              ))}
-            {displayInfo.pv.length > 12 && " ..."}
-          </div>
-        </div>
+        <PVLine fen={fen} pv={displayInfo.pv} />
       )}
 
       {/* WDL */}

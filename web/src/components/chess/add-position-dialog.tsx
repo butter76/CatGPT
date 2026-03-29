@@ -54,6 +54,24 @@ export function AddPositionDialog({
   const [moveInput, setMoveInput] = useState("");
   const [fenValid, setFenValid] = useState(!!initialFen && isValidFEN(initialFen));
 
+  const handleOpenChange = useCallback(
+    (nextOpen: boolean) => {
+      if (nextOpen) {
+        const f = initialFen ?? "";
+        setFen(f);
+        setFenValid(!!f && isValidFEN(f));
+        setName("");
+        setDescription("");
+        setType("SHARP");
+        setExpectedOutcome("draw");
+        setAnnotations([]);
+        setMoveInput("");
+      }
+      setOpen(nextOpen);
+    },
+    [initialFen]
+  );
+
   const handleFenChange = useCallback((val: string) => {
     setFen(val);
     setFenValid(isValidFEN(val));
@@ -114,7 +132,7 @@ export function AddPositionDialog({
   };
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>{children}</DialogTrigger>
       <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
