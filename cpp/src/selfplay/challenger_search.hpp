@@ -421,7 +421,20 @@ private:
         // Recompute allocations after recursion
         auto second_allocations = compute_allocations(node, N);
 
-        // Update Q and distQ as weighted average of children
+        // Update Q and distQ as weighted average of children,
+        // omitting low-weight children (< 2% of N) to reduce noise.
+        float weight_threshold = 0.02f * N;
+
+        // Find the highest-allocation child (always included as a safety)
+        chess::Move max_alloc_move = chess::Move::NO_MOVE;
+        float max_alloc_value = -1.0f;
+        for (const auto& [move, alloc] : second_allocations) {
+            if (alloc > max_alloc_value) {
+                max_alloc_value = alloc;
+                max_alloc_move = move;
+            }
+        }
+
         float weighted_sum = 0.0f;
         float total_weight = 0.0f;
         std::array<float, VALUE_NUM_BINS> weighted_distQ{};
@@ -429,14 +442,15 @@ private:
 
         for (auto& [move, child] : node->children) {
             auto it = second_allocations.find(move);
-            if (it != second_allocations.end() && it->second > 0.0f) {
-                float N_i = it->second;
-                weighted_sum += (-child.Q) * N_i;
-                for (int j = 0; j < VALUE_NUM_BINS; ++j) {
-                    weighted_distQ[VALUE_NUM_BINS - 1 - j] += child.distQ[j] * N_i;
-                }
-                total_weight += N_i;
+            if (it == second_allocations.end() || it->second <= 0.0f) continue;
+            if (it->second < weight_threshold && move != max_alloc_move) continue;
+
+            float N_i = it->second;
+            weighted_sum += (-child.Q) * N_i;
+            for (int j = 0; j < VALUE_NUM_BINS; ++j) {
+                weighted_distQ[VALUE_NUM_BINS - 1 - j] += child.distQ[j] * N_i;
             }
+            total_weight += N_i;
         }
 
         if (total_weight > 0.0f) {
