@@ -643,7 +643,7 @@ private:
         if (node->children.empty()) return allocations;
 
         float c_puct = config_.c_puct;
-        float N_exp = std::pow(N, 0.666f) / 2.5f;
+        float N_exp = std::pow(N, 0.666f) / 3.0f;
 
         std::vector<std::pair<chess::Move, FractionalNode*>> children_vec;
         children_vec.reserve(node->children.size());
