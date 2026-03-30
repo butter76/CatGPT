@@ -281,8 +281,8 @@ private:
             }
         }
 
-        // Softmax at temp 1.2 (warmer — used only for PUCT allocation)
-        constexpr float alloc_temp = 1.2f;
+        // Softmax at temp 1.3 (warmer — used only for PUCT allocation)
+        constexpr float alloc_temp = 1.3f;
         constexpr float inv_alloc_temp = 1.0f / alloc_temp;
         std::unordered_map<chess::Move, float, MoveHash> policy_priors_alloc;
         {
@@ -300,7 +300,7 @@ private:
             }
         }
 
-        // Optimistic policy (from NN's optimistic_policy head, temp 1.2)
+        // Optimistic policy (from NN's optimistic_policy head, temp 1.3)
         std::unordered_map<chess::Move, float, MoveHash> policy_priors_optimistic;
         if (raw.has_optimistic_policy) {
             std::vector<std::pair<chess::Move, float>> opt_move_logits;
