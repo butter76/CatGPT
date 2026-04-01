@@ -21,7 +21,7 @@ Usage:
     uv run python scripts/train_jax.py +resume_from=checkpoints_jax/epoch_10
 
     # Quick test run
-    uv run python scripts/train_jax.py training.max_steps=100 training.steps_per_epoch=50
+    uv run python scripts/train_jax.py training.total_steps=100 training.steps_per_epoch=50
 """
 
 from pathlib import Path
@@ -107,8 +107,10 @@ def main(cfg: DictConfig) -> None:
     Args:
         cfg: Hydra configuration.
     """
-    # Prompt for run name first (before any logging setup)
-    run_name = prompt_run_name()
+    # Use run_name from config if provided, otherwise prompt interactively
+    run_name = cfg.get("run_name", None)
+    if run_name is None:
+        run_name = prompt_run_name()
 
     # Setup logging
     setup_logging_jax(level=cfg.get("logging", {}).get("level", "INFO"))
@@ -158,17 +160,19 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Model parameters: {param_count:,}")
 
     # Create learning rate schedule (for WandB logging)
+    # Uses total_steps (full run) so the schedule shape is correct regardless of
+    # which shard we're on. steps_per_run only controls the training loop stop.
     lr_schedule = create_lr_schedule(
         experiment_config.optimizer.learning_rate,
         experiment_config.scheduler,
-        total_steps=experiment_config.training.max_steps,
+        total_steps=experiment_config.training.total_steps,
     )
 
     # Create optimizer with gradient clipping
     optimizer = create_optimizer_with_gradient_clipping(
         experiment_config.optimizer,
         experiment_config.scheduler,
-        total_steps=experiment_config.training.max_steps,
+        total_steps=experiment_config.training.total_steps,
         gradient_clip=experiment_config.training.gradient_clip,
     )
 

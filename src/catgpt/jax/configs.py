@@ -285,9 +285,15 @@ class JaxTrainingConfig:
 
     Training is step-based with "pseudo-epochs" - fixed step intervals
     at which validation runs and checkpoints are saved.
+
+    For multi-shard training:
+    - total_steps: full run length, used to shape the LR schedule
+    - steps_per_run: how many steps each shard invocation trains for;
+      the loop stops at min(total_steps, global_step + steps_per_run)
     """
 
-    max_steps: int = 300_000  # Total training steps
+    total_steps: int = 300_000  # Total training steps across all shards (shapes LR schedule)
+    steps_per_run: int | None = None  # Steps to train in this invocation (None = train to total_steps)
     steps_per_epoch: int = 3000  # Steps per pseudo-epoch (for eval/checkpoint)
     batch_size: int = 64
     gradient_clip: float | None = 1.0

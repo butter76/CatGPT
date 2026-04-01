@@ -940,32 +940,34 @@ class Trainer:
         Training is step-based. Validation runs at the end of each
         pseudo-epoch (every `steps_per_epoch` steps).
 
+        For multi-shard training, total_steps shapes the LR schedule while
+        steps_per_run limits how far this invocation trains. The loop stops
+        at min(total_steps, global_step + steps_per_run).
+
         Returns:
             Dictionary with final metrics.
         """
-        max_steps = self.training_config.max_steps
+        total_steps = self.training_config.total_steps
+        steps_per_run = self.training_config.steps_per_run
         steps_per_epoch = self.training_config.steps_per_epoch
-        total_epochs = max_steps // steps_per_epoch
         accumulation_steps = self.training_config.gradient_accumulation_steps
 
+        # stop_at: where this invocation stops training
+        if steps_per_run is not None:
+            stop_at = min(total_steps, self.global_step + steps_per_run)
+        else:
+            stop_at = total_steps
+
+        # Total pseudo-epochs across the full run (for progress display)
+        total_epochs = total_steps // steps_per_epoch
+
         logger.info(
-            f"Starting training for {max_steps} steps "
+            f"Starting training: global_step={self.global_step}, "
+            f"stop_at={stop_at}, total_steps={total_steps} "
             f"({total_epochs} pseudo-epochs of {steps_per_epoch} steps each)"
         )
 
         data_iter = self._infinite_dataloader()
-
-        # When resuming, fast-forward the dataloader to match consumed batches.
-        # Each global_step consumed accumulation_steps batches, so skip that many.
-        batches_to_skip = self.global_step * accumulation_steps
-        if batches_to_skip > 0:
-            logger.info(f"Skipping {batches_to_skip} batches to align dataloader with checkpoint...")
-            for _ in tqdm(range(batches_to_skip), desc="Skipping batches", unit="batch"):
-                next(data_iter)
-            logger.info("Dataloader fast-forward complete.")
-
-        # Wrap with device prefetching (after fast-forward so skipped
-        # batches never touch the GPU)
         prefetch_iter = self._prefetching_dataloader(data_iter)
 
         epoch_loss = 0.0
@@ -984,7 +986,7 @@ class Trainer:
         accumulated_grads = None
         accumulation_count = 0
 
-        while self.global_step < max_steps:
+        while self.global_step < stop_at:
             batch = next(prefetch_iter)
 
             # Training step
@@ -1035,7 +1037,7 @@ class Trainer:
                     last_epoch = self.current_epoch
 
                     # Start new epoch progress bar
-                    if self.global_step < max_steps:
+                    if self.global_step < stop_at:
                         epoch_pbar = tqdm(
                             total=steps_per_epoch,
                             desc=f"Epoch {self.current_epoch}/{total_epochs}",
@@ -1060,6 +1062,8 @@ class Trainer:
 
         return {
             "final_step": self.global_step,
+            "stop_at": stop_at,
+            "total_steps": total_steps,
             "final_epoch": self.current_epoch,
             "best_val_loss": self.best_val_loss,
         }

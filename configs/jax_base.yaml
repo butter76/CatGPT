@@ -5,7 +5,7 @@
 model:
   name: "transformer"
   hidden_size: 768
-  num_layers: 16
+  num_layers: 24
   num_heads: 48
   ff_dim: 1536  # Defaults to 4 * hidden_size
   attention_dim: null  # Expanded attention dim (null = hidden_size). E.g., 768 with 48 heads for 50% more attention capacity
@@ -100,7 +100,8 @@ scheduler:
 # Training loop configuration
 # Training is step-based with "pseudo-epochs" for validation/checkpointing
 training:
-  max_steps: 150000  # Total training steps
+  total_steps: 6000000  # Total training steps across all shards (shapes LR schedule)
+  steps_per_run: 150000  # Steps per shard invocation (null = train to total_steps)
   steps_per_epoch: 6000  # Steps per pseudo-epoch (validation interval)
   batch_size: 4096
   gradient_clip: 1.0
