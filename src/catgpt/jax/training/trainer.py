@@ -270,6 +270,7 @@ class Trainer:
             self._wandb_run = wandb.init(
                 project=self.wandb_config.project,
                 entity=self.wandb_config.entity,
+                group=self.wandb_config.group,
                 name=self.wandb_config.run_name,
                 tags=self.wandb_config.tags,
                 config=config_dict,

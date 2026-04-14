@@ -345,6 +345,7 @@ class JaxWandbConfig:
     enabled: bool = True
     project: str = "catgpt-jax"
     entity: str | None = None
+    group: str | None = None
     run_name: str | None = None
     tags: list[str] = field(default_factory=list)
     log_every_steps: int = 10

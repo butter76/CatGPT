@@ -30,8 +30,9 @@ WANDB_PROJECT = "S1"
 TOTAL_SHARDS = 40
 
 # LR schedule spans the full run; each shard trains for steps_per_run steps
-TOTAL_STEPS = 6_000_000
-STEPS_PER_RUN = 150_000
+STEPS_PER_RUN = 230_000
+TOTAL_STEPS = TOTAL_SHARDS * STEPS_PER_RUN
+
 
 # Local paths
 CHECKPOINT_BASE = Path("checkpoints_jax")
@@ -106,9 +107,10 @@ def train_shard(
     cmd = [
         "uv", "run", "python", "scripts/train_jax.py",
         f"data.train_path={shard_data_path}",
-        f"data.val_path={shard_data_path}",
+        "data.val_path=/home/ubuntu/val_set/*.bag",
         f"+run_name={RUN_NAME}",
         f"wandb.project={WANDB_PROJECT}",
+        f"wandb.group={RUN_NAME}",
         f"wandb.run_name=shard_{shard_index:02d}",
         f"wandb.tags=[S1,shard_{shard_index:02d}]",
         f"training.total_steps={total_steps}",
