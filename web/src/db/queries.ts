@@ -17,6 +17,71 @@ function generateId(): string {
 
 // ─── Read ─────────────────────────────────────────────────────────
 
+/**
+ * Lightweight list query for the /positions page.
+ * Skips engine analyses and policy entries (the heaviest payloads) since the
+ * list view only needs basic metadata, move-annotation counts, and a boolean
+ * flag for whether a network analysis exists.
+ */
+export async function getAllPositionsSummary(): Promise<Position[]> {
+  const rows = await db.select().from(positions).orderBy(desc(positions.createdAt));
+
+  const posIds = rows.map((r) => r.id);
+  if (posIds.length === 0) return [];
+
+  const [annRows, naRows] = await Promise.all([
+    db.select().from(moveAnnotations).where(inArray(moveAnnotations.positionId, posIds)),
+    db
+      .select({
+        id: networkAnalyses.id,
+        positionId: networkAnalyses.positionId,
+        bestQ: networkAnalyses.bestQ,
+        wdlWin: networkAnalyses.wdlWin,
+        wdlDraw: networkAnalyses.wdlDraw,
+        wdlLoss: networkAnalyses.wdlLoss,
+        nodes: networkAnalyses.nodes,
+        createdAt: networkAnalyses.createdAt,
+      })
+      .from(networkAnalyses)
+      .where(inArray(networkAnalyses.positionId, posIds))
+      .orderBy(desc(networkAnalyses.createdAt)),
+  ]);
+
+  const annByPos = groupBy(annRows, (r) => r.positionId);
+  const naByPos = groupBy(naRows, (r) => r.positionId);
+
+  return rows.map((row) => {
+    const anns = annByPos[row.id] ?? [];
+    const nas = naByPos[row.id] ?? [];
+    const latestNA = nas[0];
+
+    return {
+      id: row.id,
+      name: row.name,
+      description: row.description ?? undefined,
+      type: row.type,
+      fen: row.fen,
+      expectedOutcome: row.expectedOutcome ?? undefined,
+      blunderTag: row.blunderTag ?? undefined,
+      moveAnnotations: anns.length > 0
+        ? anns.map((a) => ({ move: a.move, annotation: a.annotation }))
+        : undefined,
+      networkAnalysis: latestNA
+        ? {
+            policy: [],
+            wdl: { win: latestNA.wdlWin, draw: latestNA.wdlDraw, loss: latestNA.wdlLoss },
+            bestQ: latestNA.bestQ,
+            nodes: latestNA.nodes,
+            timestamp: latestNA.createdAt.toISOString(),
+          }
+        : undefined,
+      createdAt: row.createdAt.toISOString(),
+      updatedAt: row.updatedAt.toISOString(),
+    };
+  });
+}
+
+/** Full query with all related data — used by getPositionById and createPosition. */
 export async function getAllPositions(): Promise<Position[]> {
   const rows = await db.select().from(positions).orderBy(desc(positions.createdAt));
 

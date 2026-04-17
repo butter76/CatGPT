@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getAllPositions, createPosition } from "@/db/queries";
+import { getAllPositionsSummary, createPosition } from "@/db/queries";
 
-// GET /api/positions — list all positions
+// GET /api/positions — list all positions (lightweight summary)
 export async function GET() {
   try {
-    const positions = await getAllPositions();
+    const positions = await getAllPositionsSummary();
     return NextResponse.json(positions);
   } catch (error) {
     console.error("Failed to fetch positions:", error);
