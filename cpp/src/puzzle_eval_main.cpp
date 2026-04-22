@@ -42,6 +42,8 @@ void print_usage(const char* argv0) {
     std::println(stderr, "Search options:");
     std::println(stderr, "  --evals N        Min GPU evals per move (default: 400)");
     std::println(stderr, "  --cpuct F        PUCT exploration constant (default: 1.75)");
+    std::println(stderr, "  --policy-only    Skip MCTS; pick argmax of legal-move policy logits");
+    std::println(stderr, "  --value-only     1-ply value lookahead; pick move minimising opponent value");
     std::println(stderr, "");
     std::println(stderr, "Data options:");
     std::println(stderr, "  --max-puzzles N  Limit number of puzzles (default: all)");
@@ -96,6 +98,10 @@ int main(int argc, char* argv[]) {
             config.max_batch_size = next_int();
         } else if (arg == "--max-puzzles") {
             config.max_puzzles = next_int();
+        } else if (arg == "--policy-only") {
+            config.mode = catgpt::PuzzleEngineMode::PolicyOnly;
+        } else if (arg == "--value-only") {
+            config.mode = catgpt::PuzzleEngineMode::ValueOnly;
         } else {
             std::println(stderr, "Unknown option: {}", arg);
             print_usage(argv[0]);
@@ -125,8 +131,18 @@ int main(int argc, char* argv[]) {
     std::println(stderr, "  Concurrent:  {}", config.num_concurrent);
     std::println(stderr, "  Threads:     {}", config.num_search_threads);
     std::println(stderr, "  Batch size:  {}", config.max_batch_size);
-    std::println(stderr, "  Evals/move:  {}", config.search_config.min_total_evals);
-    std::println(stderr, "  PUCT:        {:.2f}", config.search_config.c_puct);
+    switch (config.mode) {
+    case catgpt::PuzzleEngineMode::PolicyOnly:
+        std::println(stderr, "  Mode:        policy-only (no search)");
+        break;
+    case catgpt::PuzzleEngineMode::ValueOnly:
+        std::println(stderr, "  Mode:        value-only (1-ply lookahead)");
+        break;
+    case catgpt::PuzzleEngineMode::Search:
+        std::println(stderr, "  Evals/move:  {}", config.search_config.min_total_evals);
+        std::println(stderr, "  PUCT:        {:.2f}", config.search_config.c_puct);
+        break;
+    }
     std::println(stderr, "");
 
     try {
