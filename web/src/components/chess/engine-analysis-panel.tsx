@@ -154,7 +154,7 @@ export function EngineAnalysisPanel({
                   onChange={(e) => setNodes(parseInt(e.target.value) || 1)}
                   className="h-8 text-xs font-mono"
                   min={isCatGPTEngine(selectedEngine) ? 10 : 100}
-                  max={isCatGPTEngine(selectedEngine) ? 10000 : 100000000}
+                  {...(isCatGPTEngine(selectedEngine) ? { max: 10000 } : {})}
                   step={isCatGPTEngine(selectedEngine) ? 100 : 100000}
                 />
               </div>
