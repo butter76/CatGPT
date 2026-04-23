@@ -41,6 +41,7 @@ export async function PATCH(
       blunderTag?: "catgpt" | "stockfish" | "leela" | null;
       type?: "SHARP" | "FORTRESS";
       expectedOutcome?: "win" | "loss" | "draw" | "unknown" | null;
+      longBench?: boolean;
     } = {};
 
     if (typeof body.name === "string" && body.name.trim()) {
@@ -66,6 +67,9 @@ export async function PATCH(
       if (validOutcomes.includes(body.expectedOutcome)) {
         updates.expectedOutcome = body.expectedOutcome;
       }
+    }
+    if (typeof body.longBench === "boolean") {
+      updates.longBench = body.longBench;
     }
 
     if (Object.keys(updates).length === 0) {

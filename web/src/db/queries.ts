@@ -1,4 +1,4 @@
-import { eq, desc, inArray } from "drizzle-orm";
+import { eq, desc, inArray, and } from "drizzle-orm";
 import { db } from "./index";
 import {
   positions,
@@ -6,8 +6,23 @@ import {
   networkAnalyses,
   policyEntries,
   engineAnalyses,
+  benchmarkRuns,
+  benchmarkPositionResults,
 } from "./schema";
-import type { Position, SharpMoveAnnotation, NetworkAnalysis, PolicyEntry, EngineAnalysis, EngineInfoLine, CatGPTSearchStats } from "@/lib/types";
+import type {
+  Position,
+  SharpMoveAnnotation,
+  NetworkAnalysis,
+  PolicyEntry,
+  EngineAnalysis,
+  EngineInfoLine,
+  CatGPTSearchStats,
+  BenchmarkRun,
+  BenchmarkPositionResult,
+  BenchmarkRunDetail,
+  BenchmarkRunStatus,
+  BenchmarkStatsSample,
+} from "@/lib/types";
 
 // ─── Helpers to assemble full Position objects ────────────────────
 
@@ -63,6 +78,7 @@ export async function getAllPositionsSummary(): Promise<Position[]> {
       fen: row.fen,
       expectedOutcome: row.expectedOutcome ?? undefined,
       blunderTag: row.blunderTag ?? undefined,
+      longBench: row.longBench,
       moveAnnotations: anns.length > 0
         ? anns.map((a) => ({ move: a.move, annotation: a.annotation }))
         : undefined,
@@ -223,6 +239,7 @@ export async function updatePositionMeta(
     blunderTag?: "catgpt" | "stockfish" | "leela" | null;
     type?: "SHARP" | "FORTRESS";
     expectedOutcome?: "win" | "loss" | "draw" | "unknown" | null;
+    longBench?: boolean;
   }
 ): Promise<void> {
   await db
@@ -387,6 +404,7 @@ function assemblePosition(
     fen: row.fen,
     expectedOutcome: row.expectedOutcome ?? undefined,
     blunderTag: row.blunderTag ?? undefined,
+    longBench: row.longBench,
     moveAnnotations: moveAnnotationsData.length > 0 ? moveAnnotationsData : undefined,
     networkAnalysis,
     engineAnalyses: engineAnalysesData.length > 0 ? engineAnalysesData : undefined,
@@ -402,4 +420,249 @@ function groupBy<T>(arr: T[], keyFn: (item: T) => string): Record<string, T[]> {
     (map[key] ??= []).push(item);
   }
   return map;
+}
+
+// ─── LongBench ────────────────────────────────────────────────────
+
+/** Return all positions flagged as LongBench, fully assembled. */
+export async function getLongBenchPositions(): Promise<Position[]> {
+  const rows = await db
+    .select()
+    .from(positions)
+    .where(eq(positions.longBench, true))
+    .orderBy(desc(positions.createdAt));
+
+  const posIds = rows.map((r) => r.id);
+  if (posIds.length === 0) return [];
+
+  const [annRows, naRows, eaRows] = await Promise.all([
+    db.select().from(moveAnnotations).where(inArray(moveAnnotations.positionId, posIds)),
+    db
+      .select()
+      .from(networkAnalyses)
+      .where(inArray(networkAnalyses.positionId, posIds))
+      .orderBy(desc(networkAnalyses.createdAt)),
+    db
+      .select()
+      .from(engineAnalyses)
+      .where(inArray(engineAnalyses.positionId, posIds))
+      .orderBy(desc(engineAnalyses.createdAt)),
+  ]);
+
+  const naIds = naRows.map((r) => r.id);
+  const peRows =
+    naIds.length > 0
+      ? await db
+          .select()
+          .from(policyEntries)
+          .where(inArray(policyEntries.analysisId, naIds))
+      : [];
+
+  const annByPos = groupBy(annRows, (r) => r.positionId);
+  const naByPos = groupBy(naRows, (r) => r.positionId);
+  const eaByPos = groupBy(eaRows, (r) => r.positionId);
+  const peByAnalysis = groupBy(peRows, (r) => r.analysisId.toString());
+
+  return rows.map((row) => assemblePosition(row, annByPos, naByPos, eaByPos, peByAnalysis));
+}
+
+export async function setLongBench(positionId: string, value: boolean): Promise<void> {
+  await db
+    .update(positions)
+    .set({ longBench: value, updatedAt: new Date() })
+    .where(eq(positions.id, positionId));
+}
+
+// ─── Benchmark runs ───────────────────────────────────────────────
+
+function toBenchmarkRun(row: typeof benchmarkRuns.$inferSelect): BenchmarkRun {
+  return {
+    id: row.id,
+    engine: row.engine,
+    maxNodes: row.maxNodes,
+    status: row.status,
+    aggregateScore: row.aggregateScore,
+    positionCount: row.positionCount,
+    errorMessage: row.errorMessage,
+    createdAt: row.createdAt.toISOString(),
+    startedAt: row.startedAt?.toISOString() ?? null,
+    finishedAt: row.finishedAt?.toISOString() ?? null,
+  };
+}
+
+function toBenchmarkPositionResult(
+  row: typeof benchmarkPositionResults.$inferSelect
+): BenchmarkPositionResult {
+  return {
+    id: row.id,
+    runId: row.runId,
+    positionId: row.positionId,
+    score: row.score,
+    stableNodes: row.stableNodes,
+    failed: row.failed,
+    finalCp: row.finalCp,
+    finalBestMove: row.finalBestMove,
+    totalNodes: row.totalNodes,
+    statsHistory: (row.statsHistory as BenchmarkStatsSample[]) ?? [],
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+export async function createBenchmarkRun(
+  engine: string,
+  maxNodes: number
+): Promise<BenchmarkRun> {
+  const [row] = await db
+    .insert(benchmarkRuns)
+    .values({ engine, maxNodes, status: "pending" })
+    .returning();
+  return toBenchmarkRun(row);
+}
+
+export async function markBenchmarkRunRunning(
+  runId: number,
+  positionCount: number
+): Promise<void> {
+  await db
+    .update(benchmarkRuns)
+    .set({ status: "running", positionCount, startedAt: new Date() })
+    .where(eq(benchmarkRuns.id, runId));
+}
+
+export async function completeBenchmarkRun(
+  runId: number,
+  aggregateScore: number
+): Promise<void> {
+  await db
+    .update(benchmarkRuns)
+    .set({
+      status: "completed",
+      aggregateScore,
+      finishedAt: new Date(),
+    })
+    .where(eq(benchmarkRuns.id, runId));
+}
+
+export async function failBenchmarkRun(
+  runId: number,
+  errorMessage: string
+): Promise<void> {
+  await db
+    .update(benchmarkRuns)
+    .set({ status: "failed", errorMessage, finishedAt: new Date() })
+    .where(eq(benchmarkRuns.id, runId));
+}
+
+export async function upsertBenchmarkPositionResult(
+  runId: number,
+  positionId: string,
+  result: {
+    score: number | null;
+    stableNodes: number | null;
+    failed: boolean;
+    finalCp: number | null;
+    finalBestMove: string | null;
+    totalNodes: number | null;
+    statsHistory: BenchmarkStatsSample[];
+  }
+): Promise<void> {
+  await db
+    .insert(benchmarkPositionResults)
+    .values({
+      runId,
+      positionId,
+      score: result.score,
+      stableNodes: result.stableNodes,
+      failed: result.failed,
+      finalCp: result.finalCp,
+      finalBestMove: result.finalBestMove,
+      totalNodes: result.totalNodes,
+      statsHistory: result.statsHistory,
+    })
+    .onConflictDoUpdate({
+      target: [benchmarkPositionResults.runId, benchmarkPositionResults.positionId],
+      set: {
+        score: result.score,
+        stableNodes: result.stableNodes,
+        failed: result.failed,
+        finalCp: result.finalCp,
+        finalBestMove: result.finalBestMove,
+        totalNodes: result.totalNodes,
+        statsHistory: result.statsHistory,
+      },
+    });
+}
+
+export async function listBenchmarkRuns(): Promise<BenchmarkRun[]> {
+  const rows = await db
+    .select()
+    .from(benchmarkRuns)
+    .orderBy(desc(benchmarkRuns.createdAt));
+  return rows.map(toBenchmarkRun);
+}
+
+export async function getBenchmarkRun(runId: number): Promise<BenchmarkRunDetail | null> {
+  const [runRow] = await db
+    .select()
+    .from(benchmarkRuns)
+    .where(eq(benchmarkRuns.id, runId));
+  if (!runRow) return null;
+
+  const resultRows = await db
+    .select()
+    .from(benchmarkPositionResults)
+    .where(eq(benchmarkPositionResults.runId, runId));
+
+  const posIds = resultRows.map((r) => r.positionId);
+  const posRows =
+    posIds.length > 0
+      ? await db.select().from(positions).where(inArray(positions.id, posIds))
+      : [];
+  const annRows =
+    posIds.length > 0
+      ? await db
+          .select()
+          .from(moveAnnotations)
+          .where(inArray(moveAnnotations.positionId, posIds))
+      : [];
+
+  const posById = new Map(posRows.map((p) => [p.id, p] as const));
+  const annByPos = groupBy(annRows, (r) => r.positionId);
+
+  const results = resultRows.map((row) => {
+    const p = posById.get(row.positionId);
+    const anns = annByPos[row.positionId] ?? [];
+    const moveAnns: SharpMoveAnnotation[] = anns.map((a) => ({
+      move: a.move,
+      annotation: a.annotation,
+    }));
+    return {
+      ...toBenchmarkPositionResult(row),
+      position: {
+        id: row.positionId,
+        name: p?.name ?? "(deleted)",
+        type: (p?.type ?? "FORTRESS") as Position["type"],
+        fen: p?.fen ?? "",
+        expectedOutcome: p?.expectedOutcome ?? undefined,
+        moveAnnotations: moveAnns.length > 0 ? moveAnns : undefined,
+      },
+    };
+  });
+
+  return {
+    ...toBenchmarkRun(runRow),
+    results,
+  };
+}
+
+/** Sweep runs that were left in `running` state (e.g. server restart). */
+export async function markStaleRunsFailed(): Promise<void> {
+  await db
+    .update(benchmarkRuns)
+    .set({
+      status: "failed",
+      errorMessage: "Interrupted (server restart)",
+      finishedAt: new Date(),
+    })
+    .where(and(eq(benchmarkRuns.status, "running")));
 }

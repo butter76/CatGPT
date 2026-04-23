@@ -8,6 +8,7 @@ import {
   timestamp,
   unique,
   jsonb,
+  boolean,
 } from "drizzle-orm/pg-core";
 
 // ─── Enums ────────────────────────────────────────────────────────
@@ -20,6 +21,13 @@ export const moveAnnotationKindEnum = pgEnum("move_annotation_kind", [
 ]);
 export const engineKindEnum = pgEnum("engine_kind", ["leela", "stockfish", "catgpt", "catgpt_mcts"]);
 export const blunderTagEnum = pgEnum("blunder_tag", ["catgpt", "stockfish", "leela"]);
+export const benchmarkRunStatusEnum = pgEnum("benchmark_run_status", [
+  "pending",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+]);
 
 // ─── Tables ───────────────────────────────────────────────────────
 
@@ -31,6 +39,7 @@ export const positions = pgTable("positions", {
   fen: text("fen").notNull(),
   expectedOutcome: outcomeEnum("expected_outcome"),
   blunderTag: blunderTagEnum("blunder_tag"),
+  longBench: boolean("long_bench").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
@@ -84,3 +93,40 @@ export const engineAnalyses = pgTable("engine_analyses", {
   depthHistory: jsonb("depth_history").notNull().default([]),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+// ─── LongBench ────────────────────────────────────────────────────
+
+export const benchmarkRuns = pgTable("benchmark_runs", {
+  id: serial("id").primaryKey(),
+  engine: text("engine").notNull(),
+  maxNodes: integer("max_nodes").notNull(),
+  status: benchmarkRunStatusEnum("status").notNull().default("pending"),
+  aggregateScore: doublePrecision("aggregate_score"),
+  positionCount: integer("position_count"),
+  errorMessage: text("error_message"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
+});
+
+export const benchmarkPositionResults = pgTable(
+  "benchmark_position_results",
+  {
+    id: serial("id").primaryKey(),
+    runId: integer("run_id")
+      .notNull()
+      .references(() => benchmarkRuns.id, { onDelete: "cascade" }),
+    positionId: text("position_id")
+      .notNull()
+      .references(() => positions.id, { onDelete: "cascade" }),
+    score: doublePrecision("score"),
+    stableNodes: integer("stable_nodes"),
+    failed: boolean("failed").notNull().default(false),
+    finalCp: doublePrecision("final_cp"),
+    finalBestMove: text("final_best_move"),
+    totalNodes: integer("total_nodes"),
+    statsHistory: jsonb("stats_history").notNull().default([]),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.runId, table.positionId)]
+);

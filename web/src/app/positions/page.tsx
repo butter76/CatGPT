@@ -24,6 +24,7 @@ import {
   Loader2,
   Tag,
   X,
+  Gauge,
 } from "lucide-react";
 
 type FilterType = "ALL" | PositionType;
@@ -47,6 +48,7 @@ export default function PositionsPage() {
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<FilterType>("ALL");
   const [blunderFilter, setBlunderFilter] = useState<BlunderFilterType>("ALL");
+  const [longBenchOnly, setLongBenchOnly] = useState(false);
   const [search, setSearch] = useState("");
 
   const loadPositions = useCallback(() => {
@@ -68,6 +70,9 @@ export default function PositionsPage() {
     if (blunderFilter !== "ALL") {
       result = result.filter((p) => p.blunderTag === blunderFilter);
     }
+    if (longBenchOnly) {
+      result = result.filter((p) => p.longBench);
+    }
     if (search.trim()) {
       const q = search.toLowerCase();
       result = result.filter(
@@ -78,7 +83,12 @@ export default function PositionsPage() {
       );
     }
     return result;
-  }, [positions, filter, blunderFilter, search]);
+  }, [positions, filter, blunderFilter, longBenchOnly, search]);
+
+  const longBenchCount = useMemo(
+    () => positions.filter((p) => p.longBench).length,
+    [positions]
+  );
 
   // Count positions by blunder tag for filter badges
   const blunderCounts = useMemo(() => {
@@ -137,6 +147,27 @@ export default function PositionsPage() {
               </TabsTrigger>
             </TabsList>
           </Tabs>
+          <Button
+            variant={longBenchOnly ? "secondary" : "outline"}
+            size="sm"
+            className={`h-9 gap-1.5 ${
+              longBenchOnly
+                ? "border-indigo-500 text-indigo-600 bg-indigo-500/10"
+                : ""
+            }`}
+            onClick={() => setLongBenchOnly((v) => !v)}
+            disabled={longBenchCount === 0 && !longBenchOnly}
+            title={
+              longBenchCount === 0
+                ? "No positions are in LongBench yet"
+                : undefined
+            }
+          >
+            <Gauge className="w-4 h-4" />
+            LongBench
+            <span className="text-xs opacity-70">({longBenchCount})</span>
+            {longBenchOnly && <X className="w-3 h-3 ml-0.5" />}
+          </Button>
         </div>
 
         {/* Blunder Tag Filter */}
@@ -274,15 +305,26 @@ export default function PositionsPage() {
                         <ArrowRight className="w-4 h-4 text-muted-foreground group-hover:text-primary transition-colors" />
                       </div>
 
-                      {/* Blunder tag */}
-                      {position.blunderTag && (
-                        <Badge
-                          variant="outline"
-                          className={`text-[10px] w-fit ${BLUNDER_TAG_CONFIG[position.blunderTag].color}`}
-                        >
-                          {BLUNDER_TAG_CONFIG[position.blunderTag].label} Blunder
-                        </Badge>
-                      )}
+                      {/* Blunder tag + LongBench */}
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        {position.blunderTag && (
+                          <Badge
+                            variant="outline"
+                            className={`text-[10px] ${BLUNDER_TAG_CONFIG[position.blunderTag].color}`}
+                          >
+                            {BLUNDER_TAG_CONFIG[position.blunderTag].label} Blunder
+                          </Badge>
+                        )}
+                        {position.longBench && (
+                          <Badge
+                            variant="outline"
+                            className="text-[10px] border-indigo-500 text-indigo-600 bg-indigo-500/10"
+                          >
+                            <Gauge className="w-2.5 h-2.5 mr-0.5" />
+                            LongBench
+                          </Badge>
+                        )}
+                      </div>
 
                       {/* Analysis indicator */}
                       {position.networkAnalysis && (
