@@ -3,10 +3,12 @@
  *
  * Loads a TensorRT engine and benchmarks inference at various batch sizes.
  * The model expects:
- *   - Input: int32 tensor of shape (batch, 64) - chess position tokens
- *   - Output "value": float32 tensor of shape (batch,) - win probability [0, 1]
- *   - Output "value_probs": float32 tensor of shape (batch, 81) - HL-Gauss value distribution
- *   - Output "policy": float32 tensor of shape (batch, 4672) - policy logits
+ *   - Input:                int32   (batch, 64)   - chess position tokens
+ *   - Output wdl_value:     float32 (batch,)      - WDL-derived Q value [-1, 1] (or [0, 1])
+ *   - Output bestq_probs:   float32 (batch, 81)   - HL-Gauss value distribution
+ *   - Output wdl_probs:     float32 (batch, 3)    - Win/Draw/Loss probabilities
+ *   - Output policy:        float32 (batch, 4672) - policy logits
+ *   - Output optim_policy:  float32 (batch, 4672) - optimistic policy logits (optional)
  */
 
 #include <NvInfer.h>
@@ -15,15 +17,19 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <print>
 #include <random>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -288,12 +294,16 @@ private:
 
 // Number of bins in the HL-Gauss value distribution
 static constexpr int32_t VALUE_NUM_BINS = 81;
+// Number of WDL classes (Win, Draw, Loss)
+static constexpr int32_t WDL_NUM_BINS = 3;
 
-// Inference result containing value, value_probs, and policy outputs
+// Inference result containing all model outputs
 struct InferenceResult {
-    std::vector<float> values;          // (batch,) - win probabilities [0, 1]
-    std::vector<float> value_probs;     // (batch * VALUE_NUM_BINS) - HL-Gauss value distribution
-    std::vector<float> policy_logits;   // (batch * POLICY_SIZE) - policy logits
+    std::vector<float> values;                     // (batch,) - WDL-derived Q value
+    std::vector<float> value_probs;                // (batch * VALUE_NUM_BINS) - bestq HL-Gauss distribution
+    std::vector<float> wdl_probs;                  // (batch * WDL_NUM_BINS) - W/D/L probabilities
+    std::vector<float> policy_logits;              // (batch * POLICY_SIZE) - policy logits
+    std::vector<float> optimistic_policy_logits;   // (batch * POLICY_SIZE) - optional, empty if not present
 };
 
 // TensorRT Engine wrapper with CUDA Graph caching and double buffering
@@ -307,14 +317,65 @@ public:
     // Batch sizes to cache CUDA graphs for
     static constexpr std::array<int32_t, 10> CACHED_BATCH_SIZES = {1, 2, 3, 4, 8, 16, 32, 64, 128, 256};
 
+    // Range of batch sizes covered by a single TRT optimization profile
+    struct ProfileRange {
+        int32_t profile_idx;
+        int32_t min_batch;
+        int32_t opt_batch;
+        int32_t max_batch;
+    };
+
     TrtEngine(const fs::path& engine_path, Logger& logger) : logger_(logger) {
         load_engine(engine_path);
         setup_io();
+        discover_profiles();
         preallocate_cached_buffers();
         setup_double_buffering();
     }
 
     ~TrtEngine() = default;
+
+    int32_t max_batch_size() const { return max_batch_size_; }
+
+    // Pick the profile that best fits this batch size:
+    //   - prefer profiles whose [min, max] contains batch_size
+    //   - among those, prefer the one with opt_batch closest to batch_size
+    // Returns -1 if no profile contains this batch size.
+    int select_profile(int32_t batch_size) const {
+        int best = -1;
+        int32_t best_dist = std::numeric_limits<int32_t>::max();
+        for (const auto& p : profiles_) {
+            if (batch_size < p.min_batch || batch_size > p.max_batch) continue;
+            int32_t dist = std::abs(p.opt_batch - batch_size);
+            if (dist < best_dist) {
+                best = p.profile_idx;
+                best_dist = dist;
+            }
+        }
+        return best;
+    }
+
+    // Register an additional batch size for CUDA graph caching and pipelined inference.
+    // Useful for testing arbitrary batch sizes not in CACHED_BATCH_SIZES.
+    void register_batch_size(int32_t batch_size) {
+        int profile_idx = select_profile(batch_size);
+        if (profile_idx < 0) {
+            throw std::runtime_error(std::format(
+                "Batch size {} is not covered by any optimization profile (max overall: {})",
+                batch_size, max_batch_size_));
+        }
+        if (!cached_resources_.contains(batch_size)) {
+            auto [it, _] = cached_resources_.emplace(batch_size, CachedBatchResources(batch_size));
+            create_cached_context(it->second, profile_idx);
+        }
+        if (!double_buffer_resources_.contains(batch_size)) {
+            auto [it, _] = double_buffer_resources_.emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(batch_size),
+                std::forward_as_tuple(batch_size));
+            create_slot_contexts(it->second, profile_idx);
+        }
+    }
 
     // Run inference on a batch of chess positions
     // Input: vector of int32 tokens, size = batch_size * SEQ_LENGTH
@@ -323,39 +384,47 @@ public:
         if (static_cast<size_t>(batch_size * SEQ_LENGTH) != input_tokens.size()) {
             throw std::runtime_error("Input size mismatch");
         }
-
-        // Check if this batch size has cached resources
-        auto it = cached_resources_.find(batch_size);
-        if (it != cached_resources_.end()) {
-            return infer_with_graph(input_tokens, batch_size, it->second);
+        if (!cached_resources_.contains(batch_size)) {
+            register_batch_size(batch_size);  // Lazily allocate context+buffers for new batch size
         }
-
-        // Fallback to non-graph path for uncached batch sizes
-        return infer_no_graph(input_tokens, batch_size);
+        return infer_with_graph(input_tokens, batch_size, cached_resources_.at(batch_size));
     }
 
 private:
-    // Per-batch-size cached resources
+    // Per-batch-size cached resources.
+    // Each batch size owns its own IExecutionContext bound to the matching
+    // optimization profile, so the captured CUDA graph references the kernels
+    // that were tuned for that specific profile.
     struct CachedBatchResources {
+        std::unique_ptr<nvinfer1::IExecutionContext> context;
+        int profile_idx = 0;
         CudaBuffer<int32_t> input_buffer;
         CudaBuffer<float> value_buffer;
         CudaBuffer<float> value_probs_buffer;
+        CudaBuffer<float> wdl_buffer;
         CudaBuffer<float> policy_buffer;
+        CudaBuffer<float> optimistic_policy_buffer;
         PinnedBuffer<int32_t> pinned_input;
         PinnedBuffer<float> pinned_value;
         PinnedBuffer<float> pinned_value_probs;
+        PinnedBuffer<float> pinned_wdl;
         PinnedBuffer<float> pinned_policy;
+        PinnedBuffer<float> pinned_optimistic_policy;
         CudaGraphExec graph_exec;
 
         CachedBatchResources(int32_t batch_size)
             : input_buffer(batch_size * SEQ_LENGTH),
               value_buffer(batch_size),
               value_probs_buffer(batch_size * VALUE_NUM_BINS),
+              wdl_buffer(batch_size * WDL_NUM_BINS),
               policy_buffer(batch_size * POLICY_SIZE),
+              optimistic_policy_buffer(batch_size * POLICY_SIZE),
               pinned_input(batch_size * SEQ_LENGTH),
               pinned_value(batch_size),
               pinned_value_probs(batch_size * VALUE_NUM_BINS),
-              pinned_policy(batch_size * POLICY_SIZE) {}
+              pinned_wdl(batch_size * WDL_NUM_BINS),
+              pinned_policy(batch_size * POLICY_SIZE),
+              pinned_optimistic_policy(batch_size * POLICY_SIZE) {}
     };
 
     // Inference using cached CUDA graph
@@ -378,34 +447,51 @@ private:
         InferenceResult result;
         result.values.resize(batch_size);
         result.value_probs.resize(batch_size * VALUE_NUM_BINS);
+        result.wdl_probs.resize(batch_size * WDL_NUM_BINS);
         result.policy_logits.resize(batch_size * POLICY_SIZE);
         std::memcpy(result.values.data(), res.pinned_value.get(), batch_size * sizeof(float));
         std::memcpy(result.value_probs.data(), res.pinned_value_probs.get(),
                     batch_size * VALUE_NUM_BINS * sizeof(float));
+        std::memcpy(result.wdl_probs.data(), res.pinned_wdl.get(),
+                    batch_size * WDL_NUM_BINS * sizeof(float));
         std::memcpy(result.policy_logits.data(), res.pinned_policy.get(),
                     batch_size * POLICY_SIZE * sizeof(float));
+        if (!optimistic_policy_output_name_.empty()) {
+            result.optimistic_policy_logits.resize(batch_size * POLICY_SIZE);
+            std::memcpy(result.optimistic_policy_logits.data(), res.pinned_optimistic_policy.get(),
+                        batch_size * POLICY_SIZE * sizeof(float));
+        }
 
         return result;
     }
 
-    // Capture CUDA graph for a batch size
+    // Capture CUDA graph for a batch size, using this batch size's profile-bound context.
     void capture_graph(int32_t batch_size, CachedBatchResources& res) {
-        // Set up tensor addresses and shapes before capture
-        context_->setTensorAddress(input_name_.c_str(), res.input_buffer.get());
-        context_->setTensorAddress(value_output_name_.c_str(), res.value_buffer.get());
+        auto& ctx = *res.context;
+
+        // Set up tensor addresses and shapes before capture (all outputs must be bound)
+        ctx.setTensorAddress(input_name_.c_str(), res.input_buffer.get());
+        ctx.setTensorAddress(value_output_name_.c_str(), res.value_buffer.get());
         if (!value_probs_output_name_.empty()) {
-            context_->setTensorAddress(value_probs_output_name_.c_str(), res.value_probs_buffer.get());
+            ctx.setTensorAddress(value_probs_output_name_.c_str(), res.value_probs_buffer.get());
         }
-        context_->setTensorAddress(policy_output_name_.c_str(), res.policy_buffer.get());
+        if (!wdl_output_name_.empty()) {
+            ctx.setTensorAddress(wdl_output_name_.c_str(), res.wdl_buffer.get());
+        }
+        ctx.setTensorAddress(policy_output_name_.c_str(), res.policy_buffer.get());
+        if (!optimistic_policy_output_name_.empty()) {
+            ctx.setTensorAddress(optimistic_policy_output_name_.c_str(), res.optimistic_policy_buffer.get());
+        }
 
         nvinfer1::Dims input_dims;
         input_dims.nbDims = 2;
         input_dims.d[0] = batch_size;
         input_dims.d[1] = SEQ_LENGTH;
-        context_->setInputShape(input_name_.c_str(), input_dims);
+        ctx.setInputShape(input_name_.c_str(), input_dims);
 
         size_t input_count = batch_size * SEQ_LENGTH;
         size_t value_probs_count = batch_size * VALUE_NUM_BINS;
+        size_t wdl_count = batch_size * WDL_NUM_BINS;
         size_t policy_count = batch_size * POLICY_SIZE;
 
         // Begin graph capture
@@ -415,7 +501,7 @@ private:
         res.input_buffer.copy_from_host_async(res.pinned_input.get(), input_count, stream_.get());
 
         // TensorRT inference (captured)
-        if (!context_->enqueueV3(stream_.get())) {
+        if (!ctx.enqueueV3(stream_.get())) {
             cudaGraph_t dummy;
             cudaStreamEndCapture(stream_.get(), &dummy);  // Clean up capture state
             throw std::runtime_error("TensorRT inference failed during graph capture");
@@ -426,70 +512,21 @@ private:
         if (!value_probs_output_name_.empty()) {
             res.value_probs_buffer.copy_to_host_async(res.pinned_value_probs.get(), value_probs_count, stream_.get());
         }
+        if (!wdl_output_name_.empty()) {
+            res.wdl_buffer.copy_to_host_async(res.pinned_wdl.get(), wdl_count, stream_.get());
+        }
         res.policy_buffer.copy_to_host_async(res.pinned_policy.get(), policy_count, stream_.get());
+        if (!optimistic_policy_output_name_.empty()) {
+            res.optimistic_policy_buffer.copy_to_host_async(
+                res.pinned_optimistic_policy.get(), policy_count, stream_.get());
+        }
 
         // End capture and instantiate
         cudaGraph_t graph = stream_.end_capture();
         res.graph_exec = CudaGraphExec(graph);
 
-        std::println("  Captured CUDA graph for batch size {}", batch_size);
-    }
-
-    // Fallback inference without graph (for uncached batch sizes)
-    InferenceResult infer_no_graph(std::span<const int32_t> input_tokens, int32_t batch_size) {
-        // Resize GPU and pinned buffers if needed
-        ensure_fallback_buffers(batch_size);
-
-        // Copy input to pinned buffer, then async H2D transfer
-        fallback_pinned_input_.copy_from(input_tokens.data(), input_tokens.size());
-        fallback_input_buffer_.copy_from_host_async(
-            fallback_pinned_input_.get(), input_tokens.size(), stream_.get());
-
-        // Set tensor addresses
-        context_->setTensorAddress(input_name_.c_str(), fallback_input_buffer_.get());
-        context_->setTensorAddress(value_output_name_.c_str(), fallback_value_buffer_.get());
-        if (!value_probs_output_name_.empty()) {
-            context_->setTensorAddress(value_probs_output_name_.c_str(), fallback_value_probs_buffer_.get());
-        }
-        context_->setTensorAddress(policy_output_name_.c_str(), fallback_policy_buffer_.get());
-
-        // Set input shape (dynamic batch)
-        nvinfer1::Dims input_dims;
-        input_dims.nbDims = 2;
-        input_dims.d[0] = batch_size;
-        input_dims.d[1] = SEQ_LENGTH;
-        context_->setInputShape(input_name_.c_str(), input_dims);
-
-        // Execute on dedicated stream
-        if (!context_->enqueueV3(stream_.get())) {
-            throw std::runtime_error("TensorRT inference failed");
-        }
-
-        // Async D2H transfer, then synchronize
-        size_t value_probs_count = batch_size * VALUE_NUM_BINS;
-        size_t policy_count = batch_size * POLICY_SIZE;
-        fallback_value_buffer_.copy_to_host_async(
-            fallback_pinned_value_.get(), batch_size, stream_.get());
-        if (!value_probs_output_name_.empty()) {
-            fallback_value_probs_buffer_.copy_to_host_async(
-                fallback_pinned_value_probs_.get(), value_probs_count, stream_.get());
-        }
-        fallback_policy_buffer_.copy_to_host_async(
-            fallback_pinned_policy_.get(), policy_count, stream_.get());
-        stream_.synchronize();
-
-        // Copy from pinned buffers to output
-        InferenceResult result;
-        result.values.resize(batch_size);
-        result.value_probs.resize(value_probs_count);
-        result.policy_logits.resize(policy_count);
-        std::memcpy(result.values.data(), fallback_pinned_value_.get(), batch_size * sizeof(float));
-        std::memcpy(result.value_probs.data(), fallback_pinned_value_probs_.get(),
-                    value_probs_count * sizeof(float));
-        std::memcpy(result.policy_logits.data(), fallback_pinned_policy_.get(),
-                    policy_count * sizeof(float));
-
-        return result;
+        std::println("  Captured CUDA graph for batch size {} (profile {})",
+                     batch_size, res.profile_idx);
     }
 
 public:
@@ -551,7 +588,9 @@ public:
     struct PipelinedResult {
         std::vector<float> values;
         std::vector<float> value_probs;
+        std::vector<float> wdl_probs;
         std::vector<float> policies;
+        std::vector<float> optimistic_policies;
     };
 
     // Process multiple batches with double buffering for maximum throughput
@@ -567,14 +606,25 @@ public:
         }
 
         auto& db = it->second;
+        const bool has_wdl = !wdl_output_name_.empty();
+        const bool has_optimistic = !optimistic_policy_output_name_.empty();
+
         PipelinedResult result;
         result.values.reserve(batches.size() * batch_size);
         result.value_probs.reserve(batches.size() * batch_size * VALUE_NUM_BINS);
+        if (has_wdl) result.wdl_probs.reserve(batches.size() * batch_size * WDL_NUM_BINS);
         result.policies.reserve(batches.size() * batch_size * POLICY_SIZE);
+        if (has_optimistic) result.optimistic_policies.reserve(batches.size() * batch_size * POLICY_SIZE);
 
         const size_t input_count = batch_size * SEQ_LENGTH;
         const size_t value_probs_count = batch_size * VALUE_NUM_BINS;
+        const size_t wdl_count = batch_size * WDL_NUM_BINS;
         const size_t policy_count = batch_size * POLICY_SIZE;
+
+        // Lazily capture per-slot CUDA graphs on first call for this batch size.
+        if (!db.buffers[0].graph_exec.valid()) {
+            capture_double_buffer_graph(batch_size, db);
+        }
 
         // Process batches with double buffering
         for (size_t i = 0; i < batches.size(); ++i) {
@@ -594,26 +644,26 @@ public:
                 result.value_probs.insert(result.value_probs.end(),
                                           out_buf.pinned_value_probs.get(),
                                           out_buf.pinned_value_probs.get() + value_probs_count);
+                if (has_wdl) {
+                    result.wdl_probs.insert(result.wdl_probs.end(),
+                                            out_buf.pinned_wdl.get(),
+                                            out_buf.pinned_wdl.get() + wdl_count);
+                }
                 result.policies.insert(result.policies.end(),
                                        out_buf.pinned_policy.get(),
                                        out_buf.pinned_policy.get() + policy_count);
+                if (has_optimistic) {
+                    result.optimistic_policies.insert(result.optimistic_policies.end(),
+                                                      out_buf.pinned_optimistic_policy.get(),
+                                                      out_buf.pinned_optimistic_policy.get() + policy_count);
+                }
             }
 
-            // Copy input to pinned buffer
+            // Copy input to pinned buffer (CPU-side, not part of graph)
             buf.pinned_input.copy_from(batches[i].data(), input_count);
 
-            // Launch the pipeline: H2D -> compute -> D2H
-            if (db.graph_exec.valid()) {
-                // Use CUDA graph for this slot
-                db.graph_exec.launch(buf.stream.get());
-            } else {
-                // Capture graph on first use (using slot 0's buffers)
-                if (slot == 0 && !db.graph_captured) {
-                    capture_double_buffer_graph(batch_size, db);
-                }
-                // For now, fall back to non-graph execution
-                execute_pipeline_step(batch_size, buf);
-            }
+            // Launch the captured pipeline graph: H2D -> compute -> D2H
+            buf.graph_exec.launch(buf.stream.get());
 
             // Record completion event
             buf.done_event.record(buf.stream.get());
@@ -631,9 +681,19 @@ public:
             result.value_probs.insert(result.value_probs.end(),
                                       buf.pinned_value_probs.get(),
                                       buf.pinned_value_probs.get() + value_probs_count);
+            if (has_wdl) {
+                result.wdl_probs.insert(result.wdl_probs.end(),
+                                        buf.pinned_wdl.get(),
+                                        buf.pinned_wdl.get() + wdl_count);
+            }
             result.policies.insert(result.policies.end(),
                                    buf.pinned_policy.get(),
                                    buf.pinned_policy.get() + policy_count);
+            if (has_optimistic) {
+                result.optimistic_policies.insert(result.optimistic_policies.end(),
+                                                  buf.pinned_optimistic_policy.get(),
+                                                  buf.pinned_optimistic_policy.get() + policy_count);
+            }
         }
 
         return result;
@@ -683,98 +743,179 @@ public:
     }
 
 private:
-    // Double buffer resources per batch size
+    // Double buffer resources per batch size.
+    // Each slot owns its own IExecutionContext and CUDA graph so the two streams
+    // can run truly concurrently (separate activation memory, no host-side context
+    // state contention between launches).
     struct DoubleBufferSlot {
         CudaStream stream;
         CudaEvent done_event;
+        std::unique_ptr<nvinfer1::IExecutionContext> context;
+        CudaGraphExec graph_exec;
         CudaBuffer<int32_t> input_buffer;
         CudaBuffer<float> value_buffer;
         CudaBuffer<float> value_probs_buffer;
+        CudaBuffer<float> wdl_buffer;
         CudaBuffer<float> policy_buffer;
+        CudaBuffer<float> optimistic_policy_buffer;
         PinnedBuffer<int32_t> pinned_input;
         PinnedBuffer<float> pinned_value;
         PinnedBuffer<float> pinned_value_probs;
+        PinnedBuffer<float> pinned_wdl;
         PinnedBuffer<float> pinned_policy;
+        PinnedBuffer<float> pinned_optimistic_policy;
 
         DoubleBufferSlot(int32_t batch_size)
             : input_buffer(batch_size * SEQ_LENGTH),
               value_buffer(batch_size),
               value_probs_buffer(batch_size * VALUE_NUM_BINS),
+              wdl_buffer(batch_size * WDL_NUM_BINS),
               policy_buffer(batch_size * POLICY_SIZE),
+              optimistic_policy_buffer(batch_size * POLICY_SIZE),
               pinned_input(batch_size * SEQ_LENGTH),
               pinned_value(batch_size),
               pinned_value_probs(batch_size * VALUE_NUM_BINS),
-              pinned_policy(batch_size * POLICY_SIZE) {}
+              pinned_wdl(batch_size * WDL_NUM_BINS),
+              pinned_policy(batch_size * POLICY_SIZE),
+              pinned_optimistic_policy(batch_size * POLICY_SIZE) {}
     };
 
     struct DoubleBufferResources {
         std::array<DoubleBufferSlot, NUM_BUFFERS> buffers;
-        CudaGraphExec graph_exec;
-        bool graph_captured = false;
 
         DoubleBufferResources(int32_t batch_size)
             : buffers{DoubleBufferSlot(batch_size), DoubleBufferSlot(batch_size)} {}
     };
 
     void setup_double_buffering() {
-        std::println("  Setting up double buffering for {} batch sizes...",
-                     CACHED_BATCH_SIZES.size());
+        size_t allocated = 0;
         for (int32_t batch_size : CACHED_BATCH_SIZES) {
-            double_buffer_resources_.emplace(
+            int profile_idx = select_profile(batch_size);
+            if (profile_idx < 0) continue;
+            auto [it, _] = double_buffer_resources_.emplace(
                 std::piecewise_construct,
                 std::forward_as_tuple(batch_size),
                 std::forward_as_tuple(batch_size));
+            create_slot_contexts(it->second, profile_idx);
+            ++allocated;
+        }
+        std::println("  Set up double buffering for {} batch sizes", allocated);
+    }
+
+    // Create the cached-batch context and bind it to the given profile.
+    void create_cached_context(CachedBatchResources& res, int profile_idx) {
+        if (res.context) return;
+        res.context.reset(engine_->createExecutionContext());
+        if (!res.context) {
+            throw std::runtime_error("Failed to create cached IExecutionContext");
+        }
+        bind_profile(*res.context, profile_idx, stream_);
+        res.profile_idx = profile_idx;
+    }
+
+    // Create a dedicated IExecutionContext for each slot in `db`, bound to `profile_idx`.
+    // Separate contexts give each stream its own activation memory, enabling true
+    // concurrent execution of the two pipelined inferences.
+    void create_slot_contexts(DoubleBufferResources& db, int profile_idx) {
+        for (auto& slot : db.buffers) {
+            if (slot.context) continue;  // Already created
+            slot.context.reset(engine_->createExecutionContext());
+            if (!slot.context) {
+                throw std::runtime_error("Failed to create slot IExecutionContext");
+            }
+            bind_profile(*slot.context, profile_idx, slot.stream);
         }
     }
 
-    void execute_pipeline_step(int32_t batch_size, DoubleBufferSlot& buf) {
-        size_t input_count = batch_size * SEQ_LENGTH;
-        size_t value_probs_count = batch_size * VALUE_NUM_BINS;
-        size_t policy_count = batch_size * POLICY_SIZE;
-
-        // H2D transfer
-        buf.input_buffer.copy_from_host_async(buf.pinned_input.get(), input_count, buf.stream.get());
-
-        // Set tensor addresses
-        context_->setTensorAddress(input_name_.c_str(), buf.input_buffer.get());
-        context_->setTensorAddress(value_output_name_.c_str(), buf.value_buffer.get());
-        if (!value_probs_output_name_.empty()) {
-            context_->setTensorAddress(value_probs_output_name_.c_str(), buf.value_probs_buffer.get());
+    // Bind a context to a TRT optimization profile and synchronize the stream
+    // so the binding is in effect before any subsequent setTensorAddress / capture.
+    static void bind_profile(nvinfer1::IExecutionContext& ctx, int profile_idx, CudaStream& stream) {
+        if (!ctx.setOptimizationProfileAsync(profile_idx, stream.get())) {
+            throw std::runtime_error(std::format(
+                "Failed to set optimization profile {} on context", profile_idx));
         }
-        context_->setTensorAddress(policy_output_name_.c_str(), buf.policy_buffer.get());
+        stream.synchronize();
+    }
 
-        // Set input shape
+    // Capture a per-slot CUDA graph that wraps H2D + enqueueV3 + D2H.
+    // Each slot uses its own context + buffers so the two graphs share no
+    // mutable state and can be launched concurrently on separate streams.
+    void capture_double_buffer_graph(int32_t batch_size, DoubleBufferResources& db) {
+        const size_t input_count = batch_size * SEQ_LENGTH;
+        const size_t value_probs_count = batch_size * VALUE_NUM_BINS;
+        const size_t wdl_count = batch_size * WDL_NUM_BINS;
+        const size_t policy_count = batch_size * POLICY_SIZE;
+
         nvinfer1::Dims input_dims;
         input_dims.nbDims = 2;
         input_dims.d[0] = batch_size;
         input_dims.d[1] = SEQ_LENGTH;
-        context_->setInputShape(input_name_.c_str(), input_dims);
 
-        // Execute
-        context_->enqueueV3(buf.stream.get());
+        for (auto& slot : db.buffers) {
+            // Bind tensor addresses & shape on this slot's context (host-side state).
+            // These persist on the context so the captured kernels reference the
+            // correct device pointers.
+            slot.context->setTensorAddress(input_name_.c_str(), slot.input_buffer.get());
+            slot.context->setTensorAddress(value_output_name_.c_str(), slot.value_buffer.get());
+            if (!value_probs_output_name_.empty()) {
+                slot.context->setTensorAddress(value_probs_output_name_.c_str(),
+                                               slot.value_probs_buffer.get());
+            }
+            if (!wdl_output_name_.empty()) {
+                slot.context->setTensorAddress(wdl_output_name_.c_str(), slot.wdl_buffer.get());
+            }
+            slot.context->setTensorAddress(policy_output_name_.c_str(), slot.policy_buffer.get());
+            if (!optimistic_policy_output_name_.empty()) {
+                slot.context->setTensorAddress(optimistic_policy_output_name_.c_str(),
+                                               slot.optimistic_policy_buffer.get());
+            }
+            slot.context->setInputShape(input_name_.c_str(), input_dims);
 
-        // D2H transfer
-        buf.value_buffer.copy_to_host_async(buf.pinned_value.get(), batch_size, buf.stream.get());
-        if (!value_probs_output_name_.empty()) {
-            buf.value_probs_buffer.copy_to_host_async(buf.pinned_value_probs.get(), value_probs_count, buf.stream.get());
+            // Capture: H2D -> compute -> D2H, all on this slot's stream.
+            slot.stream.begin_capture();
+
+            slot.input_buffer.copy_from_host_async(slot.pinned_input.get(), input_count, slot.stream.get());
+
+            if (!slot.context->enqueueV3(slot.stream.get())) {
+                cudaGraph_t dummy;
+                cudaStreamEndCapture(slot.stream.get(), &dummy);  // Clean up capture state
+                throw std::runtime_error("TensorRT inference failed during pipelined graph capture");
+            }
+
+            slot.value_buffer.copy_to_host_async(slot.pinned_value.get(), batch_size, slot.stream.get());
+            if (!value_probs_output_name_.empty()) {
+                slot.value_probs_buffer.copy_to_host_async(slot.pinned_value_probs.get(),
+                                                           value_probs_count, slot.stream.get());
+            }
+            if (!wdl_output_name_.empty()) {
+                slot.wdl_buffer.copy_to_host_async(slot.pinned_wdl.get(), wdl_count, slot.stream.get());
+            }
+            slot.policy_buffer.copy_to_host_async(slot.pinned_policy.get(), policy_count, slot.stream.get());
+            if (!optimistic_policy_output_name_.empty()) {
+                slot.optimistic_policy_buffer.copy_to_host_async(
+                    slot.pinned_optimistic_policy.get(), policy_count, slot.stream.get());
+            }
+
+            cudaGraph_t graph = slot.stream.end_capture();
+            slot.graph_exec = CudaGraphExec(graph);
         }
-        buf.policy_buffer.copy_to_host_async(buf.pinned_policy.get(), policy_count, buf.stream.get());
+
+        std::println("  Captured pipelined CUDA graphs for batch size {} ({} slots, separate contexts)",
+                     batch_size, NUM_BUFFERS);
     }
 
-    void capture_double_buffer_graph(int32_t batch_size, DoubleBufferResources& db) {
-        // For simplicity, we don't capture graphs for double buffering
-        // The overlap comes from having multiple streams
-        db.graph_captured = true;  // Mark as "attempted"
-        std::println("  Double buffering enabled for batch size {} (no graph capture)", batch_size);
-    }
-
-    // Pre-allocate resources for all cached batch sizes
+    // Pre-allocate resources for all cached batch sizes covered by some profile
     void preallocate_cached_buffers() {
-        std::println("  Pre-allocating buffers for {} cached batch sizes...",
-                     CACHED_BATCH_SIZES.size());
+        size_t allocated = 0;
         for (int32_t batch_size : CACHED_BATCH_SIZES) {
-            cached_resources_.emplace(batch_size, CachedBatchResources(batch_size));
+            int profile_idx = select_profile(batch_size);
+            if (profile_idx < 0) continue;
+            auto [it, _] = cached_resources_.emplace(batch_size, CachedBatchResources(batch_size));
+            create_cached_context(it->second, profile_idx);
+            ++allocated;
         }
+        std::println("  Pre-allocated buffers for {} cached batch sizes (<= max {})",
+                     allocated, max_batch_size_);
     }
 
     void load_engine(const fs::path& engine_path) {
@@ -805,16 +946,14 @@ private:
         if (!engine_) {
             throw std::runtime_error("Failed to deserialize CUDA engine");
         }
-
-        context_.reset(engine_->createExecutionContext());
-        if (!context_) {
-            throw std::runtime_error("Failed to create execution context");
-        }
     }
 
     void setup_io() {
         int num_io = engine_->getNbIOTensors();
         std::println("Engine has {} I/O tensors:", num_io);
+
+        // Collect all policy-shaped outputs (batch x POLICY_SIZE) for ordered assignment
+        std::vector<std::string> policy_outputs;
 
         for (int i = 0; i < num_io; ++i) {
             const char* name = engine_->getIOTensorName(i);
@@ -837,39 +976,58 @@ private:
             if (mode == nvinfer1::TensorIOMode::kINPUT) {
                 input_name_ = name;
                 std::println("  Input '{}': {} {}", name, dims_str, dtype_str);
-            } else {
-                std::string name_str(name);
-                std::println("  Output '{}': {} {}", name, dims_str, dtype_str);
+                continue;
+            }
 
-                // Try to match by name first (check value_probs before value to avoid substring collision)
-                if (name_str.find("value_probs") != std::string::npos ||
-                    name_str.find("ValueProbs") != std::string::npos) {
-                    value_probs_output_name_ = name;
-                } else if (name_str.find("value") != std::string::npos ||
-                           name_str.find("Value") != std::string::npos) {
-                    value_output_name_ = name;
-                } else if (name_str.find("policy") != std::string::npos ||
-                           name_str.find("Policy") != std::string::npos) {
-                    policy_output_name_ = name;
+            std::string name_str(name);
+            std::println("  Output '{}': {} {}", name, dims_str, dtype_str);
+
+            // Try to match by name first (order matters: check specific names before generic).
+            // jax2onnx auto-generates names like "softmax_out_33", so we fall through
+            // to shape-based detection for those.
+            if (name_str.find("wdl") != std::string::npos ||
+                name_str.find("WDL") != std::string::npos) {
+                // Distinguish wdl_probs (batch, 3) from wdl_value (batch,)
+                if (dims.nbDims == 2 && dims.d[1] == WDL_NUM_BINS) {
+                    wdl_output_name_ = name;
                 } else {
-                    // Fallback: detect by shape
-                    // Value: scalar or (batch,) or (batch, 1)
-                    // Value probs: (batch, VALUE_NUM_BINS)
-                    // Policy: (batch, POLICY_SIZE)
-                    if (dims.nbDims == 1 || (dims.nbDims == 2 && dims.d[1] == 1)) {
-                        if (value_output_name_.empty()) {
-                            value_output_name_ = name;
-                        }
-                    } else if (dims.nbDims == 2 && dims.d[1] == VALUE_NUM_BINS) {
-                        if (value_probs_output_name_.empty()) {
-                            value_probs_output_name_ = name;
-                        }
-                    } else if (dims.nbDims == 2 && dims.d[1] == POLICY_SIZE) {
-                        if (policy_output_name_.empty()) {
-                            policy_output_name_ = name;
-                        }
-                    }
+                    value_output_name_ = name;
                 }
+            } else if (name_str.find("bestq_probs") != std::string::npos ||
+                       name_str.find("value_probs") != std::string::npos) {
+                value_probs_output_name_ = name;
+            } else if (name_str.find("value") != std::string::npos ||
+                       name_str.find("Value") != std::string::npos) {
+                value_output_name_ = name;
+            } else if (name_str.find("optimistic_policy") != std::string::npos) {
+                optimistic_policy_output_name_ = name;
+            } else if (name_str.find("policy") != std::string::npos ||
+                       name_str.find("Policy") != std::string::npos) {
+                policy_output_name_ = name;
+            } else {
+                // Fallback: detect by shape
+                //   wdl_value:   (batch,) or (batch, 1)
+                //   wdl_probs:   (batch, 3)
+                //   value_probs: (batch, 81)
+                //   policy:      (batch, 4672) - first occurrence is vanilla, second is optimistic
+                if (dims.nbDims == 1 || (dims.nbDims == 2 && dims.d[1] == 1)) {
+                    if (value_output_name_.empty()) value_output_name_ = name;
+                } else if (dims.nbDims == 2 && dims.d[1] == WDL_NUM_BINS) {
+                    if (wdl_output_name_.empty()) wdl_output_name_ = name;
+                } else if (dims.nbDims == 2 && dims.d[1] == VALUE_NUM_BINS) {
+                    if (value_probs_output_name_.empty()) value_probs_output_name_ = name;
+                } else if (dims.nbDims == 2 && dims.d[1] == POLICY_SIZE) {
+                    policy_outputs.push_back(name_str);
+                }
+            }
+        }
+
+        // Assign policy-shaped outputs in order: first is vanilla policy, second is optimistic
+        for (const auto& pname : policy_outputs) {
+            if (policy_output_name_.empty()) {
+                policy_output_name_ = pname;
+            } else if (optimistic_policy_output_name_.empty()) {
+                optimistic_policy_output_name_ = pname;
             }
         }
 
@@ -887,71 +1045,61 @@ private:
         std::println("  -> Value output: '{}'", value_output_name_);
         std::println("  -> Value probs output: '{}'",
                      value_probs_output_name_.empty() ? "(not found)" : value_probs_output_name_);
+        std::println("  -> WDL probs output: '{}'",
+                     wdl_output_name_.empty() ? "(not found)" : wdl_output_name_);
         std::println("  -> Policy output: '{}'", policy_output_name_);
+        std::println("  -> Optimistic policy output: '{}'",
+                     optimistic_policy_output_name_.empty() ? "(not found)" : optimistic_policy_output_name_);
     }
 
-    void ensure_fallback_buffers(int32_t batch_size) {
-        size_t input_count = batch_size * SEQ_LENGTH;
-        size_t value_count = batch_size;
-        size_t value_probs_count = batch_size * VALUE_NUM_BINS;
-        size_t policy_count = batch_size * POLICY_SIZE;
-
-        // GPU buffers
-        if (fallback_input_buffer_.count() < input_count) {
-            fallback_input_buffer_ = CudaBuffer<int32_t>(input_count);
-        }
-        if (fallback_value_buffer_.count() < value_count) {
-            fallback_value_buffer_ = CudaBuffer<float>(value_count);
-        }
-        if (fallback_value_probs_buffer_.count() < value_probs_count) {
-            fallback_value_probs_buffer_ = CudaBuffer<float>(value_probs_count);
-        }
-        if (fallback_policy_buffer_.count() < policy_count) {
-            fallback_policy_buffer_ = CudaBuffer<float>(policy_count);
+    // Enumerate all optimization profiles and their batch-size ranges
+    void discover_profiles() {
+        int n = engine_->getNbOptimizationProfiles();
+        if (n < 1) {
+            throw std::runtime_error("Engine has no optimization profiles");
         }
 
-        // Pinned host buffers (for async transfers)
-        if (fallback_pinned_input_.count() < input_count) {
-            fallback_pinned_input_ = PinnedBuffer<int32_t>(input_count);
+        max_batch_size_ = 0;
+        profiles_.clear();
+        profiles_.reserve(n);
+        std::println("  Engine has {} optimization profile(s):", n);
+        for (int i = 0; i < n; ++i) {
+            auto min_dims = engine_->getProfileShape(
+                input_name_.c_str(), i, nvinfer1::OptProfileSelector::kMIN);
+            auto opt_dims = engine_->getProfileShape(
+                input_name_.c_str(), i, nvinfer1::OptProfileSelector::kOPT);
+            auto max_dims = engine_->getProfileShape(
+                input_name_.c_str(), i, nvinfer1::OptProfileSelector::kMAX);
+            ProfileRange p{i, min_dims.d[0], opt_dims.d[0], max_dims.d[0]};
+            profiles_.push_back(p);
+            max_batch_size_ = std::max(max_batch_size_, p.max_batch);
+            std::println("    Profile {}: min={}, opt={}, max={}",
+                         p.profile_idx, p.min_batch, p.opt_batch, p.max_batch);
         }
-        if (fallback_pinned_value_.count() < value_count) {
-            fallback_pinned_value_ = PinnedBuffer<float>(value_count);
-        }
-        if (fallback_pinned_value_probs_.count() < value_probs_count) {
-            fallback_pinned_value_probs_ = PinnedBuffer<float>(value_probs_count);
-        }
-        if (fallback_pinned_policy_.count() < policy_count) {
-            fallback_pinned_policy_ = PinnedBuffer<float>(policy_count);
-        }
+        std::println("  Overall max batch size: {}", max_batch_size_);
     }
 
     Logger& logger_;
     std::unique_ptr<nvinfer1::IRuntime> runtime_;
     std::unique_ptr<nvinfer1::ICudaEngine> engine_;
-    std::unique_ptr<nvinfer1::IExecutionContext> context_;
 
     std::string input_name_;
     std::string value_output_name_;
     std::string value_probs_output_name_;
+    std::string wdl_output_name_;
     std::string policy_output_name_;
+    std::string optimistic_policy_output_name_;
 
-    CudaStream stream_;  // Dedicated CUDA stream for inference
+    std::vector<ProfileRange> profiles_;  // Discovered TRT optimization profiles
+    int32_t max_batch_size_ = 1;  // Largest max_batch across all profiles
 
-    // Cached resources per batch size (with CUDA graphs)
+    CudaStream stream_;  // Stream used for single-mode capture/launch (graphs are stream-agnostic)
+
+    // Cached resources per batch size (with CUDA graphs and per-batch IExecutionContext)
     std::unordered_map<int32_t, CachedBatchResources> cached_resources_;
 
     // Double buffer resources per batch size (for pipelined inference)
     std::unordered_map<int32_t, DoubleBufferResources> double_buffer_resources_;
-
-    // Fallback buffers for uncached batch sizes (no graph)
-    CudaBuffer<int32_t> fallback_input_buffer_;
-    CudaBuffer<float> fallback_value_buffer_;
-    CudaBuffer<float> fallback_value_probs_buffer_;
-    CudaBuffer<float> fallback_policy_buffer_;
-    PinnedBuffer<int32_t> fallback_pinned_input_;
-    PinnedBuffer<float> fallback_pinned_value_;
-    PinnedBuffer<float> fallback_pinned_value_probs_;
-    PinnedBuffer<float> fallback_pinned_policy_;
 };
 
 void print_header() {
@@ -975,14 +1123,53 @@ void print_cuda_info() {
     std::println("└───────────────────────────────────────────────────────────────┘");
 }
 
+void print_usage(const char* prog) {
+    std::println("Usage: {} [ENGINE_PATH] [OPTIONS]", prog);
+    std::println("");
+    std::println("Arguments:");
+    std::println("  ENGINE_PATH         Path to the .trt engine file");
+    std::println("                      (default: /home/shadeform/CatGPT/test.trt)");
+    std::println("");
+    std::println("Options:");
+    std::println("  -b, --batch N       Benchmark only batch size N (single + pipelined).");
+    std::println("                      Skips the default sweep.");
+    std::println("  -h, --help          Show this help message.");
+}
+
 int main(int argc, char* argv[]) {
     print_header();
     print_cuda_info();
 
-    // Default engine path
-    fs::path engine_path = "/home/shadeform/CatGPT/catgpt.trt";
-    if (argc > 1) {
-        engine_path = argv[1];
+    // Defaults (override via CLI args)
+    fs::path engine_path = "/home/shadeform/CatGPT/test.trt";
+    int32_t target_batch_size = 0;  // 0 = default sweep
+
+    // Simple positional + flag parsing
+    for (int i = 1; i < argc; ++i) {
+        std::string_view arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_usage(argv[0]);
+            return 0;
+        }
+        if (arg == "-b" || arg == "--batch") {
+            if (i + 1 >= argc) {
+                std::println(stderr, "Error: {} requires an argument", arg);
+                return 1;
+            }
+            target_batch_size = std::stoi(argv[++i]);
+            if (target_batch_size <= 0) {
+                std::println(stderr, "Error: batch size must be positive");
+                return 1;
+            }
+            continue;
+        }
+        if (arg.starts_with("-")) {
+            std::println(stderr, "Error: unknown option '{}'", arg);
+            print_usage(argv[0]);
+            return 1;
+        }
+        // Positional: engine path
+        engine_path = arg;
     }
 
     if (!fs::exists(engine_path)) {
@@ -1002,7 +1189,7 @@ int main(int argc, char* argv[]) {
             std::vector<int32_t> test_input(TrtEngine::SEQ_LENGTH, 1);  // Simple test input
             auto result = engine.infer(test_input, 1);
             std::println("│ Single inference test:");
-            std::println("│   Value (win prob): {:.6f}", result.values[0]);
+            std::println("│   Value (Q from WDL): {:.6f}", result.values[0]);
 
             // Show value distribution summary
             if (!result.value_probs.empty()) {
@@ -1013,8 +1200,14 @@ int main(int argc, char* argv[]) {
                     std::max_element(result.value_probs.begin(),
                                      result.value_probs.begin() + VALUE_NUM_BINS)));
                 float mode_value = static_cast<float>(mode_bin) / (VALUE_NUM_BINS - 1);
-                std::println("│   Value dist: mode bin={} (v={:.3f}, p={:.4f})",
+                std::println("│   BestQ dist: mode bin={} (v={:.3f}, p={:.4f})",
                              mode_bin, mode_value, max_prob);
+            }
+
+            // Show WDL probabilities
+            if (!result.wdl_probs.empty()) {
+                std::println("│   WDL: W={:.4f}  D={:.4f}  L={:.4f}",
+                             result.wdl_probs[0], result.wdl_probs[1], result.wdl_probs[2]);
             }
 
             // Show top-5 policy logits (argmax)
@@ -1034,11 +1227,45 @@ int main(int argc, char* argv[]) {
                 std::println("│     [{}] from={}, to={}: {:.4f}",
                              i + 1, from_sq, to_sq, indexed_logits[i].second);
             }
+
+            // Show top-5 optimistic policy logits if present
+            if (!result.optimistic_policy_logits.empty()) {
+                auto& opt_policy = result.optimistic_policy_logits;
+                std::vector<std::pair<int, float>> opt_indexed;
+                opt_indexed.reserve(opt_policy.size());
+                for (size_t i = 0; i < opt_policy.size(); ++i) {
+                    opt_indexed.emplace_back(static_cast<int>(i), opt_policy[i]);
+                }
+                std::partial_sort(opt_indexed.begin(), opt_indexed.begin() + 5, opt_indexed.end(),
+                                  [](const auto& a, const auto& b) { return a.second > b.second; });
+
+                std::println("│   Top-5 optimistic policy logits:");
+                for (int i = 0; i < 5; ++i) {
+                    int from_sq = opt_indexed[i].first / 73;
+                    int to_sq = opt_indexed[i].first % 73;
+                    std::println("│     [{}] from={}, to={}: {:.4f}",
+                                 i + 1, from_sq, to_sq, opt_indexed[i].second);
+                }
+            }
         }
         std::println("└───────────────────────────────────────────────────────────────┘");
 
-        // Benchmark various batch sizes
-        std::vector<int32_t> batch_sizes = {1, 2, 4, 8, 16, 32, 64, 128, 256};
+        // Choose batch sizes: either a single targeted size, or a default sweep
+        std::vector<int32_t> batch_sizes;
+        if (target_batch_size > 0) {
+            if (target_batch_size > engine.max_batch_size()) {
+                std::println(stderr,
+                             "Error: requested batch size {} exceeds engine max {}",
+                             target_batch_size, engine.max_batch_size());
+                return 1;
+            }
+            engine.register_batch_size(target_batch_size);
+            batch_sizes.push_back(target_batch_size);
+        } else {
+            for (int32_t bs : {1, 2, 4, 8, 16, 32, 64, 128, 256}) {
+                if (bs <= engine.max_batch_size()) batch_sizes.push_back(bs);
+            }
+        }
 
         std::println("\n┌─ Benchmark Results ───────────────────────────────────────────┐");
         std::println("│ {:>6} │ {:>10} │ {:>12} │ {:>10} │ {:>10} │",
