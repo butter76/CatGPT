@@ -2,7 +2,6 @@
 
 import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -13,11 +12,13 @@ import {
   XCircle,
   Gauge,
   Loader2,
-  Play,
   RefreshCw,
   Hourglass,
   Zap,
   Castle,
+  Square,
+  Wifi,
+  WifiOff,
 } from "lucide-react";
 import type {
   BenchmarkRun,
@@ -79,6 +80,7 @@ interface LivePositionSummary {
   fen: string;
   expectedOutcome: Outcome | null;
   correctMoves: UCIMove[];
+  blunderMoves: UCIMove[];
 }
 
 interface LivePositionState {
@@ -110,6 +112,19 @@ function emptyLiveState(): LivePositionState {
   };
 }
 
+type ConnectionState = "connecting" | "open" | "closed";
+
+interface LiveState {
+  positions: LivePositionSummary[];
+  currentIndex: number;
+  byPosition: Record<string, LivePositionState>;
+  finalAggregate: number | null;
+  status: BenchmarkRunStatus;
+  error: string | null;
+  connection: ConnectionState;
+  streamDone: boolean;
+}
+
 // ─── Page ─────────────────────────────────────────────────────────
 
 export default function LongBenchRunPage({
@@ -119,20 +134,15 @@ export default function LongBenchRunPage({
 }) {
   const { id } = use(params);
   const runId = Number(id);
-  const searchParams = useSearchParams();
 
   const [detail, setDetail] = useState<BenchmarkRunDetail | null>(null);
   const [loading, setLoading] = useState(true);
+  const [aborting, setAborting] = useState(false);
 
-  // Live execution state (populated while the SSE stream is open).
-  const [live, setLive] = useState<null | {
-    positions: LivePositionSummary[];
-    currentIndex: number;
-    byPosition: Record<string, LivePositionState>;
-    finalAggregate: number | null;
-    streamError: string | null;
-    streamDone: boolean;
-  }>(null);
+  // Live execution state. Populated as soon as we open the SSE stream and the
+  // server sends a `snapshot`. Survives SSE reconnects (EventSource reconnects
+  // automatically and the server re-sends `snapshot` on each connect).
+  const [live, setLive] = useState<LiveState | null>(null);
   const esRef = useRef<EventSource | null>(null);
 
   const load = useCallback(() => {
@@ -147,34 +157,135 @@ export default function LongBenchRunPage({
     load();
   }, [load]);
 
-  const startStream = useCallback(() => {
+  // Open (and hold) a single EventSource for the lifetime of the page.
+  // We drop the connection only when the run is in a terminal state and the
+  // server has finished sending events.
+  useEffect(() => {
+    if (!detail) return;
+    // No live executor for finished runs — just use DB detail.
+    if (detail.status === "completed" || detail.status === "failed" || detail.status === "cancelled") {
+      // We still connect once briefly to pick up a cached snapshot (if the
+      // runner is retaining one for a few minutes), but this is optional.
+      // Skip to keep network quiet.
+      return;
+    }
     if (esRef.current) return;
-    setLive({
-      positions: [],
-      currentIndex: -1,
-      byPosition: {},
-      finalAggregate: null,
-      streamError: null,
-      streamDone: false,
-    });
-    const es = new EventSource(`/api/longbench/runs/${runId}/execute`);
+
+    const es = new EventSource(`/api/longbench/runs/${runId}/stream`);
     esRef.current = es;
 
+    setLive((prev) =>
+      prev ?? {
+        positions: [],
+        currentIndex: -1,
+        byPosition: {},
+        finalAggregate: null,
+        status: detail.status,
+        error: null,
+        connection: "connecting",
+        streamDone: false,
+      }
+    );
+
+    const markConnecting = () =>
+      setLive((prev) => (prev ? { ...prev, connection: "connecting" } : prev));
+    const markOpen = () =>
+      setLive((prev) => (prev ? { ...prev, connection: "open" } : prev));
+
+    es.addEventListener("open", markOpen);
+
+    es.addEventListener("snapshot", (ev) => {
+      const raw = (ev as MessageEvent).data;
+      if (raw === "null") {
+        // Run is no longer in memory — fall back to DB detail.
+        setLive((prev) =>
+          prev ? { ...prev, connection: "open", streamDone: true } : prev
+        );
+        es.close();
+        esRef.current = null;
+        load();
+        return;
+      }
+      const snap = JSON.parse(raw) as {
+        runId: number;
+        status: BenchmarkRunStatus;
+        error: string | null;
+        positions: LivePositionSummary[];
+        currentIndex: number;
+        perPosition: Record<
+          string,
+          {
+            done: boolean;
+            skipped: boolean;
+            skippedReason?: string;
+            score: number | null;
+            stableNodes: number | null;
+            failed: boolean;
+            finalCp: number | null;
+            finalBestMove: string | null;
+            totalNodes: number | null;
+            recentStats: BenchmarkStatsSample[];
+            currentCorrect: boolean | null;
+          }
+        >;
+        aggregateScore: number | null;
+      };
+      const byPosition: Record<string, LivePositionState> = {};
+      for (const p of snap.positions) {
+        const s = snap.perPosition[p.id];
+        byPosition[p.id] = s
+          ? {
+              statsHistory: [...s.recentStats],
+              currentCorrect: s.currentCorrect,
+              done: s.done,
+              skipped: s.skipped,
+              skippedReason: s.skippedReason,
+              score: s.score,
+              stableNodes: s.stableNodes,
+              failed: s.failed,
+              finalCp: s.finalCp,
+              finalBestMove: s.finalBestMove,
+              totalNodes: s.totalNodes,
+            }
+          : emptyLiveState();
+      }
+      setLive({
+        positions: snap.positions,
+        currentIndex: snap.currentIndex,
+        byPosition,
+        finalAggregate: snap.aggregateScore,
+        status: snap.status,
+        error: snap.error,
+        connection: "open",
+        streamDone: false,
+      });
+    });
+
+    // run_started arrives when the executor has loaded its position list.
+    // We may have connected before this (race on first start), in which case
+    // `snapshot` had empty positions. Handle it here so the UI populates.
     es.addEventListener("run_started", (ev) => {
       const data = JSON.parse((ev as MessageEvent).data) as {
+        engine: string;
+        maxNodes: number;
         positions: LivePositionSummary[];
       };
-      setLive((prev) =>
-        prev
-          ? {
-              ...prev,
-              positions: data.positions,
-              byPosition: Object.fromEntries(
-                data.positions.map((p) => [p.id, emptyLiveState()])
-              ),
-            }
-          : prev
-      );
+      setLive((prev) => {
+        const byPosition = { ...(prev?.byPosition ?? {}) };
+        for (const p of data.positions) {
+          if (!byPosition[p.id]) byPosition[p.id] = emptyLiveState();
+        }
+        return {
+          positions: data.positions,
+          currentIndex: prev?.currentIndex ?? -1,
+          byPosition,
+          finalAggregate: prev?.finalAggregate ?? null,
+          status: "running",
+          error: prev?.error ?? null,
+          connection: "open",
+          streamDone: prev?.streamDone ?? false,
+        };
+      });
     });
 
     es.addEventListener("position_started", (ev) => {
@@ -183,7 +294,7 @@ export default function LongBenchRunPage({
         index: number;
       };
       setLive((prev) =>
-        prev ? { ...prev, currentIndex: data.index } : prev
+        prev ? { ...prev, currentIndex: data.index, status: "running" } : prev
       );
     });
 
@@ -198,12 +309,11 @@ export default function LongBenchRunPage({
       setLive((prev) => {
         if (!prev) return prev;
         const cur = prev.byPosition[data.positionId] ?? emptyLiveState();
-        const nextHistory = cur.statsHistory;
-        nextHistory.push({
+        const nextHistory = [...cur.statsHistory, {
           nodes: data.nodes,
           cp: data.cp,
           bestMove: data.bestMove,
-        });
+        }];
         return {
           ...prev,
           byPosition: {
@@ -259,49 +369,64 @@ export default function LongBenchRunPage({
         aggregateScore: number;
       };
       setLive((prev) =>
-        prev ? { ...prev, finalAggregate: data.aggregateScore } : prev
+        prev
+          ? {
+              ...prev,
+              finalAggregate: data.aggregateScore,
+              status: "completed",
+            }
+          : prev
       );
     });
 
+    // Server-emitted error event (JSON payload with `message`).
     es.addEventListener("error", (ev) => {
       const raw = (ev as MessageEvent).data;
-      const message = raw
-        ? (() => {
-            try {
-              return JSON.parse(raw).message ?? String(raw);
-            } catch {
-              return String(raw);
-            }
-          })()
-        : "Connection error";
-      setLive((prev) =>
-        prev ? { ...prev, streamError: message } : prev
-      );
+      if (typeof raw === "string" && raw.length > 0) {
+        try {
+          const parsed = JSON.parse(raw) as { message?: string };
+          if (parsed?.message) {
+            setLive((prev) =>
+              prev ? { ...prev, error: parsed.message ?? null, status: "failed" } : prev
+            );
+            return;
+          }
+        } catch {
+          // fall through — this is a native EventSource connection error
+        }
+      }
+      // Native EventSource connection error — the browser will auto-reconnect.
+      markConnecting();
+    });
+
+    es.addEventListener("ping", () => {
+      markOpen();
     });
 
     es.addEventListener("done", () => {
-      setLive((prev) => (prev ? { ...prev, streamDone: true } : prev));
+      setLive((prev) => (prev ? { ...prev, streamDone: true, connection: "closed" } : prev));
       es.close();
       esRef.current = null;
       // Refresh the canonical detail from the DB.
       load();
     });
-  }, [runId, load]);
 
-  // Auto-start if requested via query string (from the "Start new run" flow).
-  useEffect(() => {
-    if (searchParams.get("autostart") === "1" && detail?.status === "pending") {
-      startStream();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detail?.status]);
-
-  useEffect(() => {
     return () => {
-      esRef.current?.close();
+      es.close();
       esRef.current = null;
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runId, detail?.status]);
+
+  const handleAbort = useCallback(async () => {
+    if (!confirm("Abort this run? The current position's engine will be killed.")) return;
+    setAborting(true);
+    try {
+      await fetch(`/api/longbench/runs/${runId}/abort`, { method: "POST" });
+    } finally {
+      setAborting(false);
+    }
+  }, [runId]);
 
   if (loading && !detail) {
     return (
@@ -324,8 +449,12 @@ export default function LongBenchRunPage({
     );
   }
 
-  const canStart = detail.status === "pending" && !live;
-  const isStreaming = !!live && !live.streamDone;
+  // The DB has the latest canonical status, but the stream may be ahead when
+  // a run just finished and we haven't refetched yet.
+  const effectiveStatus: BenchmarkRunStatus = live?.status ?? detail.status;
+  const isLive = !!live && !live.streamDone;
+  const canAbort =
+    effectiveStatus === "pending" || effectiveStatus === "running";
 
   return (
     <div className="space-y-6">
@@ -345,16 +474,27 @@ export default function LongBenchRunPage({
           </p>
         </div>
         <div className="flex gap-2">
+          {isLive && <ConnectionIndicator state={live!.connection} />}
           <Button variant="outline" size="sm" onClick={load} disabled={loading}>
             <RefreshCw
               className={`w-4 h-4 mr-1.5 ${loading ? "animate-spin" : ""}`}
             />
             Refresh
           </Button>
-          {canStart && (
-            <Button size="sm" onClick={startStream}>
-              <Play className="w-4 h-4 mr-1.5" />
-              Start
+          {canAbort && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleAbort}
+              disabled={aborting}
+              className="border-red-500/50 text-red-500 hover:bg-red-500/10 hover:text-red-600"
+            >
+              {aborting ? (
+                <Loader2 className="w-4 h-4 mr-1.5 animate-spin" />
+              ) : (
+                <Square className="w-4 h-4 mr-1.5" />
+              )}
+              Abort
             </Button>
           )}
         </div>
@@ -362,12 +502,32 @@ export default function LongBenchRunPage({
 
       <RunSummaryCard run={detail} live={live} />
 
-      {live && (
-        <LiveProgressCard live={live} isStreaming={isStreaming} />
-      )}
+      {live && <LiveProgressCard live={live} isStreaming={isLive} />}
 
       <ResultsTable detail={detail} live={live} />
     </div>
+  );
+}
+
+function ConnectionIndicator({ state }: { state: ConnectionState }) {
+  if (state === "open") {
+    return (
+      <Badge variant="outline" className="border-green-500 text-green-600 h-8 gap-1">
+        <Wifi className="w-3.5 h-3.5" /> live
+      </Badge>
+    );
+  }
+  if (state === "connecting") {
+    return (
+      <Badge variant="outline" className="border-yellow-500 text-yellow-600 h-8 gap-1">
+        <Loader2 className="w-3.5 h-3.5 animate-spin" /> reconnecting
+      </Badge>
+    );
+  }
+  return (
+    <Badge variant="outline" className="border-gray-400 text-gray-500 h-8 gap-1">
+      <WifiOff className="w-3.5 h-3.5" /> closed
+    </Badge>
   );
 }
 
@@ -378,11 +538,7 @@ function RunSummaryCard({
   live,
 }: {
   run: BenchmarkRun;
-  live: {
-    positions: LivePositionSummary[];
-    byPosition: Record<string, LivePositionState>;
-    finalAggregate: number | null;
-  } | null;
+  live: LiveState | null;
 }) {
   // Live aggregate = mean of scored (non-skipped, done) positions from live state.
   const liveAggregate = useMemo(() => {
@@ -450,13 +606,7 @@ function LiveProgressCard({
   live,
   isStreaming,
 }: {
-  live: {
-    positions: LivePositionSummary[];
-    currentIndex: number;
-    byPosition: Record<string, LivePositionState>;
-    streamError: string | null;
-    streamDone: boolean;
-  };
+  live: LiveState;
   isStreaming: boolean;
 }) {
   const total = live.positions.length;
@@ -557,11 +707,11 @@ function LiveProgressCard({
           </div>
         )}
 
-        {live.streamError && (
-          <p className="text-sm text-red-500">{live.streamError}</p>
+        {live.error && (
+          <p className="text-sm text-red-500">{live.error}</p>
         )}
-        {live.streamDone && !live.streamError && (
-          <p className="text-sm text-green-600">Run stream finished.</p>
+        {live.streamDone && !live.error && (
+          <p className="text-sm text-green-600">Run finished.</p>
         )}
       </CardContent>
     </Card>
@@ -589,10 +739,7 @@ type MergedResult = {
 
 function mergeResults(
   detail: BenchmarkRunDetail,
-  live: {
-    positions: LivePositionSummary[];
-    byPosition: Record<string, LivePositionState>;
-  } | null
+  live: LiveState | null
 ): MergedResult[] {
   const merged = new Map<string, MergedResult>();
 
@@ -629,10 +776,16 @@ function mergeResults(
       const liveTruth = extractGroundTruth({
         type: pos.type,
         expectedOutcome: pos.expectedOutcome ?? undefined,
-        moveAnnotations: pos.correctMoves.map((move) => ({
-          move,
-          annotation: "correct",
-        })),
+        moveAnnotations: [
+          ...pos.correctMoves.map((move) => ({
+            move,
+            annotation: "correct" as const,
+          })),
+          ...pos.blunderMoves.map((move) => ({
+            move,
+            annotation: "blunder" as const,
+          })),
+        ],
       });
       const s = live.byPosition[pos.id];
       const existing = merged.get(pos.id);
@@ -693,10 +846,7 @@ function ResultsTable({
   live,
 }: {
   detail: BenchmarkRunDetail;
-  live: {
-    positions: LivePositionSummary[];
-    byPosition: Record<string, LivePositionState>;
-  } | null;
+  live: LiveState | null;
 }) {
   const rows = useMemo(() => mergeResults(detail, live), [detail, live]);
   const [openId, setOpenId] = useState<string | null>(null);
@@ -761,14 +911,13 @@ function ResultRow({
   open: boolean;
   onToggle: () => void;
 }) {
-  const target =
-    row.type === "FORTRESS"
-      ? row.truth?.kind === "fortress"
-        ? row.truth.expected
-        : "–"
-      : row.truth?.kind === "sharp"
-      ? [...row.truth.correctMoves].join(", ")
-      : "–";
+  const target = ((): string => {
+    const t = row.truth;
+    if (!t) return "–";
+    if (t.kind === "fortress") return t.expected;
+    if (t.kind === "sharp_correct") return [...t.correctMoves].join(", ");
+    return `avoid ${[...t.blunderMoves].join(", ")}`;
+  })();
 
   return (
     <>

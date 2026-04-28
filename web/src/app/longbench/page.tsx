@@ -131,7 +131,7 @@ export default function LongBenchPage() {
             onOpenChange={setDialogOpen}
             onCreated={(runId) => {
               setDialogOpen(false);
-              router.push(`/longbench/${runId}?autostart=1`);
+              router.push(`/longbench/${runId}`);
             }}
           />
         </div>
