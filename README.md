@@ -4,7 +4,7 @@ ML research project for chess and beyond built with **JAX** and **Flax**.
 
 Behind CatGPT is a chess transformer incorporating modern innovations from LLMs into chess. Runs on top of a new type of search called Likelihood Search (LKS), aimed to fix many of the shortcomings of MCTS, especially at very high node counts.
 
-Build instructions coming soon!
+> **Looking for the C++ engine?** See [`cpp/README.md`](cpp/README.md) for build and usage instructions for the native CatGPT engine.
 
 ## Quick Start
 
