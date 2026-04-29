@@ -2,7 +2,7 @@
 
 ML research project for chess and beyond built with **JAX** and **Flax**.
 
-Behind CatGPT is a chess transformer incorporating modern innovations from LLMs into Chess. Runs on top of a new type of search called Likelihood Search (LKS), aimed to fix many of the shortcoming of MCTS search, especially at TCEC scale.
+Behind CatGPT is a chess transformer incorporating modern innovations from LLMs into chess. Runs on top of a new type of search called Likelihood Search (LKS), aimed to fix many of the shortcomings of MCTS, especially at very high node counts.
 
 Build instructions coming soon!
 
