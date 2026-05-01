@@ -267,6 +267,33 @@ set_target_properties(catgpt_puzzle_eval PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
 
+# === Fractional MCTS v2 TT/Arena PoC microbenchmark ===
+# Standalone — no TRT, no libcoro, no chess-library deps. Just C++23 + pthread.
+add_executable(tt_arena_bench
+    src/engine/fractional_mcts/v2/tt_arena_bench.cpp
+)
+target_compile_options(tt_arena_bench PRIVATE -O3 -march=native)
+target_link_libraries(tt_arena_bench PRIVATE pthread)
+set_target_properties(tt_arena_bench PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR}"
+)
+
+# === LKS search lifecycle test ===
+# Standalone skeleton test: chess-library headers only, no TRT, no libcoro.
+add_executable(lks_search_test
+    src/engine/lks/lks_search_test.cpp
+)
+target_include_directories(lks_search_test PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+)
+target_compile_options(lks_search_test PRIVATE -O2 -g)
+target_link_libraries(lks_search_test PRIVATE pthread)
+set_target_properties(lks_search_test PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR}"
+)
+
 # Enable colored output
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)
@@ -278,4 +305,6 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(catgpt_selfplay PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_search PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_puzzle_eval PRIVATE -fdiagnostics-color=always)
+    target_compile_options(tt_arena_bench PRIVATE -fdiagnostics-color=always)
+    target_compile_options(lks_search_test PRIVATE -fdiagnostics-color=always)
 endif()
