@@ -1,43 +1,41 @@
 /**
  * LKS search.
  *
- * `LksSearch` is the next-generation, Lazy-SMP-shaped search class.
+ * Lazy-SMP-shaped chess search backed by a TensorRT BatchEvaluator per
+ * worker, sharing a lock-free SearchArena.
  *
- * Threading model:
+ * Threading + ownership model:
+ *
+ *   - `LksSearch` is constructed with a TRT engine path and the desired
+ *     fan-out (num_workers, coros_per_worker, max_batch_size). The
+ *     constructor builds N persistent `WorkerSearch`es. Each owns:
+ *
+ *         * a `coro::thread_pool` (1 thread, just resumes coroutines), and
+ *         * a `BatchEvaluator` (own engine, own CUDA stream, own GPU
+ *           thread, own pinned/device buffers).
+ *
+ *     The TRT engine load and CUDA buffer allocation happen ONCE here.
+ *     They live until `LksSearch` is destroyed.
  *
  *   - `search(cfg)` spawns the `worker_main` jthread and returns
- *     immediately. `worker_main` owns the UCI emission contract and is the
- *     ONLY thread that calls `cfg.on_uci_line`.
+ *     immediately. `worker_main` resets the per-search atomics, spawns
+ *     N short-lived `runner` jthreads (one per worker_search), then
+ *     loops on aggregate stats + UCI emission.
  *
- *   - `worker_main` spawns N `WorkerSearch` jthreads (`num_workers`
- *     parameter). Each WorkerSearch is otherwise independent: its own
- *     thread, its own stop flag, its own per-worker stats. They share
- *     exactly one thing: the lock-free `SearchArena` (TT + bump arena).
+ *   - Each `runner` does `coro::sync_wait(coro::when_all(K coros))`
+ *     where each coro is a `descent_coro` that schedules itself onto the
+ *     worker's pool, picks a synthetic position, `co_await`s an
+ *     `EvalAwaitable` against the worker's evaluator, and writes the
+ *     result into the shared `SearchArena`.
  *
- *   - `quit()` triggers worker_main's stop_token. worker_main fans the
- *     stop out to every WorkerSearch and joins them, then emits a final
- *     `bestmove` line and exits. After `quit()` returns,
- *     `is_searching()` is false.
+ *   - `quit()` triggers `worker_main`'s stop_token. `worker_main` flips
+ *     each worker's `stop` atomic and joins the runners. Runners join
+ *     once their K coros all see the stop and exit. The persistent
+ *     evaluators stay alive (their GPU threads park on empty queues)
+ *     and are reused on the next `search()`.
  *
- * This milestone:
- *
- *   - WorkerSearch loops simulate "fake search work": sleep briefly,
- *     synthesize a key, eval-first batch-allocate a NodeInfo, claim the
- *     TT slot via `find_or_claim`, publish. No real algorithm, no GPU.
- *   - The point is to exercise multi-worker stop propagation, periodic
- *     aggregated UCI info emission from worker_main, and concurrent
- *     lock-free TT writes across workers.
- *
- * State carried by `LksSearch`:
- *
- *   - `chess::Board board_`        — current root position.
- *   - `SearchArena arena_`         — TT + NodeInfo bump arena. Sized once
- *                                    at construction; preserved across
- *                                    `makemove(...)` for tree reuse.
- *   - `bool searched_since_reset_` — if true, `setBoard(b)` calls
- *                                    `reset()` first.
- *   - `int num_workers_`           — number of WorkerSearch threads to
- *                                    spawn per search.
+ *   - Only at `LksSearch` destruction do the evaluators' GPU threads
+ *     and CUDA resources get torn down.
  */
 
 #ifndef CATGPT_ENGINE_LKS_LKS_SEARCH_HPP
@@ -48,6 +46,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -59,17 +58,27 @@
 #include <utility>
 #include <vector>
 
+#include <coro/sync_wait.hpp>
+#include <coro/task.hpp>
+#include <coro/thread_pool.hpp>
+#include <coro/when_all.hpp>
+
 #include "../../../external/chess-library/include/chess.hpp"
+#include "../../selfplay/batch_evaluator.hpp"
+#include "../../selfplay/eval_request.hpp"
+#include "../../tokenizer.hpp"
 #include "../fractional_mcts/v2/tt_arena.hpp"
 
 namespace catgpt::lks {
+
+namespace fs = std::filesystem;
 
 /**
  * Per-search configuration.
  *
  * `on_uci_line` is invoked from `worker_main`, one call per UCI line.
- * The string_view is valid only for the duration of the call; the worker
- * does not retain it. For UCI production install:
+ * The string_view is valid only for the duration of the call. For UCI
+ * production install:
  *   `[](std::string_view s){ std::cout << s << '\n'; std::cout.flush(); }`
  * For tests install a recording lambda.
  */
@@ -83,28 +92,59 @@ struct LksSearchConfig {
 class LksSearch {
 public:
     /**
+     * @param trt_engine_path     Path to the serialized TensorRT engine.
+     *                            Loaded once per worker_search at ctor time.
      * @param lifetime_max_evals  Capacity for the shared SearchArena (TT
      *                            entries reachable across all workers'
      *                            lifetime). Sized once; never grows.
-     * @param num_workers         Number of WorkerSearch threads spawned
-     *                            per search() call. Defaults to 2 to
-     *                            illustrate the Lazy-SMP shape; tune to
-     *                            your hardware.
+     * @param num_workers         Number of WorkerSearch instances. Each
+     *                            owns its own engine + GPU thread + stream
+     *                            for natural pipelining across the GPU.
+     * @param coros_per_worker    Parallel descent coroutines per worker.
+     *                            Drives batch sizes: K coros suspended
+     *                            → up to K positions per GPU batch.
+     * @param max_batch_size      Cap on positions per GPU batch.
      */
-    explicit LksSearch(uint64_t lifetime_max_evals = (1ULL << 20),
-                       int num_workers = 2)
-        : lifetime_max_evals_(lifetime_max_evals)
+    explicit LksSearch(fs::path trt_engine_path,
+                       uint64_t lifetime_max_evals = (1ULL << 20),
+                       int num_workers = 2,
+                       int coros_per_worker = 8,
+                       int max_batch_size = 32)
+        : trt_engine_path_(std::move(trt_engine_path))
+        , lifetime_max_evals_(lifetime_max_evals)
         , num_workers_(num_workers > 0 ? num_workers : 1)
+        , coros_per_worker_(coros_per_worker > 0 ? coros_per_worker : 1)
+        , max_batch_size_(max_batch_size > 0 ? max_batch_size : 1)
         , board_(chess::constants::STARTPOS)
     {
         arena_.emplace(lifetime_max_evals_, /*load_factor=*/0.5,
                        /*avg_moves_per_node=*/40);
         root_key_ = board_.hash();
+
+        // Persistent workers: build pool + evaluator per worker once.
+        workers_.reserve(num_workers_);
+        for (int i = 0; i < num_workers_; ++i) {
+            auto w = std::make_unique<WorkerSearch>();
+            w->pool = coro::thread_pool::make_shared(coro::thread_pool::options{
+                .thread_count = 1,
+            });
+            w->evaluator = std::make_unique<BatchEvaluator>(
+                trt_engine_path_, w->pool, max_batch_size_);
+            workers_.push_back(std::move(w));
+        }
     }
 
     ~LksSearch() {
-        // Make sure no worker outlives us.
+        // Make sure no worker_main outlives us.
         quit();
+        // workers_ vector destructs here:
+        //   - each WorkerSearch's `runner` jthread is non-joinable
+        //     (worker_main joined it before exiting).
+        //   - each WorkerSearch's `evaluator` unique_ptr drops →
+        //     BatchEvaluator dtor calls shutdown() → GPU thread joined
+        //     → CUDA resources freed.
+        //   - each WorkerSearch's `pool` shared_ptr drops →
+        //     coro::thread_pool dtor joins its worker thread.
     }
 
     LksSearch(const LksSearch&) = delete;
@@ -117,7 +157,7 @@ public:
     void reset() {
         assert(!is_searching() && "reset() called while a search is in flight");
         // Rebuild arena in place: two delete[]s on the old buffers, two new[]s
-        // on fresh ones. This is the only allocation point in the API.
+        // on fresh ones. Workers and evaluators are NOT rebuilt.
         arena_.emplace(lifetime_max_evals_, /*load_factor=*/0.5,
                        /*avg_moves_per_node=*/40);
         searched_since_reset_ = false;
@@ -134,8 +174,7 @@ public:
 
     void makemove(const chess::Move& move) {
         assert(!is_searching() && "makemove() called while a search is in flight");
-        // Tree reuse: the arena and TT are preserved. The new root is just
-        // whatever zobrist `board_` lands on after this move.
+        // Tree reuse: arena and TT preserved.
         board_.makeMove<true>(move);
         root_key_ = board_.hash();
     }
@@ -143,16 +182,15 @@ public:
     // ── Asynchronous search ─────────────────────────────────────────────
 
     /**
-     * Launches the worker_main jthread (which in turn spawns N
-     * WorkerSearches) and returns immediately. Throws std::logic_error
-     * if a search is already in flight.
+     * Launches the worker_main jthread (which spawns N runner jthreads)
+     * and returns immediately. Throws std::logic_error if a search is
+     * already in flight.
      */
     void search(LksSearchConfig config) {
         if (is_searching()) {
             throw std::logic_error("LksSearch::search called while a search is already in flight");
         }
-        // If a previous worker is joinable but already exited (running_=false),
-        // join it now so we can replace it cleanly.
+        // Reap a previous worker_main that exited but is still joinable.
         if (worker_.joinable()) {
             worker_.join();
         }
@@ -166,14 +204,13 @@ public:
 
     /**
      * Stops any in-flight search and joins worker_main (which joins all
-     * WorkerSearches before exiting). Idempotent. Safe to call from a
-     * different thread than `search()`.
+     * runners). Idempotent. Safe to call from a thread other than
+     * `search()`. Does NOT shutdown the persistent BatchEvaluators.
      */
     void quit() {
         if (!worker_.joinable()) return;
         worker_.request_stop();
         worker_.join();
-        // `running_` was already cleared by worker_main before exit.
     }
 
     [[nodiscard]] bool is_searching() const noexcept {
@@ -185,24 +222,46 @@ public:
     [[nodiscard]] const v2::SearchArena& arena() const noexcept { return *arena_; }
 
     /**
-     * Aggregated count of fake evals performed across all workers in the
+     * Aggregated count of NN evals performed across all workers in the
      * most recent (or in-flight) search. Cleared at the start of each
-     * search().
+     * `search()` call.
      */
     [[nodiscard]] uint64_t total_evals() const noexcept {
         return total_evals_.load(std::memory_order_relaxed);
     }
 
+    /**
+     * Sum of `BatchEvaluator::total_evals()` across persistent workers,
+     * across the lifetime of LksSearch (not reset between searches).
+     * Useful for verifying that the GPU actually ran inference.
+     */
+    [[nodiscard]] uint64_t lifetime_gpu_evals() const noexcept {
+        uint64_t total = 0;
+        for (const auto& w : workers_) {
+            total += static_cast<uint64_t>(w->evaluator->total_evals());
+        }
+        return total;
+    }
+
 private:
     /**
-     * Per-worker_search state. Non-movable (jthread + atomics + back-ptr).
-     * Owned by worker_main via `std::vector<std::unique_ptr<WorkerSearch>>`.
+     * Per-worker_search state.
+     *
+     * Persistent across searches:
+     *   - pool, evaluator, runner-spawn slot
+     *
+     * Per-search (reset by worker_main at the start of every search):
+     *   - stop, evals, tt_claims
      */
     struct WorkerSearch {
+        std::shared_ptr<coro::thread_pool> pool;
+        std::unique_ptr<BatchEvaluator>    evaluator;
+
         std::atomic<bool>     stop{false};
         std::atomic<uint64_t> evals{0};
         std::atomic<uint64_t> tt_claims{0};
-        std::jthread          runner;
+
+        std::jthread runner;
 
         WorkerSearch() = default;
         WorkerSearch(const WorkerSearch&) = delete;
@@ -211,6 +270,14 @@ private:
         WorkerSearch& operator=(WorkerSearch&&) = delete;
     };
 
+    static uint64_t splitmix64(uint64_t& x) noexcept {
+        x += 0x9E3779B97F4A7C15ULL;
+        uint64_t z = x;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        return z ^ (z >> 31);
+    }
+
     void worker_main(std::stop_token st, LksSearchConfig cfg) {
         auto& cb = cfg.on_uci_line;
         auto emit = [&](std::string_view s) { if (cb) cb(s); };
@@ -218,42 +285,39 @@ private:
         using Clock = std::chrono::steady_clock;
         const auto t0 = Clock::now();
 
-        // Reset aggregate counters at the start of every search.
+        // Reset per-search counters.
         total_evals_.store(0, std::memory_order_relaxed);
+        for (auto& w : workers_) {
+            w->stop.store(false, std::memory_order_relaxed);
+            w->evals.store(0, std::memory_order_relaxed);
+            w->tt_claims.store(0, std::memory_order_relaxed);
+        }
 
-        // Pick a placeholder best-move from the legal list so the final
-        // `bestmove` line is well-formed.
+        // Pick a placeholder best-move so the final `bestmove` line is well-formed.
         chess::Movelist legal;
         chess::movegen::legalmoves(legal, board_);
         chess::Move best = legal.empty() ? chess::Move::NO_MOVE : legal[0];
 
-        // Spawn N worker_searches. Each owns its own jthread and gets
-        // a worker-local rng seed derived from its index.
-        std::vector<std::unique_ptr<WorkerSearch>> workers;
-        workers.reserve(num_workers_);
         const uint64_t per_worker_budget =
-            (cfg.max_evals + num_workers_ - 1) / num_workers_;
-        const uint64_t root_seed = root_key_;
+            (static_cast<uint64_t>(cfg.max_evals) + num_workers_ - 1)
+            / static_cast<uint64_t>(num_workers_);
+
+        // Spawn per-search runner jthreads against the persistent workers.
         for (int i = 0; i < num_workers_; ++i) {
-            workers.push_back(std::make_unique<WorkerSearch>());
-            auto* w = workers.back().get();
-            w->runner = std::jthread([this, w, i, root_seed, per_worker_budget]() {
-                worker_search_loop(*w, i, root_seed, per_worker_budget);
+            auto* w = workers_[i].get();
+            w->runner = std::jthread([this, w, i, per_worker_budget]() {
+                run_worker_search(*w, i, per_worker_budget);
             });
         }
 
-        // worker_main loop: aggregate stats, emit periodic info lines,
-        // and watch for stop. We also watch for "all workers finished
-        // their per-worker budget" (each worker_search exits cleanly
-        // when it hits per_worker_budget evals).
+        // Aggregator + UCI info loop.
         auto last_info = t0;
         while (true) {
             const bool stop_requested = st.stop_requested();
-            // Are all workers done?
             bool all_done = true;
-            for (const auto& w : workers) {
-                if (w->runner.joinable() && w->evals.load(std::memory_order_relaxed)
-                                            < per_worker_budget) {
+            for (const auto& w : workers_) {
+                if (w->runner.joinable()
+                    && w->evals.load(std::memory_order_relaxed) < per_worker_budget) {
                     all_done = false;
                     break;
                 }
@@ -267,10 +331,9 @@ private:
                 now - last_info).count();
             if (since_info < cfg.min_info_period_ms) continue;
 
-            // Aggregate stats across workers.
             uint64_t evals_sum = 0;
             uint64_t claims_sum = 0;
-            for (const auto& w : workers) {
+            for (const auto& w : workers_) {
                 evals_sum += w->evals.load(std::memory_order_relaxed);
                 claims_sum += w->tt_claims.load(std::memory_order_relaxed);
             }
@@ -290,25 +353,25 @@ private:
             last_info = now;
         }
 
-        // Stop fan-out. Even if we exited the loop because all workers
-        // already finished, flipping the flag is harmless (idempotent).
-        for (auto& w : workers) {
+        // Stop fan-out + join runners. Do NOT shutdown the persistent
+        // evaluators — they live across searches.
+        for (auto& w : workers_) {
             w->stop.store(true, std::memory_order_release);
         }
-        for (auto& w : workers) {
+        for (auto& w : workers_) {
             if (w->runner.joinable()) w->runner.join();
         }
 
         // Final aggregate snapshot.
         uint64_t evals_sum = 0;
         uint64_t claims_sum = 0;
-        for (const auto& w : workers) {
+        for (const auto& w : workers_) {
             evals_sum += w->evals.load(std::memory_order_relaxed);
             claims_sum += w->tt_claims.load(std::memory_order_relaxed);
         }
         total_evals_.store(evals_sum, std::memory_order_relaxed);
+        (void)claims_sum;
 
-        // Always emit a bestmove line, even if we were stopped early.
         char bm[64];
         if (best != chess::Move::NO_MOVE) {
             const std::string uci_move = chess::uci::moveToUci(best);
@@ -318,47 +381,70 @@ private:
         }
         emit(bm);
 
-        // Flip running_ false *after* the bestmove callback returns so
-        // callers can rely on: `!is_searching()` implies bestmove already
-        // emitted.
         running_.store(false, std::memory_order_release);
     }
 
     /**
-     * Single WorkerSearch's main loop. Synthesises fake "search work" so
-     * we have something concrete to stop, count, and write to the TT.
-     *
-     * Each iteration:
-     *   1. Check stop flag; bail if set.
-     *   2. Sleep ~1ms (simulates: descent + GPU eval + post-process).
-     *   3. Eval-first batch-allocate against the shared SearchArena.
-     *   4. find_or_claim a synthetic key derived from {root, worker_idx,
-     *      iter}. Publish on win.
-     *   5. Increment per-worker counters.
+     * Runner body. Spawned per-search by worker_main on its own jthread.
+     * Builds K descent coros and blocks until they all complete.
      */
-    void worker_search_loop(WorkerSearch& w,
-                            int worker_idx,
-                            uint64_t root_seed,
-                            uint64_t per_worker_budget) {
-        // Per-worker rng so each worker hits a (with overwhelming
-        // probability) disjoint key stream. `root_seed` ties the stream to
-        // the current root for determinism within one search.
-        uint64_t state = root_seed
-                       ^ (uint64_t(worker_idx + 1) * 0x9E3779B97F4A7C15ULL);
+    void run_worker_search(WorkerSearch& w, int worker_idx, uint64_t per_worker_budget) {
+        std::vector<coro::task<void>> tasks;
+        tasks.reserve(coros_per_worker_);
+        for (int i = 0; i < coros_per_worker_; ++i) {
+            tasks.emplace_back(descent_coro(w, worker_idx, i, per_worker_budget));
+        }
+        coro::sync_wait(coro::when_all(std::move(tasks)));
+    }
 
+    /**
+     * One descent coroutine. Runs entirely on `w.pool`. Each iteration:
+     *
+     *   1. Walk a few random legal moves from `board_` to make a synthetic
+     *      reachable position.
+     *   2. Tokenize.
+     *   3. co_await EvalAwaitable on the worker's BatchEvaluator. (This
+     *      is the suspension point that lets K coros queue up batched
+     *      requests.)
+     *   4. Eval-first batch-allocate against the shared SearchArena;
+     *      claim the TT slot for this position; publish.
+     *
+     * No real algorithm yet — this is the plumbing test.
+     */
+    coro::task<void> descent_coro(WorkerSearch& w,
+                                  int worker_idx,
+                                  int coro_id,
+                                  uint64_t per_worker_budget) {
+        co_await w.pool->schedule();
+
+        uint64_t rng = root_key_
+                     ^ (uint64_t(worker_idx + 1) * 0x9E3779B97F4A7C15ULL)
+                     ^ (uint64_t(coro_id + 1)   * 0xBF58476D1CE4E5B9ULL);
+
+        chess::Board scratch;
         while (!w.stop.load(std::memory_order_relaxed)
                && w.evals.load(std::memory_order_relaxed) < per_worker_budget) {
-            // Simulate: descent + GPU eval + post-process.
-            std::this_thread::sleep_for(std::chrono::microseconds(1000));
+            // Synthesise a random reachable position from the root.
+            scratch = board_;
+            for (int d = 0; d < 4; ++d) {
+                chess::Movelist legal;
+                chess::movegen::legalmoves(legal, scratch);
+                if (legal.empty()) break;
+                uint64_t r = splitmix64(rng);
+                scratch.makeMove<true>(legal[r % legal.size()]);
+            }
 
-            // Synthetic key.
-            state += 0x9E3779B97F4A7C15ULL;
-            uint64_t z = state;
-            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-            z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-            uint64_t key = z ^ (z >> 31);
+            auto tokens = catgpt::tokenize<BatchEvaluator::SEQ_LENGTH>(
+                scratch, NO_HALFMOVE_CONFIG);
 
-            // Eval-first batch-allocate workflow against the shared TT.
+            // Suspension point. The K-1 other coros may be in various
+            // stages here; the GPU thread picks them all up as one batch.
+            RawNNOutput out = co_await EvalAwaitable(*w.evaluator, tokens);
+
+            // Stop fast-path check after resume.
+            if (w.stop.load(std::memory_order_relaxed)) break;
+
+            const uint64_t key = scratch.hash();
             constexpr uint16_t kNumMoves = 30;
             const uint64_t off = arena_->alloc_node_info(kNumMoves);
             v2::MoveInfo* moves = arena_->moves_at(off);
@@ -373,24 +459,31 @@ private:
 
             auto [entry, claimed] = arena_->find_or_claim(key);
             if (claimed) {
-                v2::SearchArena::set_initial_qn(entry, /*Q=*/0.0f, /*max_N=*/1.0f);
+                const float Q = 2.0f * out.value - 1.0f;
+                v2::SearchArena::set_initial_qn(entry, Q, /*max_N=*/1.0f);
                 v2::SearchArena::publish_info(entry, off);
                 w.tt_claims.fetch_add(1, std::memory_order_relaxed);
             }
             w.evals.fetch_add(1, std::memory_order_relaxed);
         }
+        co_return;
     }
 
+    fs::path trt_engine_path_;
     uint64_t lifetime_max_evals_;
     int      num_workers_;
-    chess::Board board_;
-    uint64_t root_key_ = 0;
-    bool     searched_since_reset_ = false;
+    int      coros_per_worker_;
+    int      max_batch_size_;
 
-    std::optional<v2::SearchArena> arena_;
-    std::jthread                   worker_;
-    std::atomic<bool>              running_{false};
-    std::atomic<uint64_t>          total_evals_{0};
+    chess::Board board_;
+    uint64_t     root_key_ = 0;
+    bool         searched_since_reset_ = false;
+
+    std::optional<v2::SearchArena>            arena_;
+    std::vector<std::unique_ptr<WorkerSearch>> workers_;
+    std::jthread                              worker_;
+    std::atomic<bool>                         running_{false};
+    std::atomic<uint64_t>                     total_evals_{0};
 };
 
 }  // namespace catgpt::lks

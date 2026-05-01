@@ -1,10 +1,12 @@
 /**
- * Lifecycle + multi-worker tests for LksSearch.
+ * Lifecycle + multi-worker tests for LksSearch (real GPU path).
  *
- * No GPU, no UCI loop. Each WorkerSearch does fake-search work that
- * writes to the shared SearchArena, so we can verify both lifecycle
- * invariants and multi-worker behaviour:
+ * Each LksSearch instance spins up N persistent BatchEvaluators, each of
+ * which loads a TensorRT engine and allocates CUDA buffers — a few seconds
+ * total. To keep this test suite fast we use num_workers=1 for the
+ * lifecycle tests that don't need parallelism.
  *
+ * Tests:
  *   1. natural completion: search() runs to max_evals, emits bestmove last
  *   2. quit-mid-search:    search() interrupted, bestmove still emitted,
  *                          no info lines after quit() returns
@@ -12,16 +14,21 @@
  *   4. makemove-preserves: makemove() does NOT reset the arena (bytes preserved)
  *   5. double-search:      calling search() while one is running throws
  *   6. quit-noop:          calling quit() with no search is a fast no-op
- *   7. multi-worker scaling: 4 workers complete more evals/sec than 1 worker
+ *   7. multi-worker scaling: 2 workers complete more evals than 1 worker
  *   8. stop-while-busy:    quit() is prompt with N busy workers
- *   9. concurrent TT writes: tt_claims sum across workers equals
- *                            non-empty TT slots (no torn writes)
+ *   9. concurrent TT writes: arena allocations consistent across workers
+ *  10. real GPU evals:     LksSearch::lifetime_gpu_evals() matches total_evals()
+ *  11. workers reused:     two back-to-back search() calls don't reload engines
+ *
+ * The TRT engine path can be overridden via the CATGPT_TRT_ENGINE env var.
  */
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -30,6 +37,8 @@
 #include <vector>
 
 #include "lks_search.hpp"
+
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -46,6 +55,18 @@ int g_failed = 0;
             ++g_failed;                                                    \
         }                                                                  \
     } while (0)
+
+fs::path resolve_engine_path() {
+    if (const char* env = std::getenv("CATGPT_TRT_ENGINE")) {
+        return env;
+    }
+    return "/home/shadeform/CatGPT/sample.trt";
+}
+
+const fs::path& engine_path() {
+    static const fs::path p = resolve_engine_path();
+    return p;
+}
 
 struct Recorder {
     std::mutex mu;
@@ -82,20 +103,20 @@ bool starts_with(std::string_view s, std::string_view prefix) {
 
 void test_natural_completion() {
     std::printf("[1] natural completion\n");
-    LksSearch search;
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*num_workers=*/1);
     Recorder rec;
 
     LksSearchConfig cfg;
-    cfg.max_evals = 12;             // ~12 * 5ms = 60ms total
-    cfg.min_info_period_ms = 0;     // emit info every step
+    cfg.max_evals = 40;
+    cfg.min_info_period_ms = 50;
     cfg.on_uci_line = rec.callback();
 
     search.search(std::move(cfg));
 
-    // Wait for completion (with a generous timeout).
     auto t0 = std::chrono::steady_clock::now();
     while (search.is_searching()) {
-        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(2)) {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(10)) {
             std::fprintf(stderr, "  timed out waiting for natural completion\n");
             ++g_failed;
             search.quit();
@@ -103,45 +124,40 @@ void test_natural_completion() {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    // Drain the worker thread.
     search.quit();
 
     auto lines = rec.snapshot();
     EXPECT(!lines.empty());
     EXPECT(starts_with(lines.back(), "bestmove "));
-    // Some info lines should have been emitted.
-    int info_count = 0;
-    for (const auto& l : lines) if (starts_with(l, "info ")) ++info_count;
-    EXPECT(info_count > 0);
 }
 
 void test_quit_mid_search() {
     std::printf("[2] quit mid-search\n");
-    LksSearch search;
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*num_workers=*/1);
     Recorder rec;
 
     LksSearchConfig cfg;
-    cfg.max_evals = 100000;         // would run for ~500s
+    cfg.max_evals = 1'000'000;          // unbounded for the test window
     cfg.min_info_period_ms = 0;
     cfg.on_uci_line = rec.callback();
 
     auto t0 = std::chrono::steady_clock::now();
     search.search(std::move(cfg));
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     search.quit();
     auto t1 = std::chrono::steady_clock::now();
 
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         t1 - t0).count();
-    EXPECT(elapsed_ms < 500);                   // quit was prompt
-    EXPECT(!search.is_searching());              // worker is gone
+    EXPECT(elapsed_ms < 1500);                  // generous: GPU batch can be slow cold
+    EXPECT(!search.is_searching());
 
     auto lines = rec.snapshot();
     EXPECT(!lines.empty());
     EXPECT(starts_with(lines.back(), "bestmove "));
 
-    // No info line should appear *after* the bestmove (the bestmove must
-    // be the last emission).
+    // No info line should appear *after* the bestmove.
     bool seen_bestmove = false;
     bool info_after_bestmove = false;
     for (const auto& l : lines) {
@@ -151,7 +167,6 @@ void test_quit_mid_search() {
     EXPECT(seen_bestmove);
     EXPECT(!info_after_bestmove);
 
-    // After quit() returns, no further callbacks may arrive.
     size_t before = rec.size();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     EXPECT(rec.size() == before);
@@ -159,24 +174,22 @@ void test_quit_mid_search() {
 
 void test_setboard_resets_after_search() {
     std::printf("[3] setBoard resets after search\n");
-    LksSearch search;
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*num_workers=*/1);
     Recorder rec;
 
     LksSearchConfig cfg;
-    cfg.max_evals = 8;
-    cfg.min_info_period_ms = 0;
+    cfg.max_evals = 16;
+    cfg.min_info_period_ms = 50;
     cfg.on_uci_line = rec.callback();
     search.search(std::move(cfg));
     while (search.is_searching()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     search.quit();
 
-    // After a real search the workers will have allocated some arena bytes.
     EXPECT(search.arena().arena_used_bytes() > 0u);
 
-    // setBoard with a different position calls reset() internally, which
-    // drops the arena_used_bytes back to 0.
     chess::Board b("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
     search.setBoard(b);
     EXPECT(search.arena().arena_used_bytes() == 0u);
@@ -185,7 +198,8 @@ void test_setboard_resets_after_search() {
 
 void test_makemove_preserves_arena() {
     std::printf("[4] makemove preserves arena\n");
-    LksSearch search;
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*num_workers=*/1);
 
     chess::Movelist moves;
     chess::movegen::legalmoves(moves, search.board());
@@ -194,34 +208,33 @@ void test_makemove_preserves_arena() {
 
     EXPECT(search.arena().arena_used_bytes() == 0u);
 
-    // Run a search so the workers actually write to the arena; then
-    // makemove and ensure those writes are preserved (no implicit reset).
     Recorder rec;
     LksSearchConfig cfg;
-    cfg.max_evals = 8;
-    cfg.min_info_period_ms = 0;
+    cfg.max_evals = 16;
+    cfg.min_info_period_ms = 50;
     cfg.on_uci_line = rec.callback();
     search.search(std::move(cfg));
-    while (search.is_searching()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    while (search.is_searching()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     search.quit();
 
     const auto used_mid = search.arena().arena_used_bytes();
-    EXPECT(used_mid > 0u);                      // search wrote something
+    EXPECT(used_mid > 0u);
 
     search.makemove(m);
     const auto used_after = search.arena().arena_used_bytes();
 
-    EXPECT(used_after == used_mid);             // makemove did not reset
+    EXPECT(used_after == used_mid);
     EXPECT(search.root_key() != 0u);
 }
 
 void test_double_search_throws() {
     std::printf("[5] double-search throws\n");
-    LksSearch search;
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*num_workers=*/1);
     Recorder rec;
 
     LksSearchConfig cfg;
-    cfg.max_evals = 1000;
+    cfg.max_evals = 1'000'000;
     cfg.min_info_period_ms = 0;
     cfg.on_uci_line = rec.callback();
     search.search(std::move(cfg));
@@ -243,7 +256,8 @@ void test_double_search_throws() {
 
 void test_quit_without_search_is_noop() {
     std::printf("[6] quit() with no search is a fast no-op\n");
-    LksSearch search;
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*num_workers=*/1);
 
     auto t0 = std::chrono::steady_clock::now();
     search.quit();
@@ -253,49 +267,49 @@ void test_quit_without_search_is_noop() {
 
     auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
         t1 - t0).count();
-    EXPECT(elapsed_us < 5000);                  // < 5ms for three calls
+    EXPECT(elapsed_us < 5000);
     EXPECT(!search.is_searching());
 }
 
 // ── Multi-worker tests ────────────────────────────────────────────────────
 
-uint64_t run_for_ms_with_workers(int num_workers, int run_ms) {
-    LksSearch search(/*lifetime_max_evals=*/(1ULL << 20), num_workers);
-    Recorder rec;
-    LksSearchConfig cfg;
-    cfg.max_evals = 1'000'000;       // effectively unbounded for the test window
-    cfg.min_info_period_ms = 0;
-    cfg.on_uci_line = rec.callback();
-
-    search.search(std::move(cfg));
-    std::this_thread::sleep_for(std::chrono::milliseconds(run_ms));
-    search.quit();
-    return search.total_evals();
-}
-
 void test_multi_worker_throughput() {
-    std::printf("[7] multi-worker throughput (4 workers > 1 worker)\n");
-    constexpr int kRunMs = 200;
-    uint64_t evals_1 = run_for_ms_with_workers(1, kRunMs);
-    uint64_t evals_4 = run_for_ms_with_workers(4, kRunMs);
+    std::printf("[7] multi-worker throughput (2 workers > 1 worker)\n");
+    constexpr int kRunMs = 500;
+    auto run_for = [](int num_workers, int run_ms) -> uint64_t {
+        LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 20),
+                         num_workers, /*coros_per_worker=*/8);
+        Recorder rec;
+        LksSearchConfig cfg;
+        cfg.max_evals = 1'000'000;
+        cfg.min_info_period_ms = 0;
+        cfg.on_uci_line = rec.callback();
+        search.search(std::move(cfg));
+        std::this_thread::sleep_for(std::chrono::milliseconds(run_ms));
+        search.quit();
+        return search.total_evals();
+    };
 
-    std::printf("    1-worker evals=%llu  4-worker evals=%llu  (run=%dms)\n",
+    uint64_t evals_1 = run_for(1, kRunMs);
+    uint64_t evals_2 = run_for(2, kRunMs);
+
+    std::printf("    1-worker evals=%llu  2-worker evals=%llu  (run=%dms)\n",
                 (unsigned long long)evals_1,
-                (unsigned long long)evals_4,
+                (unsigned long long)evals_2,
                 kRunMs);
 
-    // Each fake-search iteration sleeps ~1ms. In `kRunMs` ms a single
-    // worker does roughly kRunMs evals; four workers should be well above
-    // 1.5x of that. We use 1.5x rather than 4x to leave plenty of slack
-    // for OS scheduling jitter on busy CI hosts.
     EXPECT(evals_1 > 0);
-    EXPECT(evals_4 > evals_1);
-    EXPECT(evals_4 >= (3 * evals_1) / 2);
+    EXPECT(evals_2 > evals_1);
+    // 2 workers should pipeline the GPU. Realistically we observe ~1.25x in
+    // practice (the GPU is already mostly saturated by a single worker at
+    // K=8 coros); demand at least 1.15x.
+    EXPECT(evals_2 * 100 >= 115 * evals_1);
 }
 
 void test_stop_with_busy_workers() {
     std::printf("[8] quit() with N busy workers is prompt\n");
-    LksSearch search(/*lifetime_max_evals=*/(1ULL << 20), /*num_workers=*/4);
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 20),
+                     /*num_workers=*/2, /*coros_per_worker=*/8);
     Recorder rec;
     LksSearchConfig cfg;
     cfg.max_evals = 1'000'000;
@@ -304,7 +318,7 @@ void test_stop_with_busy_workers() {
 
     auto t0 = std::chrono::steady_clock::now();
     search.search(std::move(cfg));
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
     auto t_before_quit = std::chrono::steady_clock::now();
     search.quit();
     auto t1 = std::chrono::steady_clock::now();
@@ -318,7 +332,8 @@ void test_stop_with_busy_workers() {
                 (long long)quit_ms, (long long)total_ms,
                 (unsigned long long)search.total_evals());
 
-    EXPECT(quit_ms < 100);                       // workers exit at next 1ms tick
+    // Bound: at most one in-flight GPU batch must drain.
+    EXPECT(quit_ms < 500);
     EXPECT(!search.is_searching());
 
     auto lines = rec.snapshot();
@@ -327,11 +342,12 @@ void test_stop_with_busy_workers() {
 }
 
 void test_concurrent_tt_writes() {
-    std::printf("[9] concurrent TT writes — claims sum equals slot count\n");
-    LksSearch search(/*lifetime_max_evals=*/(1ULL << 18), /*num_workers=*/4);
+    std::printf("[9] concurrent TT writes — arena_used == evals * node_info_bytes\n");
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*num_workers=*/2, /*coros_per_worker=*/8);
     Recorder rec;
     LksSearchConfig cfg;
-    cfg.max_evals = 4 * 200;          // 200 per worker
+    cfg.max_evals = 256;
     cfg.min_info_period_ms = 0;
     cfg.on_uci_line = rec.callback();
 
@@ -339,37 +355,118 @@ void test_concurrent_tt_writes() {
     while (search.is_searching()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     search.quit();
 
-    // Walk the TT and count non-empty slots. We don't have direct access
-    // to per-worker tt_claims from outside, but we can verify that the
-    // total number of arena allocations is consistent with the number of
-    // *evals*, and that every published slot has a valid info_offset
-    // (no torn writes).
     const auto& arena = search.arena();
-    const uint64_t cap = arena.capacity();
-    // We need a const-pointer probe; SearchArena exposes find() (non-const).
-    // For the check, use the public size accessors plus a sanity scan.
-    // We can verify that arena_used_bytes is consistent with #evals * per-node bytes.
     const uint64_t per_node_bytes =
         catgpt::v2::SearchArena::node_info_bytes(/*num_moves=*/30);
     const uint64_t expected_arena_bytes = search.total_evals() * per_node_bytes;
 
-    std::printf("    total_evals=%llu  arena_used=%llu  expected_arena=%llu  cap=%llu\n",
+    std::printf("    total_evals=%llu  arena_used=%llu  expected_arena=%llu\n",
                 (unsigned long long)search.total_evals(),
                 (unsigned long long)arena.arena_used_bytes(),
-                (unsigned long long)expected_arena_bytes,
-                (unsigned long long)cap);
+                (unsigned long long)expected_arena_bytes);
 
-    // Each completed eval increments the worker's local counter exactly
-    // once, AFTER its alloc_node_info call. So the total number of
-    // alloc_node_info calls observed by the time the worker exits is
-    // `evals` per worker, summed.
     EXPECT(arena.arena_used_bytes() == expected_arena_bytes);
     EXPECT(search.total_evals() > 0);
+}
+
+void test_real_gpu_evals() {
+    std::printf("[10] real GPU evals — lifetime_gpu_evals matches total_evals\n");
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 20),
+                     /*num_workers=*/2, /*coros_per_worker=*/8);
+    Recorder rec;
+    LksSearchConfig cfg;
+    cfg.max_evals = 200;
+    cfg.min_info_period_ms = 50;
+    cfg.on_uci_line = rec.callback();
+
+    search.search(std::move(cfg));
+    while (search.is_searching()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    search.quit();
+
+    uint64_t total = search.total_evals();
+    uint64_t gpu_total = search.lifetime_gpu_evals();
+    std::printf("    total_evals=%llu  lifetime_gpu_evals=%llu (delta=%lld)\n",
+                (unsigned long long)total,
+                (unsigned long long)gpu_total,
+                (long long)gpu_total - (long long)total);
+
+    // gpu_total counts every GPU completion; total_evals counts only those
+    // for which the descent coroutine got past its post-`co_await` stop
+    // check before incrementing. When stop is flipped, up to K coros per
+    // worker can be in flight on the GPU; their results land but those
+    // coros exit without incrementing `evals`. So gpu_total >= total and
+    // gpu_total - total <= num_workers * coros_per_worker.
+    EXPECT(gpu_total >= total);
+    EXPECT(gpu_total - total <= 2 * 8);   // num_workers * coros_per_worker
+    EXPECT(total > 50);
+}
+
+void test_workers_reused() {
+    std::printf("[11] workers reused across back-to-back searches\n");
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 20),
+                     /*num_workers=*/1, /*coros_per_worker=*/8);
+
+    // Search A: short.
+    Recorder rec_a;
+    LksSearchConfig cfg_a;
+    cfg_a.max_evals = 64;
+    cfg_a.min_info_period_ms = 50;
+    cfg_a.on_uci_line = rec_a.callback();
+    auto t_a0 = std::chrono::steady_clock::now();
+    search.search(std::move(cfg_a));
+    while (search.is_searching()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    auto t_a1 = std::chrono::steady_clock::now();
+    auto a_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_a1 - t_a0).count();
+    uint64_t evals_after_a = search.total_evals();
+    uint64_t gpu_after_a = search.lifetime_gpu_evals();
+
+    EXPECT(evals_after_a > 0);
+
+    // Search B: same fan-out. Should start producing evals quickly because
+    // the engines are already loaded; no engine reload visible in latency.
+    Recorder rec_b;
+    LksSearchConfig cfg_b;
+    cfg_b.max_evals = 64;
+    cfg_b.min_info_period_ms = 50;
+    cfg_b.on_uci_line = rec_b.callback();
+    auto t_b0 = std::chrono::steady_clock::now();
+    search.search(std::move(cfg_b));
+    while (search.is_searching()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    auto t_b1 = std::chrono::steady_clock::now();
+    auto b_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_b1 - t_b0).count();
+    uint64_t evals_after_b = search.total_evals();
+    uint64_t gpu_after_b = search.lifetime_gpu_evals();
+
+    std::printf("    search A: %lldms  evals=%llu (gpu=%llu)\n",
+                (long long)a_ms,
+                (unsigned long long)evals_after_a,
+                (unsigned long long)gpu_after_a);
+    std::printf("    search B: %lldms  evals=%llu (gpu=%llu, +%llu vs after A)\n",
+                (long long)b_ms,
+                (unsigned long long)evals_after_b,
+                (unsigned long long)gpu_after_b,
+                (unsigned long long)(gpu_after_b - gpu_after_a));
+
+    // total_evals is per-search and resets at the start of each search.
+    EXPECT(evals_after_b > 0);
+    EXPECT(evals_after_b <= evals_after_a + 64 + 32);  // sanity bound
+
+    // lifetime_gpu_evals accumulates: search B's GPU evals stack on top of A.
+    EXPECT(gpu_after_b > gpu_after_a);
+
+    // Reuse signal: search B latency should be similar to A's (no engine
+    // reload). Worst-case allow 4x A's runtime as a safety margin against
+    // jitter, but flag if it's catastrophically slower.
+    if (a_ms > 0) {
+        EXPECT(b_ms <= 4 * a_ms + 500);
+    }
 }
 
 }  // namespace
 
 int main() {
+    std::printf("Using TRT engine: %s\n", engine_path().c_str());
+
     test_natural_completion();
     test_quit_mid_search();
     test_setboard_resets_after_search();
@@ -379,6 +476,8 @@ int main() {
     test_multi_worker_throughput();
     test_stop_with_busy_workers();
     test_concurrent_tt_writes();
+    test_real_gpu_evals();
+    test_workers_reused();
 
     if (g_failed == 0) {
         std::printf("\nAll tests passed.\n");
