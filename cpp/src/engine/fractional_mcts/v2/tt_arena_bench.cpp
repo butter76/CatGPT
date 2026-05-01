@@ -148,23 +148,17 @@ void run_one(uint64_t K, PhaseTimings& out) {
 
     auto t0 = Clock::now();
     for (uint64_t i = 0; i < K; ++i) {
-        bool inserted = false;
-        TTEntry* e = arena.find_or_insert(keys[i], inserted);
-        // We expect inserts for distinct keys.
-        e->Q = 0.123f;
-        e->max_N = 1.0f;
-
         const uint16_t nm = move_counts[i];
-        const uint64_t off = arena.alloc_node_info(nm);
-        e->info_offset = off;
 
+        // Eval-first batch-allocate: write the arena bytes BEFORE claiming
+        // the TT slot. (In the synthetic single-thread case the order
+        // doesn't matter for correctness but matches the production
+        // workflow.)
+        const uint64_t off = arena.alloc_node_info(nm);
         auto* hdr = arena.info_at(off);
         hdr->variance = 0.05f;
-        // num_moves was set by alloc_node_info.
 
         MoveInfo* moves = arena.moves_at(off);
-        // Fill MoveInfo deterministically; not interesting per-bench, but
-        // touches the cold arena memory.
         uint64_t s = keys[i];
         for (uint16_t j = 0; j < nm; ++j) {
             uint64_t r = splitmix64(s);
@@ -175,6 +169,11 @@ void run_one(uint64_t K, PhaseTimings& out) {
             moves[j].P_alloc = moves[j].P;
             moves[j].P_optimistic = moves[j].P;
         }
+
+        auto [e, claimed] = arena.find_or_claim(keys[i]);
+        // Distinct keys -> we always claim.
+        SearchArena::set_initial_qn(e, /*Q=*/0.123f, /*max_N=*/1.0f);
+        SearchArena::publish_info(e, off);
     }
     auto t1 = Clock::now();
     out.fill = std::chrono::duration_cast<ns>(t1 - t0);
@@ -210,9 +209,10 @@ void run_one(uint64_t K, PhaseTimings& out) {
                 hit_probes.push_back(static_cast<uint32_t>(arena.probe_length(key)));
             }
             // Walk a few moves to touch arena.
-            if (e->info_offset != kNoInfoOffset) {
-                const NodeInfoHeader* hdr = arena.info_at(e->info_offset);
-                const MoveInfo* mv = arena.moves_at(e->info_offset);
+            uint64_t off = e->info_offset.load(std::memory_order_acquire);
+            if (off != kNoInfoOffset) {
+                const NodeInfoHeader* hdr = arena.info_at(off);
+                const MoveInfo* mv = arena.moves_at(off);
                 accum += hdr->num_moves;
                 accum += mv[r % hdr->num_moves].move;
 
@@ -264,9 +264,10 @@ void run_one(uint64_t K, PhaseTimings& out) {
             arena_storage[sizeof(SearchArena)];
         SearchArena* ap = new (arena_storage) SearchArena(K, kLoadFactor, kAvgMovesPerNode);
         for (uint64_t i = 0; i < std::min<uint64_t>(K, 1024); ++i) {
-            bool ins = false;
-            TTEntry* e = ap->find_or_insert(keys[i], ins);
-            e->info_offset = ap->alloc_node_info(move_counts[i]);
+            uint64_t off = ap->alloc_node_info(move_counts[i]);
+            auto [e, claimed] = ap->find_or_claim(keys[i]);
+            (void)claimed;
+            SearchArena::publish_info(e, off);
         }
 
         g_no_alloc.store(true, std::memory_order_relaxed);
