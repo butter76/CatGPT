@@ -1,17 +1,26 @@
 /**
  * Batched TensorRT Evaluator with coroutine integration.
  *
- * Runs on a dedicated GPU thread.  Search coroutines submit EvalRequests
+ * Runs on a dedicated GPU thread. Search coroutines submit EvalRequests
  * to a thread-safe queue; the GPU thread drains the queue, batches
  * positions, runs TensorRT inference, distributes results, and resumes
  * the coroutines on the worker thread pool.
  *
- * Batching strategy:
- *   - Wait on the queue until at least one request arrives
- *   - Drain all available requests (up to max_batch_size)
- *   - Run TRT inference on the batch
- *   - Write results back to each request
- *   - Resume each coroutine via thread_pool->resume()
+ * Bucketed batching:
+ *   - The engine is built with one optimization profile per bucket size
+ *     in `kBucketSizes` (see scripts/trt.sh). Each bucket has a profile
+ *     pinned at min == opt == max, so kernels are tuned for that exact
+ *     batch size.
+ *   - Each bucket gets its own IExecutionContext bound to its profile,
+ *     with input shape and tensor addresses preset at construction. The
+ *     H2D copy, enqueueV3, and D2H copies are then captured into a
+ *     per-bucket cudaGraphExec, so the hot path is just:
+ *       host memcpy into pinned input → cudaGraphLaunch →
+ *       cudaStreamSynchronize → host memcpy out of pinned outputs.
+ *     No setInputShape, no setTensorAddress, no per-launch TRT setup,
+ *     no padding.
+ *   - The GPU thread drains exactly `pick_bucket(min(queue.size,
+ *     max_batch_size))` requests per iteration. Leftovers stay queued.
  */
 
 #ifndef CATGPT_SELFPLAY_BATCH_EVALUATOR_HPP
@@ -20,16 +29,19 @@
 #include <NvInfer.h>
 #include <cuda_runtime.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <print>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <coro/thread_pool.hpp>
@@ -55,22 +67,37 @@ public:
     static constexpr int MAX_SUPPORTED_BATCH = 256;
 
     /**
+     * Bucket sizes that the engine has tuned optimization profiles for.
+     * Must stay in sync with scripts/trt.sh — load-time validation throws
+     * if any bucket <= max_batch_size_ is missing in the engine.
+     */
+    static constexpr std::array<int, 9> kBucketSizes = {
+        1, 2, 3, 4, 8, 16, 32, 56, 112,
+    };
+
+    /**
      * @param engine_path   Path to the serialized TensorRT engine.
      * @param thread_pool   Shared pointer to the worker thread pool
      *                      (coroutines are resumed here after GPU eval).
-     * @param max_batch_size Maximum positions per batch.
+     * @param max_batch_size Soft cap on bucket selection. Only buckets
+     *                      <= max_batch_size are usable. Effective max
+     *                      batch is the largest bucket <= max_batch_size.
      */
     BatchEvaluator(const fs::path& engine_path,
                    std::shared_ptr<coro::thread_pool> thread_pool,
                    int max_batch_size = 32)
         : thread_pool_(std::move(thread_pool))
-        , max_batch_size_(max_batch_size)
+        , max_batch_size_(max_batch_size > 0 ? max_batch_size : 1)
         , shutdown_(false)
         , total_evals_(0)
     {
+        compute_effective_buckets();
         load_engine(engine_path);
         setup_io();
+        discover_profiles();
         allocate_buffers();
+        setup_contexts();
+        capture_graphs();
 
         // Start the GPU thread
         gpu_thread_ = std::jthread([this](std::stop_token st) { gpu_loop(st); });
@@ -78,6 +105,17 @@ public:
 
     ~BatchEvaluator() {
         shutdown();
+
+        // Destroy captured graph executables first; each holds references
+        // to TRT context state, the stream, and the d_*/h_* buffers.
+        for (auto& [bucket, exec] : graph_execs_) {
+            if (exec) cudaGraphExecDestroy(exec);
+        }
+        graph_execs_.clear();
+
+        // Destroy execution contexts before freeing the stream/buffers
+        // they were bound to (and before the engine that produced them).
+        contexts_.clear();
 
         // Free CUDA resources
         if (stream_) cudaStreamDestroy(stream_);
@@ -144,7 +182,7 @@ private:
 
     void gpu_loop(std::stop_token stop) {
         std::vector<EvalRequest*> batch;
-        batch.reserve(max_batch_size_);
+        batch.reserve(largest_effective_bucket());
 
         while (true) {
             batch.clear();
@@ -160,8 +198,10 @@ private:
                     break;
                 }
 
-                // Drain up to max_batch_size requests
-                int count = std::min(static_cast<int>(queue_.size()), max_batch_size_);
+                // Drain exactly `pick_bucket(queue.size())` requests.
+                // Leftovers stay queued for the next iteration; this avoids
+                // padding and keeps every batch on a tuned profile.
+                int count = pick_bucket(static_cast<int>(queue_.size()));
                 for (int i = 0; i < count; ++i) {
                     batch.push_back(queue_.front());
                     queue_.pop_front();
@@ -180,57 +220,20 @@ private:
     void process_batch(std::vector<EvalRequest*>& batch) {
         int batch_size = static_cast<int>(batch.size());
 
-        // Pack tokens into the pinned input buffer
+        // batch_size is always a bucket size (drain logic guarantees this),
+        // so a captured cudaGraphExec is always present for it.
+
+        // Pack tokens into the pinned input buffer (the graph's H2D copy
+        // reads exactly this region; tail slots are never touched).
         for (int b = 0; b < batch_size; ++b) {
             std::memcpy(h_input_ + b * SEQ_LENGTH,
                         batch[b]->tokens.data(),
                         SEQ_LENGTH * sizeof(std::int32_t));
         }
-        // Pad remaining slots with zeros (TRT needs valid memory but values don't matter)
-        if (batch_size < max_batch_size_) {
-            std::memset(h_input_ + batch_size * SEQ_LENGTH, 0,
-                        (max_batch_size_ - batch_size) * SEQ_LENGTH * sizeof(std::int32_t));
-        }
 
-        // Set dynamic batch dimension
-        nvinfer1::Dims input_dims;
-        input_dims.nbDims = 2;
-        input_dims.d[0] = batch_size;
-        input_dims.d[1] = SEQ_LENGTH;
-        context_->setInputShape(input_name_.c_str(), input_dims);
-
-        // H2D transfer
-        std::size_t input_bytes = batch_size * SEQ_LENGTH * sizeof(std::int32_t);
-        CATGPT_CUDA_CHECK(cudaMemcpyAsync(d_input_, h_input_, input_bytes,
-                                          cudaMemcpyHostToDevice, stream_));
-
-        // Run inference
-        if (!context_->enqueueV3(stream_)) {
-            std::println(stderr, "[BatchEvaluator] TensorRT inference failed for batch_size={}", batch_size);
-            // Resume coroutines anyway (with garbage output) to avoid deadlock
-        }
-
-        // D2H transfer
-        std::size_t value_bytes = batch_size * sizeof(float);
-        std::size_t vprobs_bytes = batch_size * VALUE_NUM_BINS * sizeof(float);
-        std::size_t wdl_bytes = batch_size * 3 * sizeof(float);
-        std::size_t policy_bytes = batch_size * POLICY_SIZE * sizeof(float);
-
-        CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_value_, d_value_, value_bytes,
-                                          cudaMemcpyDeviceToHost, stream_));
-        CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_value_probs_, d_value_probs_, vprobs_bytes,
-                                          cudaMemcpyDeviceToHost, stream_));
-        if (!wdl_output_name_.empty()) {
-            CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_wdl_, d_wdl_, wdl_bytes,
-                                              cudaMemcpyDeviceToHost, stream_));
-        }
-        CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_policy_, d_policy_, policy_bytes,
-                                          cudaMemcpyDeviceToHost, stream_));
-        if (!optimistic_policy_output_name_.empty()) {
-            CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_optimistic_policy_, d_optimistic_policy_, policy_bytes,
-                                              cudaMemcpyDeviceToHost, stream_));
-        }
-
+        // Launch the captured graph: H2D + enqueueV3 + D2H, all sized for
+        // this bucket. One CUDA API call instead of ~7.
+        CATGPT_CUDA_CHECK(cudaGraphLaunch(graph_execs_.at(batch_size), stream_));
         CATGPT_CUDA_CHECK(cudaStreamSynchronize(stream_));
 
         // Distribute results and resume coroutines
@@ -289,9 +292,6 @@ private:
 
         engine_.reset(runtime_->deserializeCudaEngine(engine_data.data(), engine_data.size()));
         if (!engine_) throw std::runtime_error("Failed to deserialize CUDA engine");
-
-        context_.reset(engine_->createExecutionContext());
-        if (!context_) throw std::runtime_error("Failed to create execution context");
     }
 
     void setup_io() {
@@ -369,11 +369,12 @@ private:
     }
 
     void allocate_buffers() {
-        int B = max_batch_size_;
+        // Size to the largest bucket we might actually use (== effective max).
+        const int B = largest_effective_bucket();
 
         CATGPT_CUDA_CHECK(cudaStreamCreate(&stream_));
 
-        // Device buffers (sized for max batch)
+        // Device buffers (sized for largest effective bucket; shared across contexts)
         CATGPT_CUDA_CHECK(cudaMalloc(&d_input_, B * SEQ_LENGTH * sizeof(std::int32_t)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_value_, B * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_value_probs_, B * VALUE_NUM_BINS * sizeof(float)));
@@ -393,21 +394,251 @@ private:
             CATGPT_CUDA_CHECK(cudaMallocHost(&h_optimistic_policy_, B * POLICY_SIZE * sizeof(float)));
         }
 
-        // Bind tensor addresses (will rebind input shape per batch)
-        context_->setTensorAddress(input_name_.c_str(), d_input_);
-        context_->setTensorAddress(value_output_name_.c_str(), d_value_);
-        if (!value_probs_output_name_.empty()) {
-            context_->setTensorAddress(value_probs_output_name_.c_str(), d_value_probs_);
+        std::println(stderr, "[BatchEvaluator] Allocated buffers for max effective bucket={}", B);
+    }
+
+    /**
+     * Build effective_buckets_: the subset of kBucketSizes that are <=
+     * max_batch_size_. Bucket 1 is always present so selection always
+     * returns a valid bucket.
+     */
+    void compute_effective_buckets() {
+        effective_buckets_.clear();
+        effective_buckets_.reserve(kBucketSizes.size());
+        for (int b : kBucketSizes) {
+            if (b <= max_batch_size_) effective_buckets_.push_back(b);
         }
-        if (!wdl_output_name_.empty()) {
-            context_->setTensorAddress(wdl_output_name_.c_str(), d_wdl_);
+        if (effective_buckets_.empty()) {
+            // max_batch_size_ < 1 would have been clamped to 1 in the
+            // constructor; treat any other oddity defensively.
+            effective_buckets_.push_back(kBucketSizes.front());
         }
-        context_->setTensorAddress(policy_output_name_.c_str(), d_policy_);
-        if (!optimistic_policy_output_name_.empty()) {
-            context_->setTensorAddress(optimistic_policy_output_name_.c_str(), d_optimistic_policy_);
+    }
+
+    /**
+     * Largest bucket we'll ever drain. effective_buckets_ is sorted
+     * ascending (kBucketSizes is), so the back element is the max.
+     */
+    int largest_effective_bucket() const {
+        return effective_buckets_.back();
+    }
+
+    /**
+     * Largest bucket b in effective_buckets_ with b <= n.
+     * Always >= 1 since effective_buckets_.front() == 1 (or the first
+     * bucket >= 1, but that is 1). Caller must pass n >= 1.
+     */
+    int pick_bucket(int n) const {
+        int chosen = effective_buckets_.front();
+        for (int b : effective_buckets_) {
+            if (b > n) break;
+            chosen = b;
+        }
+        return chosen;
+    }
+
+    /**
+     * Enumerate optimization profiles in the engine and build
+     * bucket_to_profile_. Throws if any expected bucket (in
+     * effective_buckets_) is missing.
+     */
+    void discover_profiles() {
+        const int num_profiles = engine_->getNbOptimizationProfiles();
+        if (num_profiles < 1) {
+            throw std::runtime_error("Engine has no optimization profiles");
         }
 
-        std::println(stderr, "[BatchEvaluator] Allocated buffers for max_batch_size={}", B);
+        bucket_to_profile_.clear();
+        for (int i = 0; i < num_profiles; ++i) {
+            auto opt_dims = engine_->getProfileShape(
+                input_name_.c_str(), i, nvinfer1::OptProfileSelector::kOPT);
+            if (opt_dims.nbDims < 1) continue;
+            const int batch = static_cast<int>(opt_dims.d[0]);
+            bucket_to_profile_[batch] = i;
+        }
+
+        // Validate: every effective bucket has a matching profile.
+        for (int b : effective_buckets_) {
+            if (!bucket_to_profile_.contains(b)) {
+                std::string expected;
+                for (int e : effective_buckets_) {
+                    if (!expected.empty()) expected += ", ";
+                    expected += std::to_string(e);
+                }
+                std::string discovered;
+                for (const auto& [k, v] : bucket_to_profile_) {
+                    if (!discovered.empty()) discovered += ", ";
+                    discovered += std::to_string(k);
+                }
+                throw std::runtime_error(std::format(
+                    "Engine missing optimization profile for bucket {}. "
+                    "Expected (effective): [{}]. Discovered (in engine): [{}]. "
+                    "Rebuild the engine with scripts/trt.sh.",
+                    b, expected, discovered));
+            }
+        }
+
+        std::println(stderr, "[BatchEvaluator] Discovered {} optimization profile(s); "
+                             "all {} effective bucket(s) covered",
+                     num_profiles, effective_buckets_.size());
+    }
+
+    /**
+     * Create one IExecutionContext per effective bucket, bind it to the
+     * bucket's profile, set input shape (min == opt == max), and bind
+     * tensor addresses to the shared d_* device buffers.
+     *
+     * After this, the hot path never touches setInputShape /
+     * setTensorAddress / setOptimizationProfileAsync.
+     */
+    void setup_contexts() {
+        contexts_.clear();
+        contexts_.reserve(effective_buckets_.size());
+
+        for (int b : effective_buckets_) {
+            const int profile_idx = bucket_to_profile_.at(b);
+
+            std::unique_ptr<nvinfer1::IExecutionContext> ctx(
+                engine_->createExecutionContext());
+            if (!ctx) {
+                throw std::runtime_error(std::format(
+                    "Failed to create IExecutionContext for bucket {}", b));
+            }
+
+            if (!ctx->setOptimizationProfileAsync(profile_idx, stream_)) {
+                throw std::runtime_error(std::format(
+                    "Failed to bind optimization profile {} for bucket {}",
+                    profile_idx, b));
+            }
+            CATGPT_CUDA_CHECK(cudaStreamSynchronize(stream_));
+
+            // min == opt == max for these profiles, so this is one-time.
+            nvinfer1::Dims input_dims;
+            input_dims.nbDims = 2;
+            input_dims.d[0] = b;
+            input_dims.d[1] = SEQ_LENGTH;
+            ctx->setInputShape(input_name_.c_str(), input_dims);
+
+            // Bind addresses to the shared device buffers.
+            ctx->setTensorAddress(input_name_.c_str(), d_input_);
+            ctx->setTensorAddress(value_output_name_.c_str(), d_value_);
+            if (!value_probs_output_name_.empty()) {
+                ctx->setTensorAddress(value_probs_output_name_.c_str(), d_value_probs_);
+            }
+            if (!wdl_output_name_.empty()) {
+                ctx->setTensorAddress(wdl_output_name_.c_str(), d_wdl_);
+            }
+            ctx->setTensorAddress(policy_output_name_.c_str(), d_policy_);
+            if (!optimistic_policy_output_name_.empty()) {
+                ctx->setTensorAddress(
+                    optimistic_policy_output_name_.c_str(), d_optimistic_policy_);
+            }
+
+            contexts_.emplace(b, std::move(ctx));
+        }
+
+        std::println(stderr,
+                     "[BatchEvaluator] Set up {} bucket context(s) (max_batch_size={}, "
+                     "max_effective_bucket={})",
+                     contexts_.size(), max_batch_size_, largest_effective_bucket());
+    }
+
+    /**
+     * Capture one cudaGraphExec per effective bucket. The graph wraps:
+     *   - H2D: bucket * SEQ_LENGTH int32 tokens
+     *   - enqueueV3 on the bucket's IExecutionContext
+     *   - D2H: value, value_probs, [wdl], policy, [optimistic_policy]
+     *
+     * After this, process_batch only does host memcpys + cudaGraphLaunch
+     * + cudaStreamSynchronize. No per-launch TRT setup, no per-launch
+     * cudaMemcpyAsync host calls.
+     */
+    void capture_graphs() {
+        graph_execs_.clear();
+        graph_execs_.reserve(effective_buckets_.size());
+        for (int b : effective_buckets_) {
+            graph_execs_.emplace(b, capture_graph(b));
+        }
+        std::println(stderr,
+                     "[BatchEvaluator] Captured {} CUDA graph(s) for buckets [{}]",
+                     graph_execs_.size(), join_buckets(effective_buckets_));
+    }
+
+    /**
+     * Capture a single bucket's H2D + enqueueV3 + D2H into a graph and
+     * return the instantiated executable. Performs one TRT warmup
+     * inference outside capture so internal state is stable, per the
+     * TRT-with-CUDA-graphs guidance.
+     */
+    cudaGraphExec_t capture_graph(int bucket) {
+        auto& ctx = *contexts_.at(bucket);
+
+        // Warmup: run the context once so any one-time TRT internal
+        // allocations / state setup happen before we start capturing.
+        if (!ctx.enqueueV3(stream_)) {
+            throw std::runtime_error(std::format(
+                "TRT warmup enqueueV3 failed for bucket {}", bucket));
+        }
+        CATGPT_CUDA_CHECK(cudaStreamSynchronize(stream_));
+
+        const std::size_t input_bytes  = bucket * SEQ_LENGTH * sizeof(std::int32_t);
+        const std::size_t value_bytes  = bucket * sizeof(float);
+        const std::size_t vprobs_bytes = bucket * VALUE_NUM_BINS * sizeof(float);
+        const std::size_t wdl_bytes    = bucket * 3 * sizeof(float);
+        const std::size_t policy_bytes = bucket * POLICY_SIZE * sizeof(float);
+
+        CATGPT_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
+
+        // H2D
+        CATGPT_CUDA_CHECK(cudaMemcpyAsync(d_input_, h_input_, input_bytes,
+                                          cudaMemcpyHostToDevice, stream_));
+
+        // Inference
+        if (!ctx.enqueueV3(stream_)) {
+            cudaGraph_t dropped;
+            cudaStreamEndCapture(stream_, &dropped);
+            if (dropped) cudaGraphDestroy(dropped);
+            throw std::runtime_error(std::format(
+                "TRT enqueueV3 failed during graph capture for bucket {}", bucket));
+        }
+
+        // D2H
+        CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_value_, d_value_, value_bytes,
+                                          cudaMemcpyDeviceToHost, stream_));
+        CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_value_probs_, d_value_probs_, vprobs_bytes,
+                                          cudaMemcpyDeviceToHost, stream_));
+        if (!wdl_output_name_.empty()) {
+            CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_wdl_, d_wdl_, wdl_bytes,
+                                              cudaMemcpyDeviceToHost, stream_));
+        }
+        CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_policy_, d_policy_, policy_bytes,
+                                          cudaMemcpyDeviceToHost, stream_));
+        if (!optimistic_policy_output_name_.empty()) {
+            CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_optimistic_policy_, d_optimistic_policy_,
+                                              policy_bytes,
+                                              cudaMemcpyDeviceToHost, stream_));
+        }
+
+        cudaGraph_t graph = nullptr;
+        CATGPT_CUDA_CHECK(cudaStreamEndCapture(stream_, &graph));
+
+        cudaGraphExec_t exec = nullptr;
+        CATGPT_CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+
+        // The executable retains everything it needs; the source graph
+        // can be freed.
+        cudaGraphDestroy(graph);
+
+        return exec;
+    }
+
+    static std::string join_buckets(const std::vector<int>& bs) {
+        std::string s;
+        for (int b : bs) {
+            if (!s.empty()) s += ", ";
+            s += std::to_string(b);
+        }
+        return s;
     }
 
     // ─── Members ────────────────────────────────────────────────────────
@@ -435,7 +666,23 @@ private:
     TrtLogger logger_;
     std::unique_ptr<nvinfer1::IRuntime> runtime_;
     std::unique_ptr<nvinfer1::ICudaEngine> engine_;
-    std::unique_ptr<nvinfer1::IExecutionContext> context_;
+
+    // Buckets <= max_batch_size_, ascending. Source of truth for
+    // pick_bucket and the keys of contexts_.
+    std::vector<int> effective_buckets_;
+
+    // bucket_size -> engine optimization profile index, populated by
+    // discover_profiles() at construction.
+    std::unordered_map<int, int> bucket_to_profile_;
+
+    // bucket_size -> IExecutionContext. Each context is bound to its
+    // bucket's profile with input shape and tensor addresses preset.
+    std::unordered_map<int, std::unique_ptr<nvinfer1::IExecutionContext>> contexts_;
+
+    // bucket_size -> captured cudaGraphExec wrapping H2D + enqueueV3 +
+    // D2H for that bucket. Owned (destroyed in ~BatchEvaluator before
+    // contexts_ and CUDA buffers).
+    std::unordered_map<int, cudaGraphExec_t> graph_execs_;
 
     std::string input_name_;
     std::string value_output_name_;

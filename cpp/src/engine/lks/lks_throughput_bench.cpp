@@ -139,6 +139,15 @@ int main(int argc, char** argv) {
     }
     std::printf("\n");
 
+    // K sweep at num_workers=2 (the pipelining sweet spot from the N sweep).
+    std::printf("# K sweep (2 workers, max_batch=%d)\n", kMaxBatch);
+    for (int K : {1, 2, 4, 8, 16, 32, 56, 112}) {
+        auto r = run_one(/*num_workers=*/2, /*coros_per_worker=*/K,
+                         /*max_batch_size=*/kMaxBatch, run_ms);
+        print_row(r);
+    }
+    std::printf("\n");
+
     // N sweep at K=112 (the per-worker peak from the K sweep).
     std::printf("# N sweep (K=112, max_batch=%d)\n", kMaxBatch);
     for (int N : {1, 2, 3, 4, 6, 8}) {
