@@ -148,7 +148,7 @@ int main(int argc, char** argv) {
     // max_batch_size sweep at num_workers=1 over the engine's bucket set.
     // (Bucket sizes mirror BatchEvaluator::kBucketSizes.)
     std::printf("# max_batch sweep (1 worker)\n");
-    for (int M : {1, 2, 4, 8, 16, 32, 56, 112}) {
+    for (int M : {1, 2, 4, 6, 8, 12, 18, 26, 36, 56, 112}) {
         auto r = run_one(/*num_workers=*/1,
                          /*coros_per_worker=*/kCoroFactor * M,
                          /*max_batch_size=*/M, run_ms);
@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
 
     // max_batch_size sweep at num_workers=2.
     std::printf("# max_batch sweep (2 workers)\n");
-    for (int M : {1, 2, 4, 8, 16, 32, 56, 112}) {
+    for (int M : {1, 2, 4, 6, 8, 12, 18, 26, 36, 56, 112}) {
         auto r = run_one(/*num_workers=*/2,
                          /*coros_per_worker=*/kCoroFactor * M,
                          /*max_batch_size=*/M, run_ms);

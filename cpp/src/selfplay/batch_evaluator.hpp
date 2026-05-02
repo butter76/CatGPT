@@ -71,8 +71,8 @@ public:
      * Must stay in sync with scripts/trt.sh — load-time validation throws
      * if any bucket <= max_batch_size_ is missing in the engine.
      */
-    static constexpr std::array<int, 9> kBucketSizes = {
-        1, 2, 3, 4, 8, 16, 32, 56, 112,
+    static constexpr std::array<int, 12> kBucketSizes = {
+        1, 2, 3, 4, 6, 8, 12, 18, 26, 36, 56, 112,
     };
 
     /**
