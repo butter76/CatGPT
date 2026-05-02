@@ -1,16 +1,30 @@
 /**
  * Throughput vs batch-size sweep for LksSearch.
  *
- * Sweeps `(num_workers, coros_per_worker)` and reports:
+ * Sweeps `(num_workers, max_batch_size)` and reports:
  *   - elapsed wall time
  *   - total NN evaluations (lifetime_gpu_evals)
  *   - throughput (evals/sec)
  *   - total GPU batches dispatched
  *   - average batch size (evals / batches)
  *
- * Intent: understand how throughput scales with K (parallel coros per
- * worker, controls batch size) and N (workers, controls GPU pipelining
- * via separate streams).
+ * Intent: understand how throughput scales with M (max GPU batch size,
+ * the engine knob controlling bucket selection) and N (workers, which
+ * controls GPU pipelining via separate streams).
+ *
+ * Saturation rule:
+ *
+ *   With the GPU thread eagerly draining `BatchEvaluator::queue_`, the
+ *   per-worker steady-state batch size is min(K - B, max_bucket(K)),
+ *   where K = coros_per_worker. The equilibrium is B = K/2 unless K is
+ *   large enough that K - B ≥ M (the largest bucket ≤ max_batch_size),
+ *   i.e. K ≥ 2*M. So to actually measure the GPU-saturated throughput
+ *   at a given max_batch_size M, you need K significantly above 2*M.
+ *
+ *   Empirically (RTX 5090, FP16 main.trt) batches saturate cleanly at
+ *   K ≈ 2*M and headline throughput peaks around K = 3*M to 4*M; above
+ *   that, queue depth grows without buying more batch size and per-
+ *   coro latency just inflates. This bench picks K = 4*M.
  */
 
 #include <chrono>
@@ -121,37 +135,44 @@ int main(int argc, char** argv) {
     int run_ms = 1000;
     if (argc > 1) run_ms = std::atoi(argv[1]);
 
-    std::printf("LKS throughput sweep: engine=%s, run_ms=%d per cell\n\n",
-                engine_path().c_str(), run_ms);
+    // Pick coros_per_worker large enough to break the K/2 equilibrium
+    // and keep BatchEvaluator's queue saturated at the target bucket.
+    constexpr int kCoroFactor = 4;
+
+    std::printf("LKS throughput sweep: engine=%s, run_ms=%d per cell, "
+                "coros_per_worker = %d * max_batch_size\n\n",
+                engine_path().c_str(), run_ms, kCoroFactor);
 
     print_header();
 
-    // max_batch=112 matches the engine's optShape/maxShape so every batch
-    // is a valid profile shape.
+    // max_batch_size sweep at num_workers=1 over the engine's bucket set.
+    // (Bucket sizes mirror BatchEvaluator::kBucketSizes.)
+    std::printf("# max_batch sweep (1 worker)\n");
+    for (int M : {1, 2, 4, 8, 16, 32, 56, 112}) {
+        auto r = run_one(/*num_workers=*/1,
+                         /*coros_per_worker=*/kCoroFactor * M,
+                         /*max_batch_size=*/M, run_ms);
+        print_row(r);
+    }
+    std::printf("\n");
+
+    // max_batch_size sweep at num_workers=2.
+    std::printf("# max_batch sweep (2 workers)\n");
+    for (int M : {1, 2, 4, 8, 16, 32, 56, 112}) {
+        auto r = run_one(/*num_workers=*/2,
+                         /*coros_per_worker=*/kCoroFactor * M,
+                         /*max_batch_size=*/M, run_ms);
+        print_row(r);
+    }
+    std::printf("\n");
+
+    // num_workers sweep at max_batch_size=112 (the largest bucket).
     constexpr int kMaxBatch = 112;
-
-    // K sweep at num_workers=1.
-    std::printf("# K sweep (1 worker, max_batch=%d)\n", kMaxBatch);
-    for (int K : {1, 2, 4, 8, 16, 32, 56, 112}) {
-        auto r = run_one(/*num_workers=*/1, /*coros_per_worker=*/K,
-                         /*max_batch_size=*/kMaxBatch, run_ms);
-        print_row(r);
-    }
-    std::printf("\n");
-
-    // K sweep at num_workers=2 (the pipelining sweet spot from the N sweep).
-    std::printf("# K sweep (2 workers, max_batch=%d)\n", kMaxBatch);
-    for (int K : {1, 2, 4, 8, 16, 32, 56, 112}) {
-        auto r = run_one(/*num_workers=*/2, /*coros_per_worker=*/K,
-                         /*max_batch_size=*/kMaxBatch, run_ms);
-        print_row(r);
-    }
-    std::printf("\n");
-
-    // N sweep at K=112 (the per-worker peak from the K sweep).
-    std::printf("# N sweep (K=112, max_batch=%d)\n", kMaxBatch);
+    std::printf("# N sweep (max_batch=%d, coros_per_worker=%d)\n",
+                kMaxBatch, kCoroFactor * kMaxBatch);
     for (int N : {1, 2, 3, 4, 6, 8}) {
-        auto r = run_one(/*num_workers=*/N, /*coros_per_worker=*/112,
+        auto r = run_one(/*num_workers=*/N,
+                         /*coros_per_worker=*/kCoroFactor * kMaxBatch,
                          /*max_batch_size=*/kMaxBatch, run_ms);
         print_row(r);
     }
