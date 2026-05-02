@@ -8,8 +8,8 @@
 
 LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/shadeform/TensorRT-10.13.3.9/lib \
 /home/shadeform/TensorRT-10.13.3.9/bin/trtexec \
-  --onnx=test.onnx \
-  --saveEngine=test.trt \
+  --onnx=main.onnx \
+  --saveEngine=main.trt \
   --minShapes=in_0:1x64 \
   --optShapes=in_0:112x64 \
   --maxShapes=in_0:112x64 \

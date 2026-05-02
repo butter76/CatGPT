@@ -243,6 +243,19 @@ public:
         return total;
     }
 
+    /**
+     * Sum of `BatchEvaluator::total_batches()` across persistent workers.
+     * Combined with `lifetime_gpu_evals()` this gives the average batch
+     * size achieved on the GPU.
+     */
+    [[nodiscard]] uint64_t lifetime_gpu_batches() const noexcept {
+        uint64_t total = 0;
+        for (const auto& w : workers_) {
+            total += static_cast<uint64_t>(w->evaluator->total_batches());
+        }
+        return total;
+    }
+
 private:
     /**
      * Per-worker_search state.

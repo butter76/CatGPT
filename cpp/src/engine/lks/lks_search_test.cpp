@@ -60,7 +60,7 @@ fs::path resolve_engine_path() {
     if (const char* env = std::getenv("CATGPT_TRT_ENGINE")) {
         return env;
     }
-    return "/home/shadeform/CatGPT/sample.trt";
+    return "/home/shadeform/CatGPT/main.trt";
 }
 
 const fs::path& engine_path() {

@@ -314,6 +314,28 @@ set_target_properties(lks_search_test PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
 
+# === LKS throughput sweep (real TRT) ===
+add_executable(lks_throughput_bench
+    src/engine/lks/lks_throughput_bench.cpp
+)
+target_include_directories(lks_throughput_bench PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${LIBCORO_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+)
+target_compile_options(lks_throughput_bench PRIVATE -O3 -march=native -fcoroutines)
+target_link_libraries(lks_throughput_bench PRIVATE
+    ${LIBCORO_LIB}
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    pthread
+)
+set_target_properties(lks_throughput_bench PROPERTIES
+    BUILD_RPATH   "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+)
+
 # Enable colored output
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)

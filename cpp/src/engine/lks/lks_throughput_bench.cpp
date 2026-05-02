@@ -1,0 +1,150 @@
+/**
+ * Throughput vs batch-size sweep for LksSearch.
+ *
+ * Sweeps `(num_workers, coros_per_worker)` and reports:
+ *   - elapsed wall time
+ *   - total NN evaluations (lifetime_gpu_evals)
+ *   - throughput (evals/sec)
+ *   - total GPU batches dispatched
+ *   - average batch size (evals / batches)
+ *
+ * Intent: understand how throughput scales with K (parallel coros per
+ * worker, controls batch size) and N (workers, controls GPU pipelining
+ * via separate streams).
+ */
+
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "lks_search.hpp"
+
+namespace fs = std::filesystem;
+using catgpt::lks::LksSearch;
+using catgpt::lks::LksSearchConfig;
+
+namespace {
+
+fs::path engine_path() {
+    if (const char* env = std::getenv("CATGPT_TRT_ENGINE")) return env;
+    return "/home/shadeform/CatGPT/main.trt";
+}
+
+struct Result {
+    int num_workers;
+    int coros_per_worker;
+    int max_batch_size;
+    double elapsed_ms;
+    uint64_t evals;
+    uint64_t batches;
+};
+
+Result run_one(int num_workers, int coros_per_worker, int max_batch_size, int run_ms) {
+    LksSearch search(engine_path(),
+                     /*lifetime_max_evals=*/(1ULL << 22),
+                     num_workers,
+                     coros_per_worker,
+                     max_batch_size);
+
+    LksSearchConfig cfg;
+    cfg.max_evals = 1'000'000'000;
+    cfg.min_info_period_ms = 1'000'000;
+    cfg.on_uci_line = [](std::string_view) {};
+
+    // Warmup: ~50ms to let TRT build optimization caches.
+    search.search(cfg);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    search.quit();
+
+    // Reset evals_ tally implicitly happens at next search() — but
+    // BatchEvaluator's lifetime counters keep accumulating. Sample now.
+    uint64_t pre_evals = search.lifetime_gpu_evals();
+
+    // Aggregate per-worker batches across workers (we'll need a delta).
+    auto total_batches = [&]() -> uint64_t {
+        uint64_t b = 0;
+        for (int i = 0; i < num_workers; ++i) {
+            // No public getter for per-worker batches; we'll use a method
+            // we'll add below.
+        }
+        return b;
+    };
+    (void)total_batches;
+    uint64_t pre_batches = search.lifetime_gpu_batches();
+
+    auto t0 = std::chrono::steady_clock::now();
+    LksSearchConfig cfg2 = cfg;
+    cfg2.on_uci_line = [](std::string_view) {};
+    search.search(std::move(cfg2));
+    std::this_thread::sleep_for(std::chrono::milliseconds(run_ms));
+    search.quit();
+    auto t1 = std::chrono::steady_clock::now();
+
+    Result r;
+    r.num_workers = num_workers;
+    r.coros_per_worker = coros_per_worker;
+    r.max_batch_size = max_batch_size;
+    r.elapsed_ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
+    r.evals = search.lifetime_gpu_evals() - pre_evals;
+    r.batches = search.lifetime_gpu_batches() - pre_batches;
+    return r;
+}
+
+void print_header() {
+    std::printf("%-7s %-6s %-9s %-10s %-10s %-12s %-10s %-9s\n",
+                "workers", "coros", "max_batch",
+                "elapsed", "evals", "evals/s", "batches", "avg_batch");
+}
+
+void print_row(const Result& r) {
+    double evals_per_sec = r.evals / (r.elapsed_ms / 1000.0);
+    double avg_batch = r.batches > 0 ? double(r.evals) / r.batches : 0.0;
+    std::printf("%-7d %-6d %-9d %-9.1fms %-10llu %-12.0f %-10llu %-9.2f\n",
+                r.num_workers,
+                r.coros_per_worker,
+                r.max_batch_size,
+                r.elapsed_ms,
+                (unsigned long long)r.evals,
+                evals_per_sec,
+                (unsigned long long)r.batches,
+                avg_batch);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    int run_ms = 1000;
+    if (argc > 1) run_ms = std::atoi(argv[1]);
+
+    std::printf("LKS throughput sweep: engine=%s, run_ms=%d per cell\n\n",
+                engine_path().c_str(), run_ms);
+
+    print_header();
+
+    // max_batch=112 matches the engine's optShape/maxShape so every batch
+    // is a valid profile shape.
+    constexpr int kMaxBatch = 112;
+
+    // K sweep at num_workers=1.
+    std::printf("# K sweep (1 worker, max_batch=%d)\n", kMaxBatch);
+    for (int K : {1, 2, 4, 8, 16, 32, 56, 112}) {
+        auto r = run_one(/*num_workers=*/1, /*coros_per_worker=*/K,
+                         /*max_batch_size=*/kMaxBatch, run_ms);
+        print_row(r);
+    }
+    std::printf("\n");
+
+    // N sweep at K=112 (the per-worker peak from the K sweep).
+    std::printf("# N sweep (K=112, max_batch=%d)\n", kMaxBatch);
+    for (int N : {1, 2, 3, 4, 6, 8}) {
+        auto r = run_one(/*num_workers=*/N, /*coros_per_worker=*/112,
+                         /*max_batch_size=*/kMaxBatch, run_ms);
+        print_row(r);
+    }
+    return 0;
+}

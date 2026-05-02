@@ -134,6 +134,11 @@ public:
         return total_evals_.load(std::memory_order_relaxed);
     }
 
+    /** Total batches dispatched to the GPU since construction. */
+    [[nodiscard]] std::int64_t total_batches() const noexcept {
+        return total_batches_.load(std::memory_order_relaxed);
+    }
+
 private:
     // ─── GPU thread main loop ───────────────────────────────────────────
 
@@ -257,6 +262,7 @@ private:
         }
 
         total_evals_.fetch_add(batch_size, std::memory_order_relaxed);
+        total_batches_.fetch_add(1, std::memory_order_relaxed);
     }
 
     // ─── TensorRT setup ─────────────────────────────────────────────────
@@ -423,6 +429,7 @@ private:
 
     // Stats
     std::atomic<std::int64_t> total_evals_;
+    std::atomic<std::int64_t> total_batches_{0};
 
     // TensorRT state
     TrtLogger logger_;
