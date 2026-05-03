@@ -686,16 +686,26 @@ private:
         for (uint16_t i = 0; i < num_moves; ++i) {
             const auto& m = moves[i];
 
+            // Depth floor — applies to EVERY child regardless of kind.
+            // With child_depth = depth + log(P), each level of recursion
+            // strictly decreases depth. Without a floor at 0 the recursion
+            // would run forever as priors compound below e^0 = 1 visit.
+            // Cuts terminal_kind contributions too: a terminal child below
+            // the floor doesn't matter at this iteration's resolution.
+            const float child_depth = (m.P > 0.0f)
+                ? depth + std::log(std::max(m.P, 1e-9f))
+                : -std::numeric_limits<float>::infinity();
+            if (child_depth < 0.0f) {
+                plans.push_back({Mode::Skip, m.P, 0.0f, 0});
+                continue;
+            }
+
             if (m.terminal_kind == v2::kTerminalDraw) {
                 plans.push_back({Mode::ReadOnly, m.P, /*Q=*/0.0f, /*key=*/0});
                 continue;
             }
             if (m.terminal_kind == v2::kTerminalLossForChild) {
                 plans.push_back({Mode::ReadOnly, m.P, /*Q=*/-1.0f, /*key=*/0});
-                continue;
-            }
-            if (m.P <= 0.0f) {
-                plans.push_back({Mode::Skip, m.P, 0.0f, 0});
                 continue;
             }
 
@@ -710,7 +720,6 @@ private:
                 continue;
             }
 
-            const float child_depth = depth + std::log(std::max(m.P, 1e-9f));
             const uint64_t child_key = cb.hash();
 
             if (v2::TTEntry* ce = arena_->find(child_key)) {
@@ -768,8 +777,17 @@ private:
             num += p.P * (-child_Q);
             den += p.P;
         }
-        const float Q_new = (den > 0.0f) ? (num / den) : 0.0f;
-        v2::SearchArena::update_qd(entry, Q_new, depth);
+        if (den > 0.0f) {
+            v2::SearchArena::update_qd(entry, num / den, depth);
+        } else {
+            // No contributing children at this depth (all below the
+            // child_depth >= 0 floor, or stop fired before any landed).
+            // Keep the existing NN-evaluated Q and just bump max_depth.
+            auto [q_old, _] = v2::unpack_qd(
+                entry->qd_packed.load(std::memory_order_acquire));
+            (void)_;
+            v2::SearchArena::update_qd(entry, q_old, depth);
+        }
     }
 
     fs::path trt_engine_path_;
