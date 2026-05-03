@@ -327,6 +327,100 @@ public:
         return total;
     }
 
+    /**
+     * Pick the root move with the best score, where score = -child_Q from
+     * our perspective. Mirrors the plan classification used in
+     * `recursive_search`: terminal_kind drives fixed Q for terminal
+     * children, `isRepetition(1)` is checked path-dependently, and
+     * non-terminal children's Q is read from their TT entry.
+     *
+     * Tiebreak (lex): score, then child max_depth, then prior P.
+     *
+     * Falls back to:
+     *   - `chess::Move::NO_MOVE` if there are no legal moves,
+     *   - `legal[0]` if the root has not yet been expanded (TT miss or
+     *     `info_offset == kNoInfoOffset`).
+     *
+     * Children that were never expanded during search (e.g. budget
+     * exhausted before they were reached) are scored as "we lose" so
+     * any move with TT-evaluated children outranks them; if NO child
+     * has a TT entry, the highest-P move wins via the P tiebreak.
+     *
+     * Safe to call concurrently with a search in flight (uses acquire
+     * loads on `qd_packed` / `info_offset`); intended to be called
+     * after `quit()`/runners join, when the result is stable.
+     */
+    [[nodiscard]] chess::Move bestmove() const {
+        chess::Movelist legal;
+        chess::movegen::legalmoves(legal, board_);
+        if (legal.empty()) return chess::Move::NO_MOVE;
+
+        const v2::TTEntry* root = arena_->find(root_key_);
+        if (root == nullptr) return legal[0];
+
+        const uint64_t info_off = root->info_offset.load(std::memory_order_acquire);
+        if (info_off == v2::kNoInfoOffset) return legal[0];
+
+        const v2::NodeInfoHeader* hdr = arena_->info_at(info_off);
+        const uint16_t num_moves = hdr->num_moves;
+        const v2::MoveInfo* moves = arena_->moves_at(info_off);
+        if (num_moves == 0) return legal[0];
+
+        chess::Move best       = chess::Move{moves[0].move};
+        float       best_score = -std::numeric_limits<float>::infinity();
+        float       best_depth = -std::numeric_limits<float>::infinity();
+        float       best_P     = -1.0f;
+
+        for (uint16_t i = 0; i < num_moves; ++i) {
+            const v2::MoveInfo& mi = moves[i];
+            const chess::Move m{mi.move};
+
+            float child_Q;
+            float child_depth = std::numeric_limits<float>::infinity();
+
+            if (mi.terminal_kind == v2::kTerminalDraw) {
+                child_Q = 0.0f;
+            } else if (mi.terminal_kind == v2::kTerminalLossForChild) {
+                child_Q = -1.0f;  // child loses ⇒ we win
+            } else {
+                chess::Board cb = board_;
+                cb.makeMove<true>(m);
+                if (cb.isRepetition(1)) {
+                    child_Q = 0.0f;
+                } else {
+                    const uint64_t child_key = cb.hash();
+                    const v2::TTEntry* ce = arena_->find(child_key);
+                    if (ce == nullptr) {
+                        // Unreached during search: score as "we lose" so
+                        // any TT-evaluated sibling outranks it. P tiebreak
+                        // still picks the highest-prior unreached move
+                        // when no children have TT entries.
+                        child_Q     = +1.0f;
+                        child_depth = -std::numeric_limits<float>::infinity();
+                    } else {
+                        auto [q, d] = v2::unpack_qd(
+                            ce->qd_packed.load(std::memory_order_acquire));
+                        child_Q     = q;
+                        child_depth = d;
+                    }
+                }
+            }
+
+            const float score = -child_Q;
+            const bool better =
+                   score > best_score
+                || (score == best_score && child_depth > best_depth)
+                || (score == best_score && child_depth == best_depth && mi.P > best_P);
+            if (better) {
+                best_score = score;
+                best_depth = child_depth;
+                best_P     = mi.P;
+                best       = m;
+            }
+        }
+        return best;
+    }
+
 private:
     // Compile-time max for the per-worker eval semaphore. Runtime starting
     // value is `4 * coros_per_worker_`, capped here.
@@ -392,11 +486,6 @@ private:
                                 * cfg.delta_depth;
             w.depth.store(start, std::memory_order_relaxed);
         }
-
-        // Pick a placeholder best-move so the final `bestmove` line is well-formed.
-        chess::Movelist legal;
-        chess::movegen::legalmoves(legal, board_);
-        chess::Move best = legal.empty() ? chess::Move::NO_MOVE : legal[0];
 
         // Spawn per-search runner jthreads against the persistent workers.
         for (int i = 0; i < num_workers_; ++i) {
@@ -472,6 +561,8 @@ private:
         total_evals_.store(evals_sum, std::memory_order_relaxed);
         (void)claims_sum;
 
+        // Pick the best move from the TT now that all runners have joined.
+        const chess::Move best = bestmove();
         char bm[64];
         if (best != chess::Move::NO_MOVE) {
             const std::string uci_move = chess::uci::moveToUci(best);

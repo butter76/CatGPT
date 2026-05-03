@@ -271,6 +271,20 @@ public:
         }
     }
 
+    [[nodiscard]] const TTEntry* find(uint64_t key) const noexcept {
+        key = canonicalize_key(key);
+        const uint64_t mask = capacity_ - 1;
+        uint64_t idx = key & mask;
+
+        while (true) {
+            const TTEntry& e = table_[idx];
+            uint64_t observed = e.key.load(std::memory_order_relaxed);
+            if (observed == key) return &e;
+            if (observed == kEmptyKey) return nullptr;
+            idx = (idx + 1) & mask;
+        }
+    }
+
     /**
      * Spin until `entry->info_offset` is published, or `max_spins` pause
      * iterations elapse. Returns true if the slot is published.
