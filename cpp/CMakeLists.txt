@@ -336,6 +336,28 @@ set_target_properties(lks_throughput_bench PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
 
+# === CatGPT LKS UCI Engine (Lazy-SMP, log-scale ID, TRT-batched) ===
+add_executable(lks_uci
+    src/lks_uci_main.cpp
+)
+target_include_directories(lks_uci PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+    ${LIBCORO_INCLUDE_DIR}
+)
+target_link_libraries(lks_uci PRIVATE
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    ${LIBCORO_LIB}
+    pthread
+)
+target_compile_options(lks_uci PRIVATE -fcoroutines)
+set_target_properties(lks_uci PROPERTIES
+    BUILD_RPATH   "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+)
+
 # Enable colored output
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)
@@ -350,4 +372,5 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(tt_arena_bench PRIVATE -fdiagnostics-color=always)
     target_compile_options(tt_arena_concurrent_bench PRIVATE -fdiagnostics-color=always)
     target_compile_options(lks_search_test PRIVATE -fdiagnostics-color=always)
+    target_compile_options(lks_uci PRIVATE -fdiagnostics-color=always)
 endif()
