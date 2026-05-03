@@ -15,7 +15,12 @@
  *                per-node info (NodeInfoHeader + MoveInfo[]). The head
  *                pointer is a `std::atomic<uint64_t>`, advanced via
  *                `fetch_add`. Indexed by `uint64_t` byte offset so we are
- *                safe past 2^32 nodes and past 4 GiB.
+ *                safe past 2^32 nodes and past 4 GiB. The first
+ *                `kArenaReservedBytes` of the buffer are reserved so that
+ *                `alloc_raw` never returns 0 — that lets us use offset 0
+ *                as the `kNoInfoOffset` "not yet published" sentinel and
+ *                get the right state on a fresh TTEntry for free via
+ *                value-init.
  *
  * Concurrency protocol (eval-first, batch-allocate workflow):
  *
@@ -65,8 +70,12 @@
 
 namespace catgpt::v2 {
 
-inline constexpr uint64_t kEmptyKey = 0ULL;
-inline constexpr uint64_t kNoInfoOffset = std::numeric_limits<uint64_t>::max();
+inline constexpr uint64_t kEmptyKey     = 0ULL;
+// Offset 0 is reserved at the start of `arena_` (see `kArenaReservedBytes`
+// below) so `alloc_raw` never hands it out. That lets us use 0 as the
+// "not yet published" sentinel and have value-init of a `TTEntry` give
+// every slot the correct empty-and-unpublished state for free.
+inline constexpr uint64_t kNoInfoOffset = 0ULL;
 
 /**
  * Pack/unpack (Q, max_depth) into a single uint64_t for atomic CAS updates.
@@ -135,6 +144,14 @@ struct NodeInfoHeader {
 static_assert(sizeof(NodeInfoHeader) == 8, "NodeInfoHeader must be 8 bytes");
 
 /**
+ * Bytes reserved at the start of `arena_` so that `alloc_raw` never
+ * returns offset 0 (which is `kNoInfoOffset`). Sized to a NodeInfoHeader
+ * so that subsequent allocations stay 4-byte aligned for the float/u16
+ * members of NodeInfoHeader and MoveInfo.
+ */
+inline constexpr uint64_t kArenaReservedBytes = sizeof(NodeInfoHeader);
+
+/**
  * Per-move slot. Holds the move itself, a terminal-kind byte that coalesces
  * terminal children (no TT entry / NodeInfo for them), and the three priors.
  */
@@ -187,13 +204,16 @@ public:
                          double load_factor = 0.5,
                          uint64_t avg_moves_per_node = 40)
         : capacity_(compute_capacity(k_max_evals, load_factor))
-        , arena_capacity_bytes_(compute_arena_bytes(k_max_evals, avg_moves_per_node))
+        , arena_capacity_bytes_(compute_arena_bytes(k_max_evals, avg_moves_per_node)
+                                + kArenaReservedBytes)
     {
-        // value-init zeros each TTEntry: key = 0, qd_packed = 0, info_offset = 0.
-        // qd_packed = 0 means (Q=0.0, max_depth=0.0), but readers should only consult
-        // qd_packed for slots whose info_offset is published (release/acquire), at
-        // which point the writer has already stored the real qd_packed. Empty slots
-        // are identified by key == 0, not by qd_packed.
+        // Value-init zeros each TTEntry: key = kEmptyKey, qd_packed = 0,
+        // info_offset = kNoInfoOffset. With both sentinels fixed at 0,
+        // every slot starts in the correct "empty + unpublished" state
+        // without an extra init pass. Readers must still gate any
+        // qd_packed read on `info_offset != kNoInfoOffset` because the
+        // writer publishes qd_packed via a relaxed store and hands off
+        // visibility through the release-store of info_offset.
         table_ = new TTEntry[capacity_]();
         arena_ = new uint8_t[arena_capacity_bytes_];
     }
@@ -426,7 +446,9 @@ public:
     [[nodiscard]] uint64_t capacity() const noexcept { return capacity_; }
     [[nodiscard]] uint64_t arena_capacity_bytes() const noexcept { return arena_capacity_bytes_; }
     [[nodiscard]] uint64_t arena_used_bytes() const noexcept {
-        return arena_head_.load(std::memory_order_relaxed);
+        // Subtract the reserved-prefix bookkeeping so callers see "0 means
+        // fresh, positive means user-visible bytes consumed".
+        return arena_head_.load(std::memory_order_relaxed) - kArenaReservedBytes;
     }
     [[nodiscard]] uint64_t table_bytes() const noexcept { return capacity_ * sizeof(TTEntry); }
 
@@ -457,7 +479,9 @@ private:
     TTEntry*              table_      = nullptr;
     uint8_t*              arena_      = nullptr;
     uint64_t              capacity_   = 0;            // pow2
-    std::atomic<uint64_t> arena_head_{0};
+    // Skip the reserved prefix so the first `alloc_raw` returns an offset
+    // > 0 and offset 0 stays available as the `kNoInfoOffset` sentinel.
+    std::atomic<uint64_t> arena_head_{kArenaReservedBytes};
     uint64_t              arena_capacity_bytes_ = 0;
 };
 

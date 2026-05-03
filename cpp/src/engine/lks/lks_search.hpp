@@ -700,8 +700,6 @@ private:
             w.eval_sem->release();
             w.evals.fetch_add(1, std::memory_order_relaxed);
 
-            if (w.should_abort()) co_return;
-
             chess::Movelist legal;
             chess::movegen::legalmoves(legal, board);
             const uint16_t num_moves = static_cast<uint16_t>(legal.size());
@@ -820,22 +818,6 @@ private:
                     plans.push_back({Mode::ReadOnly, m.P, q, child_key});
                     continue;
                 }
-            }
-
-            // Don't spawn new descents once we've blown the budget or
-            // received a stop. Treat the remaining moves as ReadOnly
-            // with whatever Q we can glean from the TT (or 0 if absent),
-            // so the rollup remains well-defined.
-            if (w.should_abort()) {
-                float q_fallback = 0.0f;
-                if (v2::TTEntry* ce = arena_->find(child_key)) {
-                    auto [q, _] = v2::unpack_qd(
-                        ce->qd_packed.load(std::memory_order_acquire));
-                    (void)_;
-                    q_fallback = q;
-                }
-                plans.push_back({Mode::ReadOnly, m.P, q_fallback, child_key});
-                continue;
             }
 
             plans.push_back({Mode::RecurseThenRead, m.P, 0.0f, child_key});
