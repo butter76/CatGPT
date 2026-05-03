@@ -53,11 +53,14 @@
  *     at depth. Inside:
  *
  *       1. TT-probe (`find`).
- *       2. If miss: semaphore-gated GPU eval, enumerate legal moves +
- *          per-move POSITION-ONLY terminal_kind detection (no
- *          repetitions in terminal_kind — those are path-dependent),
- *          alloc node_info, fill MoveInfo, then `find_or_claim` and
- *          publish. CAS losers orphan their bytes.
+ *       2. If miss: acquire eval-sem permit, then RE-PROBE the TT — a
+ *          peer worker may have published the same key while we queued
+ *          on the semaphore. On a re-probe hit, release the permit and
+ *          adopt the peer's entry. On a re-probe miss, GPU eval,
+ *          enumerate legal moves + per-move POSITION-ONLY terminal_kind
+ *          detection (no repetitions in terminal_kind — those are
+ *          path-dependent), alloc node_info, fill MoveInfo, then
+ *          `find_or_claim` and publish. CAS losers orphan their bytes.
  *       3. Re-deepen check: if the entry's max_depth >= depth, return.
  *       4. Pre-pass over children to classify them as Skip /
  *          RecurseThenRead / ReadOnly. RecurseThenRead spawns a child
@@ -681,66 +684,87 @@ private:
 
         if (entry == nullptr) {
             // ── unexpanded: eval, fill bytes, then claim ────────────────
-            auto tokens = catgpt::tokenize<BatchEvaluator::SEQ_LENGTH>(
-                board, NO_HALFMOVE_CONFIG);
-
             {
                 auto sem_res = co_await w.eval_sem->acquire();
                 if (sem_res == coro::semaphore_acquire_result::shutdown) {
                     co_return;
                 }
             }
-            // After acquire we MUST release the permit on every exit path,
-            // including stop/budget aborts that bypass the GPU eval.
+
+            // After acquire we MUST release the permit on every exit
+            // path, including stop/budget aborts that bypass the GPU
+            // eval.
             if (w.should_abort()) {
                 w.eval_sem->release();
                 co_return;
             }
-            RawNNOutput out = co_await EvalAwaitable(*w.evaluator, tokens);
-            w.eval_sem->release();
-            w.evals.fetch_add(1, std::memory_order_relaxed);
 
-            chess::Movelist legal;
-            chess::movegen::legalmoves(legal, board);
-            const uint16_t num_moves = static_cast<uint16_t>(legal.size());
-
-            std::vector<float> P;
-            softmax_legal(out, board, legal, P);
-
-            // alloc + fill BEFORE attempting to claim — these bytes are
-            // privately owned until the CAS, and orphaned if the CAS loses.
-            const uint64_t off = arena_->alloc_node_info(num_moves);
-            v2::MoveInfo* mi = arena_->moves_at(off);
-            for (uint16_t i = 0; i < num_moves; ++i) {
-                chess::Move m = legal[i];
-
-                // Per-move position-only terminal detection.
-                board.makeMove<true>(m);
-                const uint8_t tk = classify_terminal(board);
-                board.unmakeMove(m);
-
-                mi[i].move          = static_cast<uint16_t>(m.move());
-                mi[i].terminal_kind = tk;
-                mi[i]._pad          = 0;
-                mi[i].P             = P[i];
-                mi[i].P_alloc       = P[i];   // alloc/optimistic punted: same as P
-                mi[i].P_optimistic  = P[i];
-            }
-
-            const float Q = 2.0f * out.value - 1.0f;
-
-            auto [e, claimed] = arena_->find_or_claim(key);
-            if (claimed) {
-                v2::SearchArena::set_initial_qd(e, Q, depth);
-                v2::SearchArena::publish_info(e, off);
-                w.tt_claims.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                // Lost the race: our `off` bytes are orphaned (forever).
-                // The winner's claim-to-publish window is two atomic
-                // stores, so the wait spins ~tens of ns at most.
+            // Post-acquire re-probe: a peer worker may have evaluated and
+            // published this key while we were queued on the semaphore.
+            // Adopting their entry skips tokenize + GPU eval + movegen +
+            // softmax + alloc + per-move terminal classification, all of
+            // which would otherwise be wasted (the find_or_claim CAS would
+            // lose and our arena bytes would be permanently orphaned).
+            if (v2::TTEntry* e = arena_->find(key); e != nullptr) {
+                w.eval_sem->release();
                 v2::SearchArena::wait_published(e);
+                entry = e;
+            } else {
+                auto tokens = catgpt::tokenize<BatchEvaluator::SEQ_LENGTH>(
+                    board, NO_HALFMOVE_CONFIG);
+                RawNNOutput out = co_await EvalAwaitable(*w.evaluator, tokens);
+                w.eval_sem->release();
+                w.evals.fetch_add(1, std::memory_order_relaxed);
+
+                chess::Movelist legal;
+                chess::movegen::legalmoves(legal, board);
+                const uint16_t num_moves = static_cast<uint16_t>(legal.size());
+
+                std::vector<float> P;
+                softmax_legal(out, board, legal, P);
+
+                // alloc + fill BEFORE attempting to claim — these bytes are
+                // privately owned until the CAS, and orphaned if the CAS loses.
+                const uint64_t off = arena_->alloc_node_info(num_moves);
+                v2::MoveInfo* mi = arena_->moves_at(off);
+                for (uint16_t i = 0; i < num_moves; ++i) {
+                    chess::Move m = legal[i];
+
+                    // Per-move position-only terminal detection.
+                    board.makeMove<true>(m);
+                    const uint8_t tk = classify_terminal(board);
+                    board.unmakeMove(m);
+
+                    mi[i].move          = static_cast<uint16_t>(m.move());
+                    mi[i].terminal_kind = tk;
+                    mi[i]._pad          = 0;
+                    mi[i].P             = P[i];
+                    mi[i].P_alloc       = P[i];   // alloc/optimistic punted: same as P
+                    mi[i].P_optimistic  = P[i];
+                }
+
+                const float Q = 2.0f * out.value - 1.0f;
+
+                auto [ce, claimed] = arena_->find_or_claim(key);
+                if (claimed) {
+                    v2::SearchArena::set_initial_qd(ce, Q, 0.0f);
+                    v2::SearchArena::publish_info(ce, off);
+                    w.tt_claims.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    // Lost the race despite the post-acquire re-probe:
+                    // someone published in the gap between our re-probe
+                    // and our find_or_claim. Our `off` bytes are orphaned
+                    // (forever). The winner's claim-to-publish window is
+                    // two atomic stores, so the wait spins ~tens of ns.
+                    v2::SearchArena::wait_published(ce);
+                }
+
+                // Intentionally let the thread finish putting the entry
+                // into the TT/arena before aborting
+                if (w.should_abort()) co_return;
+
+                entry = ce;
             }
-            entry = e;
         }
 
         // ── re-deepen check (works for both fresh-claim and TT-shared) ──
@@ -750,8 +774,6 @@ private:
             (void)_;
             if (depth <= cur_max_d) co_return;
         }
-
-        if (w.should_abort()) co_return;
 
         // ── pre-pass: classify each child for fan-out + rollup ──────────
         const uint64_t info_off = entry->info_offset.load(std::memory_order_acquire);
