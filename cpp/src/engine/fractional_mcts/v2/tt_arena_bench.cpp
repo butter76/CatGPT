@@ -172,7 +172,7 @@ void run_one(uint64_t K, PhaseTimings& out) {
 
         auto [e, claimed] = arena.find_or_claim(keys[i]);
         // Distinct keys -> we always claim.
-        SearchArena::set_initial_qn(e, /*Q=*/0.123f, /*max_N=*/1.0f);
+        SearchArena::set_initial_qd(e, /*Q=*/0.123f, /*max_depth=*/0.0f);
         SearchArena::publish_info(e, off);
     }
     auto t1 = Clock::now();

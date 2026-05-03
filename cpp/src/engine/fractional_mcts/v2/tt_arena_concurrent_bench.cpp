@@ -6,14 +6,14 @@
  *   P1. Correctness stress:
  *       N threads each insert a disjoint random key set. After joining,
  *       every key must be findable, every slot must be published, and
- *       its qn_packed.max_N must equal the *largest* max_N any writer
- *       ever attempted via update_qn for that key.
+ *       its qd_packed.max_depth must equal the *largest* max_depth any writer
+ *       ever attempted via update_qd for that key.
  *
  *   P2. Hot insert race:
  *       M threads all try to insert the SAME small set of keys (K_HOT)
- *       repeatedly. Each thread also does a stream of update_qn calls
- *       on those keys with monotonically increasing max_N. After joining,
- *       each key has exactly one slot, and each slot's max_N is the global
+ *       repeatedly. Each thread also does a stream of update_qd calls
+ *       on those keys with monotonically increasing max_depth. After joining,
+ *       each key has exactly one slot, and each slot's max_depth is the global
  *       max attempted across all threads.
  *
  *   P3. Reader-during-writer:
@@ -50,8 +50,8 @@ using catgpt::v2::NodeInfoHeader;
 using catgpt::v2::MoveInfo;
 using catgpt::v2::ClaimResult;
 using catgpt::v2::kNoInfoOffset;
-using catgpt::v2::pack_qn;
-using catgpt::v2::unpack_qn;
+using catgpt::v2::pack_qd;
+using catgpt::v2::unpack_qd;
 
 namespace {
 
@@ -84,10 +84,10 @@ void run_p1_correctness(uint64_t per_thread_keys, int num_threads) {
 
     // Pre-generate disjoint key streams.
     std::vector<std::vector<uint64_t>> keys_per_thread(num_threads);
-    std::vector<std::vector<float>> max_n_per_thread(num_threads);
+    std::vector<std::vector<float>> max_d_per_thread(num_threads);
     for (int t = 0; t < num_threads; ++t) {
         keys_per_thread[t].resize(per_thread_keys);
-        max_n_per_thread[t].resize(per_thread_keys);
+        max_d_per_thread[t].resize(per_thread_keys);
         std::mt19937_64 rng(0xA1B2C3D4ULL ^ (uint64_t(t) * 0x9E3779B97F4A7C15ULL));
         for (uint64_t i = 0; i < per_thread_keys; ++i) {
             // Mix thread id into upper bits to keep streams disjoint with
@@ -95,7 +95,7 @@ void run_p1_correctness(uint64_t per_thread_keys, int num_threads) {
             uint64_t k = rng();
             k = (k & 0x000FFFFFFFFFFFFFULL) | (uint64_t(t + 1) << 52);
             keys_per_thread[t][i] = k;
-            max_n_per_thread[t][i] = static_cast<float>((rng() % 10000) + 1);
+            max_d_per_thread[t][i] = static_cast<float>((rng() % 10000) + 1);
         }
     }
 
@@ -106,7 +106,7 @@ void run_p1_correctness(uint64_t per_thread_keys, int num_threads) {
         workers.emplace_back([&, t]() {
             sync.arrive_and_wait();
             const auto& keys = keys_per_thread[t];
-            const auto& max_ns = max_n_per_thread[t];
+            const auto& max_ds = max_d_per_thread[t];
             for (uint64_t i = 0; i < keys.size(); ++i) {
                 const uint16_t nm = 30;
                 uint64_t off = arena.alloc_node_info(nm);
@@ -122,17 +122,17 @@ void run_p1_correctness(uint64_t per_thread_keys, int num_threads) {
 
                 auto [e, claimed] = arena.find_or_claim(keys[i]);
                 EXPECT(claimed); // disjoint keys -> always our claim
-                SearchArena::set_initial_qn(e, /*Q=*/0.0f, /*max_N=*/max_ns[i]);
+                SearchArena::set_initial_qd(e, /*Q=*/0.0f, /*max_depth=*/max_ds[i]);
                 SearchArena::publish_info(e, off);
             }
         });
     }
     for (auto& w : workers) w.join();
 
-    // Verify: every key is findable, published, with the right max_N and num_moves.
+    // Verify: every key is findable, published, with the right max_depth and num_moves.
     for (int t = 0; t < num_threads; ++t) {
         const auto& keys = keys_per_thread[t];
-        const auto& max_ns = max_n_per_thread[t];
+        const auto& max_ds = max_d_per_thread[t];
         for (uint64_t i = 0; i < keys.size(); ++i) {
             TTEntry* e = arena.find(keys[i]);
             EXPECT(e != nullptr);
@@ -141,9 +141,9 @@ void run_p1_correctness(uint64_t per_thread_keys, int num_threads) {
             EXPECT(off != kNoInfoOffset);
             const auto* hdr = arena.info_at(off);
             EXPECT(hdr->num_moves == 30);
-            auto [q, mn] = unpack_qn(e->qn_packed.load(std::memory_order_relaxed));
+            auto [q, md] = unpack_qd(e->qd_packed.load(std::memory_order_relaxed));
             (void)q;
-            EXPECT(mn == max_ns[i]);
+            EXPECT(md == max_ds[i]);
         }
     }
 }
@@ -190,15 +190,15 @@ void run_p2_hot_race(int num_threads, uint64_t k_hot, uint64_t iters_per_thread)
                         moves[j].P_alloc = moves[j].P;
                         moves[j].P_optimistic = moves[j].P;
                     }
-                    SearchArena::set_initial_qn(e, /*Q=*/0.0f, /*max_N=*/0.0f);
+                    SearchArena::set_initial_qd(e, /*Q=*/0.0f, /*max_depth=*/0.0f);
                     SearchArena::publish_info(e, off);
                 }
 
-                // Independent: every thread CAS-bumps max_N to a thread-and-iter
-                // dependent value. Final max_N for this key should equal the
+                // Independent: every thread CAS-bumps max_depth to a thread-and-iter
+                // dependent value. Final max_depth for this key should equal the
                 // global max attempted by any thread.
-                float new_mn = static_cast<float>((r >> 8) & 0xFFFFF);
-                SearchArena::update_qn(e, /*Q=*/0.0f, new_mn);
+                float new_md = static_cast<float>((r >> 8) & 0xFFFFF);
+                SearchArena::update_qd(e, /*Q=*/0.0f, new_md);
             }
             claim_wins.fetch_add(my_wins, std::memory_order_relaxed);
         });
@@ -208,18 +208,18 @@ void run_p2_hot_race(int num_threads, uint64_t k_hot, uint64_t iters_per_thread)
     // Exactly one thread won the claim per hot key.
     EXPECT(claim_wins.load() == k_hot);
 
-    // Each hot key has a published slot, and its max_N is the global max
+    // Each hot key has a published slot, and its max_depth is the global max
     // across all threads' attempted updates (which is deterministic given
     // the rng seeds).
-    std::unordered_map<uint64_t, float> expected_max_n;
-    for (uint64_t key : hot_keys) expected_max_n[key] = 0.0f;
+    std::unordered_map<uint64_t, float> expected_max_d;
+    for (uint64_t key : hot_keys) expected_max_d[key] = 0.0f;
     for (int t = 0; t < num_threads; ++t) {
         uint64_t rng = 0xFACE0000ULL ^ (uint64_t(t) * 0x9E3779B97F4A7C15ULL);
         for (uint64_t it = 0; it < iters_per_thread; ++it) {
             uint64_t r = splitmix64(rng);
             uint64_t key = hot_keys[r % k_hot];
             float candidate = static_cast<float>((r >> 8) & 0xFFFFF);
-            float& cur = expected_max_n[key];
+            float& cur = expected_max_d[key];
             if (candidate > cur) cur = candidate;
         }
     }
@@ -230,9 +230,9 @@ void run_p2_hot_race(int num_threads, uint64_t k_hot, uint64_t iters_per_thread)
         if (!e) continue;
         uint64_t off = e->info_offset.load(std::memory_order_acquire);
         EXPECT(off != kNoInfoOffset);
-        auto [q, mn] = unpack_qn(e->qn_packed.load(std::memory_order_relaxed));
+        auto [q, md] = unpack_qd(e->qd_packed.load(std::memory_order_relaxed));
         (void)q;
-        EXPECT(mn == expected_max_n[key]);
+        EXPECT(md == expected_max_d[key]);
     }
 }
 
@@ -270,9 +270,9 @@ void run_p3_reader_writer(int num_readers, uint64_t inserts, int writer_pause_us
             }
             auto [e, claimed] = arena.find_or_claim(keys[i]);
             (void)claimed;
-            // Encode num_moves into max_N for round-trip checking.
-            SearchArena::set_initial_qn(e, /*Q=*/0.0f,
-                                        /*max_N=*/static_cast<float>(nm));
+            // Encode num_moves into max_depth for round-trip checking.
+            SearchArena::set_initial_qd(e, /*Q=*/0.0f,
+                                        /*max_depth=*/static_cast<float>(nm));
             SearchArena::publish_info(e, off);
             if (writer_pause_us > 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(writer_pause_us));
@@ -297,9 +297,9 @@ void run_p3_reader_writer(int num_readers, uint64_t inserts, int writer_pause_us
                 successful_waits.fetch_add(1, std::memory_order_relaxed);
                 uint64_t off = e->info_offset.load(std::memory_order_acquire);
                 const auto* hdr = arena.info_at(off);
-                auto [q, mn] = unpack_qn(e->qn_packed.load(std::memory_order_relaxed));
+                auto [q, md] = unpack_qd(e->qd_packed.load(std::memory_order_relaxed));
                 (void)q;
-                if (static_cast<float>(hdr->num_moves) != mn) {
+                if (static_cast<float>(hdr->num_moves) != md) {
                     torn_reads.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -395,7 +395,7 @@ ThroughputResult run_p4_one(int num_threads, uint64_t per_thread_inserts) {
                     uint64_t off = base + j * per_node_bytes;
                     auto [e, claimed] = arena.find_or_claim(keys[i + j]);
                     (void)claimed;
-                    SearchArena::set_initial_qn(e, 0.0f, 1.0f);
+                    SearchArena::set_initial_qd(e, 0.0f, 1.0f);
                     SearchArena::publish_info(e, off);
                 }
 

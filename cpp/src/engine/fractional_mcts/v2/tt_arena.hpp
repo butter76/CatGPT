@@ -6,7 +6,7 @@
  * `SearchArena` (two `delete[]`s, no per-node frees).
  *
  *   - `table_` : open-addressed, linear-probed hash of `TTEntry`s. Each
- *                slot's hot mutable per-node state (key, Q, max_N,
+ *                slot's hot mutable per-node state (key, Q, max_depth,
  *                info_offset) lives in three `std::atomic<uint64_t>`
  *                fields so concurrent readers and writers never observe a
  *                torn slot. Capacity = `next_pow2(ceil(K / load_factor))`.
@@ -23,7 +23,7 @@
  *     1.  fetch_add `total_bytes` for the whole batch (one global atomic).
  *     2.  Plain stores into the (privately-owned) bytes for each position.
  *     3.  For each position: probe linearly, CAS `key` 0 -> K (acq_rel).
- *         On CAS success, relaxed-store qn_packed, then release-store
+ *         On CAS success, relaxed-store qd_packed, then release-store
  *         info_offset. On CAS failure with key == K, another writer beat
  *         us; we skip (the bytes we wrote are wasted but harmless). On
  *         CAS failure with key == K' != K, keep probing.
@@ -34,7 +34,7 @@
  *         is between its CAS and its release-store; the reader can either
  *         spin briefly (`wait_published`) or treat as miss.
  *     3.  After acquire of info_offset, the header + MoveInfo[] writes
- *         and the writer's relaxed qn_packed store are visible.
+ *         and the writer's relaxed qd_packed store are visible.
  *
  * Terminal children do NOT consume a TT entry or NodeInfo: they live as a
  * `MoveInfo.terminal_kind` byte in the parent. This preserves the invariant
@@ -69,32 +69,39 @@ inline constexpr uint64_t kEmptyKey = 0ULL;
 inline constexpr uint64_t kNoInfoOffset = std::numeric_limits<uint64_t>::max();
 
 /**
- * Pack/unpack (Q, max_N) into a single uint64_t for atomic CAS updates.
- * Layout: low 32 bits = Q (float), high 32 bits = max_N (float).
+ * Pack/unpack (Q, max_depth) into a single uint64_t for atomic CAS updates.
+ * Layout: low 32 bits = Q (float), high 32 bits = max_depth (float).
+ *
+ * `max_depth` is log-scale: max_depth == log(N) where N is the budget
+ * historically requested at this node. All search-side calculations work
+ * directly in log-scale to stay numerically safe at large N.
  */
-inline uint64_t pack_qn(float q, float max_n) noexcept {
+inline uint64_t pack_qd(float q, float max_depth) noexcept {
     uint32_t a;
     uint32_t b;
     std::memcpy(&a, &q, 4);
-    std::memcpy(&b, &max_n, 4);
+    std::memcpy(&b, &max_depth, 4);
     return static_cast<uint64_t>(a) | (static_cast<uint64_t>(b) << 32);
 }
 
-inline std::pair<float, float> unpack_qn(uint64_t v) noexcept {
+inline std::pair<float, float> unpack_qd(uint64_t v) noexcept {
     uint32_t a = static_cast<uint32_t>(v);
     uint32_t b = static_cast<uint32_t>(v >> 32);
     float q;
-    float mn;
+    float md;
     std::memcpy(&q, &a, 4);
-    std::memcpy(&mn, &b, 4);
-    return {q, mn};
+    std::memcpy(&md, &b, 4);
+    return {q, md};
 }
 
-inline constexpr uint64_t kInitialQnPacked =
-    // Q = 0.0f, max_N = -1.0f
-    (0ULL) | (static_cast<uint64_t>(0xBF800000U) << 32);
-static_assert((static_cast<uint32_t>(kInitialQnPacked) == 0U),
-              "Q half of kInitialQnPacked must be 0.0f bits");
+/**
+ * The "fresh entry" sentinel for max_depth: lower than any conceivable
+ * `start_depth`, so the first descent always wins the
+ * `depth > max_depth` gate. Use as the second arg to `set_initial_qd`
+ * when a writer claims a slot but hasn't yet decided on a depth (rare;
+ * the normal claim-after-eval path stores the real depth directly).
+ */
+inline constexpr float kFreshMaxDepth = -1.0e30f;
 
 /**
  * Hot mutable per-node entry. Cacheline-sized (32 bytes -> two-per-line on
@@ -105,7 +112,7 @@ static_assert((static_cast<uint32_t>(kInitialQnPacked) == 0U),
  */
 struct alignas(32) TTEntry {
     std::atomic<uint64_t> key;          // 8: 0 == empty; CAS target for claim
-    std::atomic<uint64_t> qn_packed;    // 8: pack_qn(Q, max_N); CAS-loop updates
+    std::atomic<uint64_t> qd_packed;    // 8: pack_qd(Q, max_depth); CAS-loop updates
     std::atomic<uint64_t> info_offset;  // 8: kNoInfoOffset until published
     uint64_t              _reserved;    // 8
 };
@@ -182,11 +189,11 @@ public:
         : capacity_(compute_capacity(k_max_evals, load_factor))
         , arena_capacity_bytes_(compute_arena_bytes(k_max_evals, avg_moves_per_node))
     {
-        // value-init zeros each TTEntry: key = 0, qn_packed = 0, info_offset = 0.
-        // qn_packed = 0 means (Q=0.0, max_N=0.0), but readers should only consult
-        // qn_packed for slots whose info_offset is published (release/acquire), at
-        // which point the writer has already stored the real qn_packed. Empty slots
-        // are identified by key == 0, not by qn_packed.
+        // value-init zeros each TTEntry: key = 0, qd_packed = 0, info_offset = 0.
+        // qd_packed = 0 means (Q=0.0, max_depth=0.0), but readers should only consult
+        // qd_packed for slots whose info_offset is published (release/acquire), at
+        // which point the writer has already stored the real qd_packed. Empty slots
+        // are identified by key == 0, not by qd_packed.
         table_ = new TTEntry[capacity_]();
         arena_ = new uint8_t[arena_capacity_bytes_];
     }
@@ -315,27 +322,27 @@ public:
     }
 
     /**
-     * Initial qn_packed store (relaxed). Use immediately after a winning
+     * Initial qd_packed store (relaxed). Use immediately after a winning
      * `find_or_claim`, *before* `publish_info`. Visibility is established
      * by the subsequent release-store of `info_offset`.
      */
-    static void set_initial_qn(TTEntry* entry, float q, float max_n) noexcept {
-        entry->qn_packed.store(pack_qn(q, max_n), std::memory_order_relaxed);
+    static void set_initial_qd(TTEntry* entry, float q, float max_depth) noexcept {
+        entry->qd_packed.store(pack_qd(q, max_depth), std::memory_order_relaxed);
     }
 
     /**
-     * CAS loop on qn_packed. Updates iff `new_max_n` strictly exceeds the
-     * currently-stored max_N. Returns true if our value won, false if a
-     * concurrent or prior writer already stored a >= max_N.
+     * CAS loop on qd_packed. Updates iff `new_max_depth` strictly exceeds
+     * the currently-stored max_depth. Returns true if our value won,
+     * false if a concurrent or prior writer already stored a >= max_depth.
      */
-    static bool update_qn(TTEntry* entry, float new_q, float new_max_n) noexcept {
-        uint64_t expected = entry->qn_packed.load(std::memory_order_relaxed);
-        const uint64_t desired = pack_qn(new_q, new_max_n);
+    static bool update_qd(TTEntry* entry, float new_q, float new_max_depth) noexcept {
+        uint64_t expected = entry->qd_packed.load(std::memory_order_relaxed);
+        const uint64_t desired = pack_qd(new_q, new_max_depth);
         while (true) {
-            auto [_, old_max_n] = unpack_qn(expected);
+            auto [_, old_max_depth] = unpack_qd(expected);
             (void)_;
-            if (!(new_max_n > old_max_n)) return false;
-            if (entry->qn_packed.compare_exchange_weak(expected, desired,
+            if (!(new_max_depth > old_max_depth)) return false;
+            if (entry->qd_packed.compare_exchange_weak(expected, desired,
                                                       std::memory_order_acq_rel,
                                                       std::memory_order_relaxed))
             {
