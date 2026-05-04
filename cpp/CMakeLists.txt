@@ -291,6 +291,17 @@ set_target_properties(tt_arena_concurrent_bench PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR}"
 )
 
+# === v2::MoveInfo encoding unit tests ===
+# Standalone — no TRT, no libcoro, no chess-library deps. Just C++23.
+add_executable(tt_arena_test
+    src/engine/fractional_mcts/v2/tt_arena_test.cpp
+)
+target_compile_options(tt_arena_test PRIVATE -O2 -g -march=native)
+set_target_properties(tt_arena_test PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR}"
+)
+
 # === LKS search lifecycle + GPU test ===
 # Real TensorRT-backed BatchEvaluator per worker. Needs CUDA/TRT/libcoro.
 add_executable(lks_search_test
@@ -371,6 +382,7 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(catgpt_puzzle_eval PRIVATE -fdiagnostics-color=always)
     target_compile_options(tt_arena_bench PRIVATE -fdiagnostics-color=always)
     target_compile_options(tt_arena_concurrent_bench PRIVATE -fdiagnostics-color=always)
+    target_compile_options(tt_arena_test PRIVATE -fdiagnostics-color=always)
     target_compile_options(lks_search_test PRIVATE -fdiagnostics-color=always)
     target_compile_options(lks_uci PRIVATE -fdiagnostics-color=always)
 endif()

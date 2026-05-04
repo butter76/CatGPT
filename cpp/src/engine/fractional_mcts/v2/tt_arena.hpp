@@ -57,6 +57,7 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <type_traits>
 #include <utility>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -146,32 +147,99 @@ static_assert(sizeof(NodeInfoHeader) == 8, "NodeInfoHeader must be 8 bytes");
 /**
  * Bytes reserved at the start of `arena_` so that `alloc_raw` never
  * returns offset 0 (which is `kNoInfoOffset`). Sized to a NodeInfoHeader
- * so that subsequent allocations stay 4-byte aligned for the float/u16
+ * so that subsequent allocations stay naturally aligned for the u16/u32
  * members of NodeInfoHeader and MoveInfo.
  */
 inline constexpr uint64_t kArenaReservedBytes = sizeof(NodeInfoHeader);
-
-/**
- * Per-move slot. Holds the move itself, a terminal-kind byte that coalesces
- * terminal children (no TT entry / NodeInfo for them), and the policy prior.
- *
- * Two MoveInfos per 16B cacheline half: the move-iteration hot loop in
- * search reads these densely, so keep this struct as small as possible.
- */
-struct MoveInfo {
-    uint16_t move;          // 2: chess::Move underlying u16
-    uint8_t  terminal_kind; // 1: 0=none, 1=draw/twofold, 2=loss_for_child
-    uint8_t  _pad;          // 1: pad to align `P` to 4 bytes
-    float    P;             // 4: policy prior (standard, temp 1.0)
-};
-static_assert(sizeof(MoveInfo) == 8, "MoveInfo must be 8 bytes");
-static_assert(alignof(MoveInfo) == 4, "MoveInfo must be 4-byte aligned");
 
 enum TerminalKind : uint8_t {
     kTerminalNone = 0,
     kTerminalDraw = 1,
     kTerminalLossForChild = 2,
 };
+
+/**
+ * Per-move slot — 4 bytes total. Layout-invisible to callers; go through
+ * the `P()` / `terminal_kind()` accessors (and `pack()` to construct).
+ *
+ * Encoding of `_packed` (viewed as IEEE 754 binary16):
+ *   - Sign bit = 0  →  non-terminal.  P = fp16_to_f32(_packed).
+ *                      `terminal_kind() == kTerminalNone`.
+ *   - Sign bit = 1  →  terminal.      P = fp16_to_f32(|_packed| with the
+ *                      least-significant mantissa bit forced to 0).
+ *                      Terminal kind is encoded in that same LSB:
+ *                          LSB = 0  →  kTerminalDraw
+ *                          LSB = 1  →  kTerminalLossForChild
+ *
+ * Why this works:
+ *   - Legal softmax priors are in [0, 1]; the sign bit is otherwise unused
+ *     so it's a free flag for "this child is terminal".
+ *   - Stealing the mantissa LSB costs ~0.1% of the value near 1.0, which
+ *     is far below the other sources of noise in the rollup.
+ *   - `_Float16` on x86-64 compiles to F16C VCVTPS2PH/VCVTPH2PS (single
+ *     cycle each) under -march=native; on hosts without F16C the compiler
+ *     emits a short software sequence. Packing is off the hot path
+ *     (once per expansion, done pre-CAS while bytes are privately owned);
+ *     unpacking is in the hot descent pre-pass but still cheap.
+ *
+ * Two MoveInfos per 8-byte word, four per 16B cacheline half: the
+ * move-iteration hot loop in search reads these densely.
+ */
+struct MoveInfo {
+    uint16_t move;     // 2: chess::Move underlying u16
+    uint16_t _packed;  // 2: opaque — holds P + terminal_kind, see above
+
+    [[nodiscard]] TerminalKind terminal_kind() const noexcept {
+        if ((_packed & kSignBit) == 0) return kTerminalNone;
+        return (_packed & kKindLSB) ? kTerminalLossForChild : kTerminalDraw;
+    }
+
+    [[nodiscard]] float P() const noexcept {
+        uint16_t bits = static_cast<uint16_t>(_packed & kMagnitudeMask);
+        // For terminals, the kind flag lived in the mantissa LSB; mask
+        // it out so the residual magnitude is a clean half-float.
+        if ((_packed & kSignBit) != 0) {
+            bits = static_cast<uint16_t>(bits & ~static_cast<uint16_t>(kKindLSB));
+        }
+        _Float16 h = std::bit_cast<_Float16>(bits);
+        return static_cast<float>(h);
+    }
+
+    /**
+     * Construct a MoveInfo from (move, P, terminal_kind). P must be
+     * non-negative; anything outside [0, fp16_max] saturates per the
+     * usual float-to-half conversion rules.
+     */
+    [[nodiscard]] static MoveInfo pack(uint16_t move, float P, TerminalKind tk) noexcept {
+        assert(P >= 0.0f && "MoveInfo::pack expects non-negative P");
+        _Float16 h = static_cast<_Float16>(P);
+        uint16_t bits = std::bit_cast<uint16_t>(h);
+        // Strip any existing sign (e.g. +0 → -0 edge cases) so the
+        // sign bit exclusively signals "terminal".
+        bits = static_cast<uint16_t>(bits & kMagnitudeMask);
+        switch (tk) {
+            case kTerminalNone:
+                break;
+            case kTerminalDraw:
+                bits = static_cast<uint16_t>((bits | kSignBit) & ~static_cast<uint16_t>(kKindLSB));
+                break;
+            case kTerminalLossForChild:
+                bits = static_cast<uint16_t>(bits | kSignBit | kKindLSB);
+                break;
+        }
+        return MoveInfo{move, bits};
+    }
+
+private:
+    static constexpr uint16_t kSignBit       = 0x8000u;
+    static constexpr uint16_t kKindLSB       = 0x0001u;
+    static constexpr uint16_t kMagnitudeMask = 0x7FFFu;
+};
+static_assert(sizeof(MoveInfo) == 4, "MoveInfo must be 4 bytes");
+static_assert(alignof(MoveInfo) == 2, "MoveInfo must be 2-byte aligned");
+static_assert(std::is_trivially_copyable_v<MoveInfo>,
+              "MoveInfo is held in arena bytes; must be trivially copyable");
+static_assert(sizeof(_Float16) == 2, "_Float16 must be IEEE 754 binary16");
 
 /**
  * Result of a `find_or_claim` probe. `entry` is never null. `claimed_by_us`

@@ -377,13 +377,15 @@ public:
         for (uint16_t i = 0; i < num_moves; ++i) {
             const v2::MoveInfo& mi = moves[i];
             const chess::Move m{mi.move};
+            const v2::TerminalKind tk = mi.terminal_kind();
+            const float mi_P = mi.P();
 
             float child_Q;
             float child_depth = std::numeric_limits<float>::infinity();
 
-            if (mi.terminal_kind == v2::kTerminalDraw) {
+            if (tk == v2::kTerminalDraw) {
                 child_Q = 0.0f;
-            } else if (mi.terminal_kind == v2::kTerminalLossForChild) {
+            } else if (tk == v2::kTerminalLossForChild) {
                 child_Q = -1.0f;  // child loses ⇒ we win
             } else {
                 chess::Board cb = board_;
@@ -413,11 +415,11 @@ public:
             const bool better =
                    score > best_score
                 || (score == best_score && child_depth > best_depth)
-                || (score == best_score && child_depth == best_depth && mi.P > best_P);
+                || (score == best_score && child_depth == best_depth && mi_P > best_P);
             if (better) {
                 best_score = score;
                 best_depth = child_depth;
-                best_P     = mi.P;
+                best_P     = mi_P;
                 best       = m;
             }
         }
@@ -702,22 +704,21 @@ private:
      *
      * Pre: `child_board` is the board AFTER `makeMove<true>(move)`.
      */
-    static uint8_t classify_terminal(chess::Board& child_board) {
+    static v2::TerminalKind classify_terminal(chess::Board& child_board) {
         chess::Movelist child_legal;
         chess::movegen::legalmoves(child_legal, child_board);
         if (child_legal.empty()) {
             // No legal replies: checkmate => loss for child; stalemate => draw.
-            return child_board.inCheck()
-                ? static_cast<uint8_t>(v2::kTerminalLossForChild)
-                : static_cast<uint8_t>(v2::kTerminalDraw);
+            return child_board.inCheck() ? v2::kTerminalLossForChild
+                                         : v2::kTerminalDraw;
         }
         if (child_board.isInsufficientMaterial()) {
-            return static_cast<uint8_t>(v2::kTerminalDraw);
+            return v2::kTerminalDraw;
         }
         if (child_board.isHalfMoveDraw()) {
-            return static_cast<uint8_t>(v2::kTerminalDraw);
+            return v2::kTerminalDraw;
         }
-        return static_cast<uint8_t>(v2::kTerminalNone);
+        return v2::kTerminalNone;
     }
 
     /**
@@ -792,13 +793,12 @@ private:
 
                     // Per-move position-only terminal detection.
                     board.makeMove<true>(m);
-                    const uint8_t tk = classify_terminal(board);
+                    const v2::TerminalKind tk = classify_terminal(board);
                     board.unmakeMove(m);
 
-                    mi[i].move          = sorted_moves[i].move;
-                    mi[i].terminal_kind = tk;
-                    mi[i]._pad          = 0;
-                    mi[i].P             = sorted_moves[i].P;
+                    mi[i] = v2::MoveInfo::pack(sorted_moves[i].move,
+                                               sorted_moves[i].P,
+                                               tk);
                 }
 
                 // Per-node variance of the value distribution, in the
@@ -860,6 +860,8 @@ private:
 
         for (uint16_t i = 0; i < num_moves; ++i) {
             const auto& m = moves[i];
+            const v2::TerminalKind m_tk = m.terminal_kind();
+            const float m_P = m.P();
 
             // Depth floor — applies to EVERY child regardless of kind.
             // With child_depth = depth + log(P), each level of recursion
@@ -867,20 +869,20 @@ private:
             // would run forever as priors compound below e^0 = 1 visit.
             // Cuts terminal_kind contributions too: a terminal child below
             // the floor doesn't matter at this iteration's resolution.
-            const float child_depth = (m.P > 0.0f)
-                ? depth + std::log(std::max(m.P, 1e-9f))
+            const float child_depth = (m_P > 0.0f)
+                ? depth + std::log(std::max(m_P, 1e-9f))
                 : -std::numeric_limits<float>::infinity();
             if (child_depth < 0.0f) {
-                plans.push_back({Mode::Skip, m.P, 0.0f, 0});
+                plans.push_back({Mode::Skip, m_P, 0.0f, 0});
                 continue;
             }
 
-            if (m.terminal_kind == v2::kTerminalDraw) {
-                plans.push_back({Mode::ReadOnly, m.P, /*Q=*/0.0f, /*key=*/0});
+            if (m_tk == v2::kTerminalDraw) {
+                plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, /*key=*/0});
                 continue;
             }
-            if (m.terminal_kind == v2::kTerminalLossForChild) {
-                plans.push_back({Mode::ReadOnly, m.P, /*Q=*/-1.0f, /*key=*/0});
+            if (m_tk == v2::kTerminalLossForChild) {
+                plans.push_back({Mode::ReadOnly, m_P, /*Q=*/-1.0f, /*key=*/0});
                 continue;
             }
 
@@ -891,7 +893,7 @@ private:
             // terminal_kind (different paths hashing to the same key
             // may not be repetitions). Treat as a draw at this caller.
             if (cb.isRepetition(1)) {
-                plans.push_back({Mode::ReadOnly, m.P, /*Q=*/0.0f, /*key=*/0});
+                plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, /*key=*/0});
                 continue;
             }
 
@@ -901,12 +903,12 @@ private:
                 auto [q, child_max_d] = v2::unpack_qd(
                     ce->qd_packed.load(std::memory_order_acquire));
                 if (child_depth <= child_max_d) {
-                    plans.push_back({Mode::ReadOnly, m.P, q, child_key});
+                    plans.push_back({Mode::ReadOnly, m_P, q, child_key});
                     continue;
                 }
             }
 
-            plans.push_back({Mode::RecurseThenRead, m.P, 0.0f, child_key});
+            plans.push_back({Mode::RecurseThenRead, m_P, 0.0f, child_key});
             child_tasks.emplace_back(
                 recursive_search(w, std::move(cb), child_depth));
         }

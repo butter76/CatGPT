@@ -112,10 +112,8 @@ void run_p1_correctness(uint64_t per_thread_keys, int num_threads) {
                 uint64_t off = arena.alloc_node_info(nm);
                 MoveInfo* moves = arena.moves_at(off);
                 for (uint16_t j = 0; j < nm; ++j) {
-                    moves[j].move = static_cast<uint16_t>(j);
-                    moves[j].terminal_kind = 0;
-                    moves[j]._pad = 0;
-                    moves[j].P = 1.0f / nm;
+                    moves[j] = MoveInfo::pack(j, 1.0f / nm,
+                                              catgpt::v2::kTerminalNone);
                 }
 
                 auto [e, claimed] = arena.find_or_claim(keys[i]);
@@ -181,10 +179,8 @@ void run_p2_hot_race(int num_threads, uint64_t k_hot, uint64_t iters_per_thread)
                     uint64_t off = arena.alloc_node_info(30);
                     MoveInfo* moves = arena.moves_at(off);
                     for (uint16_t j = 0; j < 30; ++j) {
-                        moves[j].move = static_cast<uint16_t>(j);
-                        moves[j].terminal_kind = 0;
-                        moves[j]._pad = 0;
-                        moves[j].P = 1.0f / 30.0f;
+                        moves[j] = MoveInfo::pack(j, 1.0f / 30.0f,
+                                                  catgpt::v2::kTerminalNone);
                     }
                     SearchArena::set_initial_qd(e, /*Q=*/0.0f, /*max_depth=*/0.0f);
                     SearchArena::publish_info(e, off);
@@ -257,10 +253,8 @@ void run_p3_reader_writer(int num_readers, uint64_t inserts, int writer_pause_us
             uint64_t off = arena.alloc_node_info(nm);
             MoveInfo* moves = arena.moves_at(off);
             for (uint16_t j = 0; j < nm; ++j) {
-                moves[j].move = static_cast<uint16_t>(j);
-                moves[j].terminal_kind = 0;
-                moves[j]._pad = 0;
-                moves[j].P = 1.0f / nm;
+                moves[j] = MoveInfo::pack(j, 1.0f / nm,
+                                          catgpt::v2::kTerminalNone);
             }
             auto [e, claimed] = arena.find_or_claim(keys[i]);
             (void)claimed;
@@ -375,10 +369,8 @@ ThroughputResult run_p4_one(int num_threads, uint64_t per_thread_inserts) {
                     hdr->flags = 0;
                     MoveInfo* moves = arena.moves_at(off);
                     for (uint16_t m = 0; m < kMovesPerNode; ++m) {
-                        moves[m].move = m;
-                        moves[m].terminal_kind = 0;
-                        moves[m]._pad = 0;
-                        moves[m].P = 1.0f / kMovesPerNode;
+                        moves[m] = MoveInfo::pack(m, 1.0f / kMovesPerNode,
+                                                  catgpt::v2::kTerminalNone);
                     }
                 }
 

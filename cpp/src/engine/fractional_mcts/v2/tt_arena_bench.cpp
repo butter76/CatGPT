@@ -162,10 +162,9 @@ void run_one(uint64_t K, PhaseTimings& out) {
         uint64_t s = keys[i];
         for (uint16_t j = 0; j < nm; ++j) {
             uint64_t r = splitmix64(s);
-            moves[j].move = static_cast<uint16_t>(r);
-            moves[j].terminal_kind = 0;
-            moves[j]._pad = 0;
-            moves[j].P = 1.0f / static_cast<float>(nm);
+            moves[j] = MoveInfo::pack(static_cast<uint16_t>(r),
+                                      1.0f / static_cast<float>(nm),
+                                      catgpt::v2::kTerminalNone);
         }
 
         auto [e, claimed] = arena.find_or_claim(keys[i]);
