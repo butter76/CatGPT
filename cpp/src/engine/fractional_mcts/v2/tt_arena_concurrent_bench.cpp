@@ -116,8 +116,6 @@ void run_p1_correctness(uint64_t per_thread_keys, int num_threads) {
                     moves[j].terminal_kind = 0;
                     moves[j]._pad = 0;
                     moves[j].P = 1.0f / nm;
-                    moves[j].P_alloc = moves[j].P;
-                    moves[j].P_optimistic = moves[j].P;
                 }
 
                 auto [e, claimed] = arena.find_or_claim(keys[i]);
@@ -187,8 +185,6 @@ void run_p2_hot_race(int num_threads, uint64_t k_hot, uint64_t iters_per_thread)
                         moves[j].terminal_kind = 0;
                         moves[j]._pad = 0;
                         moves[j].P = 1.0f / 30.0f;
-                        moves[j].P_alloc = moves[j].P;
-                        moves[j].P_optimistic = moves[j].P;
                     }
                     SearchArena::set_initial_qd(e, /*Q=*/0.0f, /*max_depth=*/0.0f);
                     SearchArena::publish_info(e, off);
@@ -265,8 +261,6 @@ void run_p3_reader_writer(int num_readers, uint64_t inserts, int writer_pause_us
                 moves[j].terminal_kind = 0;
                 moves[j]._pad = 0;
                 moves[j].P = 1.0f / nm;
-                moves[j].P_alloc = moves[j].P;
-                moves[j].P_optimistic = moves[j].P;
             }
             auto [e, claimed] = arena.find_or_claim(keys[i]);
             (void)claimed;
@@ -385,8 +379,6 @@ ThroughputResult run_p4_one(int num_threads, uint64_t per_thread_inserts) {
                         moves[m].terminal_kind = 0;
                         moves[m]._pad = 0;
                         moves[m].P = 1.0f / kMovesPerNode;
-                        moves[m].P_alloc = moves[m].P;
-                        moves[m].P_optimistic = moves[m].P;
                     }
                 }
 

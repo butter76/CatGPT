@@ -153,17 +153,19 @@ inline constexpr uint64_t kArenaReservedBytes = sizeof(NodeInfoHeader);
 
 /**
  * Per-move slot. Holds the move itself, a terminal-kind byte that coalesces
- * terminal children (no TT entry / NodeInfo for them), and the three priors.
+ * terminal children (no TT entry / NodeInfo for them), and the policy prior.
+ *
+ * Two MoveInfos per 16B cacheline half: the move-iteration hot loop in
+ * search reads these densely, so keep this struct as small as possible.
  */
 struct MoveInfo {
     uint16_t move;          // 2: chess::Move underlying u16
     uint8_t  terminal_kind; // 1: 0=none, 1=draw/twofold, 2=loss_for_child
-    uint8_t  _pad;          // 1
-    float    P;             // 4: policy1 (standard, temp 1.0)
-    float    P_alloc;       // 4: policy2 (temp 1.3)
-    float    P_optimistic;  // 4: policy3 (optimistic head)
+    uint8_t  _pad;          // 1: pad to align `P` to 4 bytes
+    float    P;             // 4: policy prior (standard, temp 1.0)
 };
-static_assert(sizeof(MoveInfo) == 16, "MoveInfo must be 16 bytes");
+static_assert(sizeof(MoveInfo) == 8, "MoveInfo must be 8 bytes");
+static_assert(alignof(MoveInfo) == 4, "MoveInfo must be 4-byte aligned");
 
 enum TerminalKind : uint8_t {
     kTerminalNone = 0,

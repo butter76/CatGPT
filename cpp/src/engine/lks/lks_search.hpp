@@ -739,8 +739,6 @@ private:
                     mi[i].terminal_kind = tk;
                     mi[i]._pad          = 0;
                     mi[i].P             = P[i];
-                    mi[i].P_alloc       = P[i];   // alloc/optimistic punted: same as P
-                    mi[i].P_optimistic  = P[i];
                 }
 
                 const float Q = 2.0f * out.value - 1.0f;

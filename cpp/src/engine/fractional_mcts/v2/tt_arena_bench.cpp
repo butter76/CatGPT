@@ -166,8 +166,6 @@ void run_one(uint64_t K, PhaseTimings& out) {
             moves[j].terminal_kind = 0;
             moves[j]._pad = 0;
             moves[j].P = 1.0f / static_cast<float>(nm);
-            moves[j].P_alloc = moves[j].P;
-            moves[j].P_optimistic = moves[j].P;
         }
 
         auto [e, claimed] = arena.find_or_claim(keys[i]);
