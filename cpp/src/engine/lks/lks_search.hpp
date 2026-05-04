@@ -607,36 +607,92 @@ private:
     }
 
     /**
-     * Mirror `coroutine_search.hpp::evaluate_node`'s temp-1.0 softmax over
-     * legal-move policy logits. Writes one float per legal move into `P`,
-     * in the same order as `legal`.
+     * Paired legal move + its softmax prior. Emitted by
+     * `softmax_legal_sorted` in decreasing-P order so downstream
+     * MoveInfo fill is a single sequential pass and the arena
+     * ends up P-sorted without an in-place shuffle.
+     *
+     * Kept small (8 bytes) and mirrors MoveInfo's `move`/`P` layout:
+     * sorting cost is the same as sorting MoveInfos, and we avoid
+     * the makeMove/unmakeMove terminal work running in a soon-to-be-
+     * thrown-away order. Stored as the raw `uint16_t` rather than a
+     * `chess::Move` because the latter carries an unused 16-bit
+     * score field that would bloat this struct.
      */
-    static void softmax_legal(const RawNNOutput& out,
-                              const chess::Board& board,
-                              const chess::Movelist& legal,
-                              std::vector<float>& P)
+    struct MoveWithPrior {
+        uint16_t move;  // 2: chess::Move underlying u16
+        uint16_t _pad;  // 2
+        float    P;     // 4
+    };
+    static_assert(sizeof(MoveWithPrior) == 8, "MoveWithPrior must be 8 bytes");
+
+    /**
+     * Mirror `coroutine_search.hpp::evaluate_node`'s temp-1.0 softmax over
+     * legal-move policy logits, sorted by decreasing P. Output order is
+     * what downstream descent expects (highest-prior first), and is also
+     * the order we want in the arena's MoveInfo[].
+     */
+    static void softmax_legal_sorted(const RawNNOutput& out,
+                                     const chess::Board& board,
+                                     const chess::Movelist& legal,
+                                     std::vector<MoveWithPrior>& moves)
     {
         const bool flip = board.sideToMove() == chess::Color::BLACK;
         const int n = legal.size();
-        P.resize(static_cast<size_t>(n));
+        moves.resize(static_cast<size_t>(n));
 
         float max_logit = -std::numeric_limits<float>::infinity();
         for (int i = 0; i < n; ++i) {
             const auto [from_idx, to_idx] = encode_move_to_policy_index(legal[i], flip);
             const int flat = policy_flat_index(from_idx, to_idx);
             const float logit = out.policy[flat];
-            P[i] = logit;
+            moves[i].move = static_cast<uint16_t>(legal[i].move());
+            moves[i]._pad = 0;
+            moves[i].P = logit;
             max_logit = std::max(max_logit, logit);
         }
         float sum_exp = 0.0f;
         for (int i = 0; i < n; ++i) {
-            P[i] = std::exp(P[i] - max_logit);
-            sum_exp += P[i];
+            moves[i].P = std::exp(moves[i].P - max_logit);
+            sum_exp += moves[i].P;
         }
         const float inv_sum = sum_exp > 0.0f ? 1.0f / sum_exp : 0.0f;
         for (int i = 0; i < n; ++i) {
-            P[i] *= inv_sum;
+            moves[i].P *= inv_sum;
         }
+
+        std::sort(moves.begin(), moves.end(),
+            [](const MoveWithPrior& a, const MoveWithPrior& b) {
+                return a.P > b.P;
+            });
+    }
+
+    /**
+     * Variance of the NN value distribution, measured in the same
+     * [-1, 1] scale as `Q = 2*out.value - 1`. The HL-Gauss head's 81
+     * bins are taken as equal-width over [-1, 1] with the i-th center
+     * at `-1 + (i + 0.5) * (2 / VALUE_NUM_BINS)`.
+     *
+     * Mirrors `FractionalNode::compute_variance` in
+     * `engine/fractional_mcts/node.hpp` so LKS agrees on scale with
+     * the prototype search.
+     */
+    static float compute_value_variance(
+        const std::array<float, VALUE_NUM_BINS>& value_probs) noexcept
+    {
+        constexpr float bin_width = 2.0f / static_cast<float>(VALUE_NUM_BINS);
+        float mean = 0.0f;
+        for (int i = 0; i < VALUE_NUM_BINS; ++i) {
+            const float center = -1.0f + (static_cast<float>(i) + 0.5f) * bin_width;
+            mean += value_probs[i] * center;
+        }
+        float var = 0.0f;
+        for (int i = 0; i < VALUE_NUM_BINS; ++i) {
+            const float center = -1.0f + (static_cast<float>(i) + 0.5f) * bin_width;
+            const float diff = center - mean;
+            var += value_probs[i] * diff * diff;
+        }
+        return var;
     }
 
     /**
@@ -720,26 +776,36 @@ private:
                 chess::movegen::legalmoves(legal, board);
                 const uint16_t num_moves = static_cast<uint16_t>(legal.size());
 
-                std::vector<float> P;
-                softmax_legal(out, board, legal, P);
+                // Sort moves by decreasing P up front (on compact
+                // 8-byte pairs) so the arena fill below is a single
+                // pass that writes each MoveInfo exactly once in the
+                // order descent will consume them.
+                std::vector<MoveWithPrior> sorted_moves;
+                softmax_legal_sorted(out, board, legal, sorted_moves);
 
                 // alloc + fill BEFORE attempting to claim — these bytes are
                 // privately owned until the CAS, and orphaned if the CAS loses.
                 const uint64_t off = arena_->alloc_node_info(num_moves);
                 v2::MoveInfo* mi = arena_->moves_at(off);
                 for (uint16_t i = 0; i < num_moves; ++i) {
-                    chess::Move m = legal[i];
+                    const chess::Move m{sorted_moves[i].move};
 
                     // Per-move position-only terminal detection.
                     board.makeMove<true>(m);
                     const uint8_t tk = classify_terminal(board);
                     board.unmakeMove(m);
 
-                    mi[i].move          = static_cast<uint16_t>(m.move());
+                    mi[i].move          = sorted_moves[i].move;
                     mi[i].terminal_kind = tk;
                     mi[i]._pad          = 0;
-                    mi[i].P             = P[i];
+                    mi[i].P             = sorted_moves[i].P;
                 }
+
+                // Per-node variance of the value distribution, in the
+                // same [-1, 1] scale as Q. alloc_node_info pre-fills
+                // variance=0; overwrite with the real value.
+                arena_->info_at(off)->variance =
+                    compute_value_variance(out.value_probs);
 
                 const float Q = 2.0f * out.value - 1.0f;
 
