@@ -27,6 +27,16 @@
  *       workflow against a private random key stream. Report inserts/sec
  *       and lookups/sec, plus the scaling factor vs T=1.
  *
+ *   P5. Torn-claim regression (the bug the 128-bit Cell A fix targets):
+ *       1 writer holds a single hot key and re-claims it (via a fresh
+ *       SearchArena per generation) while encoding a generation tag in
+ *       qd_packed.q. N readers `find()` the key and `load_qd()` it; for
+ *       any successful key match, the loaded qd_packed must encode the
+ *       same generation as the writer was on at that moment (or one
+ *       neighbouring generation). Pre-fix this would race: a reader
+ *       could observe the new key with a still-zero qd_packed. With
+ *       the 128-bit CAS in Cell A the race is structurally impossible.
+ *
  * No TRT / libcoro / chess-library deps. Pure C++23 + pthread.
  */
 
@@ -116,10 +126,11 @@ void run_p1_correctness(uint64_t per_thread_keys, int num_threads) {
                                               catgpt::v2::kTerminalNone);
                 }
 
-                auto [e, claimed] = arena.find_or_claim(keys[i]);
+                auto [e, claimed] = arena.find_or_claim(keys[i],
+                                                        /*Q=*/0.0f,
+                                                        /*max_depth=*/max_ds[i]);
                 EXPECT(claimed); // disjoint keys -> always our claim
-                SearchArena::set_initial_qd(e, /*Q=*/0.0f, /*max_depth=*/max_ds[i]);
-                SearchArena::publish_info(e, off);
+                SearchArena::publish_info(e, /*origQ=*/0.0f, off);
             }
         });
     }
@@ -133,11 +144,11 @@ void run_p1_correctness(uint64_t per_thread_keys, int num_threads) {
             TTEntry* e = arena.find(keys[i]);
             EXPECT(e != nullptr);
             if (!e) continue;
-            uint64_t off = e->info_offset.load(std::memory_order_acquire);
-            EXPECT(off != kNoInfoOffset);
-            const auto* hdr = arena.info_at(off);
+            const catgpt::v2::InfoCell info = SearchArena::load_info(e);
+            EXPECT(info.info_offset != kNoInfoOffset);
+            const auto* hdr = arena.info_at(info.info_offset);
             EXPECT(hdr->num_moves == 30);
-            auto [q, md] = unpack_qd(e->qd_packed.load(std::memory_order_relaxed));
+            auto [q, md] = unpack_qd(SearchArena::load_qd(e).qd_packed);
             (void)q;
             EXPECT(md == max_ds[i]);
         }
@@ -173,7 +184,7 @@ void run_p2_hot_race(int num_threads, uint64_t k_hot, uint64_t iters_per_thread)
                 uint64_t r = splitmix64(rng);
                 uint64_t key = hot_keys[r % k_hot];
 
-                auto [e, claimed] = arena.find_or_claim(key);
+                auto [e, claimed] = arena.find_or_claim(key, /*Q=*/0.0f, /*max_depth=*/0.0f);
                 if (claimed) {
                     ++my_wins;
                     uint64_t off = arena.alloc_node_info(30);
@@ -182,8 +193,7 @@ void run_p2_hot_race(int num_threads, uint64_t k_hot, uint64_t iters_per_thread)
                         moves[j] = MoveInfo::pack(j, 1.0f / 30.0f,
                                                   catgpt::v2::kTerminalNone);
                     }
-                    SearchArena::set_initial_qd(e, /*Q=*/0.0f, /*max_depth=*/0.0f);
-                    SearchArena::publish_info(e, off);
+                    SearchArena::publish_info(e, /*origQ=*/0.0f, off);
                 }
 
                 // Independent: every thread CAS-bumps max_depth to a thread-and-iter
@@ -220,9 +230,9 @@ void run_p2_hot_race(int num_threads, uint64_t k_hot, uint64_t iters_per_thread)
         TTEntry* e = arena.find(key);
         EXPECT(e != nullptr);
         if (!e) continue;
-        uint64_t off = e->info_offset.load(std::memory_order_acquire);
-        EXPECT(off != kNoInfoOffset);
-        auto [q, md] = unpack_qd(e->qd_packed.load(std::memory_order_relaxed));
+        const catgpt::v2::InfoCell info = SearchArena::load_info(e);
+        EXPECT(info.info_offset != kNoInfoOffset);
+        auto [q, md] = unpack_qd(SearchArena::load_qd(e).qd_packed);
         (void)q;
         EXPECT(md == expected_max_d[key]);
     }
@@ -256,12 +266,12 @@ void run_p3_reader_writer(int num_readers, uint64_t inserts, int writer_pause_us
                 moves[j] = MoveInfo::pack(j, 1.0f / nm,
                                           catgpt::v2::kTerminalNone);
             }
-            auto [e, claimed] = arena.find_or_claim(keys[i]);
-            (void)claimed;
             // Encode num_moves into max_depth for round-trip checking.
-            SearchArena::set_initial_qd(e, /*Q=*/0.0f,
-                                        /*max_depth=*/static_cast<float>(nm));
-            SearchArena::publish_info(e, off);
+            auto [e, claimed] = arena.find_or_claim(keys[i],
+                                                    /*Q=*/0.0f,
+                                                    /*max_depth=*/static_cast<float>(nm));
+            (void)claimed;
+            SearchArena::publish_info(e, /*origQ=*/0.0f, off);
             if (writer_pause_us > 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(writer_pause_us));
             }
@@ -278,14 +288,14 @@ void run_p3_reader_writer(int num_readers, uint64_t inserts, int writer_pause_us
                 uint64_t idx = splitmix64(rng_state) % keys.size();
                 TTEntry* e = arena.find(keys[idx]);
                 if (!e) continue;
-                if (!SearchArena::wait_published(e, 4096)) {
+                auto info_opt = SearchArena::wait_published(e, 4096);
+                if (!info_opt) {
                     wait_timeouts.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
                 successful_waits.fetch_add(1, std::memory_order_relaxed);
-                uint64_t off = e->info_offset.load(std::memory_order_acquire);
-                const auto* hdr = arena.info_at(off);
-                auto [q, md] = unpack_qd(e->qd_packed.load(std::memory_order_relaxed));
+                const auto* hdr = arena.info_at(info_opt->info_offset);
+                auto [q, md] = unpack_qd(SearchArena::load_qd(e).qd_packed);
                 (void)q;
                 if (static_cast<float>(hdr->num_moves) != md) {
                     torn_reads.fetch_add(1, std::memory_order_relaxed);
@@ -377,10 +387,11 @@ ThroughputResult run_p4_one(int num_threads, uint64_t per_thread_inserts) {
                 // 3. claim + publish each
                 for (uint64_t j = 0; j < this_batch; ++j) {
                     uint64_t off = base + j * per_node_bytes;
-                    auto [e, claimed] = arena.find_or_claim(keys[i + j]);
+                    auto [e, claimed] = arena.find_or_claim(keys[i + j],
+                                                            /*Q=*/0.0f,
+                                                            /*max_depth=*/1.0f);
                     (void)claimed;
-                    SearchArena::set_initial_qd(e, 0.0f, 1.0f);
-                    SearchArena::publish_info(e, off);
+                    SearchArena::publish_info(e, /*origQ=*/0.0f, off);
                 }
 
                 // 4. a small lookup burst per batch (search reads are mostly hits)
@@ -434,6 +445,87 @@ void run_p4_sweep(uint64_t per_thread_inserts) {
     }
 }
 
+// ── P5 — Torn-claim regression ────────────────────────────────────────────
+//
+// Writer claims a stream of distinct keys, encoding a per-key generation
+// tag in qd_packed.q. Readers race the writer: any successful `find(key)`
+// must yield a `load_qd` whose qd_packed.q equals the tag the writer
+// committed for that key (because the 128-bit CAS in Cell A binds key
+// and qd_packed atomically). Pre-fix (key + qd as separate atomics) the
+// reader could observe key == K but qd_packed == 0; post-fix that is
+// structurally impossible.
+//
+// We deliberately skip `publish_info` here — this test exercises Cell A
+// only.
+
+void run_p5_torn_claim(int num_readers, uint64_t num_rounds) {
+    std::printf("\n[P5] torn-claim regression: %d readers vs 1 writer, %lu rounds\n",
+                num_readers, (unsigned long)num_rounds);
+
+    SearchArena arena(num_rounds, 0.5, 40);
+
+    constexpr uint64_t kKeyBase = 0xCAFEBABEDEADBEEFULL;
+
+    std::atomic<uint64_t> rounds_done{0};
+    std::atomic<bool>     writer_done{false};
+    std::atomic<uint64_t> torn_reads{0};
+    std::atomic<uint64_t> successful_reads{0};
+
+    std::thread writer([&]() {
+        for (uint64_t r = 0; r < num_rounds; ++r) {
+            const uint64_t key = kKeyBase ^ r;
+            // Strictly non-zero so a torn read of qd_packed (== 0) is
+            // distinguishable from the published value.
+            const float tag = static_cast<float>(r) + 1.0f;
+            auto [e, claimed] = arena.find_or_claim(key, /*Q=*/tag, /*max_depth=*/0.0f);
+            EXPECT(claimed);
+            (void)e;
+            rounds_done.store(r + 1, std::memory_order_release);
+        }
+        writer_done.store(true, std::memory_order_release);
+    });
+
+    std::vector<std::thread> readers;
+    readers.reserve(num_readers);
+    for (int t = 0; t < num_readers; ++t) {
+        readers.emplace_back([&, t]() {
+            uint64_t rng = 0xC001D00DULL ^ (uint64_t(t) * 0x9E3779B97F4A7C15ULL);
+            while (!writer_done.load(std::memory_order_acquire)) {
+                const uint64_t hi = rounds_done.load(std::memory_order_acquire);
+                if (hi == 0) continue;
+                const uint64_t r = splitmix64(rng) % hi;
+                const uint64_t key = kKeyBase ^ r;
+                TTEntry* e = arena.find(key);
+                if (!e) continue;
+                const catgpt::v2::KeyQd kq = SearchArena::load_qd(e);
+                if (kq.key != key) {
+                    // Probe found a slot with this key; load_qd must
+                    // observe at least the same key. (This branch should
+                    // never fire — kept for safety.)
+                    torn_reads.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                auto [q, md] = unpack_qd(kq.qd_packed);
+                (void)md;
+                const float expected = static_cast<float>(r) + 1.0f;
+                if (q != expected) {
+                    torn_reads.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    successful_reads.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+
+    writer.join();
+    for (auto& tt : readers) tt.join();
+
+    std::printf("    successful_reads=%lu  torn_reads=%lu\n",
+                (unsigned long)successful_reads.load(),
+                (unsigned long)torn_reads.load());
+    EXPECT(torn_reads.load() == 0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -446,6 +538,8 @@ int main(int argc, char** argv) {
     uint64_t p3_inserts    = 1ULL << 12;   // 4k
     int      p3_pause_us   = 0;
     uint64_t p4_per_thread = 1ULL << 16;   // 64k
+    int      p5_readers    = 4;
+    uint64_t p5_rounds     = 1ULL << 16;   // 64k claims
 
     if (argc > 1) {
         // Allow overriding p4_per_thread for quick smoke runs.
@@ -459,6 +553,7 @@ int main(int argc, char** argv) {
     run_p2_hot_race(p2_threads, p2_k_hot, p2_iters);
     run_p3_reader_writer(p3_readers, p3_inserts, p3_pause_us);
     run_p4_sweep(p4_per_thread);
+    run_p5_torn_claim(p5_readers, p5_rounds);
 
     if (g_failed == 0) {
         std::printf("\nAll concurrency assertions passed.\n");

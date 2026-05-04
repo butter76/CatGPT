@@ -167,10 +167,10 @@ void run_one(uint64_t K, PhaseTimings& out) {
                                       catgpt::v2::kTerminalNone);
         }
 
-        auto [e, claimed] = arena.find_or_claim(keys[i]);
+        auto [e, claimed] = arena.find_or_claim(keys[i], /*Q=*/0.123f, /*max_depth=*/0.0f);
+        (void)claimed;
         // Distinct keys -> we always claim.
-        SearchArena::set_initial_qd(e, /*Q=*/0.123f, /*max_depth=*/0.0f);
-        SearchArena::publish_info(e, off);
+        SearchArena::publish_info(e, /*origQ=*/0.123f, off);
     }
     auto t1 = Clock::now();
     out.fill = std::chrono::duration_cast<ns>(t1 - t0);
@@ -206,10 +206,10 @@ void run_one(uint64_t K, PhaseTimings& out) {
                 hit_probes.push_back(static_cast<uint32_t>(arena.probe_length(key)));
             }
             // Walk a few moves to touch arena.
-            uint64_t off = e->info_offset.load(std::memory_order_acquire);
-            if (off != kNoInfoOffset) {
-                const NodeInfoHeader* hdr = arena.info_at(off);
-                const MoveInfo* mv = arena.moves_at(off);
+            const catgpt::v2::InfoCell info = SearchArena::load_info(e);
+            if (info.info_offset != kNoInfoOffset) {
+                const NodeInfoHeader* hdr = arena.info_at(info.info_offset);
+                const MoveInfo* mv = arena.moves_at(info.info_offset);
                 accum += hdr->num_moves;
                 accum += mv[r % hdr->num_moves].move;
 
@@ -262,9 +262,9 @@ void run_one(uint64_t K, PhaseTimings& out) {
         SearchArena* ap = new (arena_storage) SearchArena(K, kLoadFactor, kAvgMovesPerNode);
         for (uint64_t i = 0; i < std::min<uint64_t>(K, 1024); ++i) {
             uint64_t off = ap->alloc_node_info(move_counts[i]);
-            auto [e, claimed] = ap->find_or_claim(keys[i]);
+            auto [e, claimed] = ap->find_or_claim(keys[i], /*Q=*/0.0f, /*max_depth=*/0.0f);
             (void)claimed;
-            SearchArena::publish_info(e, off);
+            SearchArena::publish_info(e, /*origQ=*/0.0f, off);
         }
 
         g_no_alloc.store(true, std::memory_order_relaxed);

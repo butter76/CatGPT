@@ -11,7 +11,6 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Compiler flags for modern C++ and optimization
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic -Wno-deprecated-declarations")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
@@ -272,8 +271,11 @@ set_target_properties(catgpt_puzzle_eval PROPERTIES
 add_executable(tt_arena_bench
     src/engine/fractional_mcts/v2/tt_arena_bench.cpp
 )
-target_compile_options(tt_arena_bench PRIVATE -O3 -march=native)
-target_link_libraries(tt_arena_bench PRIVATE pthread)
+target_compile_options(tt_arena_bench PRIVATE -O3 -march=native -mcx16)
+# libatomic provides __atomic_*_16 (gcc-14 emits libcalls for 16-byte
+# atomics rather than inlining cmpxchg16b; libatomic uses cmpxchg16b
+# internally so the ops remain lock-free).
+target_link_libraries(tt_arena_bench PRIVATE pthread atomic)
 set_target_properties(tt_arena_bench PROPERTIES
     BUILD_RPATH "${GCC14_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR}"
@@ -284,8 +286,8 @@ set_target_properties(tt_arena_bench PROPERTIES
 add_executable(tt_arena_concurrent_bench
     src/engine/fractional_mcts/v2/tt_arena_concurrent_bench.cpp
 )
-target_compile_options(tt_arena_concurrent_bench PRIVATE -O3 -march=native)
-target_link_libraries(tt_arena_concurrent_bench PRIVATE pthread)
+target_compile_options(tt_arena_concurrent_bench PRIVATE -O3 -march=native -mcx16)
+target_link_libraries(tt_arena_concurrent_bench PRIVATE pthread atomic)
 set_target_properties(tt_arena_concurrent_bench PROPERTIES
     BUILD_RPATH "${GCC14_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR}"
@@ -296,7 +298,8 @@ set_target_properties(tt_arena_concurrent_bench PROPERTIES
 add_executable(tt_arena_test
     src/engine/fractional_mcts/v2/tt_arena_test.cpp
 )
-target_compile_options(tt_arena_test PRIVATE -O2 -g -march=native)
+target_compile_options(tt_arena_test PRIVATE -O2 -g -march=native -mcx16)
+target_link_libraries(tt_arena_test PRIVATE atomic)
 set_target_properties(tt_arena_test PROPERTIES
     BUILD_RPATH "${GCC14_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR}"
@@ -313,12 +316,13 @@ target_include_directories(lks_search_test PRIVATE
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
 )
-target_compile_options(lks_search_test PRIVATE -O2 -g -fcoroutines)
+target_compile_options(lks_search_test PRIVATE -O2 -g -fcoroutines -mcx16)
 target_link_libraries(lks_search_test PRIVATE
     ${LIBCORO_LIB}
     ${NVINFER_LIB}
     ${CUDART_LIB}
     pthread
+    atomic
 )
 set_target_properties(lks_search_test PROPERTIES
     BUILD_RPATH   "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
@@ -335,12 +339,13 @@ target_include_directories(lks_throughput_bench PRIVATE
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
 )
-target_compile_options(lks_throughput_bench PRIVATE -O3 -march=native -fcoroutines)
+target_compile_options(lks_throughput_bench PRIVATE -O3 -march=native -fcoroutines -mcx16)
 target_link_libraries(lks_throughput_bench PRIVATE
     ${LIBCORO_LIB}
     ${NVINFER_LIB}
     ${CUDART_LIB}
     pthread
+    atomic
 )
 set_target_properties(lks_throughput_bench PROPERTIES
     BUILD_RPATH   "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
@@ -362,8 +367,9 @@ target_link_libraries(lks_uci PRIVATE
     ${CUDART_LIB}
     ${LIBCORO_LIB}
     pthread
+    atomic
 )
-target_compile_options(lks_uci PRIVATE -fcoroutines)
+target_compile_options(lks_uci PRIVATE -fcoroutines -mcx16)
 set_target_properties(lks_uci PROPERTIES
     BUILD_RPATH   "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"

@@ -361,12 +361,15 @@ public:
         const v2::TTEntry* root = arena_->find(root_key_);
         if (root == nullptr) return legal[0];
 
-        const uint64_t info_off = root->info_offset.load(std::memory_order_acquire);
-        if (info_off == v2::kNoInfoOffset) return legal[0];
+        // Root needs moveInfo; if Cell B is unpublished treat as a TT
+        // miss (caller-side fallback to legal[0] mirrors the find-miss
+        // path above).
+        const v2::InfoCell info = v2::SearchArena::load_info(root);
+        if (info.info_offset == v2::kNoInfoOffset) return legal[0];
 
-        const v2::NodeInfoHeader* hdr = arena_->info_at(info_off);
+        const v2::NodeInfoHeader* hdr = arena_->info_at(info.info_offset);
         const uint16_t num_moves = hdr->num_moves;
-        const v2::MoveInfo* moves = arena_->moves_at(info_off);
+        const v2::MoveInfo* moves = arena_->moves_at(info.info_offset);
         if (num_moves == 0) return legal[0];
 
         chess::Move best       = chess::Move{moves[0].move};
@@ -403,8 +406,10 @@ public:
                         child_Q     = +1.0f;
                         child_depth = -std::numeric_limits<float>::infinity();
                     } else {
+                        // Cell A is atomic with the key match — no need
+                        // to wait on Cell B (we don't need moveInfo).
                         auto [q, d] = v2::unpack_qd(
-                            ce->qd_packed.load(std::memory_order_acquire));
+                            v2::SearchArena::load_qd(ce).qd_packed);
                         child_Q     = q;
                         child_depth = d;
                     }
@@ -764,7 +769,6 @@ private:
             // lose and our arena bytes would be permanently orphaned).
             if (v2::TTEntry* e = arena_->find(key); e != nullptr) {
                 w.eval_sem->release();
-                v2::SearchArena::wait_published(e);
                 entry = e;
             } else {
                 auto tokens = catgpt::tokenize<BatchEvaluator::SEQ_LENGTH>(
@@ -809,18 +813,19 @@ private:
 
                 const float Q = 2.0f * out.value - 1.0f;
 
-                auto [ce, claimed] = arena_->find_or_claim(key);
+                // Single 128-bit CAS installs (key, qd_packed(Q, 0))
+                // atomically, so any reader observing key == K
+                // necessarily sees the matching qd. Then a single 128-bit
+                // release-store of Cell B publishes (origQ, info_offset).
+                auto [ce, claimed] = arena_->find_or_claim(key, Q, /*max_depth=*/0.0f);
                 if (claimed) {
-                    v2::SearchArena::set_initial_qd(ce, Q, 0.0f);
-                    v2::SearchArena::publish_info(ce, off);
+                    v2::SearchArena::publish_info(ce, /*origQ=*/Q, off);
                     w.tt_claims.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     // Lost the race despite the post-acquire re-probe:
                     // someone published in the gap between our re-probe
                     // and our find_or_claim. Our `off` bytes are orphaned
-                    // (forever). The winner's claim-to-publish window is
-                    // two atomic stores, so the wait spins ~tens of ns.
-                    v2::SearchArena::wait_published(ce);
+                    // (forever).
                 }
 
                 // Intentionally let the thread finish putting the entry
@@ -833,17 +838,29 @@ private:
 
         // ── re-deepen check (works for both fresh-claim and TT-shared) ──
         {
+            // Cell A is atomic with the key match (find / find_or_claim
+            // both ensure we observe a key from a successful CAS), so qd
+            // is never torn here.
             auto [_, cur_max_d] = v2::unpack_qd(
-                entry->qd_packed.load(std::memory_order_acquire));
+                v2::SearchArena::load_qd(entry).qd_packed);
             (void)_;
             if (depth <= cur_max_d) co_return;
         }
 
         // ── pre-pass: classify each child for fan-out + rollup ──────────
-        const uint64_t info_off = entry->info_offset.load(std::memory_order_acquire);
-        const v2::NodeInfoHeader* hdr = arena_->info_at(info_off);
+        // We need moveInfo, so wait on Cell B's publish if necessary.
+        // The only path that reaches here without having already
+        // synchronized on the publish is a TT-hit at line 740 followed
+        // by a re-deepen miss above; in that case the writer is
+        // mid-publish and the wait spins ~tens of ns.
+        const v2::InfoCell info_cell = [&]() {
+            auto opt = v2::SearchArena::wait_published(entry, /*max_spins=*/(1ULL << 24));
+            assert(opt.has_value() && "publish never observed; writer hung?");
+            return *opt;
+        }();
+        const v2::NodeInfoHeader* hdr = arena_->info_at(info_cell.info_offset);
         const uint16_t num_moves = hdr->num_moves;
-        const v2::MoveInfo* moves = arena_->moves_at(info_off);
+        const v2::MoveInfo* moves = arena_->moves_at(info_cell.info_offset);
 
         enum class Mode : uint8_t { Skip, RecurseThenRead, ReadOnly };
         struct Plan {
@@ -900,8 +917,13 @@ private:
             const uint64_t child_key = cb.hash();
 
             if (v2::TTEntry* ce = arena_->find(child_key)) {
+                // Cell A only — never spin on the child's moveInfo from
+                // here. If the child is claimed but unpublished,
+                // qd_packed already carries the initial (Q, 0) committed
+                // atomically with the key, so we'll just fall through
+                // to RecurseThenRead and re-deepen via the child's task.
                 auto [q, child_max_d] = v2::unpack_qd(
-                    ce->qd_packed.load(std::memory_order_acquire));
+                    v2::SearchArena::load_qd(ce).qd_packed);
                 if (child_depth <= child_max_d) {
                     plans.push_back({Mode::ReadOnly, m_P, q, child_key});
                     continue;
@@ -931,7 +953,7 @@ private:
                 v2::TTEntry* ce = arena_->find(p.child_key);
                 if (!ce) continue;       // child never claimed (e.g. stop fired)
                 auto [q, _] = v2::unpack_qd(
-                    ce->qd_packed.load(std::memory_order_acquire));
+                    v2::SearchArena::load_qd(ce).qd_packed);
                 (void)_;
                 child_Q = q;
             }
@@ -945,7 +967,7 @@ private:
             // child_depth >= 0 floor, or stop fired before any landed).
             // Keep the existing NN-evaluated Q and just bump max_depth.
             auto [q_old, _] = v2::unpack_qd(
-                entry->qd_packed.load(std::memory_order_acquire));
+                v2::SearchArena::load_qd(entry).qd_packed);
             (void)_;
             v2::SearchArena::update_qd(entry, q_old, depth);
         }

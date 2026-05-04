@@ -395,11 +395,120 @@ void test_exhaustive_packed_patterns_never_crash() {
     EXPECT(sane_count > 60000);
 }
 
+// ── Atomic128 + TTEntry layout / claim round-trip ─────────────────────────
+
+void test_atomic128_lock_free() {
+    std::printf("[9] Atomic128<KeyQd> / Atomic128<InfoCell> are lock-free\n");
+
+    // These should already be enforced by static_asserts inside Atomic128.
+    // The runtime check exists so the test binary fails loudly on any
+    // host that managed to slip past those asserts.
+    catgpt::v2::Atomic128<catgpt::v2::KeyQd>    a;
+    catgpt::v2::Atomic128<catgpt::v2::InfoCell> b;
+    (void)a;
+    (void)b;
+
+    EXPECT(sizeof(catgpt::v2::TTEntry) == 32);
+    EXPECT(alignof(catgpt::v2::TTEntry) == 32);
+    EXPECT(sizeof(catgpt::v2::KeyQd) == 16);
+    EXPECT(sizeof(catgpt::v2::InfoCell) == 16);
+}
+
+void test_claim_load_publish_round_trip() {
+    std::printf("[10] single-thread claim / load_qd / publish_info / load_info round-trip\n");
+
+    catgpt::v2::SearchArena arena(/*k_max_evals=*/1024,
+                                  /*load_factor=*/0.5,
+                                  /*avg_moves_per_node=*/40);
+
+    constexpr uint64_t kKey = 0x0123456789ABCDEFULL;
+    constexpr float    kQ   = 0.3125f;       // exact in fp32
+    constexpr float    kMD  = 4.0f;          // exact in fp32
+
+    // Pre-claim: find returns nullptr.
+    EXPECT(arena.find(kKey) == nullptr);
+
+    // Allocate arena bytes for a small node and fill MoveInfo[].
+    constexpr uint16_t kNumMoves = 5;
+    const uint64_t off = arena.alloc_node_info(kNumMoves);
+    EXPECT(off != catgpt::v2::kNoInfoOffset);
+    auto* hdr = arena.info_at(off);
+    hdr->variance = 0.25f;
+    catgpt::v2::MoveInfo* moves = arena.moves_at(off);
+    for (uint16_t i = 0; i < kNumMoves; ++i) {
+        moves[i] = catgpt::v2::MoveInfo::pack(
+            static_cast<uint16_t>(i + 1),
+            1.0f / static_cast<float>(kNumMoves),
+            catgpt::v2::kTerminalNone);
+    }
+
+    // Claim with the qd committed atomically.
+    auto [e, claimed] = arena.find_or_claim(kKey, /*Q=*/kQ, /*max_depth=*/kMD);
+    EXPECT(claimed);
+    EXPECT(e != nullptr);
+
+    // Cell A is readable immediately, with no spin.
+    catgpt::v2::KeyQd kq = catgpt::v2::SearchArena::load_qd(e);
+    EXPECT(kq.key == kKey);
+    auto [q, md] = catgpt::v2::unpack_qd(kq.qd_packed);
+    EXPECT_EQ_F(q, kQ);
+    EXPECT_EQ_F(md, kMD);
+
+    // Cell B is unpublished until publish_info.
+    catgpt::v2::InfoCell pre = catgpt::v2::SearchArena::load_info(e);
+    EXPECT(pre.info_offset == catgpt::v2::kNoInfoOffset);
+
+    // Publish: origQ kept distinct from the rolled-up Q so we can verify
+    // the round-trip preserves the input value.
+    constexpr float kOrigQ = -0.625f;        // exact in fp32
+    catgpt::v2::SearchArena::publish_info(e, /*origQ=*/kOrigQ, off);
+
+    catgpt::v2::InfoCell post = catgpt::v2::SearchArena::load_info(e);
+    EXPECT(post.info_offset == off);
+    EXPECT_EQ_F(post.origQ, kOrigQ);
+
+    auto info_opt = catgpt::v2::SearchArena::wait_published(e);
+    EXPECT(info_opt.has_value());
+    if (info_opt) {
+        EXPECT(info_opt->info_offset == off);
+        EXPECT_EQ_F(info_opt->origQ, kOrigQ);
+    }
+
+    // update_qd raises max_depth.
+    bool ok = catgpt::v2::SearchArena::update_qd(e, /*new_q=*/0.5f, /*new_max_depth=*/8.0f);
+    EXPECT(ok);
+    auto [q2, md2] = catgpt::v2::unpack_qd(
+        catgpt::v2::SearchArena::load_qd(e).qd_packed);
+    EXPECT_EQ_F(q2, 0.5f);
+    EXPECT_EQ_F(md2, 8.0f);
+
+    // Lower max_depth is rejected; q stays at the prior value.
+    bool ok2 = catgpt::v2::SearchArena::update_qd(e, /*new_q=*/0.0f, /*new_max_depth=*/4.0f);
+    EXPECT(!ok2);
+    auto [q3, md3] = catgpt::v2::unpack_qd(
+        catgpt::v2::SearchArena::load_qd(e).qd_packed);
+    EXPECT_EQ_F(q3, 0.5f);
+    EXPECT_EQ_F(md3, 8.0f);
+
+    // origQ remains untouched by update_qd.
+    catgpt::v2::InfoCell after_update = catgpt::v2::SearchArena::load_info(e);
+    EXPECT_EQ_F(after_update.origQ, kOrigQ);
+    EXPECT(after_update.info_offset == off);
+
+    // Re-finding the same key returns the same entry; second find_or_claim
+    // does NOT re-claim.
+    auto* found = arena.find(kKey);
+    EXPECT(found == e);
+    auto [e2, claimed2] = arena.find_or_claim(kKey, /*Q=*/0.0f, /*max_depth=*/0.0f);
+    EXPECT(!claimed2);
+    EXPECT(e2 == e);
+}
+
 }  // namespace
 
 int main() {
-    std::printf("tt_arena_test: MoveInfo=%zuB alignof=%zuB\n",
-                sizeof(MoveInfo), alignof(MoveInfo));
+    std::printf("tt_arena_test: MoveInfo=%zuB alignof=%zuB  TTEntry=%zuB\n",
+                sizeof(MoveInfo), alignof(MoveInfo), sizeof(catgpt::v2::TTEntry));
 
     test_static_layout();
     test_non_terminal_round_trip();
@@ -409,6 +518,8 @@ int main() {
     test_monotonicity();
     test_randomized_round_trip();
     test_exhaustive_packed_patterns_never_crash();
+    test_atomic128_lock_free();
+    test_claim_load_publish_round_trip();
 
     if (g_failed == 0) {
         std::printf("\nAll tests passed.\n");

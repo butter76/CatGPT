@@ -6,10 +6,22 @@
  * `SearchArena` (two `delete[]`s, no per-node frees).
  *
  *   - `table_` : open-addressed, linear-probed hash of `TTEntry`s. Each
- *                slot's hot mutable per-node state (key, Q, max_depth,
- *                info_offset) lives in three `std::atomic<uint64_t>`
- *                fields so concurrent readers and writers never observe a
- *                torn slot. Capacity = `next_pow2(ceil(K / load_factor))`.
+ *                slot is two 16-byte cells, each backed by a 128-bit
+ *                lock-free atomic:
+ *                  * `key_qd`  (Cell A, mutable):
+ *                       low  8 B = key (0 == empty),
+ *                       high 8 B = qd_packed (Q + max_depth).
+ *                       Claimed via a single 128-bit CAS so any reader
+ *                       observing key == K necessarily observes the
+ *                       matching qd_packed from the same atomic.
+ *                  * `info`    (Cell B, immutable post-publish):
+ *                       low  4 B = origQ (NN value at expansion time),
+ *                       next 4 B = reserved,
+ *                       high 8 B = info_offset (kNoInfoOffset until
+ *                       published). Set exactly once with a 128-bit
+ *                       release-store after the writer has filled the
+ *                       arena bytes for this node.
+ *                Capacity = `next_pow2(ceil(K / load_factor))`.
  *
  *   - `arena_` : single bump-allocated byte arena holding cold immutable
  *                per-node info (NodeInfoHeader + MoveInfo[]). The head
@@ -27,19 +39,27 @@
  *   Writer (post-GPU, batched):
  *     1.  fetch_add `total_bytes` for the whole batch (one global atomic).
  *     2.  Plain stores into the (privately-owned) bytes for each position.
- *     3.  For each position: probe linearly, CAS `key` 0 -> K (acq_rel).
- *         On CAS success, relaxed-store qd_packed, then release-store
- *         info_offset. On CAS failure with key == K, another writer beat
- *         us; we skip (the bytes we wrote are wasted but harmless). On
- *         CAS failure with key == K' != K, keep probing.
+ *     3.  For each position: probe linearly, 128-bit CAS Cell A from
+ *         (kEmptyKey, 0) to (key, pack_qd(Q, max_depth)) (acq_rel). On
+ *         success, 128-bit release-store Cell B with (origQ, info_offset).
+ *         On CAS failure with key half == K, another writer beat us; we
+ *         skip (the bytes we wrote are wasted but harmless). On CAS
+ *         failure with key half == K' != K, keep probing.
  *
- *   Reader:
- *     1.  Probe linearly, comparing `key` (relaxed).
- *     2.  On match, acquire-load info_offset. If kNoInfoOffset the writer
- *         is between its CAS and its release-store; the reader can either
- *         spin briefly (`wait_published`) or treat as miss.
- *     3.  After acquire of info_offset, the header + MoveInfo[] writes
- *         and the writer's relaxed qd_packed store are visible.
+ *   Reader (Q + max_depth path — never spins):
+ *     1.  Probe linearly, comparing the key half of `key_qd` (relaxed).
+ *     2.  On match, acquire-load Cell A and unpack qd_packed. The key
+ *         match implies qd_packed is from the same 128-bit CAS the
+ *         claimer issued, so there is no torn-read window.
+ *
+ *   Reader (moveInfo path — may spin):
+ *     1.  As above, find the matching slot.
+ *     2.  Acquire-load Cell B (or `wait_published`). If
+ *         `info_offset == kNoInfoOffset`, the writer is between its
+ *         claim CAS and its publish release-store; spin briefly.
+ *     3.  After acquire of Cell B with a non-sentinel info_offset, the
+ *         arena bytes (NodeInfoHeader + MoveInfo[]) and origQ are
+ *         visible.
  *
  * Terminal children do NOT consume a TT entry or NodeInfo: they live as a
  * `MoveInfo.terminal_kind` byte in the parent. This preserves the invariant
@@ -57,6 +77,7 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <optional>
 #include <type_traits>
 #include <utility>
 
@@ -71,6 +92,93 @@
 
 namespace catgpt::v2 {
 
+// ── 128-bit lock-free atomic ──────────────────────────────────────────────
+//
+// Thin wrapper over `unsigned __int128` with `alignas(16)`, using the GCC
+// `__atomic_*` builtins so the compiler emits inline `cmpxchg16b` on
+// x86_64 (`-mcx16`, which g++-14 does NOT auto-enable under `-march=native`
+// on AMD EPYC even though the ISA bit is set — pass it explicitly).
+//
+// We gate on `__GCC_HAVE_SYNC_COMPARE_AND_SWAP_16` rather than
+// `__atomic_always_lock_free(16, …)`: the latter returns 0 on gcc even
+// with `-mcx16` because gcc reserves "always lock-free" for sizes up to
+// 8 bytes. The macro is the canonical signal that the toolchain will
+// emit inline `cmpxchg16b` for 16-byte atomic ops.
+#if !defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_16)
+#error "tt_arena.hpp requires lock-free 16-byte CAS (build with -mcx16; "       \
+       "this is needed for the lock-free TTEntry layout)."
+#endif
+
+namespace detail {
+__extension__ using atomic128_storage_t = unsigned __int128;
+}  // namespace detail
+
+template <typename T>
+struct alignas(16) Atomic128 {
+    static_assert(sizeof(T) == 16, "Atomic128<T> requires sizeof(T) == 16");
+    static_assert(std::is_trivially_copyable_v<T>,
+                  "Atomic128<T> requires trivially copyable T");
+
+    using Storage = detail::atomic128_storage_t;
+    static_assert(sizeof(Storage) == 16);
+
+    Atomic128() noexcept : storage_(0) {}
+    explicit Atomic128(T v) noexcept { store(v, std::memory_order_relaxed); }
+
+    Atomic128(const Atomic128&)            = delete;
+    Atomic128& operator=(const Atomic128&) = delete;
+
+    [[nodiscard]] T load(std::memory_order o) const noexcept {
+        Storage s = __atomic_load_n(const_cast<Storage*>(&storage_),
+                                    static_cast<int>(o));
+        return from_storage(s);
+    }
+
+    void store(T v, std::memory_order o) noexcept {
+        __atomic_store_n(&storage_, to_storage(v), static_cast<int>(o));
+    }
+
+    bool compare_exchange_strong(T& expected, T desired,
+                                 std::memory_order succ,
+                                 std::memory_order fail) noexcept {
+        Storage e = to_storage(expected);
+        const Storage d = to_storage(desired);
+        const bool ok = __atomic_compare_exchange_n(
+            &storage_, &e, d, /*weak=*/false,
+            static_cast<int>(succ), static_cast<int>(fail));
+        if (!ok) expected = from_storage(e);
+        return ok;
+    }
+
+    bool compare_exchange_weak(T& expected, T desired,
+                               std::memory_order succ,
+                               std::memory_order fail) noexcept {
+        Storage e = to_storage(expected);
+        const Storage d = to_storage(desired);
+        const bool ok = __atomic_compare_exchange_n(
+            &storage_, &e, d, /*weak=*/true,
+            static_cast<int>(succ), static_cast<int>(fail));
+        if (!ok) expected = from_storage(e);
+        return ok;
+    }
+
+private:
+    static T from_storage(Storage s) noexcept {
+        T t;
+        std::memcpy(&t, &s, sizeof(T));
+        return t;
+    }
+    static Storage to_storage(T v) noexcept {
+        Storage s = 0;
+        std::memcpy(&s, &v, sizeof(T));
+        return s;
+    }
+
+    Storage storage_;
+};
+
+// ── TT cell layouts ──────────────────────────────────────────────────────
+
 inline constexpr uint64_t kEmptyKey     = 0ULL;
 // Offset 0 is reserved at the start of `arena_` (see `kArenaReservedBytes`
 // below) so `alloc_raw` never hands it out. That lets us use 0 as the
@@ -79,7 +187,8 @@ inline constexpr uint64_t kEmptyKey     = 0ULL;
 inline constexpr uint64_t kNoInfoOffset = 0ULL;
 
 /**
- * Pack/unpack (Q, max_depth) into a single uint64_t for atomic CAS updates.
+ * Pack/unpack (Q, max_depth) into a single uint64_t so the (Q, max_depth)
+ * pair travels as the high 8 bytes of `KeyQd` through one 128-bit atomic.
  * Layout: low 32 bits = Q (float), high 32 bits = max_depth (float).
  *
  * `max_depth` is log-scale: max_depth == log(N) where N is the budget
@@ -107,35 +216,64 @@ inline std::pair<float, float> unpack_qd(uint64_t v) noexcept {
 /**
  * The "fresh entry" sentinel for max_depth: lower than any conceivable
  * `start_depth`, so the first descent always wins the
- * `depth > max_depth` gate. Use as the second arg to `set_initial_qd`
+ * `depth > max_depth` gate. Use as the second arg to `find_or_claim`
  * when a writer claims a slot but hasn't yet decided on a depth (rare;
- * the normal claim-after-eval path stores the real depth directly).
+ * the normal claim-after-eval path passes the real depth directly).
  */
 inline constexpr float kFreshMaxDepth = -1.0e30f;
 
 /**
- * Hot mutable per-node entry. Cacheline-sized (32 bytes -> two-per-line on
- * 64B caches; we still align(32) so each slot is aligned).
+ * Cell A of a TTEntry. Mutable: the claim CAS installs (key, qd_packed)
+ * atomically; `update_qd` then mutates only the qd_packed half via a
+ * 128-bit CAS loop on the same cell.
  *
  * `key == 0` is reserved as the empty-slot sentinel; the (astronomical)
  * zero-zobrist case is handled by `SearchArena::canonicalize_key`.
  */
+struct KeyQd {
+    uint64_t key;        // 8: 0 == empty
+    uint64_t qd_packed;  // 8: pack_qd(Q, max_depth)
+};
+static_assert(sizeof(KeyQd) == 16);
+static_assert(alignof(KeyQd) == 8);
+static_assert(std::is_trivially_copyable_v<KeyQd>);
+
+/**
+ * Cell B of a TTEntry. Immutable post-publish: set exactly once with a
+ * 128-bit release-store after the writer has filled the arena bytes.
+ * Readers that need moveInfo acquire-load this cell and (optionally)
+ * spin until `info_offset != kNoInfoOffset`.
+ *
+ * `origQ` is the NN-evaluated Q for this position at expansion time. It
+ * is preserved here so it remains accessible after `update_qd` overwrites
+ * the rolled-up Q in Cell A.
+ */
+struct InfoCell {
+    float    origQ;         // 4: NN value at expansion (immutable)
+    uint32_t _reserved;     // 4: reserved for future use (flags / version)
+    uint64_t info_offset;   // 8: kNoInfoOffset until published
+};
+static_assert(sizeof(InfoCell) == 16);
+static_assert(alignof(InfoCell) == 8);
+static_assert(std::is_trivially_copyable_v<InfoCell>);
+
+/**
+ * One TT slot. Two 16-byte cells, each backed by a 128-bit atomic. Stays
+ * 32 bytes / 32-byte aligned so two slots fit per 64-byte cache line.
+ */
 struct alignas(32) TTEntry {
-    std::atomic<uint64_t> key;          // 8: 0 == empty; CAS target for claim
-    std::atomic<uint64_t> qd_packed;    // 8: pack_qd(Q, max_depth); CAS-loop updates
-    std::atomic<uint64_t> info_offset;  // 8: kNoInfoOffset until published
-    uint64_t              _reserved;    // 8
+    Atomic128<KeyQd>     key_qd;  // 16: claim CAS + update_qd CAS-loop
+    Atomic128<InfoCell>  info;    // 16: single release-store on publish
 };
 static_assert(sizeof(TTEntry) == 32, "TTEntry must be 32 bytes");
 static_assert(alignof(TTEntry) == 32, "TTEntry must be 32-byte aligned");
-static_assert(std::atomic<uint64_t>::is_always_lock_free,
-              "std::atomic<uint64_t> must be lock-free for the lock-free TT to make sense");
 
 /**
  * Per-node header at the start of each NodeInfo block in the arena.
  * Followed in memory by `MoveInfo[num_moves]`. These bytes are written
- * before the slot's `info_offset` is release-published, so they are
- * visible to any reader who acquire-loads `info_offset`.
+ * before the slot's `info` cell is release-published, so they are
+ * visible to any reader who acquire-loads `info` and observes
+ * `info_offset != kNoInfoOffset`.
  */
 struct NodeInfoHeader {
     float    variance;   // 4: computed once from NN value distribution
@@ -277,13 +415,10 @@ public:
         , arena_capacity_bytes_(compute_arena_bytes(k_max_evals, avg_moves_per_node)
                                 + kArenaReservedBytes)
     {
-        // Value-init zeros each TTEntry: key = kEmptyKey, qd_packed = 0,
-        // info_offset = kNoInfoOffset. With both sentinels fixed at 0,
-        // every slot starts in the correct "empty + unpublished" state
-        // without an extra init pass. Readers must still gate any
-        // qd_packed read on `info_offset != kNoInfoOffset` because the
-        // writer publishes qd_packed via a relaxed store and hands off
-        // visibility through the release-store of info_offset.
+        // Value-init zeros each TTEntry: Cell A = (kEmptyKey, 0) and Cell
+        // B = (origQ=0, _reserved=0, info_offset=kNoInfoOffset). With
+        // both sentinels fixed at 0, every slot starts in the correct
+        // "empty + unpublished" state without an extra init pass.
         table_ = new TTEntry[capacity_]();
         arena_ = new uint8_t[arena_capacity_bytes_];
     }
@@ -301,42 +436,46 @@ public:
     // ── TT ops ───────────────────────────────────────────────────────────
 
     /**
-     * Lock-free linear-probed find-or-claim.
+     * Lock-free linear-probed find-or-claim with combined initial qd.
      *
      * Returns `{entry, claimed_by_us}`. `entry` is never null. If
-     * `claimed_by_us` is true, the caller has just won the CAS for this
-     * key and is responsible for calling `publish_info(entry, offset)`
-     * after writing the arena bytes for the node. If false, another
-     * thread either has already claimed and possibly published the slot,
-     * or is mid-publish (caller can use `wait_published` to spin).
+     * `claimed_by_us` is true, the caller has just won the 128-bit CAS
+     * for this key (and the (q, max_depth) pair was committed atomically
+     * with the key in Cell A) — caller is on the hook to call
+     * `publish_info(entry, origQ, info_offset)` after writing the arena
+     * bytes for the node. If false, another thread either has already
+     * claimed and possibly published the slot, or is mid-publish (caller
+     * can use `wait_published` to spin).
      *
      * The caller must never insert more than `k_max_evals` distinct keys
      * (the table won't resize and load factor would degrade).
      */
-    [[nodiscard]] ClaimResult find_or_claim(uint64_t key) noexcept {
+    [[nodiscard]] ClaimResult find_or_claim(uint64_t key, float q, float max_depth) noexcept {
         key = canonicalize_key(key);
         const uint64_t mask = capacity_ - 1;
         uint64_t idx = key & mask;
+        const KeyQd desired{key, pack_qd(q, max_depth)};
 
         while (true) {
             TTEntry& e = table_[idx];
-            uint64_t observed = e.key.load(std::memory_order_relaxed);
-            if (observed == kEmptyKey) {
-                uint64_t expected = kEmptyKey;
-                if (e.key.compare_exchange_strong(expected, key,
-                                                  std::memory_order_acq_rel,
-                                                  std::memory_order_acquire))
+            KeyQd observed = e.key_qd.load(std::memory_order_relaxed);
+            if (observed.key == kEmptyKey) {
+                KeyQd expected{kEmptyKey, 0ULL};
+                if (e.key_qd.compare_exchange_strong(
+                        expected, desired,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire))
                 {
                     return {&e, /*claimed_by_us=*/true};
                 }
                 // CAS failed: someone else just claimed this slot. Re-check
                 // the now-installed key: if it's ours, we share; otherwise
                 // continue probing.
-                if (expected == key) {
+                if (expected.key == key) {
                     return {&e, /*claimed_by_us=*/false};
                 }
                 // Fall through: probe next slot.
-            } else if (observed == key) {
+            } else if (observed.key == key) {
                 return {&e, /*claimed_by_us=*/false};
             }
             idx = (idx + 1) & mask;
@@ -344,8 +483,12 @@ public:
     }
 
     /**
-     * Read-only probe. Returns nullptr on miss. Does NOT spin on
-     * info_offset; caller decides what to do with an unpublished slot.
+     * Read-only probe. Returns nullptr on miss. Does NOT spin on the
+     * info cell; caller decides what to do with an unpublished slot.
+     *
+     * Returned entry, if non-null, has Cell A's key already installed.
+     * Callers that need (Q, max_depth) should use `load_qd`; callers
+     * that need moveInfo should use `wait_published` / `load_info`.
      */
     [[nodiscard]] TTEntry* find(uint64_t key) noexcept {
         key = canonicalize_key(key);
@@ -354,9 +497,9 @@ public:
 
         while (true) {
             TTEntry& e = table_[idx];
-            uint64_t observed = e.key.load(std::memory_order_relaxed);
-            if (observed == key) return &e;
-            if (observed == kEmptyKey) return nullptr;
+            KeyQd observed = e.key_qd.load(std::memory_order_relaxed);
+            if (observed.key == key) return &e;
+            if (observed.key == kEmptyKey) return nullptr;
             idx = (idx + 1) & mask;
         }
     }
@@ -368,29 +511,52 @@ public:
 
         while (true) {
             const TTEntry& e = table_[idx];
-            uint64_t observed = e.key.load(std::memory_order_relaxed);
-            if (observed == key) return &e;
-            if (observed == kEmptyKey) return nullptr;
+            KeyQd observed = e.key_qd.load(std::memory_order_relaxed);
+            if (observed.key == key) return &e;
+            if (observed.key == kEmptyKey) return nullptr;
             idx = (idx + 1) & mask;
         }
     }
 
     /**
-     * Spin until `entry->info_offset` is published, or `max_spins` pause
-     * iterations elapse. Returns true if the slot is published.
-     *
-     * This is a busy-spin: the writer's window between claiming and
-     * publishing is ~tens of ns (one relaxed store + one release store),
-     * so spin durations are typically far below `max_spins`.
+     * 128-bit acquire-load of Cell A. Returns (key, qd_packed) atomically
+     * — any caller observing `result.key == K` necessarily observes the
+     * matching qd_packed from the same atomic. Never spins; this is the
+     * correct read for callers that only need (Q, max_depth).
      */
-    static bool wait_published(const TTEntry* entry, uint64_t max_spins = 1024) noexcept {
+    [[nodiscard]] static KeyQd load_qd(const TTEntry* entry) noexcept {
+        return entry->key_qd.load(std::memory_order_acquire);
+    }
+
+    /**
+     * 128-bit acquire-load of Cell B. If `info_offset == kNoInfoOffset`
+     * the slot is claimed but not yet published; caller can either
+     * spin (`wait_published`) or treat as unavailable.
+     */
+    [[nodiscard]] static InfoCell load_info(const TTEntry* entry) noexcept {
+        return entry->info.load(std::memory_order_acquire);
+    }
+
+    /**
+     * Spin until Cell B is published, or `max_spins` pause iterations
+     * elapse. Returns the published `InfoCell` on success, `nullopt`
+     * on timeout.
+     *
+     * The writer's window between claiming and publishing is two atomic
+     * stores plus the arena fills, so spin durations are typically far
+     * below `max_spins`.
+     */
+    [[nodiscard]] static std::optional<InfoCell> wait_published(
+            const TTEntry* entry, uint64_t max_spins = 1024) noexcept
+    {
         for (uint64_t i = 0; i < max_spins; ++i) {
-            if (entry->info_offset.load(std::memory_order_acquire) != kNoInfoOffset) {
-                return true;
-            }
+            InfoCell c = entry->info.load(std::memory_order_acquire);
+            if (c.info_offset != kNoInfoOffset) return c;
             CATGPT_CPU_RELAX();
         }
-        return entry->info_offset.load(std::memory_order_acquire) != kNoInfoOffset;
+        InfoCell c = entry->info.load(std::memory_order_acquire);
+        if (c.info_offset != kNoInfoOffset) return c;
+        return std::nullopt;
     }
 
     /**
@@ -404,9 +570,9 @@ public:
         uint64_t probes = 1;
         while (true) {
             const TTEntry& e = table_[idx];
-            uint64_t observed = e.key.load(std::memory_order_relaxed);
-            if (observed == key) return probes;
-            if (observed == kEmptyKey) return probes;
+            KeyQd observed = e.key_qd.load(std::memory_order_relaxed);
+            if (observed.key == key) return probes;
+            if (observed.key == kEmptyKey) return probes;
             idx = (idx + 1) & mask;
             ++probes;
         }
@@ -415,40 +581,40 @@ public:
     // ── Per-slot mutators ────────────────────────────────────────────────
 
     /**
-     * Release-publish `info_offset` for a slot whose arena bytes have been
+     * Release-publish Cell B for a slot whose arena bytes have been
      * fully written. This must be called exactly once per `find_or_claim`
-     * that returned `claimed_by_us == true`; do not call with a different
-     * offset later.
+     * that returned `claimed_by_us == true`; do not call twice.
+     *
+     * `origQ` is the NN-evaluated Q at expansion time. It becomes
+     * immutable once this store retires.
      */
-    static void publish_info(TTEntry* entry, uint64_t info_offset) noexcept {
+    static void publish_info(TTEntry* entry, float origQ, uint64_t info_offset) noexcept {
         assert(info_offset != kNoInfoOffset);
-        entry->info_offset.store(info_offset, std::memory_order_release);
+        const InfoCell c{origQ, /*_reserved=*/0u, info_offset};
+        entry->info.store(c, std::memory_order_release);
     }
 
     /**
-     * Initial qd_packed store (relaxed). Use immediately after a winning
-     * `find_or_claim`, *before* `publish_info`. Visibility is established
-     * by the subsequent release-store of `info_offset`.
-     */
-    static void set_initial_qd(TTEntry* entry, float q, float max_depth) noexcept {
-        entry->qd_packed.store(pack_qd(q, max_depth), std::memory_order_relaxed);
-    }
-
-    /**
-     * CAS loop on qd_packed. Updates iff `new_max_depth` strictly exceeds
-     * the currently-stored max_depth. Returns true if our value won,
-     * false if a concurrent or prior writer already stored a >= max_depth.
+     * 128-bit CAS loop on Cell A. Updates the qd_packed half iff
+     * `new_max_depth` strictly exceeds the currently-stored max_depth.
+     * The key half is kept fixed (the claim already installed it; this
+     * loop just re-asserts it as part of the CAS so we only update slots
+     * that are actually claimed).
+     *
+     * Returns true if our value won, false if a concurrent or prior
+     * writer already stored a >= max_depth.
      */
     static bool update_qd(TTEntry* entry, float new_q, float new_max_depth) noexcept {
-        uint64_t expected = entry->qd_packed.load(std::memory_order_relaxed);
-        const uint64_t desired = pack_qd(new_q, new_max_depth);
+        KeyQd expected = entry->key_qd.load(std::memory_order_relaxed);
         while (true) {
-            auto [_, old_max_depth] = unpack_qd(expected);
+            auto [_, old_max_depth] = unpack_qd(expected.qd_packed);
             (void)_;
             if (!(new_max_depth > old_max_depth)) return false;
-            if (entry->qd_packed.compare_exchange_weak(expected, desired,
-                                                      std::memory_order_acq_rel,
-                                                      std::memory_order_relaxed))
+            const KeyQd desired{expected.key, pack_qd(new_q, new_max_depth)};
+            if (entry->key_qd.compare_exchange_weak(
+                    expected, desired,
+                    std::memory_order_acq_rel,
+                    std::memory_order_relaxed))
             {
                 return true;
             }
