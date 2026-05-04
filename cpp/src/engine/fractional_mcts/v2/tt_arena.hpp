@@ -75,15 +75,20 @@
  *         The key match implies qd_packed is from the same 128-bit CAS
  *         the claimer issued, so there is no torn-read window.
  *
- *   Reader (moveInfo path — may spin):
- *     1.  As above, find the matching slot (validated against secondary).
- *     2.  Acquire-load Cell B (or `wait_published`). If
- *         `info_offset == kNoInfoOffset`, the writer is between its
- *         claim CAS and its publish release-store; spin briefly.
- *     3.  After acquire of Cell B with a non-sentinel info_offset, the
- *         arena bytes (NodeInfoHeader + MoveInfo[]) and origQ are
- *         visible. The secondary check is folded into find/find_or_claim
- *         so this stage doesn't repeat it.
+ *   Reader (moveInfo path — non-blocking after find/find_or_claim):
+ *     1.  As above, find the matching slot. Both `find` and
+ *         `find_or_claim` (claimed_by_us=false) drive the (key,
+ *         secondary) match through `secondary_matches`, which only
+ *         returns true after acquire-observing Cell B's published state.
+ *         So a non-null entry from these APIs already establishes a
+ *         release-acquire HB with the publisher's release-store.
+ *     2.  Plain `load_info` is sufficient — it is guaranteed to see
+ *         `info_offset != kNoInfoOffset` and the matching `key_secondary`.
+ *         The arena bytes (NodeInfoHeader + MoveInfo[]) and origQ are
+ *         visible by the same HB chain.
+ *     3.  `wait_published` exists for the diagnostic / test path that
+ *         enters via `find_primary_only_unsafe` (which deliberately
+ *         skips the secondary check); production readers do not need it.
  *
  * Terminal children do NOT consume a TT entry or NodeInfo: they live as a
  * `MoveInfo.terminal_kind` byte in the parent. This preserves the invariant
@@ -483,9 +488,15 @@ public:
      * `publish_info(entry, origQ, key_secondary, info_offset)` after
      * writing the arena bytes for the node. The same `key_secondary`
      * passed here MUST be passed to `publish_info`. If `claimed_by_us`
-     * is false, another thread already claimed and possibly published
-     * the slot for the same (key, key_secondary), or is mid-publish
-     * (caller can use `wait_published` to spin).
+     * is false, another thread has already claimed AND published the
+     * slot for the same (key, key_secondary): Cell B is guaranteed to
+     * be in the published state (`info_offset != kNoInfoOffset` with
+     * matching `key_secondary`), since the (key, secondary) match is
+     * what `find_or_claim` uses to decide between "share" and "probe
+     * past", and that match goes through `secondary_matches` which only
+     * returns true after observing the release-store of Cell B. Callers
+     * therefore never need `wait_published` on an entry returned by
+     * `find_or_claim` — a plain `load_info` is sufficient.
      *
      * The caller must never insert more than `k_max_evals` distinct keys
      * (the table won't resize and load factor would degrade).
@@ -539,9 +550,12 @@ public:
      * miss, since publish is microseconds and the spin budget is large).
      *
      * Returned entry, if non-null, has both Cell A's key and Cell B's
-     * key_secondary verified. Callers that need (Q, max_depth) can read
-     * Cell A directly via `load_qd`; callers that need moveInfo should
-     * use `wait_published` / `load_info`.
+     * key_secondary verified — `secondary_matches` only returns true
+     * after acquire-observing Cell B's published state, so a non-null
+     * return guarantees Cell B is in the published state with a matching
+     * `key_secondary`. Callers that need (Q, max_depth) can read Cell A
+     * directly via `load_qd`; callers that need moveInfo can use a plain
+     * `load_info` (no `wait_published` needed).
      */
     [[nodiscard]] TTEntry* find(uint64_t key, uint32_t key_secondary) noexcept {
         key = canonicalize_key(key);
@@ -587,9 +601,16 @@ public:
     }
 
     /**
-     * 128-bit acquire-load of Cell B. If `info_offset == kNoInfoOffset`
-     * the slot is claimed but not yet published; caller can either
-     * spin (`wait_published`) or treat as unavailable.
+     * 128-bit acquire-load of Cell B. For entries obtained via `find`
+     * or `find_or_claim` this is sufficient: those APIs validate
+     * `key_secondary` through `secondary_matches`, which only succeeds
+     * after observing Cell B published, so the returned `InfoCell` is
+     * guaranteed to satisfy `info_offset != kNoInfoOffset` with a
+     * matching `key_secondary`.
+     *
+     * Only diagnostic callers that bypass the secondary check (i.e.
+     * `find_primary_only_unsafe`) may observe `info_offset ==
+     * kNoInfoOffset` here; they should use `wait_published` instead.
      */
     [[nodiscard]] static InfoCell load_info(const TTEntry* entry) noexcept {
         return entry->info.load(std::memory_order_acquire);
@@ -599,6 +620,13 @@ public:
      * Spin until Cell B is published, or `max_spins` pause iterations
      * elapse. Returns the published `InfoCell` on success, `nullopt`
      * on timeout.
+     *
+     * Production code should NOT need this: a non-null entry from
+     * `find` or `find_or_claim` already implies Cell B is published
+     * (the secondary check is gated on it). `wait_published` exists
+     * for the diagnostic / test path that enters via
+     * `find_primary_only_unsafe` (which deliberately skips the
+     * secondary check) and the matching torn-claim regression tests.
      *
      * The writer's window between claiming and publishing is two atomic
      * stores plus the arena fills, so spin durations are typically far

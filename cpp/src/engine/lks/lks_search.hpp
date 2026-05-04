@@ -363,11 +363,14 @@ public:
             arena_->find(root_key_, v2::secondary_hash(board_));
         if (root == nullptr) return legal[0];
 
-        // Root needs moveInfo; if Cell B is unpublished treat as a TT
-        // miss (caller-side fallback to legal[0] mirrors the find-miss
-        // path above).
+        // A non-null `find` already guarantees Cell B is published with
+        // a matching key_secondary (the secondary check is gated on
+        // observing the release-store), so a plain `load_info` is
+        // sufficient — no spin, no kNoInfoOffset to handle here.
         const v2::InfoCell info = v2::SearchArena::load_info(root);
-        if (info.info_offset == v2::kNoInfoOffset) return legal[0];
+        assert(info.info_offset != v2::kNoInfoOffset
+               && "find returned a non-null entry whose Cell B is "
+                  "unpublished; SearchArena invariant broken");
 
         const v2::NodeInfoHeader* hdr = arena_->info_at(info.info_offset);
         const uint16_t num_moves = hdr->num_moves;
@@ -935,13 +938,13 @@ private:
             const uint32_t child_sec = v2::secondary_hash(cb);
 
             if (v2::TTEntry* ce = arena_->find(child_key, child_sec)) {
-                // (key, secondary) match verified by find. Cell A's qd
-                // is atomic with the primary match; we never spin on
-                // the child's moveInfo from here. If the child is
-                // claimed but unpublished, qd_packed already carries
-                // the initial (Q, 0) committed atomically with the
-                // key, so we'll just fall through to RecurseThenRead
-                // and re-deepen via the child's task.
+                // (key, secondary) match verified by find — find only
+                // returns non-null after `secondary_matches` observed
+                // Cell B published with a matching key_secondary, so
+                // the child entry is fully published. Cell A's qd is
+                // atomic with the primary match; we never spin on the
+                // child's moveInfo from here, and we don't need it for
+                // the ReadOnly path (just q + max_depth).
                 auto [q, child_max_d] = v2::unpack_qd(
                     v2::SearchArena::load_qd(ce).qd_packed);
                 if (child_depth <= child_max_d) {
@@ -982,14 +985,6 @@ private:
         }
         if (den > 0.0f) {
             v2::SearchArena::update_qd(entry, num / den, depth);
-        } else {
-            // No contributing children at this depth (all below the
-            // child_depth >= 0 floor, or stop fired before any landed).
-            // Keep the existing NN-evaluated Q and just bump max_depth.
-            auto [q_old, _] = v2::unpack_qd(
-                v2::SearchArena::load_qd(entry).qd_packed);
-            (void)_;
-            v2::SearchArena::update_qd(entry, q_old, depth);
         }
     }
 
