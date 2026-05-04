@@ -75,6 +75,16 @@ uint64_t splitmix64(uint64_t& x) {
     return z ^ (z >> 31);
 }
 
+// Stateless 32-bit secondary derived from a synthetic key, for the
+// non-chess benches. See lks_search::secondary_hash for the real,
+// position-derived secondary used in production.
+uint32_t fake_secondary(uint64_t key) {
+    uint64_t z = key + 0xCBF29CE484222325ULL;
+    z = (z ^ (z >> 33)) * 0xff51afd7ed558ccdULL;
+    z = (z ^ (z >> 33)) * 0xc4ceb9fe1a85ec53ULL;
+    return static_cast<uint32_t>(z ^ (z >> 33));
+}
+
 int g_failed = 0;
 
 #define EXPECT(cond) do {                                                  \
@@ -126,11 +136,12 @@ void run_p1_correctness(uint64_t per_thread_keys, int num_threads) {
                                               catgpt::v2::kTerminalNone);
                 }
 
-                auto [e, claimed] = arena.find_or_claim(keys[i],
+                const uint32_t sec = fake_secondary(keys[i]);
+                auto [e, claimed] = arena.find_or_claim(keys[i], sec,
                                                         /*Q=*/0.0f,
                                                         /*max_depth=*/max_ds[i]);
                 EXPECT(claimed); // disjoint keys -> always our claim
-                SearchArena::publish_info(e, /*origQ=*/0.0f, off);
+                SearchArena::publish_info(e, /*origQ=*/0.0f, sec, off);
             }
         });
     }
@@ -141,7 +152,7 @@ void run_p1_correctness(uint64_t per_thread_keys, int num_threads) {
         const auto& keys = keys_per_thread[t];
         const auto& max_ds = max_d_per_thread[t];
         for (uint64_t i = 0; i < keys.size(); ++i) {
-            TTEntry* e = arena.find(keys[i]);
+            TTEntry* e = arena.find(keys[i], fake_secondary(keys[i]));
             EXPECT(e != nullptr);
             if (!e) continue;
             const catgpt::v2::InfoCell info = SearchArena::load_info(e);
@@ -183,8 +194,10 @@ void run_p2_hot_race(int num_threads, uint64_t k_hot, uint64_t iters_per_thread)
             for (uint64_t it = 0; it < iters_per_thread; ++it) {
                 uint64_t r = splitmix64(rng);
                 uint64_t key = hot_keys[r % k_hot];
+                const uint32_t sec = fake_secondary(key);
 
-                auto [e, claimed] = arena.find_or_claim(key, /*Q=*/0.0f, /*max_depth=*/0.0f);
+                auto [e, claimed] = arena.find_or_claim(key, sec,
+                                                        /*Q=*/0.0f, /*max_depth=*/0.0f);
                 if (claimed) {
                     ++my_wins;
                     uint64_t off = arena.alloc_node_info(30);
@@ -193,7 +206,7 @@ void run_p2_hot_race(int num_threads, uint64_t k_hot, uint64_t iters_per_thread)
                         moves[j] = MoveInfo::pack(j, 1.0f / 30.0f,
                                                   catgpt::v2::kTerminalNone);
                     }
-                    SearchArena::publish_info(e, /*origQ=*/0.0f, off);
+                    SearchArena::publish_info(e, /*origQ=*/0.0f, sec, off);
                 }
 
                 // Independent: every thread CAS-bumps max_depth to a thread-and-iter
@@ -227,7 +240,7 @@ void run_p2_hot_race(int num_threads, uint64_t k_hot, uint64_t iters_per_thread)
     }
 
     for (uint64_t key : hot_keys) {
-        TTEntry* e = arena.find(key);
+        TTEntry* e = arena.find(key, fake_secondary(key));
         EXPECT(e != nullptr);
         if (!e) continue;
         const catgpt::v2::InfoCell info = SearchArena::load_info(e);
@@ -267,11 +280,12 @@ void run_p3_reader_writer(int num_readers, uint64_t inserts, int writer_pause_us
                                           catgpt::v2::kTerminalNone);
             }
             // Encode num_moves into max_depth for round-trip checking.
-            auto [e, claimed] = arena.find_or_claim(keys[i],
+            const uint32_t sec = fake_secondary(keys[i]);
+            auto [e, claimed] = arena.find_or_claim(keys[i], sec,
                                                     /*Q=*/0.0f,
                                                     /*max_depth=*/static_cast<float>(nm));
             (void)claimed;
-            SearchArena::publish_info(e, /*origQ=*/0.0f, off);
+            SearchArena::publish_info(e, /*origQ=*/0.0f, sec, off);
             if (writer_pause_us > 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(writer_pause_us));
             }
@@ -286,7 +300,7 @@ void run_p3_reader_writer(int num_readers, uint64_t inserts, int writer_pause_us
             uint64_t rng_state = 0xBEEFULL ^ (uint64_t(r) * 0x9E3779B97F4A7C15ULL);
             while (!writer_done.load(std::memory_order_acquire)) {
                 uint64_t idx = splitmix64(rng_state) % keys.size();
-                TTEntry* e = arena.find(keys[idx]);
+                TTEntry* e = arena.find(keys[idx], fake_secondary(keys[idx]));
                 if (!e) continue;
                 auto info_opt = SearchArena::wait_published(e, 4096);
                 if (!info_opt) {
@@ -387,17 +401,18 @@ ThroughputResult run_p4_one(int num_threads, uint64_t per_thread_inserts) {
                 // 3. claim + publish each
                 for (uint64_t j = 0; j < this_batch; ++j) {
                     uint64_t off = base + j * per_node_bytes;
-                    auto [e, claimed] = arena.find_or_claim(keys[i + j],
+                    const uint32_t sec = fake_secondary(keys[i + j]);
+                    auto [e, claimed] = arena.find_or_claim(keys[i + j], sec,
                                                             /*Q=*/0.0f,
                                                             /*max_depth=*/1.0f);
                     (void)claimed;
-                    SearchArena::publish_info(e, /*origQ=*/0.0f, off);
+                    SearchArena::publish_info(e, /*origQ=*/0.0f, sec, off);
                 }
 
                 // 4. a small lookup burst per batch (search reads are mostly hits)
                 for (uint64_t j = 0; j < this_batch; ++j) {
                     uint64_t r = splitmix64(rng_state) % (i + this_batch);
-                    TTEntry* e = arena.find(keys[r]);
+                    TTEntry* e = arena.find(keys[r], fake_secondary(keys[r]));
                     asm volatile("" : : "r"(e) : "memory");
                     ++lookups;
                 }
@@ -475,9 +490,13 @@ void run_p5_torn_claim(int num_readers, uint64_t num_rounds) {
         for (uint64_t r = 0; r < num_rounds; ++r) {
             const uint64_t key = kKeyBase ^ r;
             // Strictly non-zero so a torn read of qd_packed (== 0) is
-            // distinguishable from the published value.
+            // distinguishable from the published value. The secondary
+            // is irrelevant here: we deliberately don't publish_info
+            // and readers use `find_primary_only_unsafe` to exercise
+            // Cell A's torn-read protection in isolation.
             const float tag = static_cast<float>(r) + 1.0f;
-            auto [e, claimed] = arena.find_or_claim(key, /*Q=*/tag, /*max_depth=*/0.0f);
+            auto [e, claimed] = arena.find_or_claim(
+                key, /*key_secondary=*/0u, /*Q=*/tag, /*max_depth=*/0.0f);
             EXPECT(claimed);
             (void)e;
             rounds_done.store(r + 1, std::memory_order_release);
@@ -495,7 +514,11 @@ void run_p5_torn_claim(int num_readers, uint64_t num_rounds) {
                 if (hi == 0) continue;
                 const uint64_t r = splitmix64(rng) % hi;
                 const uint64_t key = kKeyBase ^ r;
-                TTEntry* e = arena.find(key);
+                // Cell-A-only probe: P5 deliberately doesn't publish,
+                // so the secondary-validating `find` would time out
+                // for every reader and the test wouldn't exercise the
+                // race window we care about.
+                TTEntry* e = arena.find_primary_only_unsafe(key);
                 if (!e) continue;
                 const catgpt::v2::KeyQd kq = SearchArena::load_qd(e);
                 if (kq.key != key) {

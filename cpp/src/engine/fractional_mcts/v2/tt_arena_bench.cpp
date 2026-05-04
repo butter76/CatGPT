@@ -87,6 +87,19 @@ uint64_t splitmix64(uint64_t& x) {
     return z ^ (z >> 31);
 }
 
+// Stateless 32-bit secondary derived from a synthetic key. Non-mutating
+// SplitMix-style mix; in real chess use the secondary is computed from
+// the position state directly (see lks_search::secondary_hash) so it
+// is independent of the primary Zobrist. For the synthetic bench any
+// stable function of the key suffices — we're not testing collision
+// resistance here, just that the TT plumbs the secondary through.
+uint32_t fake_secondary(uint64_t key) {
+    uint64_t z = key + 0xCBF29CE484222325ULL;
+    z = (z ^ (z >> 33)) * 0xff51afd7ed558ccdULL;
+    z = (z ^ (z >> 33)) * 0xc4ceb9fe1a85ec53ULL;
+    return static_cast<uint32_t>(z ^ (z >> 33));
+}
+
 struct PhaseTimings {
     ns fill;
     ns traverse;
@@ -167,10 +180,12 @@ void run_one(uint64_t K, PhaseTimings& out) {
                                       catgpt::v2::kTerminalNone);
         }
 
-        auto [e, claimed] = arena.find_or_claim(keys[i], /*Q=*/0.123f, /*max_depth=*/0.0f);
+        const uint32_t sec = fake_secondary(keys[i]);
+        auto [e, claimed] = arena.find_or_claim(keys[i], sec,
+                                                /*Q=*/0.123f, /*max_depth=*/0.0f);
         (void)claimed;
         // Distinct keys -> we always claim.
-        SearchArena::publish_info(e, /*origQ=*/0.123f, off);
+        SearchArena::publish_info(e, /*origQ=*/0.123f, sec, off);
     }
     auto t1 = Clock::now();
     out.fill = std::chrono::duration_cast<ns>(t1 - t0);
@@ -198,12 +213,13 @@ void run_one(uint64_t K, PhaseTimings& out) {
         uint64_t parent_idx = (r >> 3) % K;
         uint64_t key = keys[parent_idx];
 
-        TTEntry* e = arena.find(key);
+        const uint32_t sec = fake_secondary(key);
+        TTEntry* e = arena.find(key, sec);
         if (e) {
             ++hits;
             // Sample a probe length on hits, capped to keep storage bounded.
             if (hit_probes.size() < kProbeSamples) {
-                hit_probes.push_back(static_cast<uint32_t>(arena.probe_length(key)));
+                hit_probes.push_back(static_cast<uint32_t>(arena.probe_length(key, sec)));
             }
             // Walk a few moves to touch arena.
             const catgpt::v2::InfoCell info = SearchArena::load_info(e);
@@ -217,7 +233,7 @@ void run_one(uint64_t K, PhaseTimings& out) {
                     // Synthesize a "child" key that's almost certainly a miss.
                     uint64_t child_key = key ^ (mv[r % hdr->num_moves].move
                                               | 0x100000000ULL);
-                    TTEntry* ce = arena.find(child_key);
+                    TTEntry* ce = arena.find(child_key, fake_secondary(child_key));
                     if (ce) ++hits; else ++misses;
                 }
             }
@@ -262,9 +278,11 @@ void run_one(uint64_t K, PhaseTimings& out) {
         SearchArena* ap = new (arena_storage) SearchArena(K, kLoadFactor, kAvgMovesPerNode);
         for (uint64_t i = 0; i < std::min<uint64_t>(K, 1024); ++i) {
             uint64_t off = ap->alloc_node_info(move_counts[i]);
-            auto [e, claimed] = ap->find_or_claim(keys[i], /*Q=*/0.0f, /*max_depth=*/0.0f);
+            const uint32_t sec = fake_secondary(keys[i]);
+            auto [e, claimed] = ap->find_or_claim(keys[i], sec,
+                                                  /*Q=*/0.0f, /*max_depth=*/0.0f);
             (void)claimed;
-            SearchArena::publish_info(e, /*origQ=*/0.0f, off);
+            SearchArena::publish_info(e, /*origQ=*/0.0f, sec, off);
         }
 
         g_no_alloc.store(true, std::memory_order_relaxed);

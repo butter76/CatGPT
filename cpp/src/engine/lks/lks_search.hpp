@@ -106,6 +106,7 @@
 #include "../../selfplay/eval_request.hpp"
 #include "../../tokenizer.hpp"
 #include "../policy.hpp"
+#include "../fractional_mcts/v2/board_secondary.hpp"
 #include "../fractional_mcts/v2/tt_arena.hpp"
 
 namespace catgpt::lks {
@@ -358,7 +359,8 @@ public:
         chess::movegen::legalmoves(legal, board_);
         if (legal.empty()) return chess::Move::NO_MOVE;
 
-        const v2::TTEntry* root = arena_->find(root_key_);
+        const v2::TTEntry* root =
+            arena_->find(root_key_, v2::secondary_hash(board_));
         if (root == nullptr) return legal[0];
 
         // Root needs moveInfo; if Cell B is unpublished treat as a TT
@@ -397,17 +399,22 @@ public:
                     child_Q = 0.0f;
                 } else {
                     const uint64_t child_key = cb.hash();
-                    const v2::TTEntry* ce = arena_->find(child_key);
+                    const uint32_t child_sec = v2::secondary_hash(cb);
+                    const v2::TTEntry* ce = arena_->find(child_key, child_sec);
                     if (ce == nullptr) {
-                        // Unreached during search: score as "we lose" so
-                        // any TT-evaluated sibling outranks it. P tiebreak
-                        // still picks the highest-prior unreached move
-                        // when no children have TT entries.
+                        // Unreached during search (or genuine 64-bit
+                        // collision masking the entry): score as "we
+                        // lose" so any TT-evaluated sibling outranks
+                        // it. P tiebreak still picks the highest-prior
+                        // unreached move when no children have TT
+                        // entries.
                         child_Q     = +1.0f;
                         child_depth = -std::numeric_limits<float>::infinity();
                     } else {
-                        // Cell A is atomic with the key match — no need
-                        // to wait on Cell B (we don't need moveInfo).
+                        // Cell A's qd is atomic with the (key, secondary)
+                        // match — no need to wait on Cell B again
+                        // (we don't need moveInfo, and find already
+                        // verified the secondary).
                         auto [q, d] = v2::unpack_qd(
                             v2::SearchArena::load_qd(ce).qd_packed);
                         child_Q     = q;
@@ -742,7 +749,8 @@ private:
         if (w.should_abort()) co_return;
 
         const uint64_t key = board.hash();
-        v2::TTEntry* entry = arena_->find(key);
+        const uint32_t sec = v2::secondary_hash(board);
+        v2::TTEntry* entry = arena_->find(key, sec);
 
         if (entry == nullptr) {
             // ── unexpanded: eval, fill bytes, then claim ────────────────
@@ -767,7 +775,7 @@ private:
             // softmax + alloc + per-move terminal classification, all of
             // which would otherwise be wasted (the find_or_claim CAS would
             // lose and our arena bytes would be permanently orphaned).
-            if (v2::TTEntry* e = arena_->find(key); e != nullptr) {
+            if (v2::TTEntry* e = arena_->find(key, sec); e != nullptr) {
                 w.eval_sem->release();
                 entry = e;
             } else {
@@ -816,10 +824,13 @@ private:
                 // Single 128-bit CAS installs (key, qd_packed(Q, 0))
                 // atomically, so any reader observing key == K
                 // necessarily sees the matching qd. Then a single 128-bit
-                // release-store of Cell B publishes (origQ, info_offset).
-                auto [ce, claimed] = arena_->find_or_claim(key, Q, /*max_depth=*/0.0f);
+                // release-store of Cell B publishes
+                // (origQ, key_secondary, info_offset).
+                auto [ce, claimed] = arena_->find_or_claim(
+                    key, sec, Q, /*max_depth=*/0.0f);
                 if (claimed) {
-                    v2::SearchArena::publish_info(ce, /*origQ=*/Q, off);
+                    v2::SearchArena::publish_info(
+                        ce, /*origQ=*/Q, /*key_secondary=*/sec, off);
                     w.tt_claims.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     // Lost the race despite the post-acquire re-probe:
@@ -848,16 +859,19 @@ private:
         }
 
         // ── pre-pass: classify each child for fan-out + rollup ──────────
-        // We need moveInfo, so wait on Cell B's publish if necessary.
-        // The only path that reaches here without having already
-        // synchronized on the publish is a TT-hit at line 740 followed
-        // by a re-deepen miss above; in that case the writer is
-        // mid-publish and the wait spins ~tens of ns.
-        const v2::InfoCell info_cell = [&]() {
-            auto opt = v2::SearchArena::wait_published(entry, /*max_spins=*/(1ULL << 24));
-            assert(opt.has_value() && "publish never observed; writer hung?");
-            return *opt;
-        }();
+        // Cell B is provably published by the time we reach this point:
+        //   * `find(key, sec)` only returns non-null after validating
+        //     the secondary, which requires Cell B to be published
+        //     (the validation acquire-loads it).
+        //   * On the fresh-claim path we called `publish_info`
+        //     ourselves before assigning `entry`.
+        //   * On the post-acquire-re-probe path the same `find(key, sec)`
+        //     guarantee applies.
+        // So a plain `load_info` is sufficient — no spin needed.
+        const v2::InfoCell info_cell = v2::SearchArena::load_info(entry);
+        assert(info_cell.info_offset != v2::kNoInfoOffset
+               && "Cell B unpublished after find/find_or_claim returned a "
+                  "validated entry; invariant broken");
         const v2::NodeInfoHeader* hdr = arena_->info_at(info_cell.info_offset);
         const uint16_t num_moves = hdr->num_moves;
         const v2::MoveInfo* moves = arena_->moves_at(info_cell.info_offset);
@@ -868,6 +882,9 @@ private:
             float    P;
             float    fixed_Q;     // valid for ReadOnly
             uint64_t child_key;   // valid for RecurseThenRead
+            uint32_t child_sec;   // valid for RecurseThenRead (cached so
+                                  // the post-fan-out rollup re-find can
+                                  // run without re-deriving the board)
         };
         std::vector<Plan> plans;
         plans.reserve(num_moves);
@@ -890,16 +907,16 @@ private:
                 ? depth + std::log(std::max(m_P, 1e-9f))
                 : -std::numeric_limits<float>::infinity();
             if (child_depth < 0.0f) {
-                plans.push_back({Mode::Skip, m_P, 0.0f, 0});
+                plans.push_back({Mode::Skip, m_P, 0.0f, 0, 0});
                 continue;
             }
 
             if (m_tk == v2::kTerminalDraw) {
-                plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, /*key=*/0});
+                plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, 0, 0});
                 continue;
             }
             if (m_tk == v2::kTerminalLossForChild) {
-                plans.push_back({Mode::ReadOnly, m_P, /*Q=*/-1.0f, /*key=*/0});
+                plans.push_back({Mode::ReadOnly, m_P, /*Q=*/-1.0f, 0, 0});
                 continue;
             }
 
@@ -910,27 +927,30 @@ private:
             // terminal_kind (different paths hashing to the same key
             // may not be repetitions). Treat as a draw at this caller.
             if (cb.isRepetition(1)) {
-                plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, /*key=*/0});
+                plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, 0, 0});
                 continue;
             }
 
             const uint64_t child_key = cb.hash();
+            const uint32_t child_sec = v2::secondary_hash(cb);
 
-            if (v2::TTEntry* ce = arena_->find(child_key)) {
-                // Cell A only — never spin on the child's moveInfo from
-                // here. If the child is claimed but unpublished,
-                // qd_packed already carries the initial (Q, 0) committed
-                // atomically with the key, so we'll just fall through
-                // to RecurseThenRead and re-deepen via the child's task.
+            if (v2::TTEntry* ce = arena_->find(child_key, child_sec)) {
+                // (key, secondary) match verified by find. Cell A's qd
+                // is atomic with the primary match; we never spin on
+                // the child's moveInfo from here. If the child is
+                // claimed but unpublished, qd_packed already carries
+                // the initial (Q, 0) committed atomically with the
+                // key, so we'll just fall through to RecurseThenRead
+                // and re-deepen via the child's task.
                 auto [q, child_max_d] = v2::unpack_qd(
                     v2::SearchArena::load_qd(ce).qd_packed);
                 if (child_depth <= child_max_d) {
-                    plans.push_back({Mode::ReadOnly, m_P, q, child_key});
+                    plans.push_back({Mode::ReadOnly, m_P, q, child_key, child_sec});
                     continue;
                 }
             }
 
-            plans.push_back({Mode::RecurseThenRead, m_P, 0.0f, child_key});
+            plans.push_back({Mode::RecurseThenRead, m_P, 0.0f, child_key, child_sec});
             child_tasks.emplace_back(
                 recursive_search(w, std::move(cb), child_depth));
         }
@@ -950,7 +970,7 @@ private:
             if (p.mode == Mode::ReadOnly) {
                 child_Q = p.fixed_Q;
             } else {
-                v2::TTEntry* ce = arena_->find(p.child_key);
+                v2::TTEntry* ce = arena_->find(p.child_key, p.child_sec);
                 if (!ce) continue;       // child never claimed (e.g. stop fired)
                 auto [q, _] = v2::unpack_qd(
                     v2::SearchArena::load_qd(ce).qd_packed);

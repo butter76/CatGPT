@@ -422,11 +422,12 @@ void test_claim_load_publish_round_trip() {
                                   /*avg_moves_per_node=*/40);
 
     constexpr uint64_t kKey = 0x0123456789ABCDEFULL;
+    constexpr uint32_t kSec = 0xDEADBEEFu;
     constexpr float    kQ   = 0.3125f;       // exact in fp32
     constexpr float    kMD  = 4.0f;          // exact in fp32
 
     // Pre-claim: find returns nullptr.
-    EXPECT(arena.find(kKey) == nullptr);
+    EXPECT(arena.find(kKey, kSec) == nullptr);
 
     // Allocate arena bytes for a small node and fill MoveInfo[].
     constexpr uint16_t kNumMoves = 5;
@@ -443,7 +444,7 @@ void test_claim_load_publish_round_trip() {
     }
 
     // Claim with the qd committed atomically.
-    auto [e, claimed] = arena.find_or_claim(kKey, /*Q=*/kQ, /*max_depth=*/kMD);
+    auto [e, claimed] = arena.find_or_claim(kKey, kSec, /*Q=*/kQ, /*max_depth=*/kMD);
     EXPECT(claimed);
     EXPECT(e != nullptr);
 
@@ -461,11 +462,13 @@ void test_claim_load_publish_round_trip() {
     // Publish: origQ kept distinct from the rolled-up Q so we can verify
     // the round-trip preserves the input value.
     constexpr float kOrigQ = -0.625f;        // exact in fp32
-    catgpt::v2::SearchArena::publish_info(e, /*origQ=*/kOrigQ, off);
+    catgpt::v2::SearchArena::publish_info(e, /*origQ=*/kOrigQ,
+                                          /*key_secondary=*/kSec, off);
 
     catgpt::v2::InfoCell post = catgpt::v2::SearchArena::load_info(e);
     EXPECT(post.info_offset == off);
     EXPECT_EQ_F(post.origQ, kOrigQ);
+    EXPECT(post.key_secondary == kSec);
 
     auto info_opt = catgpt::v2::SearchArena::wait_published(e);
     EXPECT(info_opt.has_value());
@@ -495,13 +498,110 @@ void test_claim_load_publish_round_trip() {
     EXPECT_EQ_F(after_update.origQ, kOrigQ);
     EXPECT(after_update.info_offset == off);
 
-    // Re-finding the same key returns the same entry; second find_or_claim
-    // does NOT re-claim.
-    auto* found = arena.find(kKey);
+    // Re-finding the same (key, sec) returns the same entry; second
+    // find_or_claim does NOT re-claim.
+    auto* found = arena.find(kKey, kSec);
     EXPECT(found == e);
-    auto [e2, claimed2] = arena.find_or_claim(kKey, /*Q=*/0.0f, /*max_depth=*/0.0f);
+    auto [e2, claimed2] = arena.find_or_claim(kKey, kSec,
+                                              /*Q=*/0.0f, /*max_depth=*/0.0f);
     EXPECT(!claimed2);
     EXPECT(e2 == e);
+
+    // A find with the same primary key but a different secondary
+    // (i.e. a genuine 64-bit Zobrist collision) MUST NOT return the
+    // existing entry — the probe walks past it. Capacity is 1024 here
+    // (k_max_evals=1024 -> next_pow2(2048)=2048) so the empty slot just
+    // past kKey's home position is reachable.
+    constexpr uint32_t kSecCollide = kSec ^ 0xFFFFFFFFu;
+    auto* collide = arena.find(kKey, kSecCollide);
+    EXPECT(collide == nullptr);
+}
+
+void test_forced_zobrist_collision() {
+    std::printf("[11] forced same-primary collision: "
+                "two distinct (key, sec) pairs coexist in the TT\n");
+
+    // Simulate a genuine 64-bit Zobrist collision: two "positions" with
+    // identical primary key but different (independent) secondaries.
+    // The TT must store them in distinct slots, return them
+    // independently from `find`, and never confuse one for the other.
+    catgpt::v2::SearchArena arena(/*k_max_evals=*/1024,
+                                  /*load_factor=*/0.5,
+                                  /*avg_moves_per_node=*/40);
+
+    constexpr uint64_t kKey  = 0xFEEDFACECAFEBEEFULL;
+    constexpr uint32_t kSec1 = 0x11111111u;
+    constexpr uint32_t kSec2 = 0x22222222u;
+    constexpr float    kQ1   = 0.25f;
+    constexpr float    kQ2   = -0.5f;
+
+    // First claim: empty slot somewhere in kKey's probe sequence.
+    auto [e1, claimed1] = arena.find_or_claim(kKey, kSec1, kQ1, /*max_depth=*/1.0f);
+    EXPECT(claimed1);
+    EXPECT(e1 != nullptr);
+    const uint64_t off1 = arena.alloc_node_info(/*num_moves=*/3);
+    catgpt::v2::SearchArena::publish_info(e1, /*origQ=*/kQ1, kSec1, off1);
+
+    // Second claim with the same primary but a different secondary.
+    // The probe should walk past e1 and claim a fresh slot.
+    auto [e2, claimed2] = arena.find_or_claim(kKey, kSec2, kQ2, /*max_depth=*/2.0f);
+    EXPECT(claimed2);
+    EXPECT(e2 != nullptr);
+    EXPECT(e2 != e1);  // distinct slots
+    const uint64_t off2 = arena.alloc_node_info(/*num_moves=*/5);
+    catgpt::v2::SearchArena::publish_info(e2, /*origQ=*/kQ2, kSec2, off2);
+
+    // find_or_claim with each secondary returns the matching slot
+    // (claimed_by_us = false on both).
+    {
+        auto [e, claimed] = arena.find_or_claim(kKey, kSec1, /*Q=*/0.0f, /*max_depth=*/0.0f);
+        EXPECT(!claimed);
+        EXPECT(e == e1);
+    }
+    {
+        auto [e, claimed] = arena.find_or_claim(kKey, kSec2, /*Q=*/0.0f, /*max_depth=*/0.0f);
+        EXPECT(!claimed);
+        EXPECT(e == e2);
+    }
+
+    // find resolves to the correct slot for each secondary, and Cell B
+    // contents are not crossed.
+    catgpt::v2::TTEntry* f1 = arena.find(kKey, kSec1);
+    catgpt::v2::TTEntry* f2 = arena.find(kKey, kSec2);
+    EXPECT(f1 == e1);
+    EXPECT(f2 == e2);
+
+    catgpt::v2::InfoCell ic1 = catgpt::v2::SearchArena::load_info(f1);
+    catgpt::v2::InfoCell ic2 = catgpt::v2::SearchArena::load_info(f2);
+    EXPECT(ic1.key_secondary == kSec1);
+    EXPECT(ic2.key_secondary == kSec2);
+    EXPECT(ic1.info_offset == off1);
+    EXPECT(ic2.info_offset == off2);
+    EXPECT_EQ_F(ic1.origQ, kQ1);
+    EXPECT_EQ_F(ic2.origQ, kQ2);
+
+    // Cell A's qd round-trip is unaffected by the colocation: each
+    // entry still reports its own (Q, max_depth) committed at claim.
+    auto [q1, md1] = catgpt::v2::unpack_qd(
+        catgpt::v2::SearchArena::load_qd(f1).qd_packed);
+    auto [q2, md2] = catgpt::v2::unpack_qd(
+        catgpt::v2::SearchArena::load_qd(f2).qd_packed);
+    EXPECT_EQ_F(q1, kQ1);
+    EXPECT_EQ_F(md1, 1.0f);
+    EXPECT_EQ_F(q2, kQ2);
+    EXPECT_EQ_F(md2, 2.0f);
+
+    // A third secondary that matches neither published entry is a
+    // miss: probe walks past both slots and lands on the empty one.
+    constexpr uint32_t kSec3 = 0x33333333u;
+    catgpt::v2::TTEntry* f3 = arena.find(kKey, kSec3);
+    EXPECT(f3 == nullptr);
+
+    // The diagnostic primary-only probe finds *some* slot with the
+    // primary (the lower-indexed of the two) — proving there really is
+    // a colocated collision in the table.
+    catgpt::v2::TTEntry* prim = arena.find_primary_only_unsafe(kKey);
+    EXPECT(prim == e1 || prim == e2);
 }
 
 }  // namespace
@@ -520,6 +620,7 @@ int main() {
     test_exhaustive_packed_patterns_never_crash();
     test_atomic128_lock_free();
     test_claim_load_publish_round_trip();
+    test_forced_zobrist_collision();
 
     if (g_failed == 0) {
         std::printf("\nAll tests passed.\n");

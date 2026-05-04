@@ -16,12 +16,28 @@
  *                       matching qd_packed from the same atomic.
  *                  * `info`    (Cell B, immutable post-publish):
  *                       low  4 B = origQ (NN value at expansion time),
- *                       next 4 B = reserved,
+ *                       next 4 B = key_secondary (independent 32-bit
+ *                       hash of the position; meaningful iff
+ *                       info_offset != kNoInfoOffset),
  *                       high 8 B = info_offset (kNoInfoOffset until
  *                       published). Set exactly once with a 128-bit
  *                       release-store after the writer has filled the
  *                       arena bytes for this node.
  *                Capacity = `next_pow2(ceil(K / load_factor))`.
+ *
+ *                A "match" for find/find_or_claim is the (key, key_secondary)
+ *                pair, not just the primary key. The secondary is a 32-bit
+ *                hash computed from the board state via a path independent
+ *                of `chess::Zobrist`, so a primary collision is essentially
+ *                uncorrelated with a secondary collision; effective key
+ *                width is 96 bits → collision probability ~2^-96.
+ *                On primary-match-but-secondary-mismatch, the probe walks
+ *                past the slot (treated identically to a different-key
+ *                slot). The secondary is published atomically with
+ *                info_offset in the same 128-bit release-store, so any
+ *                reader observing `info_offset != kNoInfoOffset` also
+ *                observes the matching `key_secondary` from the same
+ *                atomic.
  *
  *   - `arena_` : single bump-allocated byte arena holding cold immutable
  *                per-node info (NodeInfoHeader + MoveInfo[]). The head
@@ -41,25 +57,33 @@
  *     2.  Plain stores into the (privately-owned) bytes for each position.
  *     3.  For each position: probe linearly, 128-bit CAS Cell A from
  *         (kEmptyKey, 0) to (key, pack_qd(Q, max_depth)) (acq_rel). On
- *         success, 128-bit release-store Cell B with (origQ, info_offset).
- *         On CAS failure with key half == K, another writer beat us; we
- *         skip (the bytes we wrote are wasted but harmless). On CAS
- *         failure with key half == K' != K, keep probing.
+ *         success, 128-bit release-store Cell B with
+ *         (origQ, key_secondary, info_offset). On CAS failure with key
+ *         half == K and matching key_secondary on the published Cell B,
+ *         another writer beat us with the same position; we skip (the
+ *         bytes we wrote are wasted but harmless). On CAS failure with a
+ *         different K, or with K matching but a mismatching secondary
+ *         (genuine 64-bit collision), keep probing.
  *
- *   Reader (Q + max_depth path — never spins):
+ *   Reader (Q + max_depth path — Cell A acquire + Cell B acquire):
  *     1.  Probe linearly, comparing the key half of `key_qd` (relaxed).
- *     2.  On match, acquire-load Cell A and unpack qd_packed. The key
- *         match implies qd_packed is from the same 128-bit CAS the
- *         claimer issued, so there is no torn-read window.
+ *     2.  On primary match, acquire-load Cell B and verify
+ *         `key_secondary == expected_secondary`; if Cell B is unpublished
+ *         (claimed but pre-publish), spin briefly. On secondary mismatch
+ *         (collision) or spin timeout, continue probing past the slot.
+ *     3.  On confirmed match, acquire-load Cell A and unpack qd_packed.
+ *         The key match implies qd_packed is from the same 128-bit CAS
+ *         the claimer issued, so there is no torn-read window.
  *
  *   Reader (moveInfo path — may spin):
- *     1.  As above, find the matching slot.
+ *     1.  As above, find the matching slot (validated against secondary).
  *     2.  Acquire-load Cell B (or `wait_published`). If
  *         `info_offset == kNoInfoOffset`, the writer is between its
  *         claim CAS and its publish release-store; spin briefly.
  *     3.  After acquire of Cell B with a non-sentinel info_offset, the
  *         arena bytes (NodeInfoHeader + MoveInfo[]) and origQ are
- *         visible.
+ *         visible. The secondary check is folded into find/find_or_claim
+ *         so this stage doesn't repeat it.
  *
  * Terminal children do NOT consume a TT entry or NodeInfo: they live as a
  * `MoveInfo.terminal_kind` byte in the parent. This preserves the invariant
@@ -247,11 +271,20 @@ static_assert(std::is_trivially_copyable_v<KeyQd>);
  * `origQ` is the NN-evaluated Q for this position at expansion time. It
  * is preserved here so it remains accessible after `update_qd` overwrites
  * the rolled-up Q in Cell A.
+ *
+ * `key_secondary` is a 32-bit hash of the position computed via a path
+ * independent of the primary `key` (e.g. derived from the board's piece
+ * bitboards rather than the chess Zobrist tables). It exists solely to
+ * detect 64-bit primary-key collisions: a slot only "matches" a probe
+ * when both `key` and `key_secondary` agree. Meaningful iff
+ * `info_offset != kNoInfoOffset` — published atomically with it in the
+ * same 128-bit release-store.
  */
 struct InfoCell {
-    float    origQ;         // 4: NN value at expansion (immutable)
-    uint32_t _reserved;     // 4: reserved for future use (flags / version)
-    uint64_t info_offset;   // 8: kNoInfoOffset until published
+    float    origQ;          // 4: NN value at expansion (immutable)
+    uint32_t key_secondary;  // 4: independent 32-bit hash; valid iff
+                             //    info_offset != kNoInfoOffset
+    uint64_t info_offset;    // 8: kNoInfoOffset until published
 };
 static_assert(sizeof(InfoCell) == 16);
 static_assert(alignof(InfoCell) == 8);
@@ -438,19 +471,29 @@ public:
     /**
      * Lock-free linear-probed find-or-claim with combined initial qd.
      *
+     * Match is on the (key, key_secondary) pair: a slot whose primary
+     * key matches but whose published `key_secondary` differs is a
+     * genuine 64-bit collision and is probed past, exactly like a
+     * primary mismatch.
+     *
      * Returns `{entry, claimed_by_us}`. `entry` is never null. If
      * `claimed_by_us` is true, the caller has just won the 128-bit CAS
      * for this key (and the (q, max_depth) pair was committed atomically
      * with the key in Cell A) — caller is on the hook to call
-     * `publish_info(entry, origQ, info_offset)` after writing the arena
-     * bytes for the node. If false, another thread either has already
-     * claimed and possibly published the slot, or is mid-publish (caller
-     * can use `wait_published` to spin).
+     * `publish_info(entry, origQ, key_secondary, info_offset)` after
+     * writing the arena bytes for the node. The same `key_secondary`
+     * passed here MUST be passed to `publish_info`. If `claimed_by_us`
+     * is false, another thread already claimed and possibly published
+     * the slot for the same (key, key_secondary), or is mid-publish
+     * (caller can use `wait_published` to spin).
      *
      * The caller must never insert more than `k_max_evals` distinct keys
      * (the table won't resize and load factor would degrade).
      */
-    [[nodiscard]] ClaimResult find_or_claim(uint64_t key, float q, float max_depth) noexcept {
+    [[nodiscard]] ClaimResult find_or_claim(uint64_t key,
+                                            uint32_t key_secondary,
+                                            float q,
+                                            float max_depth) noexcept {
         key = canonicalize_key(key);
         const uint64_t mask = capacity_ - 1;
         uint64_t idx = key & mask;
@@ -468,14 +511,16 @@ public:
                 {
                     return {&e, /*claimed_by_us=*/true};
                 }
-                // CAS failed: someone else just claimed this slot. Re-check
-                // the now-installed key: if it's ours, we share; otherwise
-                // continue probing.
-                if (expected.key == key) {
+                // CAS failed: someone else just claimed this slot. If
+                // they claimed it for our exact (key, key_secondary)
+                // pair, share. Otherwise (different primary key, or
+                // same primary but a colliding secondary), probe past.
+                if (expected.key == key && secondary_matches(&e, key_secondary)) {
                     return {&e, /*claimed_by_us=*/false};
                 }
                 // Fall through: probe next slot.
-            } else if (observed.key == key) {
+            } else if (observed.key == key
+                       && secondary_matches(&e, key_secondary)) {
                 return {&e, /*claimed_by_us=*/false};
             }
             idx = (idx + 1) & mask;
@@ -483,14 +528,22 @@ public:
     }
 
     /**
-     * Read-only probe. Returns nullptr on miss. Does NOT spin on the
-     * info cell; caller decides what to do with an unpublished slot.
+     * Read-only probe. Returns nullptr on miss.
      *
-     * Returned entry, if non-null, has Cell A's key already installed.
-     * Callers that need (Q, max_depth) should use `load_qd`; callers
-     * that need moveInfo should use `wait_published` / `load_info`.
+     * Match is on (key, key_secondary). A slot whose primary matches
+     * but whose published `key_secondary` differs is treated as a
+     * collision and the probe walks past it. If a primary-matching slot
+     * is mid-publish (claimed but pre-publish), `secondary_matches`
+     * spins briefly waiting for the publish; on timeout the probe walks
+     * past (always safe — the worst case is treating a real match as a
+     * miss, since publish is microseconds and the spin budget is large).
+     *
+     * Returned entry, if non-null, has both Cell A's key and Cell B's
+     * key_secondary verified. Callers that need (Q, max_depth) can read
+     * Cell A directly via `load_qd`; callers that need moveInfo should
+     * use `wait_published` / `load_info`.
      */
-    [[nodiscard]] TTEntry* find(uint64_t key) noexcept {
+    [[nodiscard]] TTEntry* find(uint64_t key, uint32_t key_secondary) noexcept {
         key = canonicalize_key(key);
         const uint64_t mask = capacity_ - 1;
         uint64_t idx = key & mask;
@@ -498,13 +551,16 @@ public:
         while (true) {
             TTEntry& e = table_[idx];
             KeyQd observed = e.key_qd.load(std::memory_order_relaxed);
-            if (observed.key == key) return &e;
             if (observed.key == kEmptyKey) return nullptr;
+            if (observed.key == key && secondary_matches(&e, key_secondary)) {
+                return &e;
+            }
             idx = (idx + 1) & mask;
         }
     }
 
-    [[nodiscard]] const TTEntry* find(uint64_t key) const noexcept {
+    [[nodiscard]] const TTEntry* find(uint64_t key,
+                                      uint32_t key_secondary) const noexcept {
         key = canonicalize_key(key);
         const uint64_t mask = capacity_ - 1;
         uint64_t idx = key & mask;
@@ -512,8 +568,10 @@ public:
         while (true) {
             const TTEntry& e = table_[idx];
             KeyQd observed = e.key_qd.load(std::memory_order_relaxed);
-            if (observed.key == key) return &e;
             if (observed.key == kEmptyKey) return nullptr;
+            if (observed.key == key && secondary_matches(&e, key_secondary)) {
+                return &e;
+            }
             idx = (idx + 1) & mask;
         }
     }
@@ -560,10 +618,39 @@ public:
     }
 
     /**
-     * Number of probes a `find` would perform for `key` (for benchmarks).
-     * Returns 1 when the key is found in its home slot. Linear probing.
+     * DIAGNOSTIC / TEST ONLY: linear probe by primary key alone,
+     * ignoring `key_secondary`. Returns the first slot whose primary
+     * key matches, even if its published secondary differs (or Cell B
+     * isn't yet published). Used by torn-claim regression tests that
+     * deliberately skip `publish_info` to exercise Cell A's
+     * atomicity in isolation.
+     *
+     * Production code MUST NOT use this: on a genuine 64-bit Zobrist
+     * collision it returns the wrong position's entry, exactly the
+     * bug the secondary was added to prevent.
      */
-    [[nodiscard]] uint64_t probe_length(uint64_t key) const noexcept {
+    [[nodiscard]] TTEntry* find_primary_only_unsafe(uint64_t key) noexcept {
+        key = canonicalize_key(key);
+        const uint64_t mask = capacity_ - 1;
+        uint64_t idx = key & mask;
+        while (true) {
+            TTEntry& e = table_[idx];
+            KeyQd observed = e.key_qd.load(std::memory_order_relaxed);
+            if (observed.key == kEmptyKey) return nullptr;
+            if (observed.key == key) return &e;
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    /**
+     * Number of probes a `find` would perform for `(key, key_secondary)`
+     * (for benchmarks). Returns 1 when the entry is found in its home
+     * slot. Linear probing. A primary-matching slot whose secondary
+     * differs (genuine 64-bit collision) counts as one probe and the
+     * walk continues, mirroring `find`.
+     */
+    [[nodiscard]] uint64_t probe_length(uint64_t key,
+                                        uint32_t key_secondary) const noexcept {
         key = canonicalize_key(key);
         const uint64_t mask = capacity_ - 1;
         uint64_t idx = key & mask;
@@ -571,8 +658,10 @@ public:
         while (true) {
             const TTEntry& e = table_[idx];
             KeyQd observed = e.key_qd.load(std::memory_order_relaxed);
-            if (observed.key == key) return probes;
             if (observed.key == kEmptyKey) return probes;
+            if (observed.key == key && secondary_matches(&e, key_secondary)) {
+                return probes;
+            }
             idx = (idx + 1) & mask;
             ++probes;
         }
@@ -587,10 +676,19 @@ public:
      *
      * `origQ` is the NN-evaluated Q at expansion time. It becomes
      * immutable once this store retires.
+     *
+     * `key_secondary` MUST be the same value the caller passed to
+     * `find_or_claim` for this position. The 128-bit release-store
+     * publishes (origQ, key_secondary, info_offset) atomically, so any
+     * acquire-loader observing `info_offset != kNoInfoOffset` also
+     * observes the matching `key_secondary`.
      */
-    static void publish_info(TTEntry* entry, float origQ, uint64_t info_offset) noexcept {
+    static void publish_info(TTEntry* entry,
+                             float origQ,
+                             uint32_t key_secondary,
+                             uint64_t info_offset) noexcept {
         assert(info_offset != kNoInfoOffset);
-        const InfoCell c{origQ, /*_reserved=*/0u, info_offset};
+        const InfoCell c{origQ, key_secondary, info_offset};
         entry->info.store(c, std::memory_order_release);
     }
 
@@ -711,6 +809,31 @@ private:
     static uint64_t canonicalize_key(uint64_t k) noexcept {
         return k == 0ULL ? 0x8000000000000000ULL : k;
     }
+
+    /**
+     * Returns true iff the slot's published `key_secondary` equals
+     * `expected`. If Cell B is not yet published (claim CAS happened
+     * but publish release-store hasn't), spin briefly waiting; on
+     * timeout return false so the probe walks past. Treating an
+     * unpublished slot as "no match on timeout" is always safe: the
+     * worst case is we create a duplicate entry for the same position,
+     * which wastes one slot. The publish window is two stores plus the
+     * arena fills (sub-microsecond); `kSecondarySpinBudget` is sized so
+     * timeouts never fire in practice.
+     */
+    static bool secondary_matches(const TTEntry* e,
+                                  uint32_t expected) noexcept {
+        for (uint64_t i = 0; i <= kSecondarySpinBudget; ++i) {
+            InfoCell ic = e->info.load(std::memory_order_acquire);
+            if (ic.info_offset != kNoInfoOffset) {
+                return ic.key_secondary == expected;
+            }
+            CATGPT_CPU_RELAX();
+        }
+        return false;
+    }
+
+    static constexpr uint64_t kSecondarySpinBudget = 4096;
 
     TTEntry*              table_      = nullptr;
     uint8_t*              arena_      = nullptr;
