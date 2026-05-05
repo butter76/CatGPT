@@ -49,8 +49,8 @@
  *
  *   - `recursive_search(board, depth)` follows the "caller-skip"
  *     contract: caller has already verified the position is not
- *     terminal-by-MoveInfo, not a path-repetition, and not TT-cached
- *     at depth. Inside:
+ *     terminal-by-MoveInfo, not a path-repetition, not a 50-move
+ *     draw, and not TT-cached at depth. Inside:
  *
  *       1. TT-probe (`find`).
  *       2. If miss: acquire eval-sem permit, then RE-PROBE the TT — a
@@ -58,16 +58,17 @@
  *          on the semaphore. On a re-probe hit, release the permit and
  *          adopt the peer's entry. On a re-probe miss, GPU eval,
  *          enumerate legal moves + per-move POSITION-ONLY terminal_kind
- *          detection (no repetitions in terminal_kind — those are
- *          path-dependent), alloc node_info, fill MoveInfo, then
- *          `find_or_claim` and publish. CAS losers orphan their bytes.
+ *          detection (repetitions and 50-move draws are NOT in
+ *          terminal_kind — they are path-dependent), alloc node_info,
+ *          fill MoveInfo, then `find_or_claim` and publish. CAS losers
+ *          orphan their bytes.
  *       3. Re-deepen check: if the entry's max_depth >= depth, return.
  *       4. Pre-pass over children to classify them as Skip /
  *          RecurseThenRead / ReadOnly. RecurseThenRead spawns a child
  *          `recursive_search` task; all are run in parallel via
  *          `coro::when_all`.
  *       5. Rollup: P-weighted average of -child_Q over the same plan
- *          vector (terminal/repetition contribute fixed Q;
+ *          vector (terminal/repetition/50-move contribute fixed Q;
  *          RecurseThenRead reads the child's TT entry).
  *       6. `update_qd` with the new (Q, depth).
  */
@@ -335,8 +336,9 @@ public:
      * Pick the root move with the best score, where score = -child_Q from
      * our perspective. Mirrors the plan classification used in
      * `recursive_search`: terminal_kind drives fixed Q for terminal
-     * children, `isRepetition(1)` is checked path-dependently, and
-     * non-terminal children's Q is read from their TT entry.
+     * children; `isRepetition(1)` and `isHalfMoveDraw()` are checked
+     * path-dependently (drawn at this caller); non-terminal children's
+     * Q is read from their TT entry.
      *
      * Tiebreak (lex): score, then child max_depth, then prior P.
      *
@@ -398,7 +400,7 @@ public:
             } else {
                 chess::Board cb = board_;
                 cb.makeMove<true>(m);
-                if (cb.isRepetition(1)) {
+                if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
                     child_Q = 0.0f;
                 } else {
                     const uint64_t child_key = cb.hash();
@@ -714,8 +716,13 @@ private:
 
     /**
      * Position-only terminal classification for a child move at expansion
-     * time. Repetitions are NOT considered terminal here — they are
-     * path-dependent and handled at descent time via `isRepetition(1)`.
+     * time. Path-dependent terminal conditions are NOT considered here:
+     *   - repetitions: handled at descent time via `isRepetition(1)`.
+     *   - 50-move rule: handled at descent time via `isHalfMoveDraw()`.
+     * Both depend on data (path history / half-move clock) that is not
+     * part of the Zobrist key, so two transpositions to the same key can
+     * disagree on them. Only stable, position-only draws (insufficient
+     * material) and mate/stalemate go into the TT-stored terminal_kind.
      *
      * Pre: `child_board` is the board AFTER `makeMove<true>(move)`.
      */
@@ -730,9 +737,6 @@ private:
         if (child_board.isInsufficientMaterial()) {
             return v2::kTerminalDraw;
         }
-        if (child_board.isHalfMoveDraw()) {
-            return v2::kTerminalDraw;
-        }
         return v2::kTerminalNone;
     }
 
@@ -740,9 +744,10 @@ private:
      * Recursive search, log-scale, claim-after-eval.
      *
      * Caller-skip protocol: caller has already verified that this
-     * position is NOT a path-repetition and is NOT TT-cached at depth.
-     * Caller-skip for terminals is enforced at the parent's MoveInfo
-     * level (terminal_kind != None children are never recursed into).
+     * position is NOT a path-repetition, is NOT a 50-move draw, and
+     * is NOT TT-cached at depth. Caller-skip for terminals is enforced
+     * at the parent's MoveInfo level (terminal_kind != None children
+     * are never recursed into).
      *
      * `board` is taken by value: it lives in this coroutine's frame for
      * the entire descent, so children can capture references to it
@@ -926,10 +931,12 @@ private:
             chess::Board cb = board;
             cb.makeMove<true>(chess::Move{m.move});
 
-            // Path-dependent: a 2-fold along this path is NOT in
-            // terminal_kind (different paths hashing to the same key
-            // may not be repetitions). Treat as a draw at this caller.
-            if (cb.isRepetition(1)) {
+            // Path-dependent: a 2-fold along this path or a 50-move
+            // expiration is NOT in terminal_kind (different paths
+            // hashing to the same key may disagree on repetition state
+            // / half-move clock since neither is part of the Zobrist
+            // key). Treat as a draw at this caller.
+            if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
                 plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, 0, 0});
                 continue;
             }
