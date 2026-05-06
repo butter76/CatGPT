@@ -43,11 +43,14 @@
 #include "../engine/move_hash.hpp"
 #include "../engine/policy.hpp"
 #include "../tokenizer.hpp"
-#include "batch_evaluator.hpp"
 #include "coroutine_search.hpp"  // For MoveResult
-#include "eval_request.hpp"
+#include "legacy/batch_evaluator.hpp"
+#include "legacy/eval_request.hpp"
 
 namespace catgpt {
+
+using namespace legacy;  // libcoro-flavored BatchEvaluator/EvalAwaitable/RawNNOutput live in catgpt::legacy
+
 
 /**
  * Challenger MCTS — edit this to test MCTS variations.

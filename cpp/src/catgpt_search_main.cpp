@@ -34,7 +34,7 @@
 #include "../external/chess-library/include/chess.hpp"
 #include "engine/fractional_mcts/config.hpp"
 #include "engine/mcts/config.hpp"
-#include "selfplay/batch_evaluator.hpp"
+#include "selfplay/legacy/batch_evaluator.hpp"
 #include "selfplay/coroutine_mcts.hpp"
 #include "selfplay/coroutine_search.hpp"
 
@@ -42,7 +42,7 @@ namespace fs = std::filesystem;
 
 coro::task<catgpt::MoveResult> run_fractional_search(
     std::shared_ptr<coro::thread_pool> pool,
-    catgpt::BatchEvaluator& evaluator,
+    catgpt::legacy::BatchEvaluator& evaluator,
     const catgpt::FractionalMCTSConfig& config,
     const std::string& fen)
 {
@@ -54,7 +54,7 @@ coro::task<catgpt::MoveResult> run_fractional_search(
 
 coro::task<catgpt::MoveResult> run_mcts_search(
     std::shared_ptr<coro::thread_pool> pool,
-    catgpt::BatchEvaluator& evaluator,
+    catgpt::legacy::BatchEvaluator& evaluator,
     const catgpt::MCTSConfig& config,
     const std::string& fen)
 {
@@ -104,7 +104,7 @@ int main(int argc, char* argv[]) {
         });
 
         std::println(stderr, "Loading TensorRT engine: {}", engine_path.string());
-        catgpt::BatchEvaluator evaluator(engine_path, pool, /*max_batch_size=*/1);
+        catgpt::legacy::BatchEvaluator evaluator(engine_path, pool, /*max_batch_size=*/1);
         std::println(stderr, "Engine loaded successfully ({})",
                      use_mcts ? "MCTS" : "Fractional MCTS");
         std::cerr.flush();

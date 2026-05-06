@@ -36,18 +36,21 @@
 #include <coro/when_all.hpp>
 
 #include "../../external/chess-library/include/chess.hpp"
-#include "batch_evaluator.hpp"
 #include "challenger_mcts.hpp"
 #include "challenger_search.hpp"
 #include "coroutine_mcts.hpp"
 #include "coroutine_search.hpp"
 #include "game_slot.hpp"
+#include "legacy/batch_evaluator.hpp"
 #include "selfplay_config.hpp"
 #include "lc0_pool.hpp"
 #include "stockfish_pool.hpp"
 #include "syzygy.hpp"
 
 namespace catgpt {
+
+using namespace legacy;  // libcoro-flavored BatchEvaluator/EvalAwaitable/RawNNOutput live in catgpt::legacy
+
 
 /**
  * An opening position with optional move history.

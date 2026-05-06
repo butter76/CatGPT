@@ -35,10 +35,13 @@
 #include <coro/when_all.hpp>
 
 #include "../../external/chess-library/include/chess.hpp"
-#include "batch_evaluator.hpp"
 #include "coroutine_search.hpp"
+#include "legacy/batch_evaluator.hpp"
 
 namespace catgpt {
+
+using namespace legacy;  // libcoro-flavored BatchEvaluator/EvalAwaitable/RawNNOutput live in catgpt::legacy
+
 
 // ─── Puzzle data structures ─────────────────────────────────────────────────
 

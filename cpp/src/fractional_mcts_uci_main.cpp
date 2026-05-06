@@ -23,7 +23,7 @@
 #include "../external/chess-library/include/chess.hpp"
 #include "engine/fractional_mcts/config.hpp"
 #include "engine/search_algo.hpp"
-#include "selfplay/batch_evaluator.hpp"
+#include "selfplay/legacy/batch_evaluator.hpp"
 #include "selfplay/coroutine_search.hpp"
 #include "uci/uci_handler.hpp"
 
@@ -42,7 +42,7 @@ namespace catgpt {
 class CoroutineSearchAdapter : public SearchAlgo {
 public:
     CoroutineSearchAdapter(std::shared_ptr<coro::thread_pool> pool,
-                           std::shared_ptr<BatchEvaluator> evaluator,
+                           std::shared_ptr<legacy::BatchEvaluator> evaluator,
                            FractionalMCTSConfig config = {})
         : pool_(std::move(pool))
         , evaluator_(std::move(evaluator))
@@ -104,7 +104,7 @@ private:
      */
     static coro::task<MoveResult> run_search(
         std::shared_ptr<coro::thread_pool> pool,
-        BatchEvaluator& evaluator,
+        legacy::BatchEvaluator& evaluator,
         const FractionalMCTSConfig& config,
         chess::Board board)
     {
@@ -114,7 +114,7 @@ private:
     }
 
     std::shared_ptr<coro::thread_pool> pool_;
-    std::shared_ptr<BatchEvaluator> evaluator_;
+    std::shared_ptr<legacy::BatchEvaluator> evaluator_;
     FractionalMCTSConfig config_;
     chess::Board board_;
 };
@@ -147,7 +147,7 @@ int main(int argc, char* argv[]) {
 
         // Create batch evaluator (starts GPU thread internally)
         std::println(stderr, "Loading TensorRT engine: {}", engine_path.string());
-        auto evaluator = std::make_shared<catgpt::BatchEvaluator>(
+        auto evaluator = std::make_shared<catgpt::legacy::BatchEvaluator>(
             engine_path, pool, /*max_batch_size=*/1);
         std::println(stderr, "Engine loaded successfully");
 
