@@ -20,18 +20,30 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
-# === vcpkg / libcoro ===
-# vcpkg doesn't provide a CMake config for libcoro, so we set paths manually
+# === vcpkg / libcoro (optional) ===
+# Only the legacy `catgpt_*` targets (see selfplay/legacy/) need libcoro.
+# The LKS family and standalone tests run on libfork only and must build
+# on machines without libcoro installed (e.g. fresh dev boxes / CI).
+# We probe for libcoro non-fatally and gate the legacy targets on
+# HAVE_LIBCORO further down.
 set(VCPKG_ROOT "$ENV{HOME}/vcpkg" CACHE PATH "vcpkg installation root")
 set(VCPKG_INSTALLED_DIR "${VCPKG_ROOT}/installed/x64-linux")
 
 set(LIBCORO_INCLUDE_DIR "${VCPKG_INSTALLED_DIR}/include")
 set(LIBCORO_LIB_DIR "${VCPKG_INSTALLED_DIR}/lib")
-find_library(LIBCORO_LIB coro PATHS ${LIBCORO_LIB_DIR} REQUIRED)
+find_library(LIBCORO_LIB coro PATHS ${LIBCORO_LIB_DIR})
 
-message(STATUS "vcpkg root: ${VCPKG_ROOT}")
-message(STATUS "libcoro include: ${LIBCORO_INCLUDE_DIR}")
-message(STATUS "libcoro library: ${LIBCORO_LIB}")
+if(LIBCORO_LIB AND EXISTS "${LIBCORO_INCLUDE_DIR}/coro/task.hpp")
+    set(HAVE_LIBCORO TRUE)
+    message(STATUS "vcpkg root: ${VCPKG_ROOT}")
+    message(STATUS "libcoro include: ${LIBCORO_INCLUDE_DIR}")
+    message(STATUS "libcoro library: ${LIBCORO_LIB}")
+else()
+    set(HAVE_LIBCORO FALSE)
+    message(STATUS "libcoro not found at ${LIBCORO_LIB_DIR} / ${LIBCORO_INCLUDE_DIR}; "
+                   "skipping legacy catgpt_* targets (catgpt_mcts, catgpt_search, "
+                   "catgpt_fractional_mcts, catgpt_selfplay, catgpt_puzzle_eval)")
+endif()
 
 # === libfork (header-only, git submodule) ===
 # Continuation-stealing fork-join coroutine runtime. Coexists with libcoro
@@ -104,6 +116,7 @@ set_target_properties(trt_benchmark PROPERTIES
 )
 
 # === CatGPT Fractional MCTS UCI Engine (coroutines + TensorRT) ===
+if(HAVE_LIBCORO)
 add_executable(catgpt_fractional_mcts
     src/fractional_mcts_uci_main.cpp
 )
@@ -129,8 +142,10 @@ set_target_properties(catgpt_fractional_mcts PROPERTIES
     BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
+endif()
 
 # === CatGPT MCTS UCI Engine (coroutines + TensorRT) ===
+if(HAVE_LIBCORO)
 add_executable(catgpt_mcts
     src/mcts_uci_main.cpp
 )
@@ -156,6 +171,7 @@ set_target_properties(catgpt_mcts PROPERTIES
     BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
+endif()
 
 # === CatGPT FEN Analyzer (with TensorRT) ===
 add_executable(catgpt_analyze
@@ -181,6 +197,7 @@ set_target_properties(catgpt_analyze PROPERTIES
 
 # === CatGPT Search Binary (standalone Fractional MCTS for web UI) ===
 # Uses CoroutineSearch (same algorithm as selfplay) with coroutine infrastructure
+if(HAVE_LIBCORO)
 add_executable(catgpt_search
     src/catgpt_search_main.cpp
 )
@@ -206,6 +223,7 @@ set_target_properties(catgpt_search PROPERTIES
     BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
+endif()
 
 # === Fathom (Syzygy tablebase probing, C library) ===
 set(FATHOM_SRC_DIR "${CMAKE_SOURCE_DIR}/external/fathom/src")
@@ -221,6 +239,7 @@ set_target_properties(fathom PROPERTIES
 target_compile_options(fathom PRIVATE -O3 -w)
 
 # === CatGPT Batched Self-Play (coroutines + TensorRT) ===
+if(HAVE_LIBCORO)
 add_executable(catgpt_selfplay
     src/selfplay_main.cpp
 )
@@ -248,8 +267,10 @@ set_target_properties(catgpt_selfplay PROPERTIES
     BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
+endif()
 
 # === CatGPT Batched Puzzle Evaluation (coroutines + TensorRT) ===
+if(HAVE_LIBCORO)
 add_executable(catgpt_puzzle_eval
     src/puzzle_eval_main.cpp
 )
@@ -274,6 +295,7 @@ set_target_properties(catgpt_puzzle_eval PROPERTIES
     BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
+endif()
 
 # === Fractional MCTS v2 TT/Arena PoC microbenchmark ===
 # Standalone — no TRT, no libcoro, no chess-library deps. Just C++23 + pthread.
@@ -402,15 +424,17 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)
     target_compile_options(trt_benchmark PRIVATE -fdiagnostics-color=always)
     target_compile_options(chess_lib_tests PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_fractional_mcts PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_mcts PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_analyze PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_selfplay PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_search PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_puzzle_eval PRIVATE -fdiagnostics-color=always)
     target_compile_options(tt_arena_bench PRIVATE -fdiagnostics-color=always)
     target_compile_options(tt_arena_concurrent_bench PRIVATE -fdiagnostics-color=always)
     target_compile_options(tt_arena_test PRIVATE -fdiagnostics-color=always)
     target_compile_options(lks_search_test PRIVATE -fdiagnostics-color=always)
     target_compile_options(lks_uci PRIVATE -fdiagnostics-color=always)
+    if(HAVE_LIBCORO)
+        target_compile_options(catgpt_fractional_mcts PRIVATE -fdiagnostics-color=always)
+        target_compile_options(catgpt_mcts PRIVATE -fdiagnostics-color=always)
+        target_compile_options(catgpt_selfplay PRIVATE -fdiagnostics-color=always)
+        target_compile_options(catgpt_search PRIVATE -fdiagnostics-color=always)
+        target_compile_options(catgpt_puzzle_eval PRIVATE -fdiagnostics-color=always)
+    endif()
 endif()
