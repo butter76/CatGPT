@@ -78,14 +78,13 @@
  *     draw, and not TT-cached at depth. Inside:
  *
  *       1. TT-probe (`find`).
- *       2. If miss: RE-PROBE the TT — a peer worker may have published
- *          the same key while we were waiting to be scheduled. On a
- *          re-probe hit, adopt the peer's entry. On a re-probe miss,
- *          GPU eval, enumerate legal moves + per-move POSITION-ONLY
- *          terminal_kind detection (repetitions and 50-move draws are
- *          NOT in terminal_kind — they are path-dependent), alloc
- *          node_info, fill MoveInfo, then `find_or_claim` and publish.
- *          CAS losers orphan their bytes.
+ *       2. If miss: GPU eval, enumerate legal moves + per-move
+ *          POSITION-ONLY terminal_kind detection (repetitions and
+ *          50-move draws are NOT in terminal_kind — they are
+ *          path-dependent), alloc node_info, fill MoveInfo, then
+ *          `find_or_claim` and publish. CAS losers (peers that
+ *          published during our eval await) adopt the peer's entry
+ *          and orphan their bytes.
  *       3. Re-deepen check: if the entry's max_depth >= depth, return.
  *       4. Single-pass classify+fork: each child is either
  *          Skip / RecurseThenRead / ReadOnly. RecurseThenRead spawns a
@@ -357,81 +356,74 @@ inline constexpr auto recursive_search =
     if (entry == nullptr) {
         // ── unexpanded: eval, fill bytes, then claim ────────────────
         // We already hold a Permit (entry invariant) — no separate
-        // eval-sem acquire/release. The re-probe still matters: a peer
-        // worker may have published this key while we were sitting on
-        // the lazy_pool's submit queue. Adopting their entry skips
-        // tokenize + GPU eval + movegen + softmax + alloc + per-move
-        // terminal classification, all of which would otherwise be
-        // wasted (the find_or_claim CAS would lose and our arena
-        // bytes would be permanently orphaned).
-        if (v2::TTEntry* e = ctx->arena->find(key, sec); e != nullptr) {
-            entry = e;
-        } else {
-            auto tokens = catgpt::tokenize<BatchEvaluator::SEQ_LENGTH>(
-                board, NO_HALFMOVE_CONFIG);
-            RawNNOutput out = co_await EvalAwaitable(*ctx->evaluator, tokens);
-            ctx->w->evals.fetch_add(1, std::memory_order_relaxed);
+        // eval-sem acquire/release, and therefore no yield point
+        // between the find() above and the find_or_claim() below
+        // where a peer could publish without us noticing. The CAS in
+        // find_or_claim is the sole source of truth for ownership;
+        // the eval-await window's race is handled there.
+        auto tokens = catgpt::tokenize<BatchEvaluator::SEQ_LENGTH>(
+            board, NO_HALFMOVE_CONFIG);
+        RawNNOutput out = co_await EvalAwaitable(*ctx->evaluator, tokens);
+        ctx->w->evals.fetch_add(1, std::memory_order_relaxed);
 
-            chess::Movelist legal;
-            chess::movegen::legalmoves(legal, board);
-            const uint16_t num_moves = static_cast<uint16_t>(legal.size());
+        chess::Movelist legal;
+        chess::movegen::legalmoves(legal, board);
+        const uint16_t num_moves = static_cast<uint16_t>(legal.size());
 
-            // Sort moves by decreasing P up front (on compact 8-byte
-            // pairs) so the arena fill below is a single pass that
-            // writes each MoveInfo exactly once in the order descent
-            // will consume them.
-            std::vector<MoveWithPrior> sorted_moves;
-            softmax_legal_sorted(out, board, legal, sorted_moves);
+        // Sort moves by decreasing P up front (on compact 8-byte
+        // pairs) so the arena fill below is a single pass that
+        // writes each MoveInfo exactly once in the order descent
+        // will consume them.
+        std::vector<MoveWithPrior> sorted_moves;
+        softmax_legal_sorted(out, board, legal, sorted_moves);
 
-            // alloc + fill BEFORE attempting to claim — these bytes
-            // are privately owned until the CAS, and orphaned if the
-            // CAS loses.
-            const uint64_t off = ctx->arena->alloc_node_info(num_moves);
-            v2::MoveInfo* mi = ctx->arena->moves_at(off);
-            for (uint16_t i = 0; i < num_moves; ++i) {
-                const chess::Move m{sorted_moves[i].move};
+        // alloc + fill BEFORE attempting to claim — these bytes
+        // are privately owned until the CAS, and orphaned if the
+        // CAS loses.
+        const uint64_t off = ctx->arena->alloc_node_info(num_moves);
+        v2::MoveInfo* mi = ctx->arena->moves_at(off);
+        for (uint16_t i = 0; i < num_moves; ++i) {
+            const chess::Move m{sorted_moves[i].move};
 
-                // Per-move position-only terminal detection.
-                board.makeMove<true>(m);
-                const v2::TerminalKind tk = classify_terminal(board);
-                board.unmakeMove(m);
+            // Per-move position-only terminal detection.
+            board.makeMove<true>(m);
+            const v2::TerminalKind tk = classify_terminal(board);
+            board.unmakeMove(m);
 
-                mi[i] = v2::MoveInfo::pack(sorted_moves[i].move,
-                                           sorted_moves[i].P,
-                                           tk);
-            }
-
-            // Per-node variance of the value distribution, in the same
-            // [-1, 1] scale as Q. alloc_node_info pre-fills variance=0;
-            // overwrite with the real value.
-            ctx->arena->info_at(off)->variance =
-                compute_value_variance(out.value_probs);
-
-            const float Q = 2.0f * out.value - 1.0f;
-
-            // Single 128-bit CAS installs (key, qd_packed(Q, 0))
-            // atomically, so any reader observing key == K necessarily
-            // sees the matching qd. Then a single 128-bit release-store
-            // of Cell B publishes (origQ, key_secondary, info_offset).
-            auto [ce, claimed] = ctx->arena->find_or_claim(
-                key, sec, Q, /*max_depth=*/0.0f);
-            if (claimed) {
-                v2::SearchArena::publish_info(
-                    ce, /*origQ=*/Q, /*key_secondary=*/sec, off);
-                ctx->w->tt_claims.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                // Lost the race despite the post-acquire re-probe:
-                // someone published in the gap between our re-probe
-                // and our find_or_claim. Our `off` bytes are orphaned
-                // (forever).
-            }
-
-            // Intentionally let the thread finish putting the entry
-            // into the TT/arena before aborting.
-            if (ctx->w->should_abort()) co_return;
-
-            entry = ce;
+            mi[i] = v2::MoveInfo::pack(sorted_moves[i].move,
+                                       sorted_moves[i].P,
+                                       tk);
         }
+
+        // Per-node variance of the value distribution, in the same
+        // [-1, 1] scale as Q. alloc_node_info pre-fills variance=0;
+        // overwrite with the real value.
+        ctx->arena->info_at(off)->variance =
+            compute_value_variance(out.value_probs);
+
+        const float Q = 2.0f * out.value - 1.0f;
+
+        // Single 128-bit CAS installs (key, qd_packed(Q, 0))
+        // atomically, so any reader observing key == K necessarily
+        // sees the matching qd. Then a single 128-bit release-store
+        // of Cell B publishes (origQ, key_secondary, info_offset).
+        auto [ce, claimed] = ctx->arena->find_or_claim(
+            key, sec, Q, /*max_depth=*/0.0f);
+        if (claimed) {
+            v2::SearchArena::publish_info(
+                ce, /*origQ=*/Q, /*key_secondary=*/sec, off);
+            ctx->w->tt_claims.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            // A peer published this key while we were awaiting the
+            // GPU eval. Adopt their entry; our `off` bytes are
+            // orphaned (forever).
+        }
+
+        // Intentionally let the thread finish putting the entry
+        // into the TT/arena before aborting.
+        if (ctx->w->should_abort()) co_return;
+
+        entry = ce;
     }
 
     // ── re-deepen check (works for both fresh-claim and TT-shared) ──
@@ -452,8 +444,10 @@ inline constexpr auto recursive_search =
     //     (the validation acquire-loads it).
     //   * On the fresh-claim path we called `publish_info`
     //     ourselves before assigning `entry`.
-    //   * On the post-acquire-re-probe path the same `find(key, sec)`
-    //     guarantee applies.
+    //   * On the lost-CAS / adopt-peer path, find_or_claim's
+    //     (key, secondary) match goes through `secondary_matches`,
+    //     which only returns true after acquire-observing the
+    //     winning peer's Cell B publish — same HB chain as `find`.
     // So a plain `load_info` is sufficient — no spin needed.
     const v2::InfoCell info_cell = v2::SearchArena::load_info(entry);
     assert(info_cell.info_offset != v2::kNoInfoOffset
