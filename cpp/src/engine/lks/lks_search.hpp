@@ -292,7 +292,7 @@ inline v2::TerminalKind classify_terminal(chess::Board& child_board) {
 struct WorkerSearch {
     std::unique_ptr<lf::lazy_pool>            pool;       // 1 worker
     std::unique_ptr<BatchEvaluator>           evaluator;
-    std::unique_ptr<lfsync::LfAsyncSemaphore> sem;        // permits = 4 * coros_per_worker
+    std::unique_ptr<lfsync::LfAsyncSemaphore> sem;        // permits = coros_per_worker
 
     std::atomic<bool>     stop{false};
     std::atomic<uint64_t> evals{0};
@@ -616,7 +616,7 @@ public:
      *                            for natural pipelining across the GPU.
      * @param coros_per_worker    Tuning knob for the per-worker semaphore:
      *                            each worker permits up to
-     *                            `4 * coros_per_worker` simultaneously-alive
+     *                            `coros_per_worker` simultaneously-alive
      *                            recursive_search invocations. Bounds
      *                            both orchestration frames and GPU evals.
      * @param max_batch_size      Cap on positions per GPU batch.
@@ -624,7 +624,7 @@ public:
     explicit LksSearch(fs::path trt_engine_path,
                        uint64_t lifetime_max_evals = (1ULL << 20),
                        int num_workers = 2,
-                       int coros_per_worker = 8,
+                       int coros_per_worker = 32,
                        int max_batch_size = 32)
         : trt_engine_path_(std::move(trt_engine_path))
         , lifetime_max_evals_(lifetime_max_evals)
@@ -638,7 +638,7 @@ public:
         root_key_ = board_.hash();
 
         // Persistent workers: build pool + evaluator + sem per worker once.
-        const int eval_permits = 4 * coros_per_worker_;
+        const int eval_permits = coros_per_worker_;
         workers_.reserve(num_workers_);
         for (int i = 0; i < num_workers_; ++i) {
             auto w = std::make_unique<WorkerSearch>();

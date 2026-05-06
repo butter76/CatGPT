@@ -16,10 +16,11 @@
  *   engine_path: Path to TensorRT engine file
  *                (default: $CATGPT_TRT_ENGINE or /home/shadeform/CatGPT/main.trt)
  *
- * Tuning env vars (defaults match LksSearch ctor defaults):
+ * Tuning env vars (UCI defaults tuned for headline GPU saturation;
+ * may differ from LksSearch ctor defaults):
  *   LKS_NUM_WORKERS         (default 2)
- *   LKS_COROS_PER_WORKER    (default 8)
- *   LKS_MAX_BATCH_SIZE      (default 32)
+ *   LKS_COROS_PER_WORKER    (default 112)
+ *   LKS_MAX_BATCH_SIZE      (default 56)
  *   LKS_LIFETIME_MAX_EVALS  (default 1<<20)
  */
 
@@ -330,8 +331,8 @@ int main(int argc, char* argv[]) {
     }
 
     const int num_workers      = catgpt::env_int("LKS_NUM_WORKERS", 2);
-    const int coros_per_worker = catgpt::env_int("LKS_COROS_PER_WORKER", 8);
-    const int max_batch_size   = catgpt::env_int("LKS_MAX_BATCH_SIZE", 32);
+    const int coros_per_worker = catgpt::env_int("LKS_COROS_PER_WORKER", 112);
+    const int max_batch_size   = catgpt::env_int("LKS_MAX_BATCH_SIZE", 56);
     const uint64_t lifetime_max_evals =
         catgpt::env_u64("LKS_LIFETIME_MAX_EVALS", 1ULL << 20);
 

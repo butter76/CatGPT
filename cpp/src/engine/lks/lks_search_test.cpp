@@ -401,13 +401,14 @@ void test_real_gpu_evals() {
 
     // gpu_total counts every GPU completion; total_evals counts only those
     // for which the descent coroutine got past its post-`co_await` stop
-    // check before incrementing. When stop is flipped, up to `4 * K` coros
+    // check before incrementing. When stop is flipped, up to `K` coros
     // per worker can have an in-flight GPU eval (the eval semaphore's
-    // permit count); their results land but those coros may exit without
-    // incrementing `evals`. So gpu_total >= total and
-    //   gpu_total - total <= num_workers * 4 * coros_per_worker.
+    // permit count, equal to coros_per_worker); their results land but
+    // those coros may exit without incrementing `evals`. So
+    // gpu_total >= total and
+    //   gpu_total - total <= num_workers * coros_per_worker.
     EXPECT(gpu_total >= total);
-    EXPECT(gpu_total - total <= 2 * 4 * 8);   // num_workers * 4 * coros_per_worker
+    EXPECT(gpu_total - total <= 2 * 8);   // num_workers * coros_per_worker
     EXPECT(total > 50);
 }
 
