@@ -33,6 +33,15 @@ message(STATUS "vcpkg root: ${VCPKG_ROOT}")
 message(STATUS "libcoro include: ${LIBCORO_INCLUDE_DIR}")
 message(STATUS "libcoro library: ${LIBCORO_LIB}")
 
+# === libfork (header-only, git submodule) ===
+# Continuation-stealing fork-join coroutine runtime. Coexists with libcoro
+# during the in-progress migration; consume by linking `libfork::libfork`.
+# Disable hwloc auto-detection — no NUMA box and we want a quiet build.
+# Drop LF_NO_HWLOC=ON if/when hwloc dev headers are installed.
+set(LF_NO_HWLOC ON CACHE BOOL "Disable libfork's hwloc/NUMA support" FORCE)
+add_subdirectory(external/libfork EXCLUDE_FROM_ALL)
+message(STATUS "libfork: ${CMAKE_SOURCE_DIR}/external/libfork (target libfork::libfork)")
+
 # === Chess Library (header-only) ===
 set(CHESS_LIBRARY_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/external/chess-library/include")
 message(STATUS "Chess library include: ${CHESS_LIBRARY_INCLUDE_DIR}")
@@ -350,6 +359,22 @@ target_link_libraries(lks_throughput_bench PRIVATE
 set_target_properties(lks_throughput_bench PROPERTIES
     BUILD_RPATH   "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+)
+
+# === libfork smoke test ===
+# Standalone PoC for libfork + custom context_switcher awaitable that
+# bridges to a fake batched "GPU" evaluator thread. No TRT, no libcoro,
+# no chess deps.
+add_executable(libfork_smoke_test
+    src/libfork_smoke_test.cpp
+)
+target_link_libraries(libfork_smoke_test PRIVATE
+    libfork::libfork
+    pthread
+)
+set_target_properties(libfork_smoke_test PROPERTIES
+    BUILD_RPATH   "${GCC14_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR}"
 )
 
 # === CatGPT LKS UCI Engine (Lazy-SMP, log-scale ID, TRT-batched) ===

@@ -4,3 +4,6 @@
 [submodule "cpp/external/fathom"]
 	path = cpp/external/fathom
 	url = https://github.com/jdart1/Fathom.git
+[submodule "cpp/external/libfork"]
+	path = cpp/external/libfork
+	url = https://github.com/ConorWilliams/libfork.git
