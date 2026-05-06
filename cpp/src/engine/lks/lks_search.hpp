@@ -2,7 +2,8 @@
  * LKS search.
  *
  * Lazy-SMP-shaped chess search backed by a TensorRT BatchEvaluator per
- * worker, sharing a lock-free SearchArena.
+ * worker, sharing a lock-free SearchArena, with libfork (continuation
+ * stealing, segmented stacks) running the per-worker fan-out.
  *
  * Threading + ownership model:
  *
@@ -10,10 +11,11 @@
  *     fan-out (num_workers, coros_per_worker, max_batch_size). The
  *     constructor builds N persistent `WorkerSearch`es. Each owns:
  *
- *         * a `coro::thread_pool` (1 thread, just resumes coroutines),
+ *         * a `lf::lazy_pool` (1 worker thread, sleeps when no work),
  *         * a `BatchEvaluator` (own engine, own CUDA stream, own GPU
  *           thread, own pinned/device buffers),
- *         * a `coro::semaphore` (caps in-flight GPU evals to 4*K).
+ *         * a `LfAsyncSemaphore` (caps concurrently-alive
+ *           `recursive_search` invocations to 4*K).
  *
  *     The TRT engine load and CUDA buffer allocation happen ONCE here.
  *     They live until `LksSearch` is destroyed.
@@ -25,9 +27,11 @@
  *
  *   - Each `runner` runs its own iterative-deepening loop, with the
  *     starting depth Lazy-SMP-staggered across workers. Each iteration
- *     is a single `recursive_search` from the root; intra-iteration
- *     batching comes from `coro::when_all` over children, with the
- *     per-worker eval semaphore gating in-flight GPU evals.
+ *     is a single `recursive_search` from the root, dispatched onto the
+ *     worker's lazy_pool via `lf::sync_wait`. Intra-iteration batching
+ *     comes from libfork fork-join over RecurseThenRead children, with
+ *     the per-worker semaphore gating in-flight recursive_search
+ *     invocations.
  *
  *   - `quit()` triggers `worker_main`'s stop_token. `worker_main` flips
  *     each worker's `stop` atomic and joins the runners. Persistent
@@ -36,6 +40,27 @@
  *
  *   - Only at `LksSearch` destruction do the evaluators' GPU threads
  *     and CUDA resources get torn down.
+ *
+ * Permit pattern (libfork-specific, replaces the libcoro `eval_sem`):
+ *
+ *   - Every entry to `recursive_search` owns one `Permit` on entry.
+ *     The Permit is move-only; its destructor releases the slot back
+ *     to the per-worker `LfAsyncSemaphore`.
+ *
+ *   - The eval-on-miss path no longer acquires/releases a separate
+ *     semaphore; the entry permit covers the GPU eval.
+ *
+ *   - At fan-out, the FIRST RecurseThenRead child inherits the parent's
+ *     permit via `lf::fork(self)(... std::move(permit) ...)`; every
+ *     subsequent sibling does `co_await sem.acquire()` first to get its
+ *     own permit. This is the producer-side backpressure: when permits
+ *     are exhausted, the parent suspends in acquire() before any new
+ *     child frame is allocated.
+ *
+ *   - K = LfAsyncSemaphore.count = "max simultaneously-alive
+ *     recursive_search invocations per worker" (was "max in-flight GPU
+ *     evals" under libcoro). Tighter bound; orchestration frames
+ *     (TT-traversal / pre-pass) are bounded too.
  *
  * Search algorithm:
  *
@@ -53,24 +78,25 @@
  *     draw, and not TT-cached at depth. Inside:
  *
  *       1. TT-probe (`find`).
- *       2. If miss: acquire eval-sem permit, then RE-PROBE the TT — a
- *          peer worker may have published the same key while we queued
- *          on the semaphore. On a re-probe hit, release the permit and
- *          adopt the peer's entry. On a re-probe miss, GPU eval,
- *          enumerate legal moves + per-move POSITION-ONLY terminal_kind
- *          detection (repetitions and 50-move draws are NOT in
- *          terminal_kind — they are path-dependent), alloc node_info,
- *          fill MoveInfo, then `find_or_claim` and publish. CAS losers
- *          orphan their bytes.
+ *       2. If miss: RE-PROBE the TT — a peer worker may have published
+ *          the same key while we were waiting to be scheduled. On a
+ *          re-probe hit, adopt the peer's entry. On a re-probe miss,
+ *          GPU eval, enumerate legal moves + per-move POSITION-ONLY
+ *          terminal_kind detection (repetitions and 50-move draws are
+ *          NOT in terminal_kind — they are path-dependent), alloc
+ *          node_info, fill MoveInfo, then `find_or_claim` and publish.
+ *          CAS losers orphan their bytes.
  *       3. Re-deepen check: if the entry's max_depth >= depth, return.
- *       4. Pre-pass over children to classify them as Skip /
- *          RecurseThenRead / ReadOnly. RecurseThenRead spawns a child
- *          `recursive_search` task; all are run in parallel via
- *          `coro::when_all`.
- *       5. Rollup: P-weighted average of -child_Q over the same plan
+ *       4. Single-pass classify+fork: each child is either
+ *          Skip / RecurseThenRead / ReadOnly. RecurseThenRead spawns a
+ *          child `recursive_search` task via `lf::fork`. First fork
+ *          inherits the parent's permit; subsequent forks each
+ *          `co_await sem.acquire()`.
+ *       5. `lf::join` waits for all forked children.
+ *       6. Rollup: P-weighted average of -child_Q over the same plan
  *          vector (terminal/repetition/50-move contribute fixed Q;
  *          RecurseThenRead reads the child's TT entry).
- *       6. `update_qd` with the new (Q, depth).
+ *       7. `update_qd` with the new (Q, depth).
  */
 
 #ifndef CATGPT_ENGINE_LKS_LKS_SEARCH_HPP
@@ -96,13 +122,11 @@
 #include <utility>
 #include <vector>
 
-#include <coro/semaphore.hpp>
-#include <coro/sync_wait.hpp>
-#include <coro/task.hpp>
-#include <coro/thread_pool.hpp>
-#include <coro/when_all.hpp>
+#include <libfork/core.hpp>
+#include <libfork/schedule.hpp>
 
 #include "../../../external/chess-library/include/chess.hpp"
+#include "../../lf/async_semaphore.hpp"
 #include "../../selfplay/batch_evaluator.hpp"
 #include "../../selfplay/eval_request.hpp"
 #include "../../tokenizer.hpp"
@@ -135,8 +159,458 @@ struct LksSearchConfig {
     std::function<void(std::string_view)> on_uci_line;
 };
 
+namespace detail {
+
+/**
+ * Paired legal move + its softmax prior. Emitted by
+ * `softmax_legal_sorted` in decreasing-P order so downstream
+ * MoveInfo fill is a single sequential pass and the arena
+ * ends up P-sorted without an in-place shuffle.
+ *
+ * Kept small (8 bytes) and mirrors MoveInfo's `move`/`P` layout:
+ * sorting cost is the same as sorting MoveInfos, and we avoid
+ * the makeMove/unmakeMove terminal work running in a soon-to-be-
+ * thrown-away order. Stored as the raw `uint16_t` rather than a
+ * `chess::Move` because the latter carries an unused 16-bit
+ * score field that would bloat this struct.
+ */
+struct MoveWithPrior {
+    uint16_t move;  // 2: chess::Move underlying u16
+    uint16_t _pad;  // 2
+    float    P;     // 4
+};
+static_assert(sizeof(MoveWithPrior) == 8, "MoveWithPrior must be 8 bytes");
+
+/**
+ * Mirror `coroutine_search.hpp::evaluate_node`'s temp-1.0 softmax over
+ * legal-move policy logits, sorted by decreasing P. Output order is
+ * what downstream descent expects (highest-prior first), and is also
+ * the order we want in the arena's MoveInfo[].
+ */
+inline void softmax_legal_sorted(const RawNNOutput& out,
+                                 const chess::Board& board,
+                                 const chess::Movelist& legal,
+                                 std::vector<MoveWithPrior>& moves)
+{
+    const bool flip = board.sideToMove() == chess::Color::BLACK;
+    const int n = legal.size();
+    moves.resize(static_cast<size_t>(n));
+
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < n; ++i) {
+        const auto [from_idx, to_idx] = encode_move_to_policy_index(legal[i], flip);
+        const int flat = policy_flat_index(from_idx, to_idx);
+        const float logit = out.policy[flat];
+        moves[i].move = static_cast<uint16_t>(legal[i].move());
+        moves[i]._pad = 0;
+        moves[i].P = logit;
+        max_logit = std::max(max_logit, logit);
+    }
+    float sum_exp = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        moves[i].P = std::exp(moves[i].P - max_logit);
+        sum_exp += moves[i].P;
+    }
+    const float inv_sum = sum_exp > 0.0f ? 1.0f / sum_exp : 0.0f;
+    for (int i = 0; i < n; ++i) {
+        moves[i].P *= inv_sum;
+    }
+
+    std::sort(moves.begin(), moves.end(),
+        [](const MoveWithPrior& a, const MoveWithPrior& b) {
+            return a.P > b.P;
+        });
+}
+
+/**
+ * Variance of the NN value distribution, measured in the same
+ * [-1, 1] scale as `Q = 2*out.value - 1`. The HL-Gauss head's 81
+ * bins are taken as equal-width over [-1, 1] with the i-th center
+ * at `-1 + (i + 0.5) * (2 / VALUE_NUM_BINS)`.
+ *
+ * Mirrors `FractionalNode::compute_variance` in
+ * `engine/fractional_mcts/node.hpp` so LKS agrees on scale with
+ * the prototype search.
+ */
+inline float compute_value_variance(
+    const std::array<float, VALUE_NUM_BINS>& value_probs) noexcept
+{
+    constexpr float bin_width = 2.0f / static_cast<float>(VALUE_NUM_BINS);
+    float mean = 0.0f;
+    for (int i = 0; i < VALUE_NUM_BINS; ++i) {
+        const float center = -1.0f + (static_cast<float>(i) + 0.5f) * bin_width;
+        mean += value_probs[i] * center;
+    }
+    float var = 0.0f;
+    for (int i = 0; i < VALUE_NUM_BINS; ++i) {
+        const float center = -1.0f + (static_cast<float>(i) + 0.5f) * bin_width;
+        const float diff = center - mean;
+        var += value_probs[i] * diff * diff;
+    }
+    return var;
+}
+
+/**
+ * Position-only terminal classification for a child move at expansion
+ * time. Path-dependent terminal conditions are NOT considered here:
+ *   - repetitions: handled at descent time via `isRepetition(1)`.
+ *   - 50-move rule: handled at descent time via `isHalfMoveDraw()`.
+ * Both depend on data (path history / half-move clock) that is not
+ * part of the Zobrist key, so two transpositions to the same key can
+ * disagree on them. Only stable, position-only draws (insufficient
+ * material) and mate/stalemate go into the TT-stored terminal_kind.
+ *
+ * Pre: `child_board` is the board AFTER `makeMove<true>(move)`.
+ */
+inline v2::TerminalKind classify_terminal(chess::Board& child_board) {
+    chess::Movelist child_legal;
+    chess::movegen::legalmoves(child_legal, child_board);
+    if (child_legal.empty()) {
+        // No legal replies: checkmate => loss for child; stalemate => draw.
+        return child_board.inCheck() ? v2::kTerminalLossForChild
+                                     : v2::kTerminalDraw;
+    }
+    if (child_board.isInsufficientMaterial()) {
+        return v2::kTerminalDraw;
+    }
+    return v2::kTerminalNone;
+}
+
+/**
+ * Per-worker_search state.
+ *
+ * Persistent across searches:
+ *   - pool, evaluator, sem
+ *
+ * Per-search (reset by worker_main at the start of every search):
+ *   - stop, evals, tt_claims, depth, budget
+ *
+ * Declaration order matters for safe destruction:
+ *   sem        -> destroyed first  (no waiters by then; runners joined)
+ *   evaluator  -> destroyed second (joins GPU thread; no more pool->schedule)
+ *   pool       -> destroyed last   (safe now; GPU thread won't call into it)
+ */
+struct WorkerSearch {
+    std::unique_ptr<lf::lazy_pool>            pool;       // 1 worker
+    std::unique_ptr<BatchEvaluator>           evaluator;
+    std::unique_ptr<lfsync::LfAsyncSemaphore> sem;        // permits = 4 * coros_per_worker
+
+    std::atomic<bool>     stop{false};
+    std::atomic<uint64_t> evals{0};
+    std::atomic<uint64_t> tt_claims{0};
+    std::atomic<uint64_t> budget{0};            // per-worker eval cap for this search
+    std::atomic<float>    depth{0.0f};
+
+    std::jthread runner;
+
+    WorkerSearch() = default;
+    WorkerSearch(const WorkerSearch&) = delete;
+    WorkerSearch& operator=(const WorkerSearch&) = delete;
+    WorkerSearch(WorkerSearch&&) = delete;
+    WorkerSearch& operator=(WorkerSearch&&) = delete;
+
+    // Single common abort-check for both `stop` and budget exhaustion.
+    // Used at every `co_await` boundary so a search drains promptly.
+    [[nodiscard]] bool should_abort() const noexcept {
+        return stop.load(std::memory_order_relaxed)
+            || evals.load(std::memory_order_relaxed)
+               >= budget.load(std::memory_order_relaxed);
+    }
+};
+
+/**
+ * Stable bag of per-worker dependencies passed by pointer into the
+ * recursive_search lambda (libfork lambdas can't capture, so all
+ * dependencies must be arguments). Constructed once per ID iteration
+ * in run_iteration().
+ */
+struct RecurseContext {
+    v2::SearchArena*          arena;
+    BatchEvaluator*           evaluator;
+    lfsync::LfAsyncSemaphore* sem;
+    WorkerSearch*             w;
+};
+
+/**
+ * Recursive descent (libfork lambda).
+ *
+ * INVARIANT: every entry owns exactly one `Permit`. The permit covers
+ * this entire invocation including any GPU eval. At fan-out the first
+ * RecurseThenRead child inherits via std::move(permit); subsequent
+ * children each co_await sem->acquire(). On exit (either co_return at
+ * abort, base, or after lf::join) any permit still held is released by
+ * RAII.
+ */
+inline constexpr auto recursive_search =
+    [](auto recursive_search,
+       RecurseContext* ctx,
+       lfsync::Permit permit,
+       chess::Board board,
+       float depth) -> lf::task<void>
+{
+    if (ctx->w->should_abort()) co_return;
+
+    const uint64_t key = board.hash();
+    const uint32_t sec = v2::secondary_hash(board);
+    v2::TTEntry* entry = ctx->arena->find(key, sec);
+
+    if (entry == nullptr) {
+        // ── unexpanded: eval, fill bytes, then claim ────────────────
+        // We already hold a Permit (entry invariant) — no separate
+        // eval-sem acquire/release. The re-probe still matters: a peer
+        // worker may have published this key while we were sitting on
+        // the lazy_pool's submit queue. Adopting their entry skips
+        // tokenize + GPU eval + movegen + softmax + alloc + per-move
+        // terminal classification, all of which would otherwise be
+        // wasted (the find_or_claim CAS would lose and our arena
+        // bytes would be permanently orphaned).
+        if (v2::TTEntry* e = ctx->arena->find(key, sec); e != nullptr) {
+            entry = e;
+        } else {
+            auto tokens = catgpt::tokenize<BatchEvaluator::SEQ_LENGTH>(
+                board, NO_HALFMOVE_CONFIG);
+            RawNNOutput out = co_await EvalAwaitable(*ctx->evaluator, tokens);
+            ctx->w->evals.fetch_add(1, std::memory_order_relaxed);
+
+            chess::Movelist legal;
+            chess::movegen::legalmoves(legal, board);
+            const uint16_t num_moves = static_cast<uint16_t>(legal.size());
+
+            // Sort moves by decreasing P up front (on compact 8-byte
+            // pairs) so the arena fill below is a single pass that
+            // writes each MoveInfo exactly once in the order descent
+            // will consume them.
+            std::vector<MoveWithPrior> sorted_moves;
+            softmax_legal_sorted(out, board, legal, sorted_moves);
+
+            // alloc + fill BEFORE attempting to claim — these bytes
+            // are privately owned until the CAS, and orphaned if the
+            // CAS loses.
+            const uint64_t off = ctx->arena->alloc_node_info(num_moves);
+            v2::MoveInfo* mi = ctx->arena->moves_at(off);
+            for (uint16_t i = 0; i < num_moves; ++i) {
+                const chess::Move m{sorted_moves[i].move};
+
+                // Per-move position-only terminal detection.
+                board.makeMove<true>(m);
+                const v2::TerminalKind tk = classify_terminal(board);
+                board.unmakeMove(m);
+
+                mi[i] = v2::MoveInfo::pack(sorted_moves[i].move,
+                                           sorted_moves[i].P,
+                                           tk);
+            }
+
+            // Per-node variance of the value distribution, in the same
+            // [-1, 1] scale as Q. alloc_node_info pre-fills variance=0;
+            // overwrite with the real value.
+            ctx->arena->info_at(off)->variance =
+                compute_value_variance(out.value_probs);
+
+            const float Q = 2.0f * out.value - 1.0f;
+
+            // Single 128-bit CAS installs (key, qd_packed(Q, 0))
+            // atomically, so any reader observing key == K necessarily
+            // sees the matching qd. Then a single 128-bit release-store
+            // of Cell B publishes (origQ, key_secondary, info_offset).
+            auto [ce, claimed] = ctx->arena->find_or_claim(
+                key, sec, Q, /*max_depth=*/0.0f);
+            if (claimed) {
+                v2::SearchArena::publish_info(
+                    ce, /*origQ=*/Q, /*key_secondary=*/sec, off);
+                ctx->w->tt_claims.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                // Lost the race despite the post-acquire re-probe:
+                // someone published in the gap between our re-probe
+                // and our find_or_claim. Our `off` bytes are orphaned
+                // (forever).
+            }
+
+            // Intentionally let the thread finish putting the entry
+            // into the TT/arena before aborting.
+            if (ctx->w->should_abort()) co_return;
+
+            entry = ce;
+        }
+    }
+
+    // ── re-deepen check (works for both fresh-claim and TT-shared) ──
+    {
+        // Cell A is atomic with the key match (find / find_or_claim
+        // both ensure we observe a key from a successful CAS), so qd
+        // is never torn here.
+        auto [_, cur_max_d] = v2::unpack_qd(
+            v2::SearchArena::load_qd(entry).qd_packed);
+        (void)_;
+        if (depth <= cur_max_d) co_return;
+    }
+
+    // ── single classify-and-fork pass over children ─────────────────
+    // Cell B is provably published by the time we reach this point:
+    //   * `find(key, sec)` only returns non-null after validating
+    //     the secondary, which requires Cell B to be published
+    //     (the validation acquire-loads it).
+    //   * On the fresh-claim path we called `publish_info`
+    //     ourselves before assigning `entry`.
+    //   * On the post-acquire-re-probe path the same `find(key, sec)`
+    //     guarantee applies.
+    // So a plain `load_info` is sufficient — no spin needed.
+    const v2::InfoCell info_cell = v2::SearchArena::load_info(entry);
+    assert(info_cell.info_offset != v2::kNoInfoOffset
+           && "Cell B unpublished after find/find_or_claim returned a "
+              "validated entry; invariant broken");
+    const v2::NodeInfoHeader* hdr = ctx->arena->info_at(info_cell.info_offset);
+    const uint16_t num_moves = hdr->num_moves;
+    const v2::MoveInfo* moves = ctx->arena->moves_at(info_cell.info_offset);
+
+    enum class Mode : uint8_t { Skip, RecurseThenRead, ReadOnly };
+    struct Plan {
+        Mode     mode;
+        float    P;
+        float    fixed_Q;     // valid for ReadOnly
+        uint64_t child_key;   // valid for RecurseThenRead
+        uint32_t child_sec;   // valid for RecurseThenRead (cached so
+                              // the post-fan-out rollup re-find can
+                              // run without re-deriving the board)
+    };
+    std::vector<Plan> plans;
+    plans.reserve(num_moves);
+
+    // first_fork tracks whether we've consumed the inherited permit yet.
+    // any_fork tracks whether we've opened a fork-join scope (must lf::join
+    // before returning iff any_fork is true).
+    bool first_fork = true;
+    bool any_fork   = false;
+
+    for (uint16_t i = 0; i < num_moves; ++i) {
+        const auto& m = moves[i];
+        const v2::TerminalKind m_tk = m.terminal_kind();
+        const float m_P = m.P();
+
+        // Depth floor — applies to EVERY child regardless of kind.
+        // With child_depth = depth + log(P), each level of recursion
+        // strictly decreases depth. Without a floor at 0 the recursion
+        // would run forever as priors compound below e^0 = 1 visit.
+        // Cuts terminal_kind contributions too: a terminal child below
+        // the floor doesn't matter at this iteration's resolution.
+        const float child_depth = (m_P > 0.0f)
+            ? depth + std::log(std::max(m_P, 1e-9f))
+            : -std::numeric_limits<float>::infinity();
+        if (child_depth < 0.0f) {
+            plans.push_back({Mode::Skip, m_P, 0.0f, 0, 0});
+            continue;
+        }
+
+        if (m_tk == v2::kTerminalDraw) {
+            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, 0, 0});
+            continue;
+        }
+        if (m_tk == v2::kTerminalLossForChild) {
+            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/-1.0f, 0, 0});
+            continue;
+        }
+
+        chess::Board cb = board;
+        cb.makeMove<true>(chess::Move{m.move});
+
+        // Path-dependent: a 2-fold along this path or a 50-move
+        // expiration is NOT in terminal_kind (different paths
+        // hashing to the same key may disagree on repetition state
+        // / half-move clock since neither is part of the Zobrist
+        // key). Treat as a draw at this caller.
+        if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
+            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, 0, 0});
+            continue;
+        }
+
+        const uint64_t child_key = cb.hash();
+        const uint32_t child_sec = v2::secondary_hash(cb);
+
+        if (v2::TTEntry* ce = ctx->arena->find(child_key, child_sec)) {
+            // (key, secondary) match verified by find — find only
+            // returns non-null after `secondary_matches` observed
+            // Cell B published with a matching key_secondary, so
+            // the child entry is fully published. Cell A's qd is
+            // atomic with the primary match; we never spin on the
+            // child's moveInfo from here, and we don't need it for
+            // the ReadOnly path (just q + max_depth).
+            auto [q, child_max_d] = v2::unpack_qd(
+                v2::SearchArena::load_qd(ce).qd_packed);
+            if (child_depth <= child_max_d) {
+                plans.push_back({Mode::ReadOnly, m_P, q, child_key, child_sec});
+                continue;
+            }
+        }
+
+        // ── RecurseThenRead: fork with permit-passing ───────────────
+        // First fork inherits our permit (no acquire). Subsequent forks
+        // co_await sem->acquire() — when permits run out, the producer
+        // (this coroutine) suspends in acquire() before any new child
+        // frame is allocated. That's the real backpressure point.
+        lfsync::Permit child_permit = first_fork
+            ? std::move(permit)
+            : co_await ctx->sem->acquire();
+        first_fork = false;
+        any_fork   = true;
+
+        plans.push_back({Mode::RecurseThenRead, m_P, 0.0f, child_key, child_sec});
+        co_await lf::fork[recursive_search](
+            ctx, std::move(child_permit), std::move(cb), child_depth);
+    }
+
+    if (any_fork) {
+        co_await lf::join;
+    }
+
+    if (ctx->w->should_abort()) co_return;
+
+    // ── rollup: P-weighted average of -child_Q ──────────────────────
+    float num = 0.0f;
+    float den = 0.0f;
+    for (const Plan& p : plans) {
+        if (p.mode == Mode::Skip) continue;
+        float child_Q;
+        if (p.mode == Mode::ReadOnly) {
+            child_Q = p.fixed_Q;
+        } else {
+            v2::TTEntry* ce = ctx->arena->find(p.child_key, p.child_sec);
+            if (!ce) continue;       // child never claimed (e.g. stop fired)
+            auto [q, _] = v2::unpack_qd(
+                v2::SearchArena::load_qd(ce).qd_packed);
+            (void)_;
+            child_Q = q;
+        }
+        num += p.P * (-child_Q);
+        den += p.P;
+    }
+    if (den > 0.0f) {
+        v2::SearchArena::update_qd(entry, num / den, depth);
+    }
+};
+
+/**
+ * Thin root entry: acquires the very first permit from the per-worker
+ * semaphore, then descends into recursive_search. Keeps the
+ * recursive_search invariant ("entry owns a permit") clean.
+ */
+inline constexpr auto root_search =
+    [](auto /*self*/,
+       RecurseContext* ctx,
+       chess::Board board,
+       float depth) -> lf::task<void>
+{
+    lfsync::Permit p = co_await ctx->sem->acquire();
+    co_await lf::call[recursive_search](
+        ctx, std::move(p), std::move(board), depth);
+    co_await lf::join;
+};
+
+}  // namespace detail
+
 class LksSearch {
 public:
+    using WorkerSearch = detail::WorkerSearch;
+
     /**
      * @param trt_engine_path     Path to the serialized TensorRT engine.
      *                            Loaded once per worker_search at ctor time.
@@ -146,10 +620,11 @@ public:
      * @param num_workers         Number of WorkerSearch instances. Each
      *                            owns its own engine + GPU thread + stream
      *                            for natural pipelining across the GPU.
-     * @param coros_per_worker    Tuning knob for the eval semaphore: each
-     *                            worker permits up to `4 * coros_per_worker`
-     *                            in-flight GPU evals concurrently. Drives
-     *                            achieved batch sizes.
+     * @param coros_per_worker    Tuning knob for the per-worker semaphore:
+     *                            each worker permits up to
+     *                            `4 * coros_per_worker` simultaneously-alive
+     *                            recursive_search invocations. Bounds
+     *                            both orchestration frames and GPU evals.
      * @param max_batch_size      Cap on positions per GPU batch.
      */
     explicit LksSearch(fs::path trt_engine_path,
@@ -168,18 +643,20 @@ public:
                        /*avg_moves_per_node=*/40);
         root_key_ = board_.hash();
 
-        // Persistent workers: build pool + evaluator + eval_sem per worker once.
-        const std::ptrdiff_t eval_permits =
-            std::min<std::ptrdiff_t>(4 * coros_per_worker_, kMaxEvalSemValue);
+        // Persistent workers: build pool + evaluator + sem per worker once.
+        const int eval_permits = 4 * coros_per_worker_;
         workers_.reserve(num_workers_);
         for (int i = 0; i < num_workers_; ++i) {
             auto w = std::make_unique<WorkerSearch>();
-            w->pool = coro::thread_pool::make_shared(coro::thread_pool::options{
-                .thread_count = 1,
-            });
+            // 1 worker per pool: per-WorkerSearch isolation is the model.
+            // lazy_pool means the worker thread sleeps when no work
+            // is ready, woken on pool->schedule(handle) by the GPU
+            // thread or by a release()'d semaphore waiter.
+            w->pool = std::make_unique<lf::lazy_pool>(/*n=*/1);
             w->evaluator = std::make_unique<BatchEvaluator>(
-                trt_engine_path_, w->pool, max_batch_size_);
-            w->eval_sem = std::make_unique<coro::semaphore<kMaxEvalSemValue>>(eval_permits);
+                trt_engine_path_, w->pool.get(), max_batch_size_);
+            w->sem = std::make_unique<lfsync::LfAsyncSemaphore>(
+                eval_permits, *w->pool);
             workers_.push_back(std::move(w));
         }
     }
@@ -190,11 +667,13 @@ public:
         // workers_ vector destructs here:
         //   - each WorkerSearch's `runner` jthread is non-joinable
         //     (worker_main joined it before exiting).
-        //   - each WorkerSearch's `evaluator` unique_ptr drops →
+        //   - each WorkerSearch's `sem` drops first (no waiters; runners
+        //     joined).
+        //   - each WorkerSearch's `evaluator` drops next →
         //     BatchEvaluator dtor calls shutdown() → GPU thread joined
-        //     → CUDA resources freed.
-        //   - each WorkerSearch's `pool` shared_ptr drops →
-        //     coro::thread_pool dtor joins its worker thread.
+        //     → CUDA resources freed. After this no more pool->schedule.
+        //   - each WorkerSearch's `pool` drops last → lazy_pool dtor
+        //     joins its worker thread.
     }
 
     LksSearch(const LksSearch&) = delete;
@@ -444,47 +923,6 @@ public:
     }
 
 private:
-    // Compile-time max for the per-worker eval semaphore. Runtime starting
-    // value is `4 * coros_per_worker_`, capped here.
-    static constexpr std::ptrdiff_t kMaxEvalSemValue = 256;
-
-    /**
-     * Per-worker_search state.
-     *
-     * Persistent across searches:
-     *   - pool, evaluator, eval_sem
-     *
-     * Per-search (reset by worker_main at the start of every search):
-     *   - stop, evals, tt_claims, depth, budget
-     */
-    struct WorkerSearch {
-        std::shared_ptr<coro::thread_pool>                  pool;
-        std::unique_ptr<BatchEvaluator>                     evaluator;
-        std::unique_ptr<coro::semaphore<kMaxEvalSemValue>>  eval_sem;
-
-        std::atomic<bool>     stop{false};
-        std::atomic<uint64_t> evals{0};
-        std::atomic<uint64_t> tt_claims{0};
-        std::atomic<uint64_t> budget{0};            // per-worker eval cap for this search
-        std::atomic<float>    depth{0.0f};
-
-        std::jthread runner;
-
-        WorkerSearch() = default;
-        WorkerSearch(const WorkerSearch&) = delete;
-        WorkerSearch& operator=(const WorkerSearch&) = delete;
-        WorkerSearch(WorkerSearch&&) = delete;
-        WorkerSearch& operator=(WorkerSearch&&) = delete;
-
-        // Single common abort-check for both `stop` and budget exhaustion.
-        // Used at every `co_await` boundary so a search drains promptly.
-        [[nodiscard]] bool should_abort() const noexcept {
-            return stop.load(std::memory_order_relaxed)
-                || evals.load(std::memory_order_relaxed)
-                   >= budget.load(std::memory_order_relaxed);
-        }
-    };
-
     void worker_main(std::stop_token st, LksSearchConfig cfg) {
         auto& cb = cfg.on_uci_line;
         auto emit = [&](std::string_view s) { if (cb) cb(s); };
@@ -610,389 +1048,28 @@ private:
         float depth = start;
         w.depth.store(depth, std::memory_order_relaxed);
         while (!w.should_abort() && depth < cfg.max_depth) {
-            coro::sync_wait(run_iteration(w, depth));
+            run_iteration(w, depth);
             depth += cfg.delta_depth;
             w.depth.store(depth, std::memory_order_relaxed);
         }
     }
 
     /**
-     * One ID iteration: schedule onto the worker's pool and descend
-     * from the root at the given log-scale depth.
-     */
-    coro::task<void> run_iteration(WorkerSearch& w, float depth) {
-        co_await w.pool->schedule();
-        co_await recursive_search(w, board_, depth);
-    }
-
-    /**
-     * Paired legal move + its softmax prior. Emitted by
-     * `softmax_legal_sorted` in decreasing-P order so downstream
-     * MoveInfo fill is a single sequential pass and the arena
-     * ends up P-sorted without an in-place shuffle.
+     * One ID iteration: build a per-iteration RecurseContext and dispatch
+     * the descent onto this worker's lazy_pool. lf::sync_wait blocks the
+     * runner thread until the recursion completes.
      *
-     * Kept small (8 bytes) and mirrors MoveInfo's `move`/`P` layout:
-     * sorting cost is the same as sorting MoveInfos, and we avoid
-     * the makeMove/unmakeMove terminal work running in a soon-to-be-
-     * thrown-away order. Stored as the raw `uint16_t` rather than a
-     * `chess::Move` because the latter carries an unused 16-bit
-     * score field that would bloat this struct.
+     * The runner is NOT a libfork worker thread, so calling sync_wait
+     * (which would throw schedule_in_worker if called from one) is safe.
      */
-    struct MoveWithPrior {
-        uint16_t move;  // 2: chess::Move underlying u16
-        uint16_t _pad;  // 2
-        float    P;     // 4
-    };
-    static_assert(sizeof(MoveWithPrior) == 8, "MoveWithPrior must be 8 bytes");
-
-    /**
-     * Mirror `coroutine_search.hpp::evaluate_node`'s temp-1.0 softmax over
-     * legal-move policy logits, sorted by decreasing P. Output order is
-     * what downstream descent expects (highest-prior first), and is also
-     * the order we want in the arena's MoveInfo[].
-     */
-    static void softmax_legal_sorted(const RawNNOutput& out,
-                                     const chess::Board& board,
-                                     const chess::Movelist& legal,
-                                     std::vector<MoveWithPrior>& moves)
-    {
-        const bool flip = board.sideToMove() == chess::Color::BLACK;
-        const int n = legal.size();
-        moves.resize(static_cast<size_t>(n));
-
-        float max_logit = -std::numeric_limits<float>::infinity();
-        for (int i = 0; i < n; ++i) {
-            const auto [from_idx, to_idx] = encode_move_to_policy_index(legal[i], flip);
-            const int flat = policy_flat_index(from_idx, to_idx);
-            const float logit = out.policy[flat];
-            moves[i].move = static_cast<uint16_t>(legal[i].move());
-            moves[i]._pad = 0;
-            moves[i].P = logit;
-            max_logit = std::max(max_logit, logit);
-        }
-        float sum_exp = 0.0f;
-        for (int i = 0; i < n; ++i) {
-            moves[i].P = std::exp(moves[i].P - max_logit);
-            sum_exp += moves[i].P;
-        }
-        const float inv_sum = sum_exp > 0.0f ? 1.0f / sum_exp : 0.0f;
-        for (int i = 0; i < n; ++i) {
-            moves[i].P *= inv_sum;
-        }
-
-        std::sort(moves.begin(), moves.end(),
-            [](const MoveWithPrior& a, const MoveWithPrior& b) {
-                return a.P > b.P;
-            });
-    }
-
-    /**
-     * Variance of the NN value distribution, measured in the same
-     * [-1, 1] scale as `Q = 2*out.value - 1`. The HL-Gauss head's 81
-     * bins are taken as equal-width over [-1, 1] with the i-th center
-     * at `-1 + (i + 0.5) * (2 / VALUE_NUM_BINS)`.
-     *
-     * Mirrors `FractionalNode::compute_variance` in
-     * `engine/fractional_mcts/node.hpp` so LKS agrees on scale with
-     * the prototype search.
-     */
-    static float compute_value_variance(
-        const std::array<float, VALUE_NUM_BINS>& value_probs) noexcept
-    {
-        constexpr float bin_width = 2.0f / static_cast<float>(VALUE_NUM_BINS);
-        float mean = 0.0f;
-        for (int i = 0; i < VALUE_NUM_BINS; ++i) {
-            const float center = -1.0f + (static_cast<float>(i) + 0.5f) * bin_width;
-            mean += value_probs[i] * center;
-        }
-        float var = 0.0f;
-        for (int i = 0; i < VALUE_NUM_BINS; ++i) {
-            const float center = -1.0f + (static_cast<float>(i) + 0.5f) * bin_width;
-            const float diff = center - mean;
-            var += value_probs[i] * diff * diff;
-        }
-        return var;
-    }
-
-    /**
-     * Position-only terminal classification for a child move at expansion
-     * time. Path-dependent terminal conditions are NOT considered here:
-     *   - repetitions: handled at descent time via `isRepetition(1)`.
-     *   - 50-move rule: handled at descent time via `isHalfMoveDraw()`.
-     * Both depend on data (path history / half-move clock) that is not
-     * part of the Zobrist key, so two transpositions to the same key can
-     * disagree on them. Only stable, position-only draws (insufficient
-     * material) and mate/stalemate go into the TT-stored terminal_kind.
-     *
-     * Pre: `child_board` is the board AFTER `makeMove<true>(move)`.
-     */
-    static v2::TerminalKind classify_terminal(chess::Board& child_board) {
-        chess::Movelist child_legal;
-        chess::movegen::legalmoves(child_legal, child_board);
-        if (child_legal.empty()) {
-            // No legal replies: checkmate => loss for child; stalemate => draw.
-            return child_board.inCheck() ? v2::kTerminalLossForChild
-                                         : v2::kTerminalDraw;
-        }
-        if (child_board.isInsufficientMaterial()) {
-            return v2::kTerminalDraw;
-        }
-        return v2::kTerminalNone;
-    }
-
-    /**
-     * Recursive search, log-scale, claim-after-eval.
-     *
-     * Caller-skip protocol: caller has already verified that this
-     * position is NOT a path-repetition, is NOT a 50-move draw, and
-     * is NOT TT-cached at depth. Caller-skip for terminals is enforced
-     * at the parent's MoveInfo level (terminal_kind != None children
-     * are never recursed into).
-     *
-     * `board` is taken by value: it lives in this coroutine's frame for
-     * the entire descent, so children can capture references to it
-     * during the parallel fan-out without lifetime hazards.
-     */
-    coro::task<void> recursive_search(WorkerSearch& w, chess::Board board, float depth) {
-        if (w.should_abort()) co_return;
-
-        const uint64_t key = board.hash();
-        const uint32_t sec = v2::secondary_hash(board);
-        v2::TTEntry* entry = arena_->find(key, sec);
-
-        if (entry == nullptr) {
-            // ── unexpanded: eval, fill bytes, then claim ────────────────
-            {
-                auto sem_res = co_await w.eval_sem->acquire();
-                if (sem_res == coro::semaphore_acquire_result::shutdown) {
-                    co_return;
-                }
-            }
-
-            // After acquire we MUST release the permit on every exit
-            // path, including stop/budget aborts that bypass the GPU
-            // eval.
-            if (w.should_abort()) {
-                w.eval_sem->release();
-                co_return;
-            }
-
-            // Post-acquire re-probe: a peer worker may have evaluated and
-            // published this key while we were queued on the semaphore.
-            // Adopting their entry skips tokenize + GPU eval + movegen +
-            // softmax + alloc + per-move terminal classification, all of
-            // which would otherwise be wasted (the find_or_claim CAS would
-            // lose and our arena bytes would be permanently orphaned).
-            if (v2::TTEntry* e = arena_->find(key, sec); e != nullptr) {
-                w.eval_sem->release();
-                entry = e;
-            } else {
-                auto tokens = catgpt::tokenize<BatchEvaluator::SEQ_LENGTH>(
-                    board, NO_HALFMOVE_CONFIG);
-                RawNNOutput out = co_await EvalAwaitable(*w.evaluator, tokens);
-                w.eval_sem->release();
-                w.evals.fetch_add(1, std::memory_order_relaxed);
-
-                chess::Movelist legal;
-                chess::movegen::legalmoves(legal, board);
-                const uint16_t num_moves = static_cast<uint16_t>(legal.size());
-
-                // Sort moves by decreasing P up front (on compact
-                // 8-byte pairs) so the arena fill below is a single
-                // pass that writes each MoveInfo exactly once in the
-                // order descent will consume them.
-                std::vector<MoveWithPrior> sorted_moves;
-                softmax_legal_sorted(out, board, legal, sorted_moves);
-
-                // alloc + fill BEFORE attempting to claim — these bytes are
-                // privately owned until the CAS, and orphaned if the CAS loses.
-                const uint64_t off = arena_->alloc_node_info(num_moves);
-                v2::MoveInfo* mi = arena_->moves_at(off);
-                for (uint16_t i = 0; i < num_moves; ++i) {
-                    const chess::Move m{sorted_moves[i].move};
-
-                    // Per-move position-only terminal detection.
-                    board.makeMove<true>(m);
-                    const v2::TerminalKind tk = classify_terminal(board);
-                    board.unmakeMove(m);
-
-                    mi[i] = v2::MoveInfo::pack(sorted_moves[i].move,
-                                               sorted_moves[i].P,
-                                               tk);
-                }
-
-                // Per-node variance of the value distribution, in the
-                // same [-1, 1] scale as Q. alloc_node_info pre-fills
-                // variance=0; overwrite with the real value.
-                arena_->info_at(off)->variance =
-                    compute_value_variance(out.value_probs);
-
-                const float Q = 2.0f * out.value - 1.0f;
-
-                // Single 128-bit CAS installs (key, qd_packed(Q, 0))
-                // atomically, so any reader observing key == K
-                // necessarily sees the matching qd. Then a single 128-bit
-                // release-store of Cell B publishes
-                // (origQ, key_secondary, info_offset).
-                auto [ce, claimed] = arena_->find_or_claim(
-                    key, sec, Q, /*max_depth=*/0.0f);
-                if (claimed) {
-                    v2::SearchArena::publish_info(
-                        ce, /*origQ=*/Q, /*key_secondary=*/sec, off);
-                    w.tt_claims.fetch_add(1, std::memory_order_relaxed);
-                } else {
-                    // Lost the race despite the post-acquire re-probe:
-                    // someone published in the gap between our re-probe
-                    // and our find_or_claim. Our `off` bytes are orphaned
-                    // (forever).
-                }
-
-                // Intentionally let the thread finish putting the entry
-                // into the TT/arena before aborting
-                if (w.should_abort()) co_return;
-
-                entry = ce;
-            }
-        }
-
-        // ── re-deepen check (works for both fresh-claim and TT-shared) ──
-        {
-            // Cell A is atomic with the key match (find / find_or_claim
-            // both ensure we observe a key from a successful CAS), so qd
-            // is never torn here.
-            auto [_, cur_max_d] = v2::unpack_qd(
-                v2::SearchArena::load_qd(entry).qd_packed);
-            (void)_;
-            if (depth <= cur_max_d) co_return;
-        }
-
-        // ── pre-pass: classify each child for fan-out + rollup ──────────
-        // Cell B is provably published by the time we reach this point:
-        //   * `find(key, sec)` only returns non-null after validating
-        //     the secondary, which requires Cell B to be published
-        //     (the validation acquire-loads it).
-        //   * On the fresh-claim path we called `publish_info`
-        //     ourselves before assigning `entry`.
-        //   * On the post-acquire-re-probe path the same `find(key, sec)`
-        //     guarantee applies.
-        // So a plain `load_info` is sufficient — no spin needed.
-        const v2::InfoCell info_cell = v2::SearchArena::load_info(entry);
-        assert(info_cell.info_offset != v2::kNoInfoOffset
-               && "Cell B unpublished after find/find_or_claim returned a "
-                  "validated entry; invariant broken");
-        const v2::NodeInfoHeader* hdr = arena_->info_at(info_cell.info_offset);
-        const uint16_t num_moves = hdr->num_moves;
-        const v2::MoveInfo* moves = arena_->moves_at(info_cell.info_offset);
-
-        enum class Mode : uint8_t { Skip, RecurseThenRead, ReadOnly };
-        struct Plan {
-            Mode     mode;
-            float    P;
-            float    fixed_Q;     // valid for ReadOnly
-            uint64_t child_key;   // valid for RecurseThenRead
-            uint32_t child_sec;   // valid for RecurseThenRead (cached so
-                                  // the post-fan-out rollup re-find can
-                                  // run without re-deriving the board)
+    void run_iteration(WorkerSearch& w, float depth) {
+        detail::RecurseContext ctx{
+            /*arena=*/&*arena_,
+            /*evaluator=*/w.evaluator.get(),
+            /*sem=*/w.sem.get(),
+            /*w=*/&w,
         };
-        std::vector<Plan> plans;
-        plans.reserve(num_moves);
-
-        std::vector<coro::task<void>> child_tasks;
-        child_tasks.reserve(num_moves);
-
-        for (uint16_t i = 0; i < num_moves; ++i) {
-            const auto& m = moves[i];
-            const v2::TerminalKind m_tk = m.terminal_kind();
-            const float m_P = m.P();
-
-            // Depth floor — applies to EVERY child regardless of kind.
-            // With child_depth = depth + log(P), each level of recursion
-            // strictly decreases depth. Without a floor at 0 the recursion
-            // would run forever as priors compound below e^0 = 1 visit.
-            // Cuts terminal_kind contributions too: a terminal child below
-            // the floor doesn't matter at this iteration's resolution.
-            const float child_depth = (m_P > 0.0f)
-                ? depth + std::log(std::max(m_P, 1e-9f))
-                : -std::numeric_limits<float>::infinity();
-            if (child_depth < 0.0f) {
-                plans.push_back({Mode::Skip, m_P, 0.0f, 0, 0});
-                continue;
-            }
-
-            if (m_tk == v2::kTerminalDraw) {
-                plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, 0, 0});
-                continue;
-            }
-            if (m_tk == v2::kTerminalLossForChild) {
-                plans.push_back({Mode::ReadOnly, m_P, /*Q=*/-1.0f, 0, 0});
-                continue;
-            }
-
-            chess::Board cb = board;
-            cb.makeMove<true>(chess::Move{m.move});
-
-            // Path-dependent: a 2-fold along this path or a 50-move
-            // expiration is NOT in terminal_kind (different paths
-            // hashing to the same key may disagree on repetition state
-            // / half-move clock since neither is part of the Zobrist
-            // key). Treat as a draw at this caller.
-            if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
-                plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, 0, 0});
-                continue;
-            }
-
-            const uint64_t child_key = cb.hash();
-            const uint32_t child_sec = v2::secondary_hash(cb);
-
-            if (v2::TTEntry* ce = arena_->find(child_key, child_sec)) {
-                // (key, secondary) match verified by find — find only
-                // returns non-null after `secondary_matches` observed
-                // Cell B published with a matching key_secondary, so
-                // the child entry is fully published. Cell A's qd is
-                // atomic with the primary match; we never spin on the
-                // child's moveInfo from here, and we don't need it for
-                // the ReadOnly path (just q + max_depth).
-                auto [q, child_max_d] = v2::unpack_qd(
-                    v2::SearchArena::load_qd(ce).qd_packed);
-                if (child_depth <= child_max_d) {
-                    plans.push_back({Mode::ReadOnly, m_P, q, child_key, child_sec});
-                    continue;
-                }
-            }
-
-            plans.push_back({Mode::RecurseThenRead, m_P, 0.0f, child_key, child_sec});
-            child_tasks.emplace_back(
-                recursive_search(w, std::move(cb), child_depth));
-        }
-
-        if (!child_tasks.empty()) {
-            co_await coro::when_all(std::move(child_tasks));
-        }
-
-        if (w.should_abort()) co_return;
-
-        // ── rollup: P-weighted average of -child_Q ──────────────────────
-        float num = 0.0f;
-        float den = 0.0f;
-        for (const Plan& p : plans) {
-            if (p.mode == Mode::Skip) continue;
-            float child_Q;
-            if (p.mode == Mode::ReadOnly) {
-                child_Q = p.fixed_Q;
-            } else {
-                v2::TTEntry* ce = arena_->find(p.child_key, p.child_sec);
-                if (!ce) continue;       // child never claimed (e.g. stop fired)
-                auto [q, _] = v2::unpack_qd(
-                    v2::SearchArena::load_qd(ce).qd_packed);
-                (void)_;
-                child_Q = q;
-            }
-            num += p.P * (-child_Q);
-            den += p.P;
-        }
-        if (den > 0.0f) {
-            v2::SearchArena::update_qd(entry, num / den, depth);
-        }
+        lf::sync_wait(*w.pool, detail::root_search, &ctx, board_, depth);
     }
 
     fs::path trt_engine_path_;

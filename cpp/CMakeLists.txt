@@ -315,27 +315,26 @@ set_target_properties(tt_arena_test PROPERTIES
 )
 
 # === LKS search lifecycle + GPU test ===
-# Real TensorRT-backed BatchEvaluator per worker. Needs CUDA/TRT/libcoro.
+# Real TensorRT-backed BatchEvaluator per worker. Now libfork-backed.
 add_executable(lks_search_test
     src/engine/lks/lks_search_test.cpp
 )
 target_include_directories(lks_search_test PRIVATE
     ${CHESS_LIBRARY_INCLUDE_DIR}
-    ${LIBCORO_INCLUDE_DIR}
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
 )
 target_compile_options(lks_search_test PRIVATE -O2 -g -fcoroutines -mcx16)
 target_link_libraries(lks_search_test PRIVATE
-    ${LIBCORO_LIB}
+    libfork::libfork
     ${NVINFER_LIB}
     ${CUDART_LIB}
     pthread
     atomic
 )
 set_target_properties(lks_search_test PROPERTIES
-    BUILD_RPATH   "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-    INSTALL_RPATH "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    BUILD_RPATH   "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
 
 # === LKS throughput sweep (real TRT) ===
@@ -344,21 +343,20 @@ add_executable(lks_throughput_bench
 )
 target_include_directories(lks_throughput_bench PRIVATE
     ${CHESS_LIBRARY_INCLUDE_DIR}
-    ${LIBCORO_INCLUDE_DIR}
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
 )
 target_compile_options(lks_throughput_bench PRIVATE -O3 -march=native -fcoroutines -mcx16)
 target_link_libraries(lks_throughput_bench PRIVATE
-    ${LIBCORO_LIB}
+    libfork::libfork
     ${NVINFER_LIB}
     ${CUDART_LIB}
     pthread
     atomic
 )
 set_target_properties(lks_throughput_bench PROPERTIES
-    BUILD_RPATH   "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-    INSTALL_RPATH "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    BUILD_RPATH   "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
 
 # === libfork smoke test ===
@@ -385,19 +383,18 @@ target_include_directories(lks_uci PRIVATE
     ${CHESS_LIBRARY_INCLUDE_DIR}
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
-    ${LIBCORO_INCLUDE_DIR}
 )
 target_link_libraries(lks_uci PRIVATE
+    libfork::libfork
     ${NVINFER_LIB}
     ${CUDART_LIB}
-    ${LIBCORO_LIB}
     pthread
     atomic
 )
 target_compile_options(lks_uci PRIVATE -fcoroutines -mcx16)
 set_target_properties(lks_uci PROPERTIES
-    BUILD_RPATH   "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-    INSTALL_RPATH "${GCC14_LIB_DIR};${LIBCORO_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    BUILD_RPATH   "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
 
 # Enable colored output

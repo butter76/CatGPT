@@ -1,10 +1,12 @@
 /**
- * Batched TensorRT Evaluator with coroutine integration.
+ * Batched TensorRT Evaluator with libfork-coroutine integration.
  *
  * Runs on a dedicated GPU thread. Search coroutines submit EvalRequests
  * to a thread-safe queue; the GPU thread drains the queue, batches
- * positions, runs TensorRT inference, distributes results, and resumes
- * the coroutines on the worker thread pool.
+ * positions, runs TensorRT inference, distributes results, and hands
+ * each suspended task's lf::submit_handle back to the libfork
+ * lazy_pool via pool_->schedule(h). The pool's notifier wakes a
+ * worker which then runs lf::resume(h) and the task continues.
  *
  * Bucketed batching:
  *   - The engine is built with one optimization profile per bucket size
@@ -44,7 +46,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include <coro/thread_pool.hpp>
+#include <libfork/core.hpp>
+#include <libfork/schedule.hpp>
 
 #include "../engine/policy.hpp"
 #include "../engine/trt_evaluator.hpp"  // VALUE_NUM_BINS, TrtLogger, CATGPT_CUDA_CHECK
@@ -58,8 +61,9 @@ namespace catgpt {
  * Batched TensorRT evaluator running on a dedicated GPU thread.
  *
  * Search coroutines call submit() to enqueue an evaluation request,
- * then suspend.  The GPU thread processes batches and resumes the
- * coroutines on the thread pool.
+ * then suspend.  The GPU thread processes batches and hands each
+ * suspended task's lf::submit_handle back to the libfork pool, which
+ * resumes them on a worker.
  */
 class BatchEvaluator {
 public:
@@ -77,16 +81,18 @@ public:
 
     /**
      * @param engine_path   Path to the serialized TensorRT engine.
-     * @param thread_pool   Shared pointer to the worker thread pool
-     *                      (coroutines are resumed here after GPU eval).
+     * @param pool          Non-owning pointer to the libfork lazy_pool
+     *                      (suspended tasks are handed back here after
+     *                      GPU eval via pool->schedule(handle)).
+     *                      Must outlive this BatchEvaluator.
      * @param max_batch_size Soft cap on bucket selection. Only buckets
      *                      <= max_batch_size are usable. Effective max
      *                      batch is the largest bucket <= max_batch_size.
      */
     BatchEvaluator(const fs::path& engine_path,
-                   std::shared_ptr<coro::thread_pool> thread_pool,
+                   lf::lazy_pool* pool,
                    int max_batch_size = 32)
-        : thread_pool_(std::move(thread_pool))
+        : pool_(pool)
         , max_batch_size_(max_batch_size > 0 ? max_batch_size : 1)
         , shutdown_(false)
         , total_evals_(0)
@@ -260,8 +266,13 @@ private:
                 req->result.has_optimistic_policy = true;
             }
 
-            // Resume the coroutine on the worker thread pool
-            thread_pool_->resume(req->continuation);
+            // Hand the submit_handle back to the libfork pool. The pool's
+            // notifier wakes a sleeping worker, which calls lf::resume(h)
+            // and the suspended task continues from EvalAwaitable::await_resume.
+            // pool_->schedule is documented as concurrent-safe; the GPU
+            // thread is NOT a libfork worker so we must NOT call
+            // lf::resume() directly here.
+            pool_->schedule(req->continuation);
         }
 
         total_evals_.fetch_add(batch_size, std::memory_order_relaxed);
@@ -643,8 +654,10 @@ private:
 
     // ─── Members ────────────────────────────────────────────────────────
 
-    // Thread pool for resuming coroutines
-    std::shared_ptr<coro::thread_pool> thread_pool_;
+    // Libfork lazy_pool to which suspended tasks are handed back after
+    // their GPU eval completes. Non-owning; the LksSearch (or whoever
+    // owns this BatchEvaluator) owns the pool and must outlive us.
+    lf::lazy_pool* pool_;
 
     // Configuration
     int max_batch_size_;
@@ -712,7 +725,7 @@ private:
 
 // ─── EvalAwaitable::await_suspend (needs BatchEvaluator to be complete) ────
 
-inline void EvalAwaitable::await_suspend(std::coroutine_handle<> h) noexcept {
+inline void EvalAwaitable::await_suspend(lf::submit_handle h) noexcept {
     request_.continuation = h;
     evaluator_.submit(&request_);
 }

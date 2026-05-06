@@ -42,7 +42,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
-#include <deque>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -54,6 +53,8 @@
 
 #include <libfork/core.hpp>
 #include <libfork/schedule.hpp>
+
+#include "lf/async_semaphore.hpp"
 
 namespace {
 
@@ -184,7 +185,7 @@ class FakeGpuEvaluator {
 
 class EvalAwaitable {
    public:
-    EvalAwaitable(FakeGpuEvaluator& eval, lf::busy_pool& pool, int input)
+    EvalAwaitable(FakeGpuEvaluator& eval, lf::lazy_pool& pool, int input)
         : eval_(&eval), pool_(&pool), input_(input) {}
 
     bool await_ready() const noexcept { return false; }
@@ -204,7 +205,7 @@ class EvalAwaitable {
 
    private:
     FakeGpuEvaluator* eval_;
-    lf::busy_pool* pool_;
+    lf::lazy_pool* pool_;
     int input_;
     int result_ = 0;
 };
@@ -213,154 +214,20 @@ static_assert(lf::context_switcher<EvalAwaitable>,
               "EvalAwaitable must satisfy lf::context_switcher so it can "
               "be co_awaited inside an lf::task");
 
-// ---------- Libfork-aware async counting semaphore + RAII permit -------
+// ---------- Async semaphore + permit -----------------------------------
 //
-// The semaphore enforces "at most K in-flight permits at a time". It's
-// designed for the producer-side acquire pattern:
-//
-//     for (i = 0; i < N; ++i) {
-//         Permit p = co_await sem.acquire();   // <-- backpressure here
-//         co_await lf::fork(&out[i], child)(... std::move(p) ...);
-//     }
-//
-// When permits are exhausted the producer (driver) coroutine itself
-// suspends in `acquire()` - it does NOT allocate a new child frame
-// first. That's the whole point: this is the only spot you can apply
-// real backpressure without paying for the suspended frame anyway.
-//
-// On `release()` (normally invoked by ~Permit when the child finishes),
-// either the count is incremented or, if a producer is parked on
-// `acquire()`, that producer's submit_handle is pushed back to the
-// libfork pool via `pool.schedule(h)` - same handoff pattern as the
-// GPU evaluator.
+// Lifted into the shared header `cpp/src/lf/async_semaphore.hpp` so that
+// the LKS port (and any future libfork-using code) can reuse them. We
+// just import the names below for ergonomics.
 
-class LfAsyncSemaphore;
-
-class Permit {
-   public:
-    Permit() = default;
-    explicit Permit(LfAsyncSemaphore& s) noexcept : sem_(&s) {}
-
-    Permit(const Permit&) = delete;
-    Permit& operator=(const Permit&) = delete;
-
-    Permit(Permit&& o) noexcept : sem_(std::exchange(o.sem_, nullptr)) {}
-    Permit& operator=(Permit&& o) noexcept {
-        if (this != &o) {
-            release();
-            sem_ = std::exchange(o.sem_, nullptr);
-        }
-        return *this;
-    }
-
-    ~Permit() { release(); }
-
-    bool valid() const noexcept { return sem_ != nullptr; }
-
-    // Manual early release. Idempotent.
-    void release() noexcept;
-
-   private:
-    LfAsyncSemaphore* sem_ = nullptr;
-};
-
-class LfAsyncSemaphore {
-   public:
-    LfAsyncSemaphore(int initial_count, lf::busy_pool& pool)
-        : pool_(&pool), count_(initial_count) {}
-
-    LfAsyncSemaphore(const LfAsyncSemaphore&) = delete;
-    LfAsyncSemaphore& operator=(const LfAsyncSemaphore&) = delete;
-
-    class AcquireAwaitable {
-       public:
-        explicit AcquireAwaitable(LfAsyncSemaphore* sem) noexcept : sem_(sem) {}
-
-        // Fast-path: take a permit synchronously if available. Held under
-        // the mutex so we and `release()` agree on the count.
-        bool await_ready() noexcept {
-            std::lock_guard lk(sem_->mu_);
-            if (sem_->count_ > 0) {
-                --sem_->count_;
-                return true;  // skip suspension entirely
-            }
-            return false;
-        }
-
-        // Slow-path: re-check under the lock to close the race where a
-        // release happened between await_ready returning false and us
-        // getting here. If it did, take it and just reschedule h so the
-        // worker resumes us on its next loop iteration.
-        void await_suspend(lf::submit_handle h) noexcept {
-            bool resume_now = false;
-            {
-                std::lock_guard lk(sem_->mu_);
-                if (sem_->count_ > 0) {
-                    --sem_->count_;
-                    resume_now = true;
-                } else {
-                    sem_->waiters_.push_back(h);
-                }
-            }
-            if (resume_now) {
-                sem_->pool_->schedule(h);
-            }
-        }
-
-        // By the time we get here, exactly one count was decremented on
-        // our behalf (either by await_ready, by await_suspend, or by a
-        // release that handed its slot to us). The Permit owns it.
-        Permit await_resume() noexcept { return Permit{*sem_}; }
-
-       private:
-        LfAsyncSemaphore* sem_;
-    };
-
-    [[nodiscard]] AcquireAwaitable acquire() noexcept {
-        return AcquireAwaitable{this};
-    }
-
-    void release() noexcept {
-        lf::submit_handle to_wake = nullptr;
-        {
-            std::lock_guard lk(mu_);
-            if (!waiters_.empty()) {
-                // Transfer the slot directly to a waiter (count stays).
-                to_wake = waiters_.front();
-                waiters_.pop_front();
-            } else {
-                ++count_;
-            }
-        }
-        if (to_wake) {
-            // Safe from any thread per libfork's worker_context::schedule
-            // contract ("supports concurrent submission").
-            pool_->schedule(to_wake);
-        }
-    }
-
-   private:
-    lf::busy_pool* pool_;
-    std::mutex mu_;
-    int count_;
-    std::deque<lf::submit_handle> waiters_;
-};
-
-inline void Permit::release() noexcept {
-    if (auto* s = std::exchange(sem_, nullptr)) {
-        s->release();
-    }
-}
-
-static_assert(lf::context_switcher<LfAsyncSemaphore::AcquireAwaitable>,
-              "AcquireAwaitable must satisfy lf::context_switcher so it can "
-              "be co_awaited inside an lf::task");
+using catgpt::lfsync::LfAsyncSemaphore;
+using catgpt::lfsync::Permit;
 
 // ---------- Async functions ---------------------------------------------
 
 // One GPU query: suspend on the evaluator, return the result.
 inline constexpr auto gpu_query =
-    [](auto /*self*/, FakeGpuEvaluator* eval, lf::busy_pool* pool, int x)
+    [](auto /*self*/, FakeGpuEvaluator* eval, lf::lazy_pool* pool, int x)
     -> lf::task<int> {
     {
         std::ostringstream oss;
@@ -378,11 +245,11 @@ inline constexpr auto gpu_query =
 
 // Driver: fork N gpu_queries in parallel, join, return sum.
 inline constexpr auto driver = [](auto /*self*/, FakeGpuEvaluator* eval,
-                                  lf::busy_pool* pool, int n,
+                                  lf::lazy_pool* pool, int n,
                                   int* out_results) -> lf::task<int> {
     log("driver: starting fork loop");
     for (int i = 0; i < n; ++i) {
-        co_await lf::fork(&out_results[i], gpu_query)(eval, pool, i);
+        co_await lf::fork[&out_results[i], gpu_query](eval, pool, i);
         std::ostringstream oss;
         oss << "driver: forked child " << i;
         log(oss.str());
@@ -400,7 +267,7 @@ inline constexpr auto driver = [](auto /*self*/, FakeGpuEvaluator* eval,
 // Permit destructor runs which calls sem.release(), waking the next
 // producer that's parked on acquire().
 inline constexpr auto gpu_query_with_permit =
-    [](auto /*self*/, FakeGpuEvaluator* eval, lf::busy_pool* pool,
+    [](auto /*self*/, FakeGpuEvaluator* eval, lf::lazy_pool* pool,
        Permit /*permit*/, int x) -> lf::task<int> {
     {
         std::ostringstream oss;
@@ -423,7 +290,7 @@ inline constexpr auto gpu_query_with_permit =
 // no new child frame gets allocated until a permit is free. That's the
 // real backpressure point.
 inline constexpr auto bounded_driver =
-    [](auto /*self*/, FakeGpuEvaluator* eval, lf::busy_pool* pool,
+    [](auto /*self*/, FakeGpuEvaluator* eval, lf::lazy_pool* pool,
        LfAsyncSemaphore* sem, int n, int* out_results) -> lf::task<int> {
     log("bounded_driver: starting acquire-then-fork loop");
     for (int i = 0; i < n; ++i) {
@@ -438,7 +305,7 @@ inline constexpr auto bounded_driver =
             oss << "bounded_driver: got permit, forking child " << i;
             log(oss.str());
         }
-        co_await lf::fork(&out_results[i], gpu_query_with_permit)(
+        co_await lf::fork[&out_results[i], gpu_query_with_permit](
             eval, pool, std::move(p), i);
     }
     log("bounded_driver: all forked, awaiting join");
@@ -474,8 +341,13 @@ int main() {
     // SINGLE worker. The smoke tests' whole point is that this one
     // thread never blocks waiting on the GPU - it just keeps forking
     // children until they're all parked, then idles.
-    lf::busy_pool pool{1};
-    log("libfork busy_pool started with 1 worker");
+    //
+    // lazy_pool sleeps when idle (vs busy_pool which spins). For the
+    // GPU-batched-eval pattern we expect frequent idle periods (worker
+    // parks at lf::join, GPU thread eventually wakes it) so lazy_pool
+    // is the right default.
+    lf::lazy_pool pool{1};
+    log("libfork lazy_pool started with 1 worker");
 
     int rc = 0;
 

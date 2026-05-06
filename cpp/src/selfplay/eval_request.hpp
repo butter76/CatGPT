@@ -1,17 +1,20 @@
 /**
- * Evaluation Request — the coroutine-to-GPU bridge.
+ * Evaluation Request — the libfork-coroutine-to-GPU bridge.
  *
  * An EvalRequest holds the input tokens for a position and an output slot
  * for the neural network result.  When a search coroutine needs a GPU
  * evaluation it creates an EvalAwaitable, which:
  *   1. Packs the tokens into an EvalRequest
  *   2. Submits the request to the BatchEvaluator queue
- *   3. Suspends the coroutine (returning its handle for later resumption)
- *   4. On resumption (by the GPU thread → thread pool), returns the result
+ *   3. Suspends the coroutine, handing libfork's submit_handle to the
+ *      evaluator so the GPU thread can later wake it via
+ *      pool.schedule(handle).
+ *   4. On resumption (libfork worker resumes via lf::resume(handle))
+ *      returns the result.
  *
  * Lifetime: EvalAwaitable is a temporary materialized in the coroutine
  * frame by `co_await`, so it (and the embedded EvalRequest) is alive for
- * the entire suspension.  The GPU thread reads `tokens` and writes `result`
+ * the entire suspension. The GPU thread reads `tokens` and writes `result`
  * while the coroutine is suspended; the coroutine reads `result` on resume.
  */
 
@@ -19,8 +22,9 @@
 #define CATGPT_SELFPLAY_EVAL_REQUEST_HPP
 
 #include <array>
-#include <coroutine>
 #include <cstdint>
+
+#include <libfork/core.hpp>
 
 #include "../engine/policy.hpp"
 #include "../engine/trt_evaluator.hpp"  // VALUE_NUM_BINS
@@ -54,8 +58,8 @@ struct RawNNOutput {
  * A single evaluation request.
  *
  * Allocated inside the coroutine frame (via EvalAwaitable).
- * The GPU thread reads `tokens` and writes `result`, then resumes
- * the coroutine via `continuation`.
+ * The GPU thread reads `tokens` and writes `result`, then resumes the
+ * suspended task via `pool->schedule(continuation)`.
  */
 struct EvalRequest {
     // --- Input (written by coroutine before suspend) ---
@@ -64,46 +68,48 @@ struct EvalRequest {
     // --- Output (written by GPU thread before resuming coroutine) ---
     RawNNOutput result;
 
-    // --- Coroutine handle (set by await_suspend, used by GPU thread) ---
-    std::coroutine_handle<> continuation;
+    // --- Libfork submit handle (set by await_suspend, consumed by
+    //     BatchEvaluator::process_batch via pool->schedule). ---
+    lf::submit_handle continuation = nullptr;
 };
 
 /**
- * Awaitable that submits an eval request to the batch evaluator
- * and suspends the calling coroutine until the GPU result is ready.
+ * Awaitable that submits an eval request to the batch evaluator and
+ * suspends the calling coroutine until the GPU result is ready.
  *
- * Usage inside a coroutine:
+ * Conforms to lf::context_switcher (await_suspend takes lf::submit_handle,
+ * not std::coroutine_handle<>) so it can be co_awaited inside any
+ * lf::task.
+ *
+ * Usage inside a libfork task:
  *   RawNNOutput output = co_await EvalAwaitable(evaluator, tokens);
  */
 class EvalAwaitable {
-public:
+   public:
     EvalAwaitable(BatchEvaluator& evaluator,
                   const std::array<std::uint8_t, 64>& tokens)
-        : evaluator_(evaluator)
-    {
+        : evaluator_(evaluator) {
         // Convert uint8 tokens to int32 (TRT input format)
         for (int i = 0; i < 64; ++i) {
             request_.tokens[i] = static_cast<std::int32_t>(tokens[i]);
         }
     }
 
-    // Never immediately ready — always go through the GPU.
     bool await_ready() const noexcept { return false; }
 
-    // Submit the request and suspend.  Defined after BatchEvaluator
-    // is complete (see bottom of batch_evaluator.hpp).
-    void await_suspend(std::coroutine_handle<> h) noexcept;
+    // Defined after BatchEvaluator is complete (bottom of batch_evaluator.hpp).
+    void await_suspend(lf::submit_handle h) noexcept;
 
-    // Called when the coroutine resumes — the GPU thread has already
-    // filled request_.result.
-    RawNNOutput await_resume() noexcept {
-        return request_.result;
-    }
+    RawNNOutput await_resume() noexcept { return request_.result; }
 
-private:
+   private:
     BatchEvaluator& evaluator_;
     EvalRequest request_;
 };
+
+static_assert(lf::context_switcher<EvalAwaitable>,
+              "EvalAwaitable must satisfy lf::context_switcher so it can "
+              "be co_awaited inside an lf::task");
 
 }  // namespace catgpt
 
