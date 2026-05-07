@@ -17,13 +17,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iostream>
-#include <limits>
 #include <memory>
 #include <numeric>
 #include <print>
@@ -32,6 +30,8 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include "engine/network_file.hpp"
 
 namespace fs = std::filesystem;
 
@@ -315,20 +315,18 @@ public:
     static constexpr int NUM_BUFFERS = 2;  // Double buffering
 
     // Batch sizes to cache CUDA graphs for
-    static constexpr std::array<int32_t, 10> CACHED_BATCH_SIZES = {1, 2, 3, 4, 8, 16, 32, 64, 128, 256};
+    static constexpr std::array<int32_t, 12> CACHED_BATCH_SIZES = {1, 2, 3, 4, 6, 8, 12, 18, 26, 36, 56, 112};
 
-    // Range of batch sizes covered by a single TRT optimization profile
-    struct ProfileRange {
-        int32_t profile_idx;
-        int32_t min_batch;
-        int32_t opt_batch;
-        int32_t max_batch;
+    // One bucket = one per-bucket sub-engine (single profile, min == opt ==
+    // max == bucket_size).
+    struct BucketInfo {
+        int32_t bucket_size;
     };
 
-    TrtEngine(const fs::path& engine_path, Logger& logger) : logger_(logger) {
-        load_engine(engine_path);
+    TrtEngine(const fs::path& network_path, Logger& logger) : logger_(logger) {
+        load_engines(network_path);
         setup_io();
-        discover_profiles();
+        discover_buckets();
         preallocate_cached_buffers();
         setup_double_buffering();
     }
@@ -337,43 +335,41 @@ public:
 
     int32_t max_batch_size() const { return max_batch_size_; }
 
-    // Pick the profile that best fits this batch size:
-    //   - prefer profiles whose [min, max] contains batch_size
-    //   - among those, prefer the one with opt_batch closest to batch_size
-    // Returns -1 if no profile contains this batch size.
-    int select_profile(int32_t batch_size) const {
-        int best = -1;
-        int32_t best_dist = std::numeric_limits<int32_t>::max();
-        for (const auto& p : profiles_) {
-            if (batch_size < p.min_batch || batch_size > p.max_batch) continue;
-            int32_t dist = std::abs(p.opt_batch - batch_size);
-            if (dist < best_dist) {
-                best = p.profile_idx;
-                best_dist = dist;
-            }
+    // Bucket sizes available in the loaded .network, ascending.
+    const std::vector<BucketInfo>& buckets() const { return buckets_; }
+
+    // .network files only support fixed bucket sizes. Returns true if
+    // batch_size is one of the bucket sizes in this network.
+    bool has_bucket(int32_t batch_size) const {
+        for (const auto& p : buckets_) {
+            if (p.bucket_size == batch_size) return true;
         }
-        return best;
+        return false;
     }
 
-    // Register an additional batch size for CUDA graph caching and pipelined inference.
-    // Useful for testing arbitrary batch sizes not in CACHED_BATCH_SIZES.
+    // Register a batch size for CUDA graph caching and pipelined inference.
+    // batch_size MUST be one of the bucket sizes baked into the .network.
     void register_batch_size(int32_t batch_size) {
-        int profile_idx = select_profile(batch_size);
-        if (profile_idx < 0) {
+        if (!has_bucket(batch_size)) {
+            std::string available;
+            for (const auto& p : buckets_) {
+                if (!available.empty()) available += ", ";
+                available += std::to_string(p.bucket_size);
+            }
             throw std::runtime_error(std::format(
-                "Batch size {} is not covered by any optimization profile (max overall: {})",
-                batch_size, max_batch_size_));
+                "Batch size {} is not a bucket in this .network. Available: [{}]",
+                batch_size, available));
         }
         if (!cached_resources_.contains(batch_size)) {
             auto [it, _] = cached_resources_.emplace(batch_size, CachedBatchResources(batch_size));
-            create_cached_context(it->second, profile_idx);
+            create_cached_context(it->second, batch_size);
         }
         if (!double_buffer_resources_.contains(batch_size)) {
             auto [it, _] = double_buffer_resources_.emplace(
                 std::piecewise_construct,
                 std::forward_as_tuple(batch_size),
                 std::forward_as_tuple(batch_size));
-            create_slot_contexts(it->second, profile_idx);
+            create_slot_contexts(it->second, batch_size);
         }
     }
 
@@ -391,13 +387,13 @@ public:
     }
 
 private:
-    // Per-batch-size cached resources.
-    // Each batch size owns its own IExecutionContext bound to the matching
-    // optimization profile, so the captured CUDA graph references the kernels
-    // that were tuned for that specific profile.
+    // Per-bucket cached resources.
+    // Each bucket owns its own IExecutionContext, created from that bucket's
+    // dedicated sub-engine (single profile pinned at min == opt == max ==
+    // bucket). The captured CUDA graph thus references kernels that were
+    // tuned specifically for that one shape.
     struct CachedBatchResources {
         std::unique_ptr<nvinfer1::IExecutionContext> context;
-        int profile_idx = 0;
         CudaBuffer<int32_t> input_buffer;
         CudaBuffer<float> value_buffer;
         CudaBuffer<float> value_probs_buffer;
@@ -525,8 +521,7 @@ private:
         cudaGraph_t graph = stream_.end_capture();
         res.graph_exec = CudaGraphExec(graph);
 
-        std::println("  Captured CUDA graph for batch size {} (profile {})",
-                     batch_size, res.profile_idx);
+        std::println("  Captured CUDA graph for bucket {}", batch_size);
     }
 
 public:
@@ -790,49 +785,51 @@ private:
     void setup_double_buffering() {
         size_t allocated = 0;
         for (int32_t batch_size : CACHED_BATCH_SIZES) {
-            int profile_idx = select_profile(batch_size);
-            if (profile_idx < 0) continue;
+            if (!has_bucket(batch_size)) continue;
             auto [it, _] = double_buffer_resources_.emplace(
                 std::piecewise_construct,
                 std::forward_as_tuple(batch_size),
                 std::forward_as_tuple(batch_size));
-            create_slot_contexts(it->second, profile_idx);
+            create_slot_contexts(it->second, batch_size);
             ++allocated;
         }
         std::println("  Set up double buffering for {} batch sizes", allocated);
     }
 
-    // Create the cached-batch context and bind it to the given profile.
-    void create_cached_context(CachedBatchResources& res, int profile_idx) {
+    // Create the cached-batch context from this bucket's sub-engine and bind
+    // it to profile 0 (the only profile in a per-bucket sub-engine).
+    void create_cached_context(CachedBatchResources& res, int32_t bucket_size) {
         if (res.context) return;
-        res.context.reset(engine_->createExecutionContext());
+        res.context.reset(engines_.at(bucket_size)->createExecutionContext());
         if (!res.context) {
-            throw std::runtime_error("Failed to create cached IExecutionContext");
+            throw std::runtime_error(std::format(
+                "Failed to create cached IExecutionContext for bucket {}", bucket_size));
         }
-        bind_profile(*res.context, profile_idx, stream_);
-        res.profile_idx = profile_idx;
+        bind_profile_zero(*res.context, stream_);
     }
 
-    // Create a dedicated IExecutionContext for each slot in `db`, bound to `profile_idx`.
-    // Separate contexts give each stream its own activation memory, enabling true
-    // concurrent execution of the two pipelined inferences.
-    void create_slot_contexts(DoubleBufferResources& db, int profile_idx) {
+    // Create a dedicated IExecutionContext for each slot in `db` from this
+    // bucket's sub-engine. Separate contexts give each stream its own
+    // activation memory, enabling true concurrent execution of the two
+    // pipelined inferences.
+    void create_slot_contexts(DoubleBufferResources& db, int32_t bucket_size) {
         for (auto& slot : db.buffers) {
             if (slot.context) continue;  // Already created
-            slot.context.reset(engine_->createExecutionContext());
+            slot.context.reset(engines_.at(bucket_size)->createExecutionContext());
             if (!slot.context) {
-                throw std::runtime_error("Failed to create slot IExecutionContext");
+                throw std::runtime_error(std::format(
+                    "Failed to create slot IExecutionContext for bucket {}", bucket_size));
             }
-            bind_profile(*slot.context, profile_idx, slot.stream);
+            bind_profile_zero(*slot.context, slot.stream);
         }
     }
 
-    // Bind a context to a TRT optimization profile and synchronize the stream
-    // so the binding is in effect before any subsequent setTensorAddress / capture.
-    static void bind_profile(nvinfer1::IExecutionContext& ctx, int profile_idx, CudaStream& stream) {
-        if (!ctx.setOptimizationProfileAsync(profile_idx, stream.get())) {
-            throw std::runtime_error(std::format(
-                "Failed to set optimization profile {} on context", profile_idx));
+    // Each per-bucket sub-engine has exactly one profile (index 0). Bind it
+    // and synchronize so it's in effect before any subsequent
+    // setTensorAddress / capture.
+    static void bind_profile_zero(nvinfer1::IExecutionContext& ctx, CudaStream& stream) {
+        if (!ctx.setOptimizationProfileAsync(0, stream.get())) {
+            throw std::runtime_error("Failed to set optimization profile 0 on context");
         }
         stream.synchronize();
     }
@@ -904,62 +901,62 @@ private:
                      batch_size, NUM_BUFFERS);
     }
 
-    // Pre-allocate resources for all cached batch sizes covered by some profile
+    // Pre-allocate resources for every bucket present in the .network.
     void preallocate_cached_buffers() {
         size_t allocated = 0;
         for (int32_t batch_size : CACHED_BATCH_SIZES) {
-            int profile_idx = select_profile(batch_size);
-            if (profile_idx < 0) continue;
+            if (!has_bucket(batch_size)) continue;
             auto [it, _] = cached_resources_.emplace(batch_size, CachedBatchResources(batch_size));
-            create_cached_context(it->second, profile_idx);
+            create_cached_context(it->second, batch_size);
             ++allocated;
         }
-        std::println("  Pre-allocated buffers for {} cached batch sizes (<= max {})",
+        std::println("  Pre-allocated buffers for {} cached buckets (<= max {})",
                      allocated, max_batch_size_);
     }
 
-    void load_engine(const fs::path& engine_path) {
-        // Read engine file
-        std::ifstream file(engine_path, std::ios::binary | std::ios::ate);
-        if (!file) {
-            throw std::runtime_error("Failed to open engine file: " + engine_path.string());
-        }
+    // Load a packed .network file: deserialize one ICudaEngine per bucket.
+    void load_engines(const fs::path& network_path) {
+        catgpt::NetworkFile file(network_path);
+        std::println("Loaded network file: {} ({:.1f} MB, {} sub-engine(s))",
+                     network_path.string(),
+                     file.file_size() / (1024.0 * 1024.0),
+                     file.sub_engines().size());
 
-        auto size = file.tellg();
-        file.seekg(0, std::ios::beg);
-
-        std::vector<char> engine_data(size);
-        if (!file.read(engine_data.data(), size)) {
-            throw std::runtime_error("Failed to read engine file");
-        }
-
-        std::println("Loaded engine file: {} ({:.1f} MB)", engine_path.string(),
-                     size / (1024.0 * 1024.0));
-
-        // Create runtime and deserialize engine
         runtime_.reset(nvinfer1::createInferRuntime(logger_));
         if (!runtime_) {
             throw std::runtime_error("Failed to create TensorRT runtime");
         }
 
-        engine_.reset(runtime_->deserializeCudaEngine(engine_data.data(), engine_data.size()));
-        if (!engine_) {
-            throw std::runtime_error("Failed to deserialize CUDA engine");
+        engines_.clear();
+        for (const auto& sub : file.sub_engines()) {
+            std::unique_ptr<nvinfer1::ICudaEngine> engine(
+                runtime_->deserializeCudaEngine(sub.blob.data(), sub.blob.size()));
+            if (!engine) {
+                throw std::runtime_error(std::format(
+                    "Failed to deserialize sub-engine for bucket {}", sub.bucket_size));
+            }
+            std::println("  Bucket {:>3}: {:.1f} MB",
+                         sub.bucket_size,
+                         sub.blob.size() / (1024.0 * 1024.0));
+            engines_.emplace(sub.bucket_size, std::move(engine));
         }
     }
 
     void setup_io() {
-        int num_io = engine_->getNbIOTensors();
+        // IO tensor names are identical across all sub-engines (same source
+        // ONNX). Pick the smallest-bucket engine to inspect.
+        nvinfer1::ICudaEngine& engine = *engines_.begin()->second;
+        int num_io = engine.getNbIOTensors();
         std::println("Engine has {} I/O tensors:", num_io);
 
         // Collect all policy-shaped outputs (batch x POLICY_SIZE) for ordered assignment
         std::vector<std::string> policy_outputs;
 
         for (int i = 0; i < num_io; ++i) {
-            const char* name = engine_->getIOTensorName(i);
-            auto mode = engine_->getTensorIOMode(name);
-            auto dims = engine_->getTensorShape(name);
-            auto dtype = engine_->getTensorDataType(name);
+            const char* name = engine.getIOTensorName(i);
+            auto mode = engine.getTensorIOMode(name);
+            auto dims = engine.getTensorShape(name);
+            auto dtype = engine.getTensorDataType(name);
 
             std::string dims_str = "(";
             for (int d = 0; d < dims.nbDims; ++d) {
@@ -1052,36 +1049,54 @@ private:
                      optimistic_policy_output_name_.empty() ? "(not found)" : optimistic_policy_output_name_);
     }
 
-    // Enumerate all optimization profiles and their batch-size ranges
-    void discover_profiles() {
-        int n = engine_->getNbOptimizationProfiles();
-        if (n < 1) {
-            throw std::runtime_error("Engine has no optimization profiles");
-        }
-
+    // Build the buckets_ list from loaded sub-engines and validate that each
+    // engine has exactly one profile pinned at min == opt == max == bucket.
+    void discover_buckets() {
         max_batch_size_ = 0;
-        profiles_.clear();
-        profiles_.reserve(n);
-        std::println("  Engine has {} optimization profile(s):", n);
-        for (int i = 0; i < n; ++i) {
-            auto min_dims = engine_->getProfileShape(
-                input_name_.c_str(), i, nvinfer1::OptProfileSelector::kMIN);
-            auto opt_dims = engine_->getProfileShape(
-                input_name_.c_str(), i, nvinfer1::OptProfileSelector::kOPT);
-            auto max_dims = engine_->getProfileShape(
-                input_name_.c_str(), i, nvinfer1::OptProfileSelector::kMAX);
-            ProfileRange p{i, min_dims.d[0], opt_dims.d[0], max_dims.d[0]};
-            profiles_.push_back(p);
-            max_batch_size_ = std::max(max_batch_size_, p.max_batch);
-            std::println("    Profile {}: min={}, opt={}, max={}",
-                         p.profile_idx, p.min_batch, p.opt_batch, p.max_batch);
+        buckets_.clear();
+        buckets_.reserve(engines_.size());
+
+        // Collect bucket sizes in ascending order.
+        std::vector<int32_t> ordered;
+        ordered.reserve(engines_.size());
+        for (const auto& [b, _] : engines_) ordered.push_back(b);
+        std::ranges::sort(ordered);
+
+        std::println("  .network has {} bucket(s):", ordered.size());
+        for (int32_t b : ordered) {
+            auto& engine = *engines_.at(b);
+            const int n = engine.getNbOptimizationProfiles();
+            if (n != 1) {
+                throw std::runtime_error(std::format(
+                    "Sub-engine for bucket {} has {} optimization profile(s); "
+                    "expected exactly 1 (rebuild with scripts/trt.sh).", b, n));
+            }
+            auto min_dims = engine.getProfileShape(
+                input_name_.c_str(), 0, nvinfer1::OptProfileSelector::kMIN);
+            auto opt_dims = engine.getProfileShape(
+                input_name_.c_str(), 0, nvinfer1::OptProfileSelector::kOPT);
+            auto max_dims = engine.getProfileShape(
+                input_name_.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+            if (opt_dims.d[0] != b || min_dims.d[0] != b || max_dims.d[0] != b) {
+                throw std::runtime_error(std::format(
+                    "Sub-engine for bucket {} has profile (min={}, opt={}, max={}); "
+                    "expected all == {}.",
+                    b, min_dims.d[0], opt_dims.d[0], max_dims.d[0], b));
+            }
+            buckets_.push_back(BucketInfo{b});
+            max_batch_size_ = std::max(max_batch_size_, b);
+            std::println("    Bucket {:>3} (min={}, opt={}, max={})",
+                         b, min_dims.d[0], opt_dims.d[0], max_dims.d[0]);
         }
         std::println("  Overall max batch size: {}", max_batch_size_);
     }
 
     Logger& logger_;
     std::unique_ptr<nvinfer1::IRuntime> runtime_;
-    std::unique_ptr<nvinfer1::ICudaEngine> engine_;
+
+    // bucket_size -> ICudaEngine. One sub-engine per bucket, deserialized
+    // from a packed .network file.
+    std::unordered_map<int32_t, std::unique_ptr<nvinfer1::ICudaEngine>> engines_;
 
     std::string input_name_;
     std::string value_output_name_;
@@ -1090,8 +1105,8 @@ private:
     std::string policy_output_name_;
     std::string optimistic_policy_output_name_;
 
-    std::vector<ProfileRange> profiles_;  // Discovered TRT optimization profiles
-    int32_t max_batch_size_ = 1;  // Largest max_batch across all profiles
+    std::vector<BucketInfo> buckets_;  // Buckets present in the .network, ascending
+    int32_t max_batch_size_ = 1;  // Largest bucket size
 
     CudaStream stream_;  // Stream used for single-mode capture/launch (graphs are stream-agnostic)
 
@@ -1124,15 +1139,16 @@ void print_cuda_info() {
 }
 
 void print_usage(const char* prog) {
-    std::println("Usage: {} [ENGINE_PATH] [OPTIONS]", prog);
+    std::println("Usage: {} [NETWORK_PATH] [OPTIONS]", prog);
     std::println("");
     std::println("Arguments:");
-    std::println("  ENGINE_PATH         Path to the .trt engine file");
-    std::println("                      (default: /home/shadeform/CatGPT/test.trt)");
+    std::println("  NETWORK_PATH        Path to a packed .network file (multi-engine bundle).");
+    std::println("                      (default: /home/shadeform/CatGPT/main.network)");
     std::println("");
     std::println("Options:");
     std::println("  -b, --batch N       Benchmark only batch size N (single + pipelined).");
-    std::println("                      Skips the default sweep.");
+    std::println("                      Must be one of the bucket sizes baked into the");
+    std::println("                      .network file. Skips the default sweep.");
     std::println("  -h, --help          Show this help message.");
 }
 
@@ -1140,8 +1156,7 @@ int main(int argc, char* argv[]) {
     print_header();
     print_cuda_info();
 
-    // Defaults (override via CLI args)
-    fs::path engine_path = "/home/shadeform/CatGPT/test.trt";
+    fs::path engine_path = "/home/shadeform/CatGPT/main.network";
     int32_t target_batch_size = 0;  // 0 = default sweep
 
     // Simple positional + flag parsing
@@ -1173,13 +1188,13 @@ int main(int argc, char* argv[]) {
     }
 
     if (!fs::exists(engine_path)) {
-        std::println(stderr, "Error: Engine file not found: {}", engine_path.string());
+        std::println(stderr, "Error: .network file not found: {}", engine_path.string());
         return 1;
     }
 
     try {
         Logger logger;
-        std::println("\n┌─ Loading TensorRT Engine ────────────────────────────────────┐");
+        std::println("\n┌─ Loading .network ───────────────────────────────────────────┐");
         TrtEngine engine(engine_path, logger);
         std::println("└───────────────────────────────────────────────────────────────┘");
 
@@ -1250,20 +1265,17 @@ int main(int argc, char* argv[]) {
         }
         std::println("└───────────────────────────────────────────────────────────────┘");
 
-        // Choose batch sizes: either a single targeted size, or a default sweep
+        // Choose batch sizes: either a single targeted bucket, or a default
+        // sweep of every bucket present in the .network. register_batch_size
+        // throws with the available-buckets list if the user picks something
+        // that isn't a bucket.
         std::vector<int32_t> batch_sizes;
         if (target_batch_size > 0) {
-            if (target_batch_size > engine.max_batch_size()) {
-                std::println(stderr,
-                             "Error: requested batch size {} exceeds engine max {}",
-                             target_batch_size, engine.max_batch_size());
-                return 1;
-            }
             engine.register_batch_size(target_batch_size);
             batch_sizes.push_back(target_batch_size);
         } else {
-            for (int32_t bs : {1, 2, 4, 8, 16, 32, 64, 128, 256}) {
-                if (bs <= engine.max_batch_size()) batch_sizes.push_back(bs);
+            for (int32_t bs : TrtEngine::CACHED_BATCH_SIZES) {
+                if (engine.has_bucket(bs)) batch_sizes.push_back(bs);
             }
         }
 

@@ -8,15 +8,17 @@
  * lazy_pool via pool_->schedule(h). The pool's notifier wakes a
  * worker which then runs lf::resume(h) and the task continues.
  *
- * Bucketed batching:
- *   - The engine is built with one optimization profile per bucket size
- *     in `kBucketSizes` (see scripts/trt.sh). Each bucket has a profile
- *     pinned at min == opt == max, so kernels are tuned for that exact
- *     batch size.
- *   - Each bucket gets its own IExecutionContext bound to its profile,
- *     with input shape and tensor addresses preset at construction. The
- *     H2D copy, enqueueV3, and D2H copies are then captured into a
- *     per-bucket cudaGraphExec, so the hot path is just:
+ * Multi-engine bucketed batching:
+ *   - The .network file (built by scripts/trt.sh + scripts/pack_network.py)
+ *     contains ONE TensorRT engine PER bucket size in `kBucketSizes`. Each
+ *     engine has a single optimization profile pinned at min == opt == max,
+ *     so kernel selection is tuned for exactly that shape (no cross-profile
+ *     compromise).
+ *   - We deserialize one ICudaEngine per bucket and create one
+ *     IExecutionContext per bucket. Each context has input shape and tensor
+ *     addresses preset at construction. The H2D copy, enqueueV3, and D2H
+ *     copies are then captured into a per-bucket cudaGraphExec, so the hot
+ *     path is just:
  *       host memcpy into pinned input → cudaGraphLaunch →
  *       cudaStreamSynchronize → host memcpy out of pinned outputs.
  *     No setInputShape, no setTensorAddress, no per-launch TRT setup,
@@ -49,6 +51,7 @@
 #include <libfork/core.hpp>
 #include <libfork/schedule.hpp>
 
+#include "../engine/network_file.hpp"
 #include "../engine/policy.hpp"
 #include "../engine/trt_evaluator.hpp"  // VALUE_NUM_BINS, TrtLogger, CATGPT_CUDA_CHECK
 #include "eval_request.hpp"
@@ -80,7 +83,8 @@ public:
     };
 
     /**
-     * @param engine_path   Path to the serialized TensorRT engine.
+     * @param network_path  Path to the serialized .network file (multi-engine
+     *                      bundle, one engine per bucket).
      * @param pool          Non-owning pointer to the libfork lazy_pool
      *                      (suspended tasks are handed back here after
      *                      GPU eval via pool->schedule(handle)).
@@ -89,7 +93,7 @@ public:
      *                      <= max_batch_size are usable. Effective max
      *                      batch is the largest bucket <= max_batch_size.
      */
-    BatchEvaluator(const fs::path& engine_path,
+    BatchEvaluator(const fs::path& network_path,
                    lf::lazy_pool* pool,
                    int max_batch_size = 32)
         : pool_(pool)
@@ -98,9 +102,9 @@ public:
         , total_evals_(0)
     {
         compute_effective_buckets();
-        load_engine(engine_path);
+        load_engines(network_path);
         setup_io();
-        discover_profiles();
+        validate_profiles();
         allocate_buffers();
         setup_contexts();
         capture_graphs();
@@ -120,8 +124,9 @@ public:
         graph_execs_.clear();
 
         // Destroy execution contexts before freeing the stream/buffers
-        // they were bound to (and before the engine that produced them).
+        // they were bound to (and before the engines that produced them).
         contexts_.clear();
+        engines_.clear();
 
         // Free CUDA resources
         if (stream_) cudaStreamDestroy(stream_);
@@ -281,40 +286,63 @@ private:
 
     // ─── TensorRT setup ─────────────────────────────────────────────────
 
-    void load_engine(const fs::path& engine_path) {
-        std::ifstream file(engine_path, std::ios::binary | std::ios::ate);
-        if (!file) {
-            throw std::runtime_error("Failed to open engine file: " + engine_path.string());
-        }
-
-        auto size = file.tellg();
-        file.seekg(0, std::ios::beg);
-
-        std::vector<char> engine_data(size);
-        if (!file.read(engine_data.data(), size)) {
-            throw std::runtime_error("Failed to read engine file");
-        }
-
-        std::println(stderr, "[BatchEvaluator] Loaded engine: {} ({:.1f} MB)",
-                     engine_path.string(), static_cast<double>(size) / (1024.0 * 1024.0));
+    void load_engines(const fs::path& network_path) {
+        NetworkFile file(network_path);
+        std::println(stderr,
+                     "[BatchEvaluator] Loaded {} ({:.1f} MB, {} sub-engine(s))",
+                     network_path.string(),
+                     static_cast<double>(file.file_size()) / (1024.0 * 1024.0),
+                     file.sub_engines().size());
 
         runtime_.reset(nvinfer1::createInferRuntime(logger_));
         if (!runtime_) throw std::runtime_error("Failed to create TensorRT runtime");
 
-        engine_.reset(runtime_->deserializeCudaEngine(engine_data.data(), engine_data.size()));
-        if (!engine_) throw std::runtime_error("Failed to deserialize CUDA engine");
+        engines_.clear();
+        for (const auto& sub : file.sub_engines()) {
+            std::unique_ptr<nvinfer1::ICudaEngine> engine(
+                runtime_->deserializeCudaEngine(sub.blob.data(), sub.blob.size()));
+            if (!engine) {
+                throw std::runtime_error(std::format(
+                    "Failed to deserialize sub-engine for bucket {}", sub.bucket_size));
+            }
+            engines_.emplace(sub.bucket_size, std::move(engine));
+        }
+
+        // Validate every effective bucket has a corresponding sub-engine.
+        for (int b : effective_buckets_) {
+            if (!engines_.contains(b)) {
+                std::string expected;
+                for (int e : effective_buckets_) {
+                    if (!expected.empty()) expected += ", ";
+                    expected += std::to_string(e);
+                }
+                std::string discovered;
+                for (const auto& [k, _] : engines_) {
+                    if (!discovered.empty()) discovered += ", ";
+                    discovered += std::to_string(k);
+                }
+                throw std::runtime_error(std::format(
+                    "NetworkFile {} missing sub-engine for bucket {}. "
+                    "Expected (effective): [{}]. Found in file: [{}]. "
+                    "Rebuild with scripts/trt.sh.",
+                    network_path.string(), b, expected, discovered));
+            }
+        }
     }
 
     void setup_io() {
-        int num_io = engine_->getNbIOTensors();
+        // IO tensor names are identical across all sub-engines (same ONNX
+        // source). Use any engine — pick the one for the smallest bucket.
+        nvinfer1::ICudaEngine& engine = *engines_.begin()->second;
+        int num_io = engine.getNbIOTensors();
 
         // Collect all policy-shaped outputs for later assignment
         std::vector<std::string> policy_outputs;
 
         for (int i = 0; i < num_io; ++i) {
-            const char* name = engine_->getIOTensorName(i);
-            auto mode = engine_->getTensorIOMode(name);
-            auto dims = engine_->getTensorShape(name);
+            const char* name = engine.getIOTensorName(i);
+            auto mode = engine.getTensorIOMode(name);
+            auto dims = engine.getTensorShape(name);
             std::string name_str(name);
 
             if (mode == nvinfer1::TensorIOMode::kINPUT) {
@@ -449,55 +477,39 @@ private:
     }
 
     /**
-     * Enumerate optimization profiles in the engine and build
-     * bucket_to_profile_. Throws if any expected bucket (in
-     * effective_buckets_) is missing.
+     * Sanity-check each per-bucket sub-engine: must contain exactly one
+     * optimization profile pinned at min == opt == max == bucket. If the
+     * .network file was built by scripts/pack_network.py from per-bucket
+     * trtexec runs, this is automatically true; this validation guards
+     * against hand-crafted or stale .network files.
      */
-    void discover_profiles() {
-        const int num_profiles = engine_->getNbOptimizationProfiles();
-        if (num_profiles < 1) {
-            throw std::runtime_error("Engine has no optimization profiles");
-        }
-
-        bucket_to_profile_.clear();
-        for (int i = 0; i < num_profiles; ++i) {
-            auto opt_dims = engine_->getProfileShape(
-                input_name_.c_str(), i, nvinfer1::OptProfileSelector::kOPT);
-            if (opt_dims.nbDims < 1) continue;
-            const int batch = static_cast<int>(opt_dims.d[0]);
-            bucket_to_profile_[batch] = i;
-        }
-
-        // Validate: every effective bucket has a matching profile.
+    void validate_profiles() {
         for (int b : effective_buckets_) {
-            if (!bucket_to_profile_.contains(b)) {
-                std::string expected;
-                for (int e : effective_buckets_) {
-                    if (!expected.empty()) expected += ", ";
-                    expected += std::to_string(e);
-                }
-                std::string discovered;
-                for (const auto& [k, v] : bucket_to_profile_) {
-                    if (!discovered.empty()) discovered += ", ";
-                    discovered += std::to_string(k);
-                }
+            auto& engine = *engines_.at(b);
+            const int n = engine.getNbOptimizationProfiles();
+            if (n != 1) {
                 throw std::runtime_error(std::format(
-                    "Engine missing optimization profile for bucket {}. "
-                    "Expected (effective): [{}]. Discovered (in engine): [{}]. "
-                    "Rebuild the engine with scripts/trt.sh.",
-                    b, expected, discovered));
+                    "Sub-engine for bucket {} has {} optimization profile(s); "
+                    "expected exactly 1 (rebuild with scripts/trt.sh).", b, n));
+            }
+            auto opt = engine.getProfileShape(
+                input_name_.c_str(), 0, nvinfer1::OptProfileSelector::kOPT);
+            if (opt.nbDims < 1 || opt.d[0] != b) {
+                throw std::runtime_error(std::format(
+                    "Sub-engine for bucket {} has profile opt batch {}, expected {}.",
+                    b, opt.nbDims < 1 ? -1 : opt.d[0], b));
             }
         }
-
-        std::println(stderr, "[BatchEvaluator] Discovered {} optimization profile(s); "
-                             "all {} effective bucket(s) covered",
-                     num_profiles, effective_buckets_.size());
+        std::println(stderr,
+                     "[BatchEvaluator] Validated {} per-bucket sub-engine(s)",
+                     effective_buckets_.size());
     }
 
     /**
-     * Create one IExecutionContext per effective bucket, bind it to the
-     * bucket's profile, set input shape (min == opt == max), and bind
-     * tensor addresses to the shared d_* device buffers.
+     * Create one IExecutionContext per effective bucket from that bucket's
+     * own per-bucket sub-engine, bind it to profile 0 (the only profile,
+     * pinned min == opt == max == bucket), set input shape, and bind tensor
+     * addresses to the shared d_* device buffers.
      *
      * After this, the hot path never touches setInputShape /
      * setTensorAddress / setOptimizationProfileAsync.
@@ -507,23 +519,21 @@ private:
         contexts_.reserve(effective_buckets_.size());
 
         for (int b : effective_buckets_) {
-            const int profile_idx = bucket_to_profile_.at(b);
-
             std::unique_ptr<nvinfer1::IExecutionContext> ctx(
-                engine_->createExecutionContext());
+                engines_.at(b)->createExecutionContext());
             if (!ctx) {
                 throw std::runtime_error(std::format(
                     "Failed to create IExecutionContext for bucket {}", b));
             }
 
-            if (!ctx->setOptimizationProfileAsync(profile_idx, stream_)) {
+            // Each sub-engine has exactly one profile (index 0).
+            if (!ctx->setOptimizationProfileAsync(0, stream_)) {
                 throw std::runtime_error(std::format(
-                    "Failed to bind optimization profile {} for bucket {}",
-                    profile_idx, b));
+                    "Failed to bind optimization profile 0 for bucket {}", b));
             }
             CATGPT_CUDA_CHECK(cudaStreamSynchronize(stream_));
 
-            // min == opt == max for these profiles, so this is one-time.
+            // min == opt == max for this profile, so this is one-time.
             nvinfer1::Dims input_dims;
             input_dims.nbDims = 2;
             input_dims.d[0] = b;
@@ -678,18 +688,20 @@ private:
     // TensorRT state
     TrtLogger logger_;
     std::unique_ptr<nvinfer1::IRuntime> runtime_;
-    std::unique_ptr<nvinfer1::ICudaEngine> engine_;
+
+    // bucket_size -> ICudaEngine. One sub-engine per bucket, deserialized
+    // from a packed .network file (see scripts/pack_network.py). Each engine
+    // has exactly one optimization profile pinned at min == opt == max ==
+    // bucket, so kernels are tuned for that exact shape.
+    std::unordered_map<int, std::unique_ptr<nvinfer1::ICudaEngine>> engines_;
 
     // Buckets <= max_batch_size_, ascending. Source of truth for
     // pick_bucket and the keys of contexts_.
     std::vector<int> effective_buckets_;
 
-    // bucket_size -> engine optimization profile index, populated by
-    // discover_profiles() at construction.
-    std::unordered_map<int, int> bucket_to_profile_;
-
-    // bucket_size -> IExecutionContext. Each context is bound to its
-    // bucket's profile with input shape and tensor addresses preset.
+    // bucket_size -> IExecutionContext. Each context is created from its
+    // bucket's own sub-engine, bound to profile 0, with input shape and
+    // tensor addresses preset.
     std::unordered_map<int, std::unique_ptr<nvinfer1::IExecutionContext>> contexts_;
 
     // bucket_size -> captured cudaGraphExec wrapping H2D + enqueueV3 +
