@@ -984,10 +984,17 @@ private:
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - t0).count();
             const long long mss = static_cast<long long>(ms);
+            // UCI's `depth` field is integer-valued (cutechess parses via
+            // QString::toInt and most other GUIs do the same). Encode our
+            // log-scale fractional depth as centi-depth so two ID steps of
+            // delta=0.2 advance the field by 20 each.
+            const long depth_centi = std::isfinite(min_d)
+                ? std::lround(min_d * 100.0f)
+                : 0L;
             char buf[224];
             std::snprintf(buf, sizeof(buf),
-                "info depth %.2f nodes %llu tt_claims %llu time %lld nps %lld",
-                std::isfinite(min_d) ? min_d : 0.0f,
+                "info depth %ld nodes %llu tt_claims %llu time %lld nps %lld",
+                depth_centi,
                 static_cast<unsigned long long>(evals_sum),
                 static_cast<unsigned long long>(claims_sum),
                 mss,
