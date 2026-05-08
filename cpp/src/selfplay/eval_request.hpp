@@ -41,13 +41,11 @@ class BatchEvaluator;
  * The model exports:
  *   value            — WDL-derived Q value P(W)+0.5*P(D) in [0, 1]
  *   value_probs      — BestQ HL-Gauss distribution (81 bins)
- *   wdl              — Win/Draw/Loss probabilities [W, D, L]
  *   policy           — Move distribution logits (4672)
  */
 struct RawNNOutput {
     float value;                                    // WDL-derived Q value [0, 1]
     std::array<float, VALUE_NUM_BINS> value_probs;  // BestQ distribution (81 bins)
-    std::array<float, 3> wdl;                       // Win/Draw/Loss probabilities [W, D, L]
     std::array<float, POLICY_SIZE> policy;          // Policy logits (4672)
 };
 

@@ -6,7 +6,6 @@
  *   - Input:                int32   (batch, 64)   - chess position tokens
  *   - Output wdl_value:     float32 (batch,)      - WDL-derived Q value [-1, 1] (or [0, 1])
  *   - Output bestq_probs:   float32 (batch, 81)   - HL-Gauss value distribution
- *   - Output wdl_probs:     float32 (batch, 3)    - Win/Draw/Loss probabilities
  *   - Output policy:        float32 (batch, 4672) - policy logits
  */
 
@@ -293,14 +292,10 @@ private:
 
 // Number of bins in the HL-Gauss value distribution
 static constexpr int32_t VALUE_NUM_BINS = 81;
-// Number of WDL classes (Win, Draw, Loss)
-static constexpr int32_t WDL_NUM_BINS = 3;
-
 // Inference result containing all model outputs
 struct InferenceResult {
     std::vector<float> values;                     // (batch,) - WDL-derived Q value
     std::vector<float> value_probs;                // (batch * VALUE_NUM_BINS) - bestq HL-Gauss distribution
-    std::vector<float> wdl_probs;                  // (batch * WDL_NUM_BINS) - W/D/L probabilities
     std::vector<float> policy_logits;              // (batch * POLICY_SIZE) - policy logits
 };
 
@@ -395,12 +390,10 @@ private:
         CudaBuffer<int32_t> input_buffer;
         CudaBuffer<float> value_buffer;
         CudaBuffer<float> value_probs_buffer;
-        CudaBuffer<float> wdl_buffer;
         CudaBuffer<float> policy_buffer;
         PinnedBuffer<int32_t> pinned_input;
         PinnedBuffer<float> pinned_value;
         PinnedBuffer<float> pinned_value_probs;
-        PinnedBuffer<float> pinned_wdl;
         PinnedBuffer<float> pinned_policy;
         CudaGraphExec graph_exec;
 
@@ -408,12 +401,10 @@ private:
             : input_buffer(batch_size * SEQ_LENGTH),
               value_buffer(batch_size),
               value_probs_buffer(batch_size * VALUE_NUM_BINS),
-              wdl_buffer(batch_size * WDL_NUM_BINS),
               policy_buffer(batch_size * POLICY_SIZE),
               pinned_input(batch_size * SEQ_LENGTH),
               pinned_value(batch_size),
               pinned_value_probs(batch_size * VALUE_NUM_BINS),
-              pinned_wdl(batch_size * WDL_NUM_BINS),
               pinned_policy(batch_size * POLICY_SIZE) {}
     };
 
@@ -437,13 +428,10 @@ private:
         InferenceResult result;
         result.values.resize(batch_size);
         result.value_probs.resize(batch_size * VALUE_NUM_BINS);
-        result.wdl_probs.resize(batch_size * WDL_NUM_BINS);
         result.policy_logits.resize(batch_size * POLICY_SIZE);
         std::memcpy(result.values.data(), res.pinned_value.get(), batch_size * sizeof(float));
         std::memcpy(result.value_probs.data(), res.pinned_value_probs.get(),
                     batch_size * VALUE_NUM_BINS * sizeof(float));
-        std::memcpy(result.wdl_probs.data(), res.pinned_wdl.get(),
-                    batch_size * WDL_NUM_BINS * sizeof(float));
         std::memcpy(result.policy_logits.data(), res.pinned_policy.get(),
                     batch_size * POLICY_SIZE * sizeof(float));
 
@@ -460,9 +448,6 @@ private:
         if (!value_probs_output_name_.empty()) {
             ctx.setTensorAddress(value_probs_output_name_.c_str(), res.value_probs_buffer.get());
         }
-        if (!wdl_output_name_.empty()) {
-            ctx.setTensorAddress(wdl_output_name_.c_str(), res.wdl_buffer.get());
-        }
         ctx.setTensorAddress(policy_output_name_.c_str(), res.policy_buffer.get());
 
         nvinfer1::Dims input_dims;
@@ -473,7 +458,6 @@ private:
 
         size_t input_count = batch_size * SEQ_LENGTH;
         size_t value_probs_count = batch_size * VALUE_NUM_BINS;
-        size_t wdl_count = batch_size * WDL_NUM_BINS;
         size_t policy_count = batch_size * POLICY_SIZE;
 
         // Begin graph capture
@@ -493,9 +477,6 @@ private:
         res.value_buffer.copy_to_host_async(res.pinned_value.get(), batch_size, stream_.get());
         if (!value_probs_output_name_.empty()) {
             res.value_probs_buffer.copy_to_host_async(res.pinned_value_probs.get(), value_probs_count, stream_.get());
-        }
-        if (!wdl_output_name_.empty()) {
-            res.wdl_buffer.copy_to_host_async(res.pinned_wdl.get(), wdl_count, stream_.get());
         }
         res.policy_buffer.copy_to_host_async(res.pinned_policy.get(), policy_count, stream_.get());
 
@@ -565,7 +546,6 @@ public:
     struct PipelinedResult {
         std::vector<float> values;
         std::vector<float> value_probs;
-        std::vector<float> wdl_probs;
         std::vector<float> policies;
     };
 
@@ -582,17 +562,14 @@ public:
         }
 
         auto& db = it->second;
-        const bool has_wdl = !wdl_output_name_.empty();
 
         PipelinedResult result;
         result.values.reserve(batches.size() * batch_size);
         result.value_probs.reserve(batches.size() * batch_size * VALUE_NUM_BINS);
-        if (has_wdl) result.wdl_probs.reserve(batches.size() * batch_size * WDL_NUM_BINS);
         result.policies.reserve(batches.size() * batch_size * POLICY_SIZE);
 
         const size_t input_count = batch_size * SEQ_LENGTH;
         const size_t value_probs_count = batch_size * VALUE_NUM_BINS;
-        const size_t wdl_count = batch_size * WDL_NUM_BINS;
         const size_t policy_count = batch_size * POLICY_SIZE;
 
         // Lazily capture per-slot CUDA graphs on first call for this batch size.
@@ -618,11 +595,6 @@ public:
                 result.value_probs.insert(result.value_probs.end(),
                                           out_buf.pinned_value_probs.get(),
                                           out_buf.pinned_value_probs.get() + value_probs_count);
-                if (has_wdl) {
-                    result.wdl_probs.insert(result.wdl_probs.end(),
-                                            out_buf.pinned_wdl.get(),
-                                            out_buf.pinned_wdl.get() + wdl_count);
-                }
                 result.policies.insert(result.policies.end(),
                                        out_buf.pinned_policy.get(),
                                        out_buf.pinned_policy.get() + policy_count);
@@ -650,11 +622,6 @@ public:
             result.value_probs.insert(result.value_probs.end(),
                                       buf.pinned_value_probs.get(),
                                       buf.pinned_value_probs.get() + value_probs_count);
-            if (has_wdl) {
-                result.wdl_probs.insert(result.wdl_probs.end(),
-                                        buf.pinned_wdl.get(),
-                                        buf.pinned_wdl.get() + wdl_count);
-            }
             result.policies.insert(result.policies.end(),
                                    buf.pinned_policy.get(),
                                    buf.pinned_policy.get() + policy_count);
@@ -719,24 +686,20 @@ private:
         CudaBuffer<int32_t> input_buffer;
         CudaBuffer<float> value_buffer;
         CudaBuffer<float> value_probs_buffer;
-        CudaBuffer<float> wdl_buffer;
         CudaBuffer<float> policy_buffer;
         PinnedBuffer<int32_t> pinned_input;
         PinnedBuffer<float> pinned_value;
         PinnedBuffer<float> pinned_value_probs;
-        PinnedBuffer<float> pinned_wdl;
         PinnedBuffer<float> pinned_policy;
 
         DoubleBufferSlot(int32_t batch_size)
             : input_buffer(batch_size * SEQ_LENGTH),
               value_buffer(batch_size),
               value_probs_buffer(batch_size * VALUE_NUM_BINS),
-              wdl_buffer(batch_size * WDL_NUM_BINS),
               policy_buffer(batch_size * POLICY_SIZE),
               pinned_input(batch_size * SEQ_LENGTH),
               pinned_value(batch_size),
               pinned_value_probs(batch_size * VALUE_NUM_BINS),
-              pinned_wdl(batch_size * WDL_NUM_BINS),
               pinned_policy(batch_size * POLICY_SIZE) {}
     };
 
@@ -805,7 +768,6 @@ private:
     void capture_double_buffer_graph(int32_t batch_size, DoubleBufferResources& db) {
         const size_t input_count = batch_size * SEQ_LENGTH;
         const size_t value_probs_count = batch_size * VALUE_NUM_BINS;
-        const size_t wdl_count = batch_size * WDL_NUM_BINS;
         const size_t policy_count = batch_size * POLICY_SIZE;
 
         nvinfer1::Dims input_dims;
@@ -822,9 +784,6 @@ private:
             if (!value_probs_output_name_.empty()) {
                 slot.context->setTensorAddress(value_probs_output_name_.c_str(),
                                                slot.value_probs_buffer.get());
-            }
-            if (!wdl_output_name_.empty()) {
-                slot.context->setTensorAddress(wdl_output_name_.c_str(), slot.wdl_buffer.get());
             }
             slot.context->setTensorAddress(policy_output_name_.c_str(), slot.policy_buffer.get());
             slot.context->setInputShape(input_name_.c_str(), input_dims);
@@ -844,9 +803,6 @@ private:
             if (!value_probs_output_name_.empty()) {
                 slot.value_probs_buffer.copy_to_host_async(slot.pinned_value_probs.get(),
                                                            value_probs_count, slot.stream.get());
-            }
-            if (!wdl_output_name_.empty()) {
-                slot.wdl_buffer.copy_to_host_async(slot.pinned_wdl.get(), wdl_count, slot.stream.get());
             }
             slot.policy_buffer.copy_to_host_async(slot.pinned_policy.get(), policy_count, slot.stream.get());
 
@@ -939,16 +895,8 @@ private:
             // Try to match by name first (order matters: check specific names before generic).
             // jax2onnx auto-generates names like "softmax_out_33", so we fall through
             // to shape-based detection for those.
-            if (name_str.find("wdl") != std::string::npos ||
-                name_str.find("WDL") != std::string::npos) {
-                // Distinguish wdl_probs (batch, 3) from wdl_value (batch,)
-                if (dims.nbDims == 2 && dims.d[1] == WDL_NUM_BINS) {
-                    wdl_output_name_ = name;
-                } else {
-                    value_output_name_ = name;
-                }
-            } else if (name_str.find("bestq_probs") != std::string::npos ||
-                       name_str.find("value_probs") != std::string::npos) {
+            if (name_str.find("bestq_probs") != std::string::npos ||
+                name_str.find("value_probs") != std::string::npos) {
                 value_probs_output_name_ = name;
             } else if (name_str.find("value") != std::string::npos ||
                        name_str.find("Value") != std::string::npos) {
@@ -959,13 +907,10 @@ private:
             } else {
                 // Fallback: detect by shape
                 //   wdl_value:   (batch,) or (batch, 1)
-                //   wdl_probs:   (batch, 3)
                 //   value_probs: (batch, 81)
                 //   policy:      (batch, 4672)
                 if (dims.nbDims == 1 || (dims.nbDims == 2 && dims.d[1] == 1)) {
                     if (value_output_name_.empty()) value_output_name_ = name;
-                } else if (dims.nbDims == 2 && dims.d[1] == WDL_NUM_BINS) {
-                    if (wdl_output_name_.empty()) wdl_output_name_ = name;
                 } else if (dims.nbDims == 2 && dims.d[1] == VALUE_NUM_BINS) {
                     if (value_probs_output_name_.empty()) value_probs_output_name_ = name;
                 } else if (dims.nbDims == 2 && dims.d[1] == POLICY_SIZE) {
@@ -994,8 +939,6 @@ private:
         std::println("  -> Value output: '{}'", value_output_name_);
         std::println("  -> Value probs output: '{}'",
                      value_probs_output_name_.empty() ? "(not found)" : value_probs_output_name_);
-        std::println("  -> WDL probs output: '{}'",
-                     wdl_output_name_.empty() ? "(not found)" : wdl_output_name_);
         std::println("  -> Policy output: '{}'", policy_output_name_);
     }
 
@@ -1051,7 +994,6 @@ private:
     std::string input_name_;
     std::string value_output_name_;
     std::string value_probs_output_name_;
-    std::string wdl_output_name_;
     std::string policy_output_name_;
 
     std::vector<BucketInfo> buckets_;  // Buckets present in the .network, ascending
@@ -1166,12 +1108,6 @@ int main(int argc, char* argv[]) {
                 float mode_value = static_cast<float>(mode_bin) / (VALUE_NUM_BINS - 1);
                 std::println("│   BestQ dist: mode bin={} (v={:.3f}, p={:.4f})",
                              mode_bin, mode_value, max_prob);
-            }
-
-            // Show WDL probabilities
-            if (!result.wdl_probs.empty()) {
-                std::println("│   WDL: W={:.4f}  D={:.4f}  L={:.4f}",
-                             result.wdl_probs[0], result.wdl_probs[1], result.wdl_probs[2]);
             }
 
             // Show top-5 policy logits (argmax)

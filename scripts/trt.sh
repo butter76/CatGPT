@@ -15,7 +15,6 @@
 # ONNX outputs (auto-detected by TRT):
 #   wdl_value    — WDL-derived Q value, scalar (batch,)
 #   bestq_probs  — BestQ HL-Gauss distribution (batch, 81)
-#   wdl_probs    — Win/Draw/Loss probabilities (batch, 3)
 #   policy_logit — Move distribution logits (batch, 4672)
 
 set -euo pipefail

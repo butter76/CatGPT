@@ -8,7 +8,6 @@
 # Outputs (in order):
 #   wdl_value    — WDL-derived Q value, scalar (batch,)
 #   bestq_probs  — BestQ HL-Gauss distribution (batch, 81)
-#   wdl_probs    — Win/Draw/Loss probabilities (batch, 3)
 #   policy_logit — Move distribution logits (batch, 4672)
 #
 # Usage: ./export-onnx.sh [checkpoint_path]
@@ -18,7 +17,7 @@ set -e
 uv run python scripts/export_onnx.py \
     --checkpoint ./checkpoints_jax/S1/shard_14 \
     --output-path main.onnx \
-    --output-keys wdl_value bestq_probs wdl_probs policy_logit \
+    --output-keys wdl_value bestq_probs policy_logit \
     --dynamic-batch \
     --opset 20 \
     --validate

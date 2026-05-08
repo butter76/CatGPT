@@ -134,12 +134,10 @@ public:
         if (d_input_) cudaFree(d_input_);
         if (d_value_) cudaFree(d_value_);
         if (d_value_probs_) cudaFree(d_value_probs_);
-        if (d_wdl_) cudaFree(d_wdl_);
         if (d_policy_) cudaFree(d_policy_);
         if (h_input_) cudaFreeHost(h_input_);
         if (h_value_) cudaFreeHost(h_value_);
         if (h_value_probs_) cudaFreeHost(h_value_probs_);
-        if (h_wdl_) cudaFreeHost(h_wdl_);
         if (h_policy_) cudaFreeHost(h_policy_);
     }
 
@@ -253,13 +251,6 @@ private:
             std::memcpy(req->result.value_probs.data(),
                         h_value_probs_ + b * VALUE_NUM_BINS,
                         VALUE_NUM_BINS * sizeof(float));
-            if (!wdl_output_name_.empty()) {
-                std::memcpy(req->result.wdl.data(),
-                            h_wdl_ + b * 3,
-                            3 * sizeof(float));
-            } else {
-                req->result.wdl = {0.0f, 1.0f, 0.0f};  // Default to draw
-            }
             std::memcpy(req->result.policy.data(),
                         h_policy_ + b * POLICY_SIZE,
                         POLICY_SIZE * sizeof(float));
@@ -341,16 +332,8 @@ private:
             }
 
             // Match by name first (specific names before generic)
-            if (name_str.find("wdl") != std::string::npos ||
-                name_str.find("WDL") != std::string::npos) {
-                // Distinguish wdl_probs (batch, 3) from wdl_value (scalar)
-                if (dims.nbDims == 2 && dims.d[1] == 3) {
-                    wdl_output_name_ = name;
-                } else {
-                    value_output_name_ = name;
-                }
-            } else if (name_str.find("policy") != std::string::npos ||
-                       name_str.find("Policy") != std::string::npos) {
+            if (name_str.find("policy") != std::string::npos ||
+                name_str.find("Policy") != std::string::npos) {
                 policy_output_name_ = name;
             } else if (name_str.find("value_probs") != std::string::npos ||
                        name_str.find("bestq_probs") != std::string::npos) {
@@ -366,8 +349,6 @@ private:
                     if (value_output_name_.empty()) value_output_name_ = name;
                 } else if (dims.nbDims == 2 && dims.d[1] == VALUE_NUM_BINS) {
                     if (value_probs_output_name_.empty()) value_probs_output_name_ = name;
-                } else if (dims.nbDims == 2 && dims.d[1] == 3) {
-                    if (wdl_output_name_.empty()) wdl_output_name_ = name;
                 } else if (dims.nbDims == 2 && dims.d[1] == POLICY_SIZE) {
                     if (policy_output_name_.empty()) policy_output_name_ = name_str;
                 }
@@ -378,8 +359,8 @@ private:
         if (value_output_name_.empty()) throw std::runtime_error("Could not find value output tensor");
         if (policy_output_name_.empty()) throw std::runtime_error("Could not find policy output tensor");
 
-        std::println(stderr, "[BatchEvaluator] IO: input='{}', value='{}', bestq_probs='{}', wdl='{}', policy='{}'",
-                     input_name_, value_output_name_, value_probs_output_name_, wdl_output_name_, policy_output_name_);
+        std::println(stderr, "[BatchEvaluator] IO: input='{}', value='{}', bestq_probs='{}', policy='{}'",
+                     input_name_, value_output_name_, value_probs_output_name_, policy_output_name_);
     }
 
     void allocate_buffers() {
@@ -392,14 +373,12 @@ private:
         CATGPT_CUDA_CHECK(cudaMalloc(&d_input_, B * SEQ_LENGTH * sizeof(std::int32_t)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_value_, B * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_value_probs_, B * VALUE_NUM_BINS * sizeof(float)));
-        CATGPT_CUDA_CHECK(cudaMalloc(&d_wdl_, B * 3 * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_policy_, B * POLICY_SIZE * sizeof(float)));
 
         // Pinned host buffers
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_input_, B * SEQ_LENGTH * sizeof(std::int32_t)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_value_, B * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_value_probs_, B * VALUE_NUM_BINS * sizeof(float)));
-        CATGPT_CUDA_CHECK(cudaMallocHost(&h_wdl_, B * 3 * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_policy_, B * POLICY_SIZE * sizeof(float)));
 
         std::println(stderr, "[BatchEvaluator] Allocated buffers for max effective bucket={}", B);
@@ -515,9 +494,6 @@ private:
             if (!value_probs_output_name_.empty()) {
                 ctx->setTensorAddress(value_probs_output_name_.c_str(), d_value_probs_);
             }
-            if (!wdl_output_name_.empty()) {
-                ctx->setTensorAddress(wdl_output_name_.c_str(), d_wdl_);
-            }
             ctx->setTensorAddress(policy_output_name_.c_str(), d_policy_);
 
             contexts_.emplace(b, std::move(ctx));
@@ -533,7 +509,7 @@ private:
      * Capture one cudaGraphExec per effective bucket. The graph wraps:
      *   - H2D: bucket * SEQ_LENGTH int32 tokens
      *   - enqueueV3 on the bucket's IExecutionContext
-     *   - D2H: value, value_probs, [wdl], policy
+     *   - D2H: value, value_probs, policy
      *
      * After this, process_batch only does host memcpys + cudaGraphLaunch
      * + cudaStreamSynchronize. No per-launch TRT setup, no per-launch
@@ -570,7 +546,6 @@ private:
         const std::size_t input_bytes  = bucket * SEQ_LENGTH * sizeof(std::int32_t);
         const std::size_t value_bytes  = bucket * sizeof(float);
         const std::size_t vprobs_bytes = bucket * VALUE_NUM_BINS * sizeof(float);
-        const std::size_t wdl_bytes    = bucket * 3 * sizeof(float);
         const std::size_t policy_bytes = bucket * POLICY_SIZE * sizeof(float);
 
         CATGPT_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
@@ -593,10 +568,6 @@ private:
                                           cudaMemcpyDeviceToHost, stream_));
         CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_value_probs_, d_value_probs_, vprobs_bytes,
                                           cudaMemcpyDeviceToHost, stream_));
-        if (!wdl_output_name_.empty()) {
-            CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_wdl_, d_wdl_, wdl_bytes,
-                                              cudaMemcpyDeviceToHost, stream_));
-        }
         CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_policy_, d_policy_, policy_bytes,
                                           cudaMemcpyDeviceToHost, stream_));
 
@@ -672,7 +643,6 @@ private:
     std::string input_name_;
     std::string value_output_name_;
     std::string value_probs_output_name_;
-    std::string wdl_output_name_;
     std::string policy_output_name_;
 
     cudaStream_t stream_ = nullptr;
@@ -681,14 +651,12 @@ private:
     std::int32_t* d_input_ = nullptr;
     float* d_value_ = nullptr;
     float* d_value_probs_ = nullptr;
-    float* d_wdl_ = nullptr;
     float* d_policy_ = nullptr;
 
     // Pinned host buffers
     std::int32_t* h_input_ = nullptr;
     float* h_value_ = nullptr;
     float* h_value_probs_ = nullptr;
-    float* h_wdl_ = nullptr;
     float* h_policy_ = nullptr;
 };
 
