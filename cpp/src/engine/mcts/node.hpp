@@ -36,8 +36,8 @@ class MCTSNode {
 public:
     MCTSNode() = default;
 
-    explicit MCTSNode(float prior, float prior_optimistic = 0.0f)
-        : P(prior), P_optimistic(prior_optimistic) {}
+    explicit MCTSNode(float prior)
+        : P(prior) {}
 
     /**
      * Mean value (expected outcome from this position).
@@ -132,7 +132,6 @@ public:
     float origQ = 0.0f;   // Original NN evaluation or terminal value
     float cached_Q = 0.0f; // Computed Q from recursive formula
     float P = 0.0f;       // Prior probability (standard policy)
-    float P_optimistic = 0.0f;  // Optimistic prior (from optimistic policy head)
 
     // Value distribution from HL-Gauss head (81 bins over [0, 1])
     std::array<float, VALUE_NUM_BINS> value_probs{};

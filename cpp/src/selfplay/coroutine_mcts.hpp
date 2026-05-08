@@ -273,8 +273,8 @@ private:
                 q = -child.Q();
             }
 
-            // PUCT formula (using optimistic policy for exploration)
-            float P_search = child.P_optimistic > 0.0f ? child.P_optimistic : child.P;
+            // PUCT formula
+            float P_search = child.P;
             float u = q + config_.c_puct * P_search * sqrt_n_parent / (1.0f + child.N);
 
             if (u > best_score) {
@@ -298,7 +298,7 @@ private:
      */
     coro::task<void> expand_and_evaluate(MCTSNode* node, chess::Board& scratch_board) {
         // Get policy and value from neural network
-        auto [policy_priors, optimistic_policy_priors, value, value_probs] =
+        auto [policy_priors, value, value_probs] =
             co_await evaluate_position(scratch_board);
 
         // Create children for all legal moves
@@ -314,13 +314,7 @@ private:
                 prior = it->second;
             }
 
-            float prior_optimistic = prior;  // fallback to standard if no optimistic
-            auto opt_it = optimistic_policy_priors.find(move);
-            if (opt_it != optimistic_policy_priors.end()) {
-                prior_optimistic = opt_it->second;
-            }
-
-            MCTSNode child(prior, prior_optimistic);
+            MCTSNode child(prior);
 
             // Check for terminal states
             scratch_board.makeMove<true>(move);
@@ -361,7 +355,6 @@ private:
      */
     struct EvalResult {
         std::unordered_map<chess::Move, float, MoveHash> policy_priors;
-        std::unordered_map<chess::Move, float, MoveHash> optimistic_policy_priors;
         float value;  // [-1, 1]
         std::array<float, VALUE_NUM_BINS> value_probs;
     };
@@ -430,37 +423,8 @@ private:
             policy_priors[move] = e / sum_exp;
         }
 
-        // Optimistic policy softmax (same temperature, from optimistic_policy head)
-        std::unordered_map<chess::Move, float, MoveHash> optimistic_policy_priors;
-        if (raw.has_optimistic_policy) {
-            std::vector<std::pair<chess::Move, float>> opt_logits;
-            opt_logits.reserve(moves.size());
-
-            float opt_max_logit = -std::numeric_limits<float>::infinity();
-            for (const auto& move : moves) {
-                auto [from_idx, to_idx] = encode_move_to_policy_index(move, flip);
-                int flat_idx = policy_flat_index(from_idx, to_idx);
-                float logit = raw.optimistic_policy[flat_idx];
-                opt_logits.emplace_back(move, logit);
-                opt_max_logit = std::max(opt_max_logit, logit);
-            }
-
-            float opt_sum_exp = 0.0f;
-            std::vector<std::pair<chess::Move, float>> opt_exps;
-            opt_exps.reserve(opt_logits.size());
-            for (const auto& [move, logit] : opt_logits) {
-                float e = std::exp((logit - opt_max_logit) * inv_temp);
-                opt_exps.emplace_back(move, e);
-                opt_sum_exp += e;
-            }
-            for (const auto& [move, e] : opt_exps) {
-                optimistic_policy_priors[move] = e / opt_sum_exp;
-            }
-        }
-
         co_return EvalResult{
             std::move(policy_priors),
-            std::move(optimistic_policy_priors),
             value,
             raw.value_probs,
         };

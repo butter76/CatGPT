@@ -46,7 +46,7 @@ struct FractionalMCTSConfig {
     /**
      * FPU (First Play Urgency) reduction for unexpanded children.
      * Unexpanded child Q is: parent.Q - fpu_reduction * sqrt(cumulative_policy)
-     * where cumulative_policy is the optimistic policy mass of higher-ranked siblings.
+     * where cumulative_policy is the alloc policy mass of higher-ranked siblings.
      */
     float fpu_reduction = 0.330f;
 

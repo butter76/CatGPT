@@ -286,42 +286,9 @@ private:
             }
         }
 
-        // Optimistic policy (from NN's optimistic_policy head, temp 1.3)
-        std::unordered_map<chess::Move, float, MoveHash> policy_priors_optimistic;
-        if (raw.has_optimistic_policy) {
-            std::vector<std::pair<chess::Move, float>> opt_move_logits;
-            opt_move_logits.reserve(moves.size());
-
-            for (const auto& move : moves) {
-                auto [from_idx, to_idx] = encode_move_to_policy_index(move, flip);
-                int flat_idx = policy_flat_index(from_idx, to_idx);
-                float logit = raw.optimistic_policy[flat_idx];
-                opt_move_logits.emplace_back(move, logit);
-            }
-
-            float opt_max_logit = -std::numeric_limits<float>::infinity();
-            for (const auto& [move, logit] : opt_move_logits) {
-                opt_max_logit = std::max(opt_max_logit, logit);
-            }
-
-            float opt_max_scaled = opt_max_logit * inv_alloc_temp;
-            float sum_exp = 0.0f;
-            std::vector<std::pair<chess::Move, float>> exps;
-            exps.reserve(opt_move_logits.size());
-            for (const auto& [move, logit] : opt_move_logits) {
-                float e = std::exp(logit * inv_alloc_temp - opt_max_scaled);
-                exps.emplace_back(move, e);
-                sum_exp += e;
-            }
-            for (const auto& [move, e] : exps) {
-                policy_priors_optimistic[move] = e / sum_exp;
-            }
-        }
-
         // Write into node
         node->policy_priors = std::move(policy_priors);
         node->policy_priors_alloc = std::move(policy_priors_alloc);
-        node->policy_priors_optimistic = std::move(policy_priors_optimistic);
         node->Q = value;
         node->value_probs = raw.value_probs;
         node->distQ = raw.value_probs;
@@ -378,9 +345,8 @@ private:
         // then recompute allocations (Q values and max_N have changed) and
         // repeat until allocations stabilise or we hit the iteration cap.
         // After the first iteration, only recurse into children that would be clamped.
-        // Use optimistic policy for exploration during the recursion.
         for (int clamp_iter = 0; clamp_iter < 100; ++clamp_iter) {
-            auto allocations = compute_allocations(node, N, /*use_optimistic=*/true);
+            auto allocations = compute_allocations(node, N);
 
             // Identify which children would be clamped and apply the clamp
             std::vector<chess::Move> clamped_moves;
@@ -477,10 +443,10 @@ private:
                                      float N) {
         if (N <= 0.0f) co_return;
 
-        // Build list of ALL legal moves with optimistic policy, sorted descending
+        // Build list of ALL legal moves sorted descending by alloc prior
         struct MoveInfo {
             chess::Move move;
-            float P_optimistic;
+            float P_alloc;
             float Q_effective;
             bool is_expanded;
         };
@@ -488,15 +454,15 @@ private:
         all_moves.reserve(node->policy_priors.size());
 
         for (const auto& [move, prior] : node->policy_priors) {
-            float p_opt = prior;
-            auto opt_it = node->policy_priors_optimistic.find(move);
-            if (opt_it != node->policy_priors_optimistic.end()) {
-                p_opt = opt_it->second;
+            float p_alloc = prior;
+            auto alloc_it = node->policy_priors_alloc.find(move);
+            if (alloc_it != node->policy_priors_alloc.end()) {
+                p_alloc = alloc_it->second;
             }
-            all_moves.push_back({move, p_opt, 0.0f, false});
+            all_moves.push_back({move, p_alloc, 0.0f, false});
         }
         std::sort(all_moves.begin(), all_moves.end(),
-                  [](const auto& a, const auto& b) { return a.P_optimistic > b.P_optimistic; });
+                  [](const auto& a, const auto& b) { return a.P_alloc > b.P_alloc; });
 
         // Assign Q values: actual Q for expanded, FPU for unexpanded
         float cumulative_policy = 0.0f;
@@ -508,7 +474,7 @@ private:
             } else {
                 info.Q_effective = node->Q - config_.fpu_reduction * std::sqrt(cumulative_policy);
             }
-            cumulative_policy += info.P_optimistic;
+            cumulative_policy += info.P_alloc;
         }
 
         // Binary search for K such that sum of allocations = N
@@ -518,7 +484,7 @@ private:
         auto compute_alloc = [c_puct, N_exp](const MoveInfo& info, float K) -> float {
             float denom = K - info.Q_effective;
             if (denom <= 0.0f) return std::numeric_limits<float>::infinity();
-            return c_puct * info.P_optimistic * N_exp / denom;
+            return c_puct * info.P_alloc * N_exp / denom;
         };
 
         auto sum_allocs = [&all_moves, &compute_alloc](float K) -> float {
@@ -580,12 +546,7 @@ private:
             if (alloc_it != node->policy_priors_alloc.end()) {
                 prior_alloc = alloc_it->second;
             }
-            float prior_optimistic = prior_alloc;
-            auto opt_it = node->policy_priors_optimistic.find(info.move);
-            if (opt_it != node->policy_priors_optimistic.end()) {
-                prior_optimistic = opt_it->second;
-            }
-            FractionalNode child(prior, prior_alloc, prior_optimistic);
+            FractionalNode child(prior, prior_alloc);
 
             scratch_board.makeMove<true>(info.move);
 
@@ -624,7 +585,7 @@ private:
     }
 
     std::unordered_map<chess::Move, float, MoveHash>
-    compute_allocations(FractionalNode* node, float N, bool use_optimistic = false) {
+    compute_allocations(FractionalNode* node, float N) {
         std::unordered_map<chess::Move, float, MoveHash> allocations;
         if (node->children.empty()) return allocations;
 
@@ -637,11 +598,10 @@ private:
             children_vec.emplace_back(move, &child);
         }
 
-        auto compute_allocation = [c_puct, N_exp, use_optimistic](FractionalNode* child, float K) -> float {
+        auto compute_allocation = [c_puct, N_exp](FractionalNode* child, float K) -> float {
             float denominator = K - (-child->Q);
             if (denominator <= 0.0f) return std::numeric_limits<float>::infinity();
-            float P = use_optimistic ? child->P_optimistic : child->P_alloc;
-            return c_puct * P * N_exp / denominator;
+            return c_puct * child->P_alloc * N_exp / denominator;
         };
 
         auto sum_allocations = [&children_vec, &compute_allocation](float K) -> float {

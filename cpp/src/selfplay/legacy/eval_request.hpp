@@ -44,15 +44,12 @@ class BatchEvaluator;
  *   value_probs      — BestQ HL-Gauss distribution (81 bins)
  *   wdl              — Win/Draw/Loss probabilities [W, D, L]
  *   policy           — Move distribution logits (4672)
- *   optimistic_policy — Optimistic policy logits (4672), trained with value-surprise weighting
  */
 struct RawNNOutput {
     float value;                                    // WDL-derived Q value [0, 1]
     std::array<float, VALUE_NUM_BINS> value_probs;  // BestQ distribution (81 bins)
     std::array<float, 3> wdl;                       // Win/Draw/Loss probabilities [W, D, L]
     std::array<float, POLICY_SIZE> policy;          // Policy logits (4672)
-    std::array<float, POLICY_SIZE> optimistic_policy;  // Optimistic policy logits (4672)
-    bool has_optimistic_policy = false;             // Whether optimistic policy is available
 };
 
 /**

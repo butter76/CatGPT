@@ -130,13 +130,11 @@ public:
         if (d_value_probs_) cudaFree(d_value_probs_);
         if (d_wdl_) cudaFree(d_wdl_);
         if (d_policy_) cudaFree(d_policy_);
-        if (d_optimistic_policy_) cudaFree(d_optimistic_policy_);
         if (h_input_) cudaFreeHost(h_input_);
         if (h_value_) cudaFreeHost(h_value_);
         if (h_value_probs_) cudaFreeHost(h_value_probs_);
         if (h_wdl_) cudaFreeHost(h_wdl_);
         if (h_policy_) cudaFreeHost(h_policy_);
-        if (h_optimistic_policy_) cudaFreeHost(h_optimistic_policy_);
     }
 
     // Non-copyable, non-movable
@@ -259,12 +257,6 @@ private:
             std::memcpy(req->result.policy.data(),
                         h_policy_ + b * POLICY_SIZE,
                         POLICY_SIZE * sizeof(float));
-            if (!optimistic_policy_output_name_.empty()) {
-                std::memcpy(req->result.optimistic_policy.data(),
-                            h_optimistic_policy_ + b * POLICY_SIZE,
-                            POLICY_SIZE * sizeof(float));
-                req->result.has_optimistic_policy = true;
-            }
 
             // Resume the coroutine on the worker thread pool
             thread_pool_->resume(req->continuation);
@@ -303,9 +295,6 @@ private:
     void setup_io() {
         int num_io = engine_->getNbIOTensors();
 
-        // Collect all policy-shaped outputs for later assignment
-        std::vector<std::string> policy_outputs;
-
         for (int i = 0; i < num_io; ++i) {
             const char* name = engine_->getIOTensorName(i);
             auto mode = engine_->getTensorIOMode(name);
@@ -326,8 +315,6 @@ private:
                 } else {
                     value_output_name_ = name;
                 }
-            } else if (name_str.find("optimistic_policy") != std::string::npos) {
-                optimistic_policy_output_name_ = name;
             } else if (name_str.find("policy") != std::string::npos ||
                        name_str.find("Policy") != std::string::npos) {
                 policy_output_name_ = name;
@@ -348,18 +335,8 @@ private:
                 } else if (dims.nbDims == 2 && dims.d[1] == 3) {
                     if (wdl_output_name_.empty()) wdl_output_name_ = name;
                 } else if (dims.nbDims == 2 && dims.d[1] == POLICY_SIZE) {
-                    // Collect policy-shaped outputs for later assignment
-                    policy_outputs.push_back(name_str);
+                    if (policy_output_name_.empty()) policy_output_name_ = name_str;
                 }
-            }
-        }
-
-        // Assign policy-shaped outputs: first is vanilla policy, second is optimistic
-        for (const auto& pname : policy_outputs) {
-            if (policy_output_name_.empty()) {
-                policy_output_name_ = pname;
-            } else if (optimistic_policy_output_name_.empty()) {
-                optimistic_policy_output_name_ = pname;
             }
         }
 
@@ -369,9 +346,6 @@ private:
 
         std::println(stderr, "[BatchEvaluator] IO: input='{}', value='{}', bestq_probs='{}', wdl='{}', policy='{}'",
                      input_name_, value_output_name_, value_probs_output_name_, wdl_output_name_, policy_output_name_);
-        if (!optimistic_policy_output_name_.empty()) {
-            std::println(stderr, "[BatchEvaluator] Optimistic policy head detected: {}", optimistic_policy_output_name_);
-        }
     }
 
     void allocate_buffers() {
@@ -386,9 +360,6 @@ private:
         CATGPT_CUDA_CHECK(cudaMalloc(&d_value_probs_, B * VALUE_NUM_BINS * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_wdl_, B * 3 * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_policy_, B * POLICY_SIZE * sizeof(float)));
-        if (!optimistic_policy_output_name_.empty()) {
-            CATGPT_CUDA_CHECK(cudaMalloc(&d_optimistic_policy_, B * POLICY_SIZE * sizeof(float)));
-        }
 
         // Pinned host buffers
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_input_, B * SEQ_LENGTH * sizeof(std::int32_t)));
@@ -396,9 +367,6 @@ private:
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_value_probs_, B * VALUE_NUM_BINS * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_wdl_, B * 3 * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_policy_, B * POLICY_SIZE * sizeof(float)));
-        if (!optimistic_policy_output_name_.empty()) {
-            CATGPT_CUDA_CHECK(cudaMallocHost(&h_optimistic_policy_, B * POLICY_SIZE * sizeof(float)));
-        }
 
         std::println(stderr, "[BatchEvaluator] Allocated buffers for max effective bucket={}", B);
     }
@@ -535,10 +503,6 @@ private:
                 ctx->setTensorAddress(wdl_output_name_.c_str(), d_wdl_);
             }
             ctx->setTensorAddress(policy_output_name_.c_str(), d_policy_);
-            if (!optimistic_policy_output_name_.empty()) {
-                ctx->setTensorAddress(
-                    optimistic_policy_output_name_.c_str(), d_optimistic_policy_);
-            }
 
             contexts_.emplace(b, std::move(ctx));
         }
@@ -553,7 +517,7 @@ private:
      * Capture one cudaGraphExec per effective bucket. The graph wraps:
      *   - H2D: bucket * SEQ_LENGTH int32 tokens
      *   - enqueueV3 on the bucket's IExecutionContext
-     *   - D2H: value, value_probs, [wdl], policy, [optimistic_policy]
+     *   - D2H: value, value_probs, [wdl], policy
      *
      * After this, process_batch only does host memcpys + cudaGraphLaunch
      * + cudaStreamSynchronize. No per-launch TRT setup, no per-launch
@@ -619,11 +583,6 @@ private:
         }
         CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_policy_, d_policy_, policy_bytes,
                                           cudaMemcpyDeviceToHost, stream_));
-        if (!optimistic_policy_output_name_.empty()) {
-            CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_optimistic_policy_, d_optimistic_policy_,
-                                              policy_bytes,
-                                              cudaMemcpyDeviceToHost, stream_));
-        }
 
         cudaGraph_t graph = nullptr;
         CATGPT_CUDA_CHECK(cudaStreamEndCapture(stream_, &graph));
@@ -695,7 +654,6 @@ private:
     std::string value_probs_output_name_;
     std::string wdl_output_name_;
     std::string policy_output_name_;
-    std::string optimistic_policy_output_name_;
 
     cudaStream_t stream_ = nullptr;
 
@@ -705,7 +663,6 @@ private:
     float* d_value_probs_ = nullptr;
     float* d_wdl_ = nullptr;
     float* d_policy_ = nullptr;
-    float* d_optimistic_policy_ = nullptr;
 
     // Pinned host buffers
     std::int32_t* h_input_ = nullptr;
@@ -713,7 +670,6 @@ private:
     float* h_value_probs_ = nullptr;
     float* h_wdl_ = nullptr;
     float* h_policy_ = nullptr;
-    float* h_optimistic_policy_ = nullptr;
 };
 
 // ─── EvalAwaitable::await_suspend (needs BatchEvaluator to be complete) ────

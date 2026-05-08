@@ -8,7 +8,6 @@
  *   - Output bestq_probs:   float32 (batch, 81)   - HL-Gauss value distribution
  *   - Output wdl_probs:     float32 (batch, 3)    - Win/Draw/Loss probabilities
  *   - Output policy:        float32 (batch, 4672) - policy logits
- *   - Output optim_policy:  float32 (batch, 4672) - optimistic policy logits (optional)
  */
 
 #include <NvInfer.h>
@@ -303,7 +302,6 @@ struct InferenceResult {
     std::vector<float> value_probs;                // (batch * VALUE_NUM_BINS) - bestq HL-Gauss distribution
     std::vector<float> wdl_probs;                  // (batch * WDL_NUM_BINS) - W/D/L probabilities
     std::vector<float> policy_logits;              // (batch * POLICY_SIZE) - policy logits
-    std::vector<float> optimistic_policy_logits;   // (batch * POLICY_SIZE) - optional, empty if not present
 };
 
 // TensorRT Engine wrapper with CUDA Graph caching and double buffering
@@ -399,13 +397,11 @@ private:
         CudaBuffer<float> value_probs_buffer;
         CudaBuffer<float> wdl_buffer;
         CudaBuffer<float> policy_buffer;
-        CudaBuffer<float> optimistic_policy_buffer;
         PinnedBuffer<int32_t> pinned_input;
         PinnedBuffer<float> pinned_value;
         PinnedBuffer<float> pinned_value_probs;
         PinnedBuffer<float> pinned_wdl;
         PinnedBuffer<float> pinned_policy;
-        PinnedBuffer<float> pinned_optimistic_policy;
         CudaGraphExec graph_exec;
 
         CachedBatchResources(int32_t batch_size)
@@ -414,13 +410,11 @@ private:
               value_probs_buffer(batch_size * VALUE_NUM_BINS),
               wdl_buffer(batch_size * WDL_NUM_BINS),
               policy_buffer(batch_size * POLICY_SIZE),
-              optimistic_policy_buffer(batch_size * POLICY_SIZE),
               pinned_input(batch_size * SEQ_LENGTH),
               pinned_value(batch_size),
               pinned_value_probs(batch_size * VALUE_NUM_BINS),
               pinned_wdl(batch_size * WDL_NUM_BINS),
-              pinned_policy(batch_size * POLICY_SIZE),
-              pinned_optimistic_policy(batch_size * POLICY_SIZE) {}
+              pinned_policy(batch_size * POLICY_SIZE) {}
     };
 
     // Inference using cached CUDA graph
@@ -452,11 +446,6 @@ private:
                     batch_size * WDL_NUM_BINS * sizeof(float));
         std::memcpy(result.policy_logits.data(), res.pinned_policy.get(),
                     batch_size * POLICY_SIZE * sizeof(float));
-        if (!optimistic_policy_output_name_.empty()) {
-            result.optimistic_policy_logits.resize(batch_size * POLICY_SIZE);
-            std::memcpy(result.optimistic_policy_logits.data(), res.pinned_optimistic_policy.get(),
-                        batch_size * POLICY_SIZE * sizeof(float));
-        }
 
         return result;
     }
@@ -475,9 +464,6 @@ private:
             ctx.setTensorAddress(wdl_output_name_.c_str(), res.wdl_buffer.get());
         }
         ctx.setTensorAddress(policy_output_name_.c_str(), res.policy_buffer.get());
-        if (!optimistic_policy_output_name_.empty()) {
-            ctx.setTensorAddress(optimistic_policy_output_name_.c_str(), res.optimistic_policy_buffer.get());
-        }
 
         nvinfer1::Dims input_dims;
         input_dims.nbDims = 2;
@@ -512,10 +498,6 @@ private:
             res.wdl_buffer.copy_to_host_async(res.pinned_wdl.get(), wdl_count, stream_.get());
         }
         res.policy_buffer.copy_to_host_async(res.pinned_policy.get(), policy_count, stream_.get());
-        if (!optimistic_policy_output_name_.empty()) {
-            res.optimistic_policy_buffer.copy_to_host_async(
-                res.pinned_optimistic_policy.get(), policy_count, stream_.get());
-        }
 
         // End capture and instantiate
         cudaGraph_t graph = stream_.end_capture();
@@ -585,7 +567,6 @@ public:
         std::vector<float> value_probs;
         std::vector<float> wdl_probs;
         std::vector<float> policies;
-        std::vector<float> optimistic_policies;
     };
 
     // Process multiple batches with double buffering for maximum throughput
@@ -602,14 +583,12 @@ public:
 
         auto& db = it->second;
         const bool has_wdl = !wdl_output_name_.empty();
-        const bool has_optimistic = !optimistic_policy_output_name_.empty();
 
         PipelinedResult result;
         result.values.reserve(batches.size() * batch_size);
         result.value_probs.reserve(batches.size() * batch_size * VALUE_NUM_BINS);
         if (has_wdl) result.wdl_probs.reserve(batches.size() * batch_size * WDL_NUM_BINS);
         result.policies.reserve(batches.size() * batch_size * POLICY_SIZE);
-        if (has_optimistic) result.optimistic_policies.reserve(batches.size() * batch_size * POLICY_SIZE);
 
         const size_t input_count = batch_size * SEQ_LENGTH;
         const size_t value_probs_count = batch_size * VALUE_NUM_BINS;
@@ -647,11 +626,6 @@ public:
                 result.policies.insert(result.policies.end(),
                                        out_buf.pinned_policy.get(),
                                        out_buf.pinned_policy.get() + policy_count);
-                if (has_optimistic) {
-                    result.optimistic_policies.insert(result.optimistic_policies.end(),
-                                                      out_buf.pinned_optimistic_policy.get(),
-                                                      out_buf.pinned_optimistic_policy.get() + policy_count);
-                }
             }
 
             // Copy input to pinned buffer (CPU-side, not part of graph)
@@ -684,11 +658,6 @@ public:
             result.policies.insert(result.policies.end(),
                                    buf.pinned_policy.get(),
                                    buf.pinned_policy.get() + policy_count);
-            if (has_optimistic) {
-                result.optimistic_policies.insert(result.optimistic_policies.end(),
-                                                  buf.pinned_optimistic_policy.get(),
-                                                  buf.pinned_optimistic_policy.get() + policy_count);
-            }
         }
 
         return result;
@@ -752,13 +721,11 @@ private:
         CudaBuffer<float> value_probs_buffer;
         CudaBuffer<float> wdl_buffer;
         CudaBuffer<float> policy_buffer;
-        CudaBuffer<float> optimistic_policy_buffer;
         PinnedBuffer<int32_t> pinned_input;
         PinnedBuffer<float> pinned_value;
         PinnedBuffer<float> pinned_value_probs;
         PinnedBuffer<float> pinned_wdl;
         PinnedBuffer<float> pinned_policy;
-        PinnedBuffer<float> pinned_optimistic_policy;
 
         DoubleBufferSlot(int32_t batch_size)
             : input_buffer(batch_size * SEQ_LENGTH),
@@ -766,13 +733,11 @@ private:
               value_probs_buffer(batch_size * VALUE_NUM_BINS),
               wdl_buffer(batch_size * WDL_NUM_BINS),
               policy_buffer(batch_size * POLICY_SIZE),
-              optimistic_policy_buffer(batch_size * POLICY_SIZE),
               pinned_input(batch_size * SEQ_LENGTH),
               pinned_value(batch_size),
               pinned_value_probs(batch_size * VALUE_NUM_BINS),
               pinned_wdl(batch_size * WDL_NUM_BINS),
-              pinned_policy(batch_size * POLICY_SIZE),
-              pinned_optimistic_policy(batch_size * POLICY_SIZE) {}
+              pinned_policy(batch_size * POLICY_SIZE) {}
     };
 
     struct DoubleBufferResources {
@@ -862,10 +827,6 @@ private:
                 slot.context->setTensorAddress(wdl_output_name_.c_str(), slot.wdl_buffer.get());
             }
             slot.context->setTensorAddress(policy_output_name_.c_str(), slot.policy_buffer.get());
-            if (!optimistic_policy_output_name_.empty()) {
-                slot.context->setTensorAddress(optimistic_policy_output_name_.c_str(),
-                                               slot.optimistic_policy_buffer.get());
-            }
             slot.context->setInputShape(input_name_.c_str(), input_dims);
 
             // Capture: H2D -> compute -> D2H, all on this slot's stream.
@@ -888,10 +849,6 @@ private:
                 slot.wdl_buffer.copy_to_host_async(slot.pinned_wdl.get(), wdl_count, slot.stream.get());
             }
             slot.policy_buffer.copy_to_host_async(slot.pinned_policy.get(), policy_count, slot.stream.get());
-            if (!optimistic_policy_output_name_.empty()) {
-                slot.optimistic_policy_buffer.copy_to_host_async(
-                    slot.pinned_optimistic_policy.get(), policy_count, slot.stream.get());
-            }
 
             cudaGraph_t graph = slot.stream.end_capture();
             slot.graph_exec = CudaGraphExec(graph);
@@ -996,8 +953,6 @@ private:
             } else if (name_str.find("value") != std::string::npos ||
                        name_str.find("Value") != std::string::npos) {
                 value_output_name_ = name;
-            } else if (name_str.find("optimistic_policy") != std::string::npos) {
-                optimistic_policy_output_name_ = name;
             } else if (name_str.find("policy") != std::string::npos ||
                        name_str.find("Policy") != std::string::npos) {
                 policy_output_name_ = name;
@@ -1006,7 +961,7 @@ private:
                 //   wdl_value:   (batch,) or (batch, 1)
                 //   wdl_probs:   (batch, 3)
                 //   value_probs: (batch, 81)
-                //   policy:      (batch, 4672) - first occurrence is vanilla, second is optimistic
+                //   policy:      (batch, 4672)
                 if (dims.nbDims == 1 || (dims.nbDims == 2 && dims.d[1] == 1)) {
                     if (value_output_name_.empty()) value_output_name_ = name;
                 } else if (dims.nbDims == 2 && dims.d[1] == WDL_NUM_BINS) {
@@ -1019,12 +974,9 @@ private:
             }
         }
 
-        // Assign policy-shaped outputs in order: first is vanilla policy, second is optimistic
         for (const auto& pname : policy_outputs) {
             if (policy_output_name_.empty()) {
                 policy_output_name_ = pname;
-            } else if (optimistic_policy_output_name_.empty()) {
-                optimistic_policy_output_name_ = pname;
             }
         }
 
@@ -1045,8 +997,6 @@ private:
         std::println("  -> WDL probs output: '{}'",
                      wdl_output_name_.empty() ? "(not found)" : wdl_output_name_);
         std::println("  -> Policy output: '{}'", policy_output_name_);
-        std::println("  -> Optimistic policy output: '{}'",
-                     optimistic_policy_output_name_.empty() ? "(not found)" : optimistic_policy_output_name_);
     }
 
     // Build the buckets_ list from loaded sub-engines and validate that each
@@ -1103,7 +1053,6 @@ private:
     std::string value_probs_output_name_;
     std::string wdl_output_name_;
     std::string policy_output_name_;
-    std::string optimistic_policy_output_name_;
 
     std::vector<BucketInfo> buckets_;  // Buckets present in the .network, ascending
     int32_t max_batch_size_ = 1;  // Largest bucket size
@@ -1241,26 +1190,6 @@ int main(int argc, char* argv[]) {
                 int to_sq = indexed_logits[i].first % 73;
                 std::println("│     [{}] from={}, to={}: {:.4f}",
                              i + 1, from_sq, to_sq, indexed_logits[i].second);
-            }
-
-            // Show top-5 optimistic policy logits if present
-            if (!result.optimistic_policy_logits.empty()) {
-                auto& opt_policy = result.optimistic_policy_logits;
-                std::vector<std::pair<int, float>> opt_indexed;
-                opt_indexed.reserve(opt_policy.size());
-                for (size_t i = 0; i < opt_policy.size(); ++i) {
-                    opt_indexed.emplace_back(static_cast<int>(i), opt_policy[i]);
-                }
-                std::partial_sort(opt_indexed.begin(), opt_indexed.begin() + 5, opt_indexed.end(),
-                                  [](const auto& a, const auto& b) { return a.second > b.second; });
-
-                std::println("│   Top-5 optimistic policy logits:");
-                for (int i = 0; i < 5; ++i) {
-                    int from_sq = opt_indexed[i].first / 73;
-                    int to_sq = opt_indexed[i].first % 73;
-                    std::println("│     [{}] from={}, to={}: {:.4f}",
-                                 i + 1, from_sq, to_sq, opt_indexed[i].second);
-                }
             }
         }
         std::println("└───────────────────────────────────────────────────────────────┘");
