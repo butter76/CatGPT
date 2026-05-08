@@ -27,8 +27,8 @@
 #include <coroutine>
 #include <cstdint>
 
+#include "../../engine/nn_constants.hpp"
 #include "../../engine/policy.hpp"
-#include "../../engine/trt_evaluator.hpp"  // VALUE_NUM_BINS
 
 namespace catgpt::legacy {
 

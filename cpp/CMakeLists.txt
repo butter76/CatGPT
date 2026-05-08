@@ -173,28 +173,6 @@ set_target_properties(catgpt_mcts PROPERTIES
 )
 endif()
 
-# === CatGPT FEN Analyzer (with TensorRT) ===
-add_executable(catgpt_analyze
-    src/analyze_fen_main.cpp
-)
-
-target_include_directories(catgpt_analyze PRIVATE
-    ${CHESS_LIBRARY_INCLUDE_DIR}
-    ${TENSORRT_INCLUDE_DIR}
-    ${CUDA_INCLUDE_DIR}
-)
-
-target_link_libraries(catgpt_analyze PRIVATE
-    ${NVINFER_LIB}
-    ${CUDART_LIB}
-    pthread
-)
-
-set_target_properties(catgpt_analyze PROPERTIES
-    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-)
-
 # === CatGPT Search Binary (standalone Fractional MCTS for web UI) ===
 # Uses CoroutineSearch (same algorithm as selfplay) with coroutine infrastructure
 if(HAVE_LIBCORO)
@@ -424,7 +402,6 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)
     target_compile_options(trt_benchmark PRIVATE -fdiagnostics-color=always)
     target_compile_options(chess_lib_tests PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_analyze PRIVATE -fdiagnostics-color=always)
     target_compile_options(tt_arena_bench PRIVATE -fdiagnostics-color=always)
     target_compile_options(tt_arena_concurrent_bench PRIVATE -fdiagnostics-color=always)
     target_compile_options(tt_arena_test PRIVATE -fdiagnostics-color=always)

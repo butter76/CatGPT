@@ -16,7 +16,7 @@
 
 #include "../../../external/chess-library/include/chess.hpp"
 #include "../move_hash.hpp"
-#include "../trt_evaluator.hpp"
+#include "../nn_constants.hpp"
 
 namespace catgpt {
 

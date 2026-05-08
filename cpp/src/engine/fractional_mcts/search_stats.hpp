@@ -28,7 +28,7 @@
 #include <vector>
 
 #include "../../../external/chess-library/include/chess.hpp"
-#include "../trt_evaluator.hpp"  // VALUE_NUM_BINS
+#include "../nn_constants.hpp"
 #include "node.hpp"
 
 namespace catgpt {

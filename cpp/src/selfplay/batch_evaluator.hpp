@@ -52,8 +52,9 @@
 #include <libfork/schedule.hpp>
 
 #include "../engine/network_file.hpp"
+#include "../engine/nn_constants.hpp"
 #include "../engine/policy.hpp"
-#include "../engine/trt_evaluator.hpp"  // VALUE_NUM_BINS, TrtLogger, CATGPT_CUDA_CHECK
+#include "../engine/trt_runtime.hpp"
 #include "eval_request.hpp"
 
 namespace fs = std::filesystem;

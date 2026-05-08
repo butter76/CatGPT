@@ -219,7 +219,7 @@ private:
         if (cache_it != eval_cache_.end()) {
             raw = cache_it->second;
         } else {
-            auto tokens = tokenize<TrtEvaluator::SEQ_LENGTH>(pos, NO_HALFMOVE_CONFIG);
+            auto tokens = tokenize<BatchEvaluator::SEQ_LENGTH>(pos, NO_HALFMOVE_CONFIG);
 
             // co_await suspends here → GPU thread batches & evaluates
             raw = co_await EvalAwaitable(evaluator_, tokens);
