@@ -22,12 +22,12 @@ from pathlib import Path
 
 WASABI_ENDPOINT = "https://s3.us-west-1.wasabisys.com"
 WASABI_BUCKET = "chessbench-checkpoints"
-WASABI_PREFIX = "S1"
+WASABI_PREFIX = "S2"
 
-RUN_NAME = "S1"
-WANDB_PROJECT = "S1"
+RUN_NAME = "S2"
+WANDB_PROJECT = "S2"
 
-TOTAL_SHARDS = 40
+TOTAL_SHARDS = 16
 
 # LR schedule spans the full run; each shard trains for steps_per_run steps
 STEPS_PER_RUN = 230_000

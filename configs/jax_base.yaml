@@ -5,7 +5,7 @@
 model:
   name: "transformer"
   hidden_size: 768
-  num_layers: 32
+  num_layers: 15
   num_heads: 48
   ff_dim: 1536  # Defaults to 4 * hidden_size
   attention_dim: null  # Expanded attention dim (null = hidden_size). E.g., 768 with 48 heads for 50% more attention capacity
@@ -39,7 +39,7 @@ model:
   # See: https://arxiv.org/abs/2601.19895
   keel:
     enabled: true        # Enable Keel normalization (replaces Peri-LN)
-    alpha: 8          # Highway scaling factor. null = auto (2 * num_layers = 32)
+    alpha: 6          # Highway scaling factor. null = auto (2 * num_layers = 32)
 
   # Output heads configuration
   output_heads:
@@ -94,8 +94,8 @@ scheduler:
   warmup_steps: 1000
   min_lr_ratio: 0.1  # Final LR = learning_rate * min_lr_ratio
   # DeepSeek schedule phase fractions (of post-warmup steps):
-  stable_fraction: 0.675  # 67.5% at constant peak LR after warmup
-  cooldown_fraction: 0.075  # 7.5% at constant min LR at end (remaining 25% = cosine decay)
+  stable_fraction: 0.50  # 50% at constant peak LR after warmup
+  cooldown_fraction: 0.0625  # 6.25% at constant min LR at end 
 
 # Training loop configuration
 # Training is step-based with "pseudo-epochs" for validation/checkpointing
