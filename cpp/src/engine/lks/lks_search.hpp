@@ -121,6 +121,10 @@
 #include <utility>
 #include <vector>
 
+#include <cuda_runtime.h>
+
+#include <exception>
+
 #include <libfork/core.hpp>
 #include <libfork/schedule.hpp>
 
@@ -130,6 +134,7 @@
 #include "../../selfplay/eval_request.hpp"
 #include "../../tokenizer.hpp"
 #include "../policy.hpp"
+#include "../trt_runtime.hpp"
 #include "../fractional_mcts/v2/board_secondary.hpp"
 #include "../fractional_mcts/v2/tt_arena.hpp"
 
@@ -293,6 +298,8 @@ struct WorkerSearch {
     std::unique_ptr<lf::lazy_pool>            pool;       // 1 worker
     std::unique_ptr<BatchEvaluator>           evaluator;
     std::unique_ptr<lfsync::LfAsyncSemaphore> sem;        // permits = coros_per_worker
+
+    int device_id = 0;  // CUDA device this worker's evaluator is bound to.
 
     std::atomic<bool>     stop{false};
     std::atomic<uint64_t> evals{0};
@@ -611,9 +618,14 @@ public:
      * @param lifetime_max_evals  Capacity for the shared SearchArena (TT
      *                            entries reachable across all workers'
      *                            lifetime). Sized once; never grows.
-     * @param num_workers         Number of WorkerSearch instances. Each
-     *                            owns its own engine + GPU thread + stream
-     *                            for natural pipelining across the GPU.
+     * @param workers_per_gpu     Number of WorkerSearch instances PER
+     *                            CUDA device. Total worker count is
+     *                            `workers_per_gpu * cudaGetDeviceCount()`.
+     *                            Each worker owns its own engine + GPU
+     *                            thread + stream for natural pipelining.
+     *                            Block-partitioned: workers
+     *                            `[i*workers_per_gpu, (i+1)*workers_per_gpu)`
+     *                            are pinned to GPU `i`.
      * @param coros_per_worker    Tuning knob for the per-worker semaphore:
      *                            each worker permits up to
      *                            `coros_per_worker` simultaneously-alive
@@ -623,35 +635,77 @@ public:
      */
     explicit LksSearch(fs::path trt_engine_path,
                        uint64_t lifetime_max_evals = (1ULL << 20),
-                       int num_workers = 2,
+                       int workers_per_gpu = 1,
                        int coros_per_worker = 32,
                        int max_batch_size = 32)
         : trt_engine_path_(std::move(trt_engine_path))
         , lifetime_max_evals_(lifetime_max_evals)
-        , num_workers_(num_workers > 0 ? num_workers : 1)
+        , workers_per_gpu_(workers_per_gpu > 0 ? workers_per_gpu : 1)
         , coros_per_worker_(coros_per_worker > 0 ? coros_per_worker : 1)
         , max_batch_size_(max_batch_size > 0 ? max_batch_size : 1)
         , board_(chess::constants::STARTPOS)
     {
+        // Discover GPU topology. CUDA_VISIBLE_DEVICES is the right knob
+        // to restrict which devices participate; this just uses every
+        // visible one.
+        int num_gpus = 0;
+        CATGPT_CUDA_CHECK(cudaGetDeviceCount(&num_gpus));
+        if (num_gpus <= 0) {
+            throw std::runtime_error(
+                "LksSearch: no CUDA devices visible (cudaGetDeviceCount==0)");
+        }
+        num_gpus_    = num_gpus;
+        num_workers_ = workers_per_gpu_ * num_gpus_;
+
+        std::println(stderr,
+                     "[LksSearch] {} device(s) x {} workers_per_gpu = {} total workers",
+                     num_gpus_, workers_per_gpu_, num_workers_);
+
         arena_.emplace(lifetime_max_evals_, /*load_factor=*/0.5,
                        /*avg_moves_per_node=*/40);
         root_key_ = board_.hash();
 
         // Persistent workers: build pool + evaluator + sem per worker once.
+        // The slow part is BatchEvaluator construction (TRT engine load,
+        // CUDA buffer alloc, graph capture); fan it out across one
+        // jthread per worker so total init time is dominated by the
+        // slowest single worker rather than the sum. Each thread pins
+        // itself to its assigned device — `cudaSetDevice` is per-thread
+        // state, so siblings on different devices don't interfere, and
+        // the BatchEvaluator ctor's CUDA calls all land on the right GPU.
         const int eval_permits = coros_per_worker_;
-        workers_.reserve(num_workers_);
-        for (int i = 0; i < num_workers_; ++i) {
-            auto w = std::make_unique<WorkerSearch>();
-            // 1 worker per pool: per-WorkerSearch isolation is the model.
-            // lazy_pool means the worker thread sleeps when no work
-            // is ready, woken on pool->schedule(handle) by the GPU
-            // thread or by a release()'d semaphore waiter.
-            w->pool = std::make_unique<lf::lazy_pool>(/*n=*/1);
-            w->evaluator = std::make_unique<BatchEvaluator>(
-                trt_engine_path_, w->pool.get(), max_batch_size_);
-            w->sem = std::make_unique<lfsync::LfAsyncSemaphore>(
-                eval_permits, *w->pool);
-            workers_.push_back(std::move(w));
+        workers_.resize(num_workers_);
+        std::vector<std::exception_ptr> errs(num_workers_);
+        {
+            std::vector<std::jthread> init_threads;
+            init_threads.reserve(num_workers_);
+            for (int i = 0; i < num_workers_; ++i) {
+                init_threads.emplace_back([this, i, eval_permits, &errs] {
+                    try {
+                        const int device_id = i / workers_per_gpu_;
+                        CATGPT_CUDA_CHECK(cudaSetDevice(device_id));
+                        auto w = std::make_unique<WorkerSearch>();
+                        w->device_id = device_id;
+                        // 1 worker per pool: per-WorkerSearch isolation
+                        // is the model. lazy_pool means the worker thread
+                        // sleeps when no work is ready, woken on
+                        // pool->schedule(handle) by the GPU thread or
+                        // by a release()'d semaphore waiter.
+                        w->pool = std::make_unique<lf::lazy_pool>(/*n=*/1);
+                        w->evaluator = std::make_unique<BatchEvaluator>(
+                            trt_engine_path_, w->pool.get(),
+                            max_batch_size_, device_id);
+                        w->sem = std::make_unique<lfsync::LfAsyncSemaphore>(
+                            eval_permits, *w->pool);
+                        workers_[i] = std::move(w);
+                    } catch (...) {
+                        errs[i] = std::current_exception();
+                    }
+                });
+            }
+        }  // jthreads join here
+        for (auto& e : errs) {
+            if (e) std::rethrow_exception(e);
         }
     }
 
@@ -739,6 +793,11 @@ public:
     [[nodiscard]] bool is_searching() const noexcept {
         return running_.load(std::memory_order_acquire);
     }
+
+    /** Total worker count (== workers_per_gpu * cudaGetDeviceCount()). */
+    [[nodiscard]] int num_workers() const noexcept { return num_workers_; }
+    [[nodiscard]] int workers_per_gpu() const noexcept { return workers_per_gpu_; }
+    [[nodiscard]] int num_gpus() const noexcept { return num_gpus_; }
 
     [[nodiscard]] const chess::Board& board() const noexcept { return board_; }
     [[nodiscard]] uint64_t root_key() const noexcept { return root_key_; }
@@ -1075,7 +1134,9 @@ private:
 
     fs::path trt_engine_path_;
     uint64_t lifetime_max_evals_;
-    int      num_workers_;
+    int      workers_per_gpu_;
+    int      num_gpus_ = 0;
+    int      num_workers_ = 0;   // workers_per_gpu_ * num_gpus_, set in ctor
     int      coros_per_worker_;
     int      max_batch_size_;
 

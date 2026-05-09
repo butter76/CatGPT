@@ -50,7 +50,7 @@ fs::path engine_path() {
 }
 
 struct Result {
-    int num_workers;
+    int workers_per_gpu;
     int coros_per_worker;
     int max_batch_size;
     double elapsed_ms;
@@ -58,10 +58,10 @@ struct Result {
     uint64_t batches;
 };
 
-Result run_one(int num_workers, int coros_per_worker, int max_batch_size, int run_ms) {
+Result run_one(int workers_per_gpu, int coros_per_worker, int max_batch_size, int run_ms) {
     LksSearch search(engine_path(),
                      /*lifetime_max_evals=*/(1ULL << 22),
-                     num_workers,
+                     workers_per_gpu,
                      coros_per_worker,
                      max_batch_size);
 
@@ -82,7 +82,7 @@ Result run_one(int num_workers, int coros_per_worker, int max_batch_size, int ru
     // Aggregate per-worker batches across workers (we'll need a delta).
     auto total_batches = [&]() -> uint64_t {
         uint64_t b = 0;
-        for (int i = 0; i < num_workers; ++i) {
+        for (int i = 0; i < workers_per_gpu; ++i) {
             // No public getter for per-worker batches; we'll use a method
             // we'll add below.
         }
@@ -100,7 +100,7 @@ Result run_one(int num_workers, int coros_per_worker, int max_batch_size, int ru
     auto t1 = std::chrono::steady_clock::now();
 
     Result r;
-    r.num_workers = num_workers;
+    r.workers_per_gpu = workers_per_gpu;
     r.coros_per_worker = coros_per_worker;
     r.max_batch_size = max_batch_size;
     r.elapsed_ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
@@ -111,7 +111,7 @@ Result run_one(int num_workers, int coros_per_worker, int max_batch_size, int ru
 
 void print_header() {
     std::printf("%-7s %-6s %-9s %-10s %-10s %-12s %-10s %-9s\n",
-                "workers", "coros", "max_batch",
+                "wpg", "coros", "max_batch",
                 "elapsed", "evals", "evals/s", "batches", "avg_batch");
 }
 
@@ -119,7 +119,7 @@ void print_row(const Result& r) {
     double evals_per_sec = r.evals / (r.elapsed_ms / 1000.0);
     double avg_batch = r.batches > 0 ? double(r.evals) / r.batches : 0.0;
     std::printf("%-7d %-6d %-9d %-9.1fms %-10llu %-12.0f %-10llu %-9.2f\n",
-                r.num_workers,
+                r.workers_per_gpu,
                 r.coros_per_worker,
                 r.max_batch_size,
                 r.elapsed_ms,
@@ -145,33 +145,33 @@ int main(int argc, char** argv) {
 
     print_header();
 
-    // max_batch_size sweep at num_workers=1 over the engine's bucket set.
+    // max_batch_size sweep at workers_per_gpu=1 over the engine's bucket set.
     // (Bucket sizes mirror BatchEvaluator::kBucketSizes.)
-    std::printf("# max_batch sweep (1 worker)\n");
+    std::printf("# max_batch sweep (1 worker per gpu)\n");
     for (int M : {1, 2, 4, 6, 8, 12, 18, 26, 36, 56, 112}) {
-        auto r = run_one(/*num_workers=*/1,
+        auto r = run_one(/*workers_per_gpu=*/1,
                          /*coros_per_worker=*/kCoroFactor * M,
                          /*max_batch_size=*/M, run_ms);
         print_row(r);
     }
     std::printf("\n");
 
-    // max_batch_size sweep at num_workers=2.
-    std::printf("# max_batch sweep (2 workers)\n");
+    // max_batch_size sweep at workers_per_gpu=2.
+    std::printf("# max_batch sweep (2 workers per gpu)\n");
     for (int M : {1, 2, 4, 6, 8, 12, 18, 26, 36, 56, 112}) {
-        auto r = run_one(/*num_workers=*/2,
+        auto r = run_one(/*workers_per_gpu=*/2,
                          /*coros_per_worker=*/kCoroFactor * M,
                          /*max_batch_size=*/M, run_ms);
         print_row(r);
     }
     std::printf("\n");
 
-    // num_workers sweep at max_batch_size=112 (the largest bucket).
+    // workers_per_gpu sweep at max_batch_size=112 (the largest bucket).
     constexpr int kMaxBatch = 112;
-    std::printf("# N sweep (max_batch=%d, coros_per_worker=%d)\n",
+    std::printf("# workers_per_gpu sweep (max_batch=%d, coros_per_worker=%d)\n",
                 kMaxBatch, kCoroFactor * kMaxBatch);
     for (int N : {1, 2, 3, 4, 6, 8}) {
-        auto r = run_one(/*num_workers=*/N,
+        auto r = run_one(/*workers_per_gpu=*/N,
                          /*coros_per_worker=*/kCoroFactor * kMaxBatch,
                          /*max_batch_size=*/kMaxBatch, run_ms);
         print_row(r);

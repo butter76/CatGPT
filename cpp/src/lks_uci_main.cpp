@@ -18,7 +18,7 @@
  *
  * Tuning env vars (UCI defaults tuned for headline GPU saturation;
  * may differ from LksSearch ctor defaults):
- *   LKS_NUM_WORKERS         (default 2)
+ *   LKS_WORKERS_PER_GPU     (default 2; total workers = this * #CUDA devices)
  *   LKS_COROS_PER_WORKER    (default 112)
  *   LKS_MAX_BATCH_SIZE      (default 56)
  *   LKS_LIFETIME_MAX_EVALS  (default 1<<20)
@@ -88,11 +88,11 @@ class LksUciDriver {
 public:
     LksUciDriver(fs::path engine_path,
                  uint64_t lifetime_max_evals,
-                 int num_workers,
+                 int workers_per_gpu,
                  int coros_per_worker,
                  int max_batch_size)
         : search_(std::move(engine_path), lifetime_max_evals,
-                  num_workers, coros_per_worker, max_batch_size)
+                  workers_per_gpu, coros_per_worker, max_batch_size)
     {}
 
     void run() {
@@ -330,7 +330,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const int num_workers      = catgpt::env_int("LKS_NUM_WORKERS", 2);
+    const int workers_per_gpu  = catgpt::env_int("LKS_WORKERS_PER_GPU", 2);
     const int coros_per_worker = catgpt::env_int("LKS_COROS_PER_WORKER", 112);
     const int max_batch_size   = catgpt::env_int("LKS_MAX_BATCH_SIZE", 56);
     const uint64_t lifetime_max_evals =
@@ -341,11 +341,11 @@ int main(int argc, char* argv[]) {
                      engine_path.string());
         std::println(
             stderr,
-            "Config: workers={} coros_per_worker={} max_batch={} arena_capacity={}",
-            num_workers, coros_per_worker, max_batch_size, lifetime_max_evals);
+            "Config: workers_per_gpu={} coros_per_worker={} max_batch={} arena_capacity={}",
+            workers_per_gpu, coros_per_worker, max_batch_size, lifetime_max_evals);
 
         catgpt::LksUciDriver driver(engine_path, lifetime_max_evals,
-                                    num_workers, coros_per_worker,
+                                    workers_per_gpu, coros_per_worker,
                                     max_batch_size);
         std::println(stderr, "Engine loaded; entering UCI loop");
         driver.run();

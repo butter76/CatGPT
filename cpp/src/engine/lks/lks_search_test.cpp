@@ -3,7 +3,7 @@
  *
  * Each LksSearch instance spins up N persistent BatchEvaluators, each of
  * which loads a TensorRT engine and allocates CUDA buffers — a few seconds
- * total. To keep this test suite fast we use num_workers=1 for the
+ * total. To keep this test suite fast we use workers_per_gpu=1 for the
  * lifecycle tests that don't need parallelism.
  *
  * Tests:
@@ -104,7 +104,7 @@ bool starts_with(std::string_view s, std::string_view prefix) {
 void test_natural_completion() {
     std::printf("[1] natural completion\n");
     LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
-                     /*num_workers=*/1);
+                     /*workers_per_gpu=*/1);
     Recorder rec;
 
     LksSearchConfig cfg;
@@ -134,7 +134,7 @@ void test_natural_completion() {
 void test_quit_mid_search() {
     std::printf("[2] quit mid-search\n");
     LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
-                     /*num_workers=*/1);
+                     /*workers_per_gpu=*/1);
     Recorder rec;
 
     LksSearchConfig cfg;
@@ -175,7 +175,7 @@ void test_quit_mid_search() {
 void test_setboard_resets_after_search() {
     std::printf("[3] setBoard resets after search\n");
     LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
-                     /*num_workers=*/1);
+                     /*workers_per_gpu=*/1);
     Recorder rec;
 
     LksSearchConfig cfg;
@@ -199,7 +199,7 @@ void test_setboard_resets_after_search() {
 void test_makemove_preserves_arena() {
     std::printf("[4] makemove preserves arena\n");
     LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
-                     /*num_workers=*/1);
+                     /*workers_per_gpu=*/1);
 
     chess::Movelist moves;
     chess::movegen::legalmoves(moves, search.board());
@@ -230,7 +230,7 @@ void test_makemove_preserves_arena() {
 void test_double_search_throws() {
     std::printf("[5] double-search throws\n");
     LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
-                     /*num_workers=*/1);
+                     /*workers_per_gpu=*/1);
     Recorder rec;
 
     LksSearchConfig cfg;
@@ -257,7 +257,7 @@ void test_double_search_throws() {
 void test_quit_without_search_is_noop() {
     std::printf("[6] quit() with no search is a fast no-op\n");
     LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
-                     /*num_workers=*/1);
+                     /*workers_per_gpu=*/1);
 
     auto t0 = std::chrono::steady_clock::now();
     search.quit();
@@ -276,9 +276,9 @@ void test_quit_without_search_is_noop() {
 void test_multi_worker_throughput() {
     std::printf("[7] multi-worker throughput (2 workers > 1 worker)\n");
     constexpr int kRunMs = 500;
-    auto run_for = [](int num_workers, int run_ms) -> uint64_t {
+    auto run_for = [](int workers_per_gpu, int run_ms) -> uint64_t {
         LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 20),
-                         num_workers, /*coros_per_worker=*/8);
+                         workers_per_gpu, /*coros_per_worker=*/8);
         Recorder rec;
         LksSearchConfig cfg;
         cfg.max_evals = 1'000'000;
@@ -309,7 +309,7 @@ void test_multi_worker_throughput() {
 void test_stop_with_busy_workers() {
     std::printf("[8] quit() with N busy workers is prompt\n");
     LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 20),
-                     /*num_workers=*/2, /*coros_per_worker=*/8);
+                     /*workers_per_gpu=*/2, /*coros_per_worker=*/8);
     Recorder rec;
     LksSearchConfig cfg;
     cfg.max_evals = 1'000'000;
@@ -344,7 +344,7 @@ void test_stop_with_busy_workers() {
 void test_concurrent_tt_writes() {
     std::printf("[9] concurrent TT writes — arena_used bounded by num_moves and eval count\n");
     LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
-                     /*num_workers=*/2, /*coros_per_worker=*/8);
+                     /*workers_per_gpu=*/2, /*coros_per_worker=*/8);
     Recorder rec;
     LksSearchConfig cfg;
     cfg.max_evals = 256;
@@ -381,7 +381,7 @@ void test_concurrent_tt_writes() {
 void test_real_gpu_evals() {
     std::printf("[10] real GPU evals — lifetime_gpu_evals matches total_evals\n");
     LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 20),
-                     /*num_workers=*/2, /*coros_per_worker=*/8);
+                     /*workers_per_gpu=*/2, /*coros_per_worker=*/8);
     Recorder rec;
     LksSearchConfig cfg;
     cfg.max_evals = 200;
@@ -408,14 +408,16 @@ void test_real_gpu_evals() {
     // gpu_total >= total and
     //   gpu_total - total <= num_workers * coros_per_worker.
     EXPECT(gpu_total >= total);
-    EXPECT(gpu_total - total <= 2 * 8);   // num_workers * coros_per_worker
+    // num_workers * coros_per_worker; num_workers scales with #GPUs.
+    EXPECT(gpu_total - total <=
+           static_cast<uint64_t>(search.num_workers()) * 8);
     EXPECT(total > 50);
 }
 
 void test_workers_reused() {
     std::printf("[11] workers reused across back-to-back searches\n");
     LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 20),
-                     /*num_workers=*/1, /*coros_per_worker=*/8);
+                     /*workers_per_gpu=*/1, /*coros_per_worker=*/8);
 
     // Search A: short.
     Recorder rec_a;
@@ -476,7 +478,7 @@ void test_workers_reused() {
 void test_id_depth_advances() {
     std::printf("[12] iterative-deepening depth advances + stays in sync\n");
     LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
-                     /*num_workers=*/2, /*coros_per_worker=*/8);
+                     /*workers_per_gpu=*/2, /*coros_per_worker=*/8);
     Recorder rec;
 
     LksSearchConfig cfg;
@@ -491,7 +493,7 @@ void test_id_depth_advances() {
 
     // Per-worker depths are always start + k*delta for some integer k >= 0.
     // The per-worker starts are staggered: worker 0 -> 0.0, worker 1 -> 0.1
-    // (cfg.delta_depth / num_workers).
+    // (cfg.delta_depth / num_workers, where num_workers = workers_per_gpu * #GPUs).
     const float min_d = search.min_depth();
     const float max_d = search.max_depth();
     std::printf("    min_depth=%.3f max_depth=%.3f spread=%.3f\n",

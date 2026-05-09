@@ -93,22 +93,51 @@ public:
      * @param max_batch_size Soft cap on bucket selection. Only buckets
      *                      <= max_batch_size are usable. Effective max
      *                      batch is the largest bucket <= max_batch_size.
+     * @param device_id     CUDA device to bind this evaluator to. The ctor,
+     *                      the GPU thread, and the dtor all cudaSetDevice
+     *                      to this id before touching CUDA APIs.
      */
     BatchEvaluator(const fs::path& network_path,
                    lf::lazy_pool* pool,
-                   int max_batch_size = 32)
+                   int max_batch_size,
+                   int device_id)
         : pool_(pool)
         , max_batch_size_(max_batch_size > 0 ? max_batch_size : 1)
+        , device_id_(device_id)
         , shutdown_(false)
         , total_evals_(0)
     {
+        // Pin every CUDA call below — runtime/engine creation, buffer
+        // allocations, context setup, and graph capture — to our device.
+        // Per-thread state, so other threads bringing up sibling
+        // evaluators on different devices don't interfere.
+        CATGPT_CUDA_CHECK(cudaSetDevice(device_id_));
+
         compute_effective_buckets();
+        // Bulk-data phase: file read, engine deserialize (uploads ~GB
+        // of weights to GPU), and buffer allocation. Parallel-safe
+        // across BatchEvaluators on the same GPU (each owns its own
+        // runtime/engines/buffers; CUDA driver serializes overlapping
+        // memcpys at the bottom).
         load_engines(network_path);
         setup_io();
         validate_profiles();
         allocate_buffers();
-        setup_contexts();
-        capture_graphs();
+
+        // GPU-stream-using phase: setup_contexts runs
+        // setOptimizationProfileAsync on stream_, capture_graphs runs
+        // a warmup enqueueV3 then captures the per-bucket graph.
+        // BOTH share Myelin/cuBLAS-like per-device state that is not
+        // safe to drive from two contexts in parallel on the same GPU
+        // (concurrent runs trip "[TRT ERROR] enqueueV3: ...
+        // executeMyelinGraph ... Platform (Cuda) error" and segfault).
+        // Serialize per device; cross-device init stays parallel.
+        {
+            std::lock_guard<std::mutex> init_lock(
+                per_device_init_mutex(device_id_));
+            setup_contexts();
+            capture_graphs();
+        }
 
         // Start the GPU thread
         gpu_thread_ = std::jthread([this](std::stop_token st) { gpu_loop(st); });
@@ -116,6 +145,12 @@ public:
 
     ~BatchEvaluator() {
         shutdown();
+
+        // Destruction can run on any thread (typically LksSearch's owner
+        // thread), so its CUDA current-device may be wrong. Pin it before
+        // calling cudaGraphExecDestroy / cudaStreamDestroy / cudaFree* —
+        // freeing buffers under the wrong device is undefined.
+        cudaSetDevice(device_id_);
 
         // Destroy captured graph executables first; each holds references
         // to TRT context state, the stream, and the d_*/h_* buffers.
@@ -189,6 +224,11 @@ private:
     // ─── GPU thread main loop ───────────────────────────────────────────
 
     void gpu_loop(std::stop_token stop) {
+        // A freshly-spawned std::jthread starts on CUDA device 0; the
+        // parent thread's current-device is NOT inherited. Pin to ours
+        // before touching any CUDA API on this thread.
+        CATGPT_CUDA_CHECK(cudaSetDevice(device_id_));
+
         std::vector<EvalRequest*> batch;
         batch.reserve(largest_effective_bucket());
 
@@ -273,7 +313,8 @@ private:
     void load_engines(const fs::path& network_path) {
         NetworkFile file(network_path);
         std::println(stderr,
-                     "[BatchEvaluator] Loaded {} ({:.1f} MB, {} sub-engine(s))",
+                     "[BatchEvaluator dev={}] Loaded {} ({:.1f} MB, {} sub-engine(s))",
+                     device_id_,
                      network_path.string(),
                      static_cast<double>(file.file_size()) / (1024.0 * 1024.0),
                      file.sub_engines().size());
@@ -381,7 +422,9 @@ private:
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_value_probs_, B * VALUE_NUM_BINS * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_policy_, B * POLICY_SIZE * sizeof(float)));
 
-        std::println(stderr, "[BatchEvaluator] Allocated buffers for max effective bucket={}", B);
+        std::println(stderr,
+                     "[BatchEvaluator dev={}] Allocated buffers for max effective bucket={}",
+                     device_id_, B);
     }
 
     /**
@@ -515,6 +558,25 @@ private:
      * + cudaStreamSynchronize. No per-launch TRT setup, no per-launch
      * cudaMemcpyAsync host calls.
      */
+    /**
+     * Per-device init mutex registry. Serializes the entire
+     * BatchEvaluator construction (engine deserialize, context setup,
+     * graph capture) across instances on the same GPU.
+     *
+     * Why per-device and not just per-process: TRT/Myelin keeps
+     * per-device shared state (JIT cache, cuBLAS-ish workspaces) that
+     * is unsafe to bring up concurrently from two contexts on one GPU.
+     * Acquired in the ctor; cross-device init runs fully in parallel.
+     */
+    static std::mutex& per_device_init_mutex(int device_id) {
+        static std::mutex map_mu;
+        static std::unordered_map<int, std::unique_ptr<std::mutex>> map;
+        std::lock_guard<std::mutex> lk(map_mu);
+        auto& slot = map[device_id];
+        if (!slot) slot = std::make_unique<std::mutex>();
+        return *slot;
+    }
+
     void capture_graphs() {
         graph_execs_.clear();
         graph_execs_.reserve(effective_buckets_.size());
@@ -548,7 +610,14 @@ private:
         const std::size_t vprobs_bytes = bucket * VALUE_NUM_BINS * sizeof(float);
         const std::size_t policy_bytes = bucket * POLICY_SIZE * sizeof(float);
 
-        CATGPT_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
+        // ThreadLocal (not Global) so concurrent BatchEvaluator init on
+        // the same GPU doesn't trip cudaErrorStreamCaptureUnsupported.
+        // Global mode makes any "unsafe-to-capture" CUDA call in any
+        // thread (e.g. another BatchEvaluator's enqueueV3 warmup, which
+        // syncs constant buffers) abort the whole process during our
+        // capture window. ThreadLocal scopes the restriction to this
+        // thread only.
+        CATGPT_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
 
         // H2D
         CATGPT_CUDA_CHECK(cudaMemcpyAsync(d_input_, h_input_, input_bytes,
@@ -602,6 +671,7 @@ private:
 
     // Configuration
     int max_batch_size_;
+    int device_id_;
 
     // Request queue
     std::deque<EvalRequest*> queue_;
