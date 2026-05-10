@@ -102,6 +102,7 @@
 #define CATGPT_ENGINE_LKS_LKS_SEARCH_HPP
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -118,6 +119,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -336,6 +338,123 @@ struct RecurseContext {
     lfsync::LfAsyncSemaphore* sem;
     WorkerSearch*             w;
 };
+
+/**
+ * POC: Halley-method allocation solver in delta-space.
+ *
+ * Computes log N_i for each child given priors P_i, child Q values
+ * Q_i, total budget N = e^depth, and c_puct, by solving for
+ * delta = K - q_max in
+ *
+ *     g(delta) = sum_i w_i / (delta + Delta_i) - N = 0
+ *
+ * with w_i = c_puct * P_i * N^(2/3)/3 and Delta_i = q_max - q_i,
+ * q_i = -Q_i. g is convex-decreasing on (0, +inf) so Halley from the
+ * provable upper bound delta_hi = c_puct/(3 N^(1/3)) converges
+ * monotonically from above without overshoot. Cubic convergence:
+ * ~3 iters cold to log_tol = 1e-6.
+ *
+ * No transcendentals in the inner loop. ~600ns at M=30 cold per the
+ * gym (`compute_alloc_gym.{hpp,cpp}` -- this is the A6c_halley_d_hi
+ * solver, ported in-place for the POC).
+ *
+ * Output is log(N_i) (LKS works in depth = log N space).
+ *
+ * NOTE: POC. Wired into recursive_search but the result is currently
+ * unused -- purpose is to validate the call site, gather realistic
+ * (P, Q) inputs from the live TT, and measure per-iteration cost
+ * inside the actual search before deciding how to consume the
+ * allocations downstream (sub-budgeting, depth shaping, etc.).
+ */
+struct AllocResult {
+    static constexpr std::size_t kMaxChildren = 256;
+    std::array<float, kMaxChildren> log_n{};
+    uint16_t M = 0;
+    uint16_t iters = 0;
+    bool converged = false;
+};
+
+inline AllocResult compute_allocations_halley(
+    const float* P,
+    const float* Q,
+    uint16_t M,
+    float depth,
+    float c_puct = 2.0f,
+    int max_iters = 12,
+    double log_tol = 1e-6)
+{
+    AllocResult r{};
+    if (M == 0 || M > AllocResult::kMaxChildren) return r;
+    r.M = M;
+
+    float qmax = -std::numeric_limits<float>::infinity();
+    for (uint16_t i = 0; i < M; ++i) {
+        const float negq = -Q[i];
+        if (negq > qmax) qmax = negq;
+    }
+
+    std::array<double, AllocResult::kMaxChildren> Delta{};
+    for (uint16_t i = 0; i < M; ++i) {
+        Delta[i] = static_cast<double>(qmax) - static_cast<double>(-Q[i]);
+    }
+
+    const double N = std::exp(static_cast<double>(depth));
+    const double w_factor = static_cast<double>(c_puct)
+                          * std::pow(N, 2.0/3.0) / 3.0;
+    const double tol_g = log_tol * N;
+
+    auto eval = [&](double d) {
+        double s = 0.0, s2 = 0.0, s3 = 0.0;
+        for (uint16_t i = 0; i < M; ++i) {
+            if (P[i] <= 0.0f) continue;
+            const double di  = d + Delta[i];
+            const double inv = 1.0 / di;
+            const double t   = w_factor * static_cast<double>(P[i]) * inv;
+            s  += t;
+            s2 += t * inv;
+            s3 += t * inv * inv;
+        }
+        return std::tuple{s - N, -s2, 2.0 * s3};
+    };
+
+    // Cold-start from the provable upper bound on delta*.
+    double d = static_cast<double>(c_puct) / (3.0 * std::cbrt(N));
+
+    int it = 0;
+    for (; it < max_iters; ++it) {
+        auto [g, gp, gpp] = eval(d);
+        if (std::fabs(g) <= tol_g) { ++it; break; }
+        const double denom = 2.0 * gp * gp - g * gpp;
+        double d_new;
+        if (gp < 0.0 && std::isfinite(denom) && denom != 0.0) {
+            d_new = d - (2.0 * g * gp) / denom;
+            if (d_new <= 0.0) d_new = d * 0.5;
+        } else {
+            d_new = d * 0.5;
+        }
+        if (std::fabs(d_new - d) <= log_tol * (d + 1e-30)) {
+            d = d_new;
+            ++it;
+            break;
+        }
+        d = d_new;
+    }
+
+    const double bias = (2.0/3.0) * static_cast<double>(depth)
+                      + std::log(static_cast<double>(c_puct) / 3.0);
+    for (uint16_t i = 0; i < M; ++i) {
+        if (P[i] <= 0.0f) {
+            r.log_n[i] = -std::numeric_limits<float>::infinity();
+        } else {
+            const double delta_i = d + Delta[i];
+            r.log_n[i] = static_cast<float>(
+                std::log(static_cast<double>(P[i])) - std::log(delta_i) + bias);
+        }
+    }
+    r.iters = static_cast<uint16_t>(it);
+    r.converged = it < max_iters;
+    return r;
+}
 
 /**
  * Recursive descent (libfork lambda).
@@ -586,6 +705,53 @@ inline constexpr auto recursive_search =
     }
     if (den > 0.0f) {
         v2::SearchArena::update_qd(entry, num / den, depth);
+    }
+
+    // ── POC: Halley allocation solve (result discarded) ─────────────
+    // Gathers (P_i, Q_i) for non-Skip children from the just-rolled-up
+    // TT state and runs the Halley-in-delta solver. Plumbed here so:
+    //   1. the call site sees realistic distributions from a live search
+    //      (priors from MoveInfo, child Qs from the post-fork-join TT),
+    //   2. the per-iteration cost can be measured under real cache/
+    //      threading conditions,
+    //   3. downstream consumption (sub-budgeting, depth shaping) can
+    //      be added later by replacing `(void)alloc;` with real use.
+    // Skip children (depth-floored siblings) are excluded from the
+    // allocation entirely -- they consume no budget and shouldn't
+    // distort the K dual. RecurseThenRead children whose TT entry is
+    // missing (stop fired mid-fork) are also dropped.
+    if (num_moves > 0 && num_moves <= AllocResult::kMaxChildren) {
+        std::array<float, AllocResult::kMaxChildren> P_buf{};
+        std::array<float, AllocResult::kMaxChildren> Q_buf{};
+        uint16_t active = 0;
+        for (uint16_t i = 0; i < num_moves; ++i) {
+            const Plan& p = plans[i];
+            float child_Q;
+            switch (p.mode) {
+                case Mode::Skip:
+                    continue;
+                case Mode::ReadOnly:
+                    child_Q = p.fixed_Q;
+                    break;
+                case Mode::RecurseThenRead: {
+                    v2::TTEntry* ce = ctx->arena->find(p.child_key, p.child_sec);
+                    if (!ce) continue;
+                    auto [q, _] = v2::unpack_qd(
+                        v2::SearchArena::load_qd(ce).qd_packed);
+                    (void)_;
+                    child_Q = q;
+                    break;
+                }
+            }
+            P_buf[active] = p.P;
+            Q_buf[active] = child_Q;
+            ++active;
+        }
+        if (active > 0) {
+            AllocResult alloc = compute_allocations_halley(
+                P_buf.data(), Q_buf.data(), active, depth);
+            (void)alloc;
+        }
     }
 };
 

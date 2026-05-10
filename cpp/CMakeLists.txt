@@ -359,6 +359,20 @@ set_target_properties(lks_throughput_bench PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
 
+# === Compute-allocations gym (standalone) ===
+# Sweeps solver implementations of the PUCT-style allocation dual problem
+# from coroutine_search.hpp::compute_allocations, working in log-space for
+# numerical stability up to N = e^22 (~3.6e9). No TRT, no chess-library,
+# no libfork — just C++23.
+add_executable(compute_alloc_gym
+    src/engine/lks/compute_alloc_gym.cpp
+)
+target_compile_options(compute_alloc_gym PRIVATE -O3 -march=native)
+set_target_properties(compute_alloc_gym PROPERTIES
+    BUILD_RPATH   "${GCC14_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR}"
+)
+
 # === libfork smoke test ===
 # Standalone PoC for libfork + custom context_switcher awaitable that
 # bridges to a fake batched "GPU" evaluator thread. No TRT, no libcoro,
