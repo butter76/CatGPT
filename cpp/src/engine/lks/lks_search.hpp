@@ -152,7 +152,7 @@ namespace fs = std::filesystem;
  * For tests install a recording lambda.
  */
 struct LksSearchConfig {
-    int max_evals = 800;            // total budget across all workers
+    uint64_t max_evals = 800;       // total budget across all workers
     int min_info_period_ms = 100;   // throttle for aggregated `info` lines
 
     // Iterative-deepening (log-scale). N = e^depth.
@@ -985,7 +985,7 @@ private:
 
         // Reset per-search counters. Stagger each worker's starting depth.
         const uint64_t per_worker_budget =
-            (static_cast<uint64_t>(cfg.max_evals) + num_workers_ - 1)
+            (cfg.max_evals + static_cast<uint64_t>(num_workers_) - 1)
             / static_cast<uint64_t>(num_workers_);
         total_evals_.store(0, std::memory_order_relaxed);
         for (int i = 0; i < num_workers_; ++i) {

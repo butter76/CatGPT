@@ -24,7 +24,6 @@
  *   LKS_LIFETIME_MAX_EVALS  (default 1<<20)
  */
 
-#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -32,7 +31,6 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
-#include <limits>
 #include <print>
 #include <stop_token>
 #include <string>
@@ -264,9 +262,7 @@ private:
         }
 
         catgpt::lks::LksSearchConfig cfg;
-        cfg.max_evals = static_cast<int>(std::min<uint64_t>(
-            max_evals,
-            static_cast<uint64_t>(std::numeric_limits<int>::max())));
+        cfg.max_evals = max_evals;
         cfg.min_info_period_ms = 100;
         cfg.on_uci_line = [](std::string_view s) { emit_line(s); };
 
