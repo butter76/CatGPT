@@ -145,6 +145,50 @@ namespace catgpt::lks {
 namespace fs = std::filesystem;
 
 /**
+ * Search-algorithm knobs (separate from per-search driver settings
+ * like budgets and UCI plumbing).
+ *
+ * Defaults mirror `coroutine_search.hpp` / `FractionalMCTSConfig`:
+ *
+ *   - c_puct                : PUCT exploration constant fed into the
+ *                             Halley allocation solver.
+ *   - fpu_reduction         : First-Play Urgency reduction. Unexpanded
+ *                             children's effective Q starts at
+ *                             `parent.Q - fpu_reduction * sqrt(cum_P)`
+ *                             where `cum_P` is the sum of priors of
+ *                             higher-ranked siblings (P-sorted).
+ *   - clamp_log_step        : per-iteration clamp cap. Each child's
+ *                             allocation `log_n_i` is clamped to
+ *                             `recorded_depth_i + clamp_log_step` (a
+ *                             recorded depth of -inf yields no clamp).
+ *                             Set to log(1.3) ≈ 0.262.
+ *   - weight_log_threshold  : at the rollup, children with
+ *                             `log_n_i < depth + weight_log_threshold`
+ *                             are dropped from the N-weighted
+ *                             average. Set to log(0.02) ≈ -3.912.
+ *   - max_clamp_iters       : hard cap on the iterative clamp loop.
+ *                             The loop also breaks early once no
+ *                             non-trivial clamp fires (iter > 0).
+ *   - forced_unexpanded     : number of P-sorted MoveInfo slots
+ *                             whose UNEXPANDED status maps to
+ *                             `depth = -inf` (so the allocator gives
+ *                             those slots their full PUCT share on
+ *                             iter 0). Position-based: applies to
+ *                             slot 0 and slot 1 iff they are
+ *                             Unexpanded; if a forced slot is
+ *                             TTHit / Terminal it keeps its natural
+ *                             depth.
+ */
+struct LksAlgoConfig {
+    float c_puct = 1.75f;
+    float fpu_reduction = 0.330f;
+    float clamp_log_step = 0.26236426f;        // log(1.3)
+    float weight_log_threshold = -3.9120230f;  // log(0.02)
+    int   max_clamp_iters = 100;
+    int   forced_unexpanded = 2;
+};
+
+/**
  * Per-search configuration.
  *
  * `on_uci_line` is invoked from `worker_main`, one call per UCI line.
@@ -161,6 +205,8 @@ struct LksSearchConfig {
     float start_depth = 0.0f;       // worker 0's starting depth
     float delta_depth = 0.2f;       // per-iteration depth step
     float max_depth   = 32.0f;      // absolute depth cap (e^32 ~= 8e13)
+
+    LksAlgoConfig algo;             // PUCT / FPU / clamp / rollup knobs
 
     std::function<void(std::string_view)> on_uci_line;
 };
@@ -337,6 +383,29 @@ struct RecurseContext {
     BatchEvaluator*           evaluator;
     lfsync::LfAsyncSemaphore* sem;
     WorkerSearch*             w;
+    const LksAlgoConfig*      algo;
+};
+
+/**
+ * Result of a single `recursive_search` invocation.
+ *
+ * `Q` is the rolled-up value from THIS node's side-to-move POV (i.e. the
+ * same convention used for `qd_packed` Cell A; the parent negates this
+ * value when accumulating into its own rollup).
+ *
+ * `depth` is the log-scale budget that was committed at this node — for
+ * a normal completion this equals the `depth` argument that was passed
+ * to `recursive_search`; for the early-out re-deepen path it equals the
+ * cached `max_depth` already in the TT entry (which is `>= depth`).
+ *
+ * Returned wrapped in `std::optional` so callers can distinguish a
+ * normal completion from an aborted descent (`std::nullopt`). Aborted
+ * children propagate up: any sibling returning `nullopt` causes the
+ * parent to also return `nullopt` without rolling up or updating the TT.
+ */
+struct QDResult {
+    float Q;
+    float depth;
 };
 
 /**
@@ -471,9 +540,9 @@ inline constexpr auto recursive_search =
        RecurseContext* ctx,
        lfsync::Permit permit,
        chess::Board board,
-       float depth) -> lf::task<void>
+       float depth) -> lf::task<std::optional<QDResult>>
 {
-    if (ctx->w->should_abort()) co_return;
+    if (ctx->w->should_abort()) co_return std::nullopt;
 
     const uint64_t key = board.hash();
     const uint32_t sec = v2::secondary_hash(board);
@@ -547,23 +616,26 @@ inline constexpr auto recursive_search =
 
         // Intentionally let the thread finish putting the entry
         // into the TT/arena before aborting.
-        if (ctx->w->should_abort()) co_return;
+        if (ctx->w->should_abort()) co_return std::nullopt;
 
         entry = ce;
     }
 
     // ── re-deepen check (works for both fresh-claim and TT-shared) ──
+    // Also captures `parent_Q` (this node's current rolled-up Q) for
+    // the FPU formula in the unexpanded-children pre-pass below.
+    float parent_Q;
     {
         // Cell A is atomic with the key match (find / find_or_claim
         // both ensure we observe a key from a successful CAS), so qd
         // is never torn here.
-        auto [_, cur_max_d] = v2::unpack_qd(
+        auto [cur_q, cur_max_d] = v2::unpack_qd(
             v2::SearchArena::load_qd(entry).qd_packed);
-        (void)_;
-        if (depth <= cur_max_d) co_return;
+        if (depth <= cur_max_d) co_return QDResult{cur_q, cur_max_d};
+        parent_Q = cur_q;
     }
 
-    // ── single classify-and-fork pass over children ─────────────────
+    // ── ChildState pre-pass over MoveInfo ──────────────────────────
     // Cell B is provably published by the time we reach this point:
     //   * `find(key, sec)` only returns non-null after validating
     //     the secondary, which requires Cell B to be published
@@ -583,193 +655,376 @@ inline constexpr auto recursive_search =
     const uint16_t num_moves = hdr->num_moves;
     const v2::MoveInfo* moves = ctx->arena->moves_at(info_cell.info_offset);
 
-    enum class Mode : uint8_t { Skip, RecurseThenRead, ReadOnly };
-    struct Plan {
-        Mode     mode;
-        float    P;
-        float    fixed_Q;     // valid for ReadOnly
-        uint64_t child_key;   // valid for RecurseThenRead
-        uint32_t child_sec;   // valid for RecurseThenRead (cached so
-                              // the post-fan-out rollup re-find can
-                              // run without re-deriving the board)
+    /**
+     * Per-child classification (data-shape, distinct from the
+     * fork-or-not control decision computed below).
+     *
+     *  - `TerminalDraw`         : MoveInfo terminal_kind == Draw.
+     *                             Q = 0 (child-POV), depth = +inf.
+     *  - `TerminalLossForChild` : MoveInfo terminal_kind == LossForChild.
+     *                             Q = -1 (child-POV: child loses),
+     *                             depth = +inf.
+     *  - `TerminalRepetition`   : path-dependent 2-fold detected
+     *                             after `makeMove`. Q = 0, depth = +inf.
+     *  - `TerminalHalfMove`     : path-dependent 50-move clock draw.
+     *                             Q = 0, depth = +inf.
+     *  - `TTHit`                : child key found in TT. Q = TT q
+     *                             (child-POV), depth = TT max_depth.
+     *  - `Unexpanded`           : child key not in TT. Q = FPU
+     *                             value in child-POV (= -(parent_Q -
+     *                             fpu_reduction * sqrt(cum_P))),
+     *                             depth = 0, except slots 0 and 1
+     *                             of the P-sorted MoveInfo are
+     *                             forced to depth = -inf when those
+     *                             slots are Unexpanded (the
+     *                             `forced_unexpanded` rule — a
+     *                             position-based override on
+     *                             indices, NOT a "first 2 among
+     *                             unexpanded children" rule).
+     */
+    enum class ChildStatus : uint8_t {
+        TerminalDraw,
+        TerminalLossForChild,
+        TerminalRepetition,
+        TerminalHalfMove,
+        TTHit,
+        Unexpanded,
     };
-    std::vector<Plan> plans;
-    plans.reserve(num_moves);
+    auto is_terminal = [](ChildStatus s) noexcept {
+        return s == ChildStatus::TerminalDraw
+            || s == ChildStatus::TerminalLossForChild
+            || s == ChildStatus::TerminalRepetition
+            || s == ChildStatus::TerminalHalfMove;
+    };
 
-    // first_fork tracks whether we've consumed the inherited permit yet.
-    // any_fork tracks whether we've opened a fork-join scope (must lf::join
-    // before returning iff any_fork is true).
-    bool first_fork = true;
-    bool any_fork   = false;
+    /**
+     * One slot per MoveInfo entry, populated unconditionally by the
+     * pre-pass and consumed by both the decision/fork loop and the
+     * rollup.
+     *
+     * `Q` is in **child-POV** (matches TT `qd_packed` semantics and
+     * the Halley solver's input convention). Parent-POV values used
+     * for the rollup are obtained as `-Q`.
+     *
+     * `cb`, `child_key`, `child_sec` are populated for every
+     * non-MoveInfo-terminal child (i.e. `cb` is junk for
+     * TerminalDraw / TerminalLossForChild). The path-dependent
+     * terminal kinds (Repetition / HalfMove) DO require `makeMove`
+     * for detection so their `cb` is also valid; we just won't
+     * recurse into them.
+     *
+     * `was_forked` is a transient flag set by the clamp-iteration
+     * fork pass to direct (a) the abort-propagation scan and (b) the
+     * (Q, depth) writeback from `child_result`. Reset to false at
+     * the top of every clamp iter.
+     *
+     * `child_result` is the return slot written by `lf::fork` into
+     * this child's `recursive_search`. Default `nullopt` for
+     * unforked children and for forks that aborted (the child
+     * coroutine returned `nullopt`).
+     */
+    struct ChildState {
+        chess::Move    move;
+        float          P;
+        ChildStatus    status;
+        float          Q;       // child-POV
+        float          depth;   // recorded log-N for the child
+        chess::Board   cb;      // post-makeMove (junk for position-only terminals)
+        uint64_t       child_key;
+        uint32_t       child_sec;
+        bool           was_forked;
+        std::optional<QDResult> child_result;
+    };
 
+    std::vector<ChildState> states;
+    states.reserve(num_moves);
+
+    constexpr float kInf = std::numeric_limits<float>::infinity();
+    const int forced_unexpanded = ctx->algo->forced_unexpanded;
+    const float fpu_reduction = ctx->algo->fpu_reduction;
+
+    float cumulative_P = 0.0f;
     for (uint16_t i = 0; i < num_moves; ++i) {
         const auto& m = moves[i];
         const v2::TerminalKind m_tk = m.terminal_kind();
         const float m_P = m.P();
 
-        // Depth floor — applies to EVERY child regardless of kind.
-        // With child_depth = depth + log(P), each level of recursion
-        // strictly decreases depth. Without a floor at 0 the recursion
-        // would run forever as priors compound below e^0 = 1 visit.
-        // Cuts terminal_kind contributions too: a terminal child below
-        // the floor doesn't matter at this iteration's resolution.
-        const float child_depth = (m_P > 0.0f)
-            ? depth + std::log(std::max(m_P, 1e-9f))
-            : -std::numeric_limits<float>::infinity();
-        if (child_depth < 0.0f) {
-            plans.push_back({Mode::Skip, m_P, 0.0f, 0, 0});
-            continue;
-        }
+        ChildState cs;
+        cs.move = chess::Move{m.move};
+        cs.P = m_P;
+        cs.child_key = 0;
+        cs.child_sec = 0;
+        cs.was_forked = false;
+        cs.child_result = std::nullopt;
 
         if (m_tk == v2::kTerminalDraw) {
-            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, 0, 0});
-            continue;
-        }
-        if (m_tk == v2::kTerminalLossForChild) {
-            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/-1.0f, 0, 0});
-            continue;
-        }
-
-        chess::Board cb = board;
-        cb.makeMove<true>(chess::Move{m.move});
-
-        // Path-dependent: a 2-fold along this path or a 50-move
-        // expiration is NOT in terminal_kind (different paths
-        // hashing to the same key may disagree on repetition state
-        // / half-move clock since neither is part of the Zobrist
-        // key). Treat as a draw at this caller.
-        if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
-            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, 0, 0});
-            continue;
-        }
-
-        const uint64_t child_key = cb.hash();
-        const uint32_t child_sec = v2::secondary_hash(cb);
-
-        if (v2::TTEntry* ce = ctx->arena->find(child_key, child_sec)) {
-            // (key, secondary) match verified by find — find only
-            // returns non-null after `secondary_matches` observed
-            // Cell B published with a matching key_secondary, so
-            // the child entry is fully published. Cell A's qd is
-            // atomic with the primary match; we never spin on the
-            // child's moveInfo from here, and we don't need it for
-            // the ReadOnly path (just q + max_depth).
-            auto [q, child_max_d] = v2::unpack_qd(
-                v2::SearchArena::load_qd(ce).qd_packed);
-            if (child_depth <= child_max_d) {
-                plans.push_back({Mode::ReadOnly, m_P, q, child_key, child_sec});
-                continue;
-            }
-        }
-
-        // ── RecurseThenRead: fork with permit-passing ───────────────
-        // First fork inherits our permit (no acquire). Subsequent forks
-        // co_await sem->acquire() — when permits run out, the producer
-        // (this coroutine) suspends in acquire() before any new child
-        // frame is allocated. That's the real backpressure point.
-        lfsync::Permit child_permit = first_fork
-            ? std::move(permit)
-            : co_await ctx->sem->acquire();
-        first_fork = false;
-        any_fork   = true;
-
-        plans.push_back({Mode::RecurseThenRead, m_P, 0.0f, child_key, child_sec});
-        co_await lf::fork[recursive_search](
-            ctx, std::move(child_permit), std::move(cb), child_depth);
-    }
-
-    if (any_fork) {
-        co_await lf::join;
-    }
-
-    if (ctx->w->should_abort()) co_return;
-
-    // ── rollup: P-weighted average of -child_Q ──────────────────────
-    float num = 0.0f;
-    float den = 0.0f;
-    for (const Plan& p : plans) {
-        if (p.mode == Mode::Skip) continue;
-        float child_Q;
-        if (p.mode == Mode::ReadOnly) {
-            child_Q = p.fixed_Q;
+            cs.status = ChildStatus::TerminalDraw;
+            cs.Q = 0.0f;
+            cs.depth = kInf;
+        } else if (m_tk == v2::kTerminalLossForChild) {
+            cs.status = ChildStatus::TerminalLossForChild;
+            cs.Q = -1.0f;
+            cs.depth = kInf;
         } else {
-            v2::TTEntry* ce = ctx->arena->find(p.child_key, p.child_sec);
-            if (!ce) continue;       // child never claimed (e.g. stop fired)
-            auto [q, _] = v2::unpack_qd(
-                v2::SearchArena::load_qd(ce).qd_packed);
-            (void)_;
-            child_Q = q;
+            // makeMove<true> is the strict-EP template overload; the
+            // local-then-move dance avoids the parser ambiguity that
+            // arises calling `cs.cb.makeMove<true>(...)` through a
+            // member access inside the auto-typed libfork lambda.
+            chess::Board cb = board;
+            cb.makeMove<true>(cs.move);
+            if (cb.isRepetition(1)) {
+                cs.status = ChildStatus::TerminalRepetition;
+                cs.Q = 0.0f;
+                cs.depth = kInf;
+                cs.cb = std::move(cb);
+            } else if (cb.isHalfMoveDraw()) {
+                cs.status = ChildStatus::TerminalHalfMove;
+                cs.Q = 0.0f;
+                cs.depth = kInf;
+                cs.cb = std::move(cb);
+            } else {
+                cs.child_key = cb.hash();
+                cs.child_sec = v2::secondary_hash(cb);
+                if (v2::TTEntry* ce = ctx->arena->find(cs.child_key, cs.child_sec)) {
+                    // (key, secondary) match verified by find. Cell A's
+                    // qd is atomic with the primary match — no spin.
+                    auto [q, child_max_d] = v2::unpack_qd(
+                        v2::SearchArena::load_qd(ce).qd_packed);
+                    cs.status = ChildStatus::TTHit;
+                    cs.Q = q;
+                    cs.depth = child_max_d;
+                } else {
+                    cs.status = ChildStatus::Unexpanded;
+                    // FPU reduction lives in PARENT-POV; we store
+                    // child-POV by negating: child-POV Q = -(parent
+                    // Q - reduction * sqrt(cum_P)).
+                    const float fpu_parent_pov =
+                        parent_Q - fpu_reduction * std::sqrt(cumulative_P);
+                    cs.Q = -fpu_parent_pov;
+                    // Position-based forced override on indices 0 and 1
+                    // (only when the slot ends up Unexpanded — a TTHit
+                    // or terminal slot at index 0/1 keeps its natural
+                    // depth).
+                    cs.depth = (i < static_cast<uint16_t>(forced_unexpanded))
+                        ? -kInf : 0.0f;
+                }
+                cs.cb = std::move(cb);
+            }
         }
-        num += p.P * (-child_Q);
-        den += p.P;
-    }
-    if (den > 0.0f) {
-        v2::SearchArena::update_qd(entry, num / den, depth);
+
+        cumulative_P += m_P;
+        states.push_back(std::move(cs));
     }
 
-    // ── POC: Halley allocation solve (result discarded) ─────────────
-    // Gathers (P_i, Q_i) for non-Skip children from the just-rolled-up
-    // TT state and runs the Halley-in-delta solver. Plumbed here so:
-    //   1. the call site sees realistic distributions from a live search
-    //      (priors from MoveInfo, child Qs from the post-fork-join TT),
-    //   2. the per-iteration cost can be measured under real cache/
-    //      threading conditions,
-    //   3. downstream consumption (sub-budgeting, depth shaping) can
-    //      be added later by replacing `(void)alloc;` with real use.
-    // Skip children (depth-floored siblings) are excluded from the
-    // allocation entirely -- they consume no budget and shouldn't
-    // distort the K dual. RecurseThenRead children whose TT entry is
-    // missing (stop fired mid-fork) are also dropped.
-    if (num_moves > 0 && num_moves <= AllocResult::kMaxChildren) {
-        std::array<float, AllocResult::kMaxChildren> P_buf{};
-        std::array<float, AllocResult::kMaxChildren> Q_buf{};
-        uint16_t active = 0;
+    // ── Halley-driven allocation + clamped iteration loop ─────────
+    // Each iter:
+    //   1. Build (P[], Q[]) from current ChildState and run the
+    //      log-space Halley solver to get log_n[i].
+    //   2. Per-child compute the clamp limit and the recurse
+    //      decision:
+    //          clamp_limit_i = (depth_i == -inf) ? +inf
+    //                                            : depth_i + clamp_log_step
+    //          clamped_i     = min(log_n_i, clamp_limit_i)
+    //          needs_recurse_i = (log_n_i > depth_i)         (strict)
+    //          clamp_fired_i   = (log_n_i > clamp_limit_i)   (strict)
+    //   3. Fork every needs_recurse_i child with depth =
+    //      clamped_i; lf::join.
+    //   4. Abort propagation: any forked child returning nullopt
+    //      causes us to also co_return nullopt (no rollup).
+    //   5. Copy (Q, depth) from each fork's QDResult back into
+    //      the corresponding ChildState slot. This avoids any TT
+    //      re-find and feeds the next iteration's Halley.
+    //   6. Termination: break the loop if `clamp_iter > 0` and no
+    //      child's `log_n_i` exceeded its clamp limit (i.e. every
+    //      forked child got its full requested allocation — the
+    //      clamping is no longer binding).
+    //
+    // Permit handling: parent enters with one permit. Iter 0's
+    // first fork inherits via std::move; every other fork
+    // (including iter ≥ 1's first fork) does its own
+    // `co_await sem.acquire()`. Tracked via `permit_held` so the
+    // inheritance fires at most once across all iterations.
+    assert(num_moves <= AllocResult::kMaxChildren
+           && "num_moves > kMaxChildren — chess legal-move count "
+              "should never exceed 256");
+    std::array<float, AllocResult::kMaxChildren> P_buf{};
+    std::array<float, AllocResult::kMaxChildren> Q_buf{};
+    std::array<float, AllocResult::kMaxChildren> clamped_log_n{};
+    std::array<bool,  AllocResult::kMaxChildren> needs_recurse{};
+
+    bool permit_held = true;
+    const auto& algo = *ctx->algo;
+    const int max_iters = algo.max_clamp_iters;
+
+    for (int clamp_iter = 0; clamp_iter < max_iters; ++clamp_iter) {
+        // Reset per-iter transient flags. `child_result` is
+        // value-reset so a slot's prior-iter value can't masquerade
+        // as this iter's return.
+        for (ChildState& cs : states) {
+            cs.was_forked = false;
+            cs.child_result = std::nullopt;
+        }
+
         for (uint16_t i = 0; i < num_moves; ++i) {
-            const Plan& p = plans[i];
-            float child_Q;
-            switch (p.mode) {
-                case Mode::Skip:
-                    continue;
-                case Mode::ReadOnly:
-                    child_Q = p.fixed_Q;
-                    break;
-                case Mode::RecurseThenRead: {
-                    v2::TTEntry* ce = ctx->arena->find(p.child_key, p.child_sec);
-                    if (!ce) continue;
-                    auto [q, _] = v2::unpack_qd(
-                        v2::SearchArena::load_qd(ce).qd_packed);
-                    (void)_;
-                    child_Q = q;
-                    break;
-                }
+            P_buf[i] = states[i].P;
+            Q_buf[i] = states[i].Q;  // child-POV — matches Halley input
+        }
+        AllocResult alloc = compute_allocations_halley(
+            P_buf.data(), Q_buf.data(), num_moves, depth, algo.c_puct);
+
+        bool any_clamp_fired = false;
+        for (uint16_t i = 0; i < num_moves; ++i) {
+            const float log_n_i = alloc.log_n[i];
+            const float d_i     = states[i].depth;
+            const float clamp_limit = (std::isinf(d_i) && d_i < 0.0f)
+                ? kInf
+                : d_i + algo.clamp_log_step;
+            if (log_n_i > clamp_limit) any_clamp_fired = true;
+            clamped_log_n[i] = std::min(log_n_i, clamp_limit);
+            needs_recurse[i] = log_n_i > d_i;
+        }
+
+        // Fork pass.
+        bool any_fork = false;
+        for (uint16_t i = 0; i < num_moves; ++i) {
+            ChildState& cs = states[i];
+            if (is_terminal(cs.status)) continue;  // d_i = +inf, never recurses
+            if (!needs_recurse[i])      continue;  // alloc <= recorded depth
+
+            lfsync::Permit child_permit = permit_held
+                ? std::move(permit)
+                : co_await ctx->sem->acquire();
+            permit_held = false;
+            any_fork    = true;
+            cs.was_forked = true;
+
+            // Copy cs.cb (rather than std::move) so the original
+            // survives the next clamp iteration — `cs.cb` is
+            // re-used unchanged across iters since the move it
+            // encodes doesn't depend on which iter we're in.
+            co_await lf::fork(&cs.child_result, recursive_search)(
+                ctx, std::move(child_permit), chess::Board(cs.cb),
+                clamped_log_n[i]);
+        }
+
+        if (any_fork) {
+            co_await lf::join;
+        }
+
+        if (ctx->w->should_abort()) co_return std::nullopt;
+
+        // Abort propagation: any forked child that returned
+        // `nullopt` is the unambiguous signal that the descent
+        // bailed out partway. Propagate up — no rollup, no TT
+        // commit — so partial / stale work doesn't pollute the TT.
+        for (const ChildState& cs : states) {
+            if (cs.was_forked && !cs.child_result.has_value()) {
+                co_return std::nullopt;
             }
-            P_buf[active] = p.P;
-            Q_buf[active] = child_Q;
-            ++active;
         }
-        if (active > 0) {
-            AllocResult alloc = compute_allocations_halley(
-                P_buf.data(), Q_buf.data(), active, depth);
-            (void)alloc;
+
+        // Pull (Q, depth) from each fork's QDResult into ChildState
+        // (no TT re-find). For the next clamp iter, cs.depth is
+        // exactly the depth the sub-recurse committed to (= the
+        // clamped allocation we just passed in).
+        for (ChildState& cs : states) {
+            if (cs.was_forked) {
+                cs.Q     = cs.child_result->Q;
+                cs.depth = cs.child_result->depth;
+            }
         }
+
+        // Termination: only after iter 0 (we always run iter 0 at
+        // least once). If no child's allocation exceeded its clamp
+        // limit, every forked child got the full allocation it
+        // wanted and the clamping is no longer binding — converged.
+        if (clamp_iter > 0 && !any_clamp_fired) break;
     }
+
+    // ── final allocation + N-weighted rollup ───────────────────────
+    // After the clamp loop converges, run one more Halley pass on
+    // the (now-stable) ChildState (P, Q, depth) to get the final
+    // log_n[i] used both for the weight-threshold filter and for the
+    // weights themselves. The rollup is a weighted average of -cs.Q
+    // (parent-POV) in N-scale (weights = N_i = exp(log_n_i)), which
+    // equivalently can be computed in log-space via a logsumexp-style
+    // reduction. Two filters apply:
+    //   1. Drop Unexpanded children — they only have FPU values, not
+    //      real Q estimates, so they shouldn't poison the rollup.
+    //   2. Drop children below the log-N threshold
+    //      (`log_n_i < depth + weight_log_threshold`, default
+    //      log(0.02)) so vanishingly small allocations don't drag
+    //      the average around.
+    // If everything is filtered out (degenerate node — only
+    // Unexpanded children with zero alloc, or all children below
+    // threshold), fall back to whatever the TT currently holds for
+    // this node and skip the `update_qd` (nothing meaningful to
+    // commit).
+    for (uint16_t i = 0; i < num_moves; ++i) {
+        P_buf[i] = states[i].P;
+        Q_buf[i] = states[i].Q;
+    }
+    AllocResult final_alloc = compute_allocations_halley(
+        P_buf.data(), Q_buf.data(), num_moves, depth, algo.c_puct);
+
+    const float weight_floor_log = depth + algo.weight_log_threshold;
+    // Numerically-stable weighted average: shift weights by the max
+    // log_n among contributing children, sum exp(log_n - max), then
+    // the max factor cancels in num/den.
+    float max_log_n = -std::numeric_limits<float>::infinity();
+    for (uint16_t i = 0; i < num_moves; ++i) {
+        const ChildState& cs = states[i];
+        if (cs.status == ChildStatus::Unexpanded) continue;
+        const float log_n_i = final_alloc.log_n[i];
+        if (log_n_i < weight_floor_log) continue;
+        if (log_n_i > max_log_n) max_log_n = log_n_i;
+    }
+
+    float rolled_q;
+    if (std::isfinite(max_log_n)) {
+        float num = 0.0f;
+        float den = 0.0f;
+        for (uint16_t i = 0; i < num_moves; ++i) {
+            const ChildState& cs = states[i];
+            if (cs.status == ChildStatus::Unexpanded) continue;
+            const float log_n_i = final_alloc.log_n[i];
+            if (log_n_i < weight_floor_log) continue;
+            const float w = std::exp(log_n_i - max_log_n);
+            num += w * (-cs.Q);
+            den += w;
+        }
+        rolled_q = num / den;  // den > 0 since max_log_n is finite
+        v2::SearchArena::update_qd(entry, rolled_q, depth);
+    } else {
+        // Degenerate: no contributing children. Fall back to whatever
+        // Cell A currently holds (typically the freshly-claimed
+        // origQ); skip update_qd.
+        rolled_q = v2::unpack_qd(
+            v2::SearchArena::load_qd(entry).qd_packed).first;
+    }
+
+    co_return QDResult{rolled_q, depth};
 };
 
 /**
  * Thin root entry: acquires the very first permit from the per-worker
  * semaphore, then descends into recursive_search. Keeps the
- * recursive_search invariant ("entry owns a permit") clean.
+ * recursive_search invariant ("entry owns a permit") clean. Forwards
+ * the descent's `std::optional<QDResult>` back to the caller of
+ * `lf::sync_wait` (`run_iteration`).
  */
 inline constexpr auto root_search =
     [](auto /*self*/,
        RecurseContext* ctx,
        chess::Board board,
-       float depth) -> lf::task<void>
+       float depth) -> lf::task<std::optional<QDResult>>
 {
     lfsync::Permit p = co_await ctx->sem->acquire();
-    co_await lf::call[recursive_search](
+    std::optional<QDResult> result;
+    co_await lf::call(&result, recursive_search)(
         ctx, std::move(p), std::move(board), depth);
     co_await lf::join;
+    co_return result;
 };
 
 }  // namespace detail
@@ -937,6 +1192,10 @@ public:
         if (worker_.joinable()) {
             worker_.join();
         }
+        // Capture the algo knobs so post-search inspectors (notably
+        // `bestmove()`) can reproduce the same Halley allocation
+        // (same c_puct etc.) the workers used during the search.
+        last_algo_ = config.algo;
         searched_since_reset_ = true;
         running_.store(true, std::memory_order_release);
         worker_ = std::jthread(
@@ -1031,28 +1290,36 @@ public:
     }
 
     /**
-     * Pick the root move with the best score, where score = -child_Q from
-     * our perspective. Mirrors the plan classification used in
-     * `recursive_search`: terminal_kind drives fixed Q for terminal
-     * children; `isRepetition(1)` and `isHalfMoveDraw()` are checked
-     * path-dependently (drawn at this caller); non-terminal children's
-     * Q is read from their TT entry.
+     * Pick the root move by argmax of the final allocation
+     * `log_n[i]` returned by the Halley solver — same selection rule
+     * as `coroutine_search.hpp`'s `compute_allocations(root, ...)` +
+     * argmax-of-allocation.
      *
-     * Tiebreak (lex): score, then child max_depth, then prior P.
+     * Pre-pass classification mirrors `detail::recursive_search`:
+     *   - `kTerminalDraw`             -> Q = 0
+     *   - `kTerminalLossForChild`     -> Q = -1 (child-POV)
+     *   - path-dependent draw         -> Q = 0
+     *   - TT-hit (non-terminal child) -> Q from child's qd_packed
+     *   - TT-miss (Unexpanded)        -> EXCLUDED from the allocation
+     *                                    argmax (matches
+     *                                    coroutine_search, which
+     *                                    only walks expanded
+     *                                    children for selection).
+     *
+     * The Halley solver runs at the root's recorded `max_depth`
+     * (i.e. the deepest budget any worker rolled up at root) using
+     * the algo `c_puct` captured at `search()`-time.
      *
      * Falls back to:
-     *   - `chess::Move::NO_MOVE` if there are no legal moves,
-     *   - `legal[0]` if the root has not yet been expanded (TT miss or
-     *     `info_offset == kNoInfoOffset`).
+     *   - `chess::Move::NO_MOVE` if there are no legal moves;
+     *   - `legal[0]` if the root has no TT entry, no MoveInfo, or
+     *     a degenerate `num_moves == 0`;
+     *   - the highest-P MoveInfo entry if every child is Unexpanded
+     *     (nothing got searched, so the prior is the only signal).
      *
-     * Children that were never expanded during search (e.g. budget
-     * exhausted before they were reached) are scored as "we lose" so
-     * any move with TT-evaluated children outranks them; if NO child
-     * has a TT entry, the highest-P move wins via the P tiebreak.
-     *
-     * Safe to call concurrently with a search in flight (uses acquire
-     * loads on `qd_packed` / `info_offset`); intended to be called
-     * after `quit()`/runners join, when the result is stable.
+     * Safe to call concurrently with a search in flight (uses
+     * acquire loads on `qd_packed` / `info_offset`); intended to be
+     * called after `quit()`/runners join, when the result is stable.
      */
     [[nodiscard]] chess::Move bestmove() const {
         chess::Movelist legal;
@@ -1077,10 +1344,21 @@ public:
         const v2::MoveInfo* moves = arena_->moves_at(info.info_offset);
         if (num_moves == 0) return legal[0];
 
-        chess::Move best       = chess::Move{moves[0].move};
-        float       best_score = -std::numeric_limits<float>::infinity();
-        float       best_depth = -std::numeric_limits<float>::infinity();
-        float       best_P     = -1.0f;
+        const auto root_qd = v2::unpack_qd(
+            v2::SearchArena::load_qd(root).qd_packed);
+        const float root_depth = root_qd.second;
+
+        // Build (P[], Q[]) for every classifiable child — i.e.
+        // everything except TT-miss "Unexpanded" slots. The
+        // `move_buf` parallel array tracks which root MoveInfo slot
+        // each (P, Q) entry came from for the post-Halley argmax.
+        std::array<float, detail::AllocResult::kMaxChildren> P_buf{};
+        std::array<float, detail::AllocResult::kMaxChildren> Q_buf{};
+        std::array<chess::Move, detail::AllocResult::kMaxChildren> move_buf{};
+        uint16_t active = 0;
+
+        chess::Move highest_P_move = chess::Move{moves[0].move};
+        float       highest_P      = moves[0].P();
 
         for (uint16_t i = 0; i < num_moves; ++i) {
             const v2::MoveInfo& mi = moves[i];
@@ -1088,13 +1366,18 @@ public:
             const v2::TerminalKind tk = mi.terminal_kind();
             const float mi_P = mi.P();
 
+            if (mi_P > highest_P) {
+                highest_P = mi_P;
+                highest_P_move = m;
+            }
+
             float child_Q;
-            float child_depth = std::numeric_limits<float>::infinity();
+            bool include = true;
 
             if (tk == v2::kTerminalDraw) {
                 child_Q = 0.0f;
             } else if (tk == v2::kTerminalLossForChild) {
-                child_Q = -1.0f;  // child loses ⇒ we win
+                child_Q = -1.0f;
             } else {
                 chess::Board cb = board_;
                 cb.makeMove<true>(m);
@@ -1105,37 +1388,44 @@ public:
                     const uint32_t child_sec = v2::secondary_hash(cb);
                     const v2::TTEntry* ce = arena_->find(child_key, child_sec);
                     if (ce == nullptr) {
-                        // Unreached during search (or genuine 64-bit
-                        // collision masking the entry): score as "we
-                        // lose" so any TT-evaluated sibling outranks
-                        // it. P tiebreak still picks the highest-prior
-                        // unreached move when no children have TT
-                        // entries.
-                        child_Q     = +1.0f;
-                        child_depth = -std::numeric_limits<float>::infinity();
+                        // Unexpanded at root — exclude from allocation
+                        // argmax (matches coroutine_search.hpp).
+                        include = false;
+                        child_Q = 0.0f;  // unused
                     } else {
                         // Cell A's qd is atomic with the (key, secondary)
-                        // match — no need to wait on Cell B again
-                        // (we don't need moveInfo, and find already
-                        // verified the secondary).
-                        auto [q, d] = v2::unpack_qd(
+                        // match.
+                        auto [q, _] = v2::unpack_qd(
                             v2::SearchArena::load_qd(ce).qd_packed);
-                        child_Q     = q;
-                        child_depth = d;
+                        (void)_;
+                        child_Q = q;
                     }
                 }
             }
 
-            const float score = -child_Q;
-            const bool better =
-                   score > best_score
-                || (score == best_score && child_depth > best_depth)
-                || (score == best_score && child_depth == best_depth && mi_P > best_P);
-            if (better) {
-                best_score = score;
-                best_depth = child_depth;
-                best_P     = mi_P;
-                best       = m;
+            if (include) {
+                P_buf[active]    = mi_P;
+                Q_buf[active]    = child_Q;
+                move_buf[active] = m;
+                ++active;
+            }
+        }
+
+        if (active == 0) {
+            // Nothing was searched (every child Unexpanded). The
+            // prior is the only signal we have.
+            return highest_P_move;
+        }
+
+        const detail::AllocResult alloc = detail::compute_allocations_halley(
+            P_buf.data(), Q_buf.data(), active, root_depth, last_algo_.c_puct);
+
+        chess::Move best  = move_buf[0];
+        float best_log_n  = alloc.log_n[0];
+        for (uint16_t i = 1; i < active; ++i) {
+            if (alloc.log_n[i] > best_log_n) {
+                best_log_n = alloc.log_n[i];
+                best       = move_buf[i];
             }
         }
         return best;
@@ -1274,7 +1564,7 @@ private:
         float depth = start;
         w.depth.store(depth, std::memory_order_relaxed);
         while (!w.should_abort() && depth < cfg.max_depth) {
-            run_iteration(w, depth);
+            run_iteration(w, depth, cfg.algo);
             depth += cfg.delta_depth;
             w.depth.store(depth, std::memory_order_relaxed);
         }
@@ -1288,14 +1578,22 @@ private:
      * The runner is NOT a libfork worker thread, so calling sync_wait
      * (which would throw schedule_in_worker if called from one) is safe.
      */
-    void run_iteration(WorkerSearch& w, float depth) {
+    void run_iteration(WorkerSearch& w, float depth, const LksAlgoConfig& algo) {
         detail::RecurseContext ctx{
             /*arena=*/&*arena_,
             /*evaluator=*/w.evaluator.get(),
             /*sem=*/w.sem.get(),
             /*w=*/&w,
+            /*algo=*/&algo,
         };
-        lf::sync_wait(*w.pool, detail::root_search, &ctx, board_, depth);
+        // root_search returns the descent's (Q, depth) as
+        // std::optional<QDResult>; nullopt indicates an aborted
+        // root-level search (stop fired or budget exhausted before any
+        // useful work). The driver loop keys progress off w.depth and
+        // the TT, so we don't need the value here — discard it.
+        auto result = lf::sync_wait(
+            *w.pool, detail::root_search, &ctx, board_, depth);
+        (void)result;
     }
 
     fs::path trt_engine_path_;
@@ -1309,6 +1607,11 @@ private:
     chess::Board board_;
     uint64_t     root_key_ = 0;
     bool         searched_since_reset_ = false;
+
+    // Captured at the start of every `search()` call so post-search
+    // inspectors (notably `bestmove()`'s argmax-of-allocation) can
+    // re-run the Halley solver with the same knobs the workers used.
+    LksAlgoConfig last_algo_{};
 
     std::optional<v2::SearchArena>             arena_;
     std::vector<std::unique_ptr<WorkerSearch>> workers_;

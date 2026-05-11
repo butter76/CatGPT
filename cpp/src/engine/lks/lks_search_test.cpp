@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -475,6 +476,71 @@ void test_workers_reused() {
     }
 }
 
+void test_root_qd_after_search() {
+    std::printf("[13] root TT (Q, depth) is finite and >= start_depth after search\n");
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*workers_per_gpu=*/1, /*coros_per_worker=*/8);
+    Recorder rec;
+
+    LksSearchConfig cfg;
+    cfg.max_evals = 128;
+    cfg.min_info_period_ms = 0;
+    cfg.start_depth = 0.0f;
+    cfg.delta_depth = 0.2f;
+    cfg.on_uci_line = rec.callback();
+    search.search(std::move(cfg));
+    while (search.is_searching()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    search.quit();
+
+    // Root entry must exist and carry a finite, in-range Q plus a
+    // depth that's at least one ID step beyond start_depth (the
+    // first iter's recursive_search at root must have called
+    // update_qd at depth >= 0.0 + 0.2).
+    const auto* root = search.arena().find(
+        search.root_key(),
+        catgpt::v2::secondary_hash(search.board()));
+    EXPECT(root != nullptr);
+    if (root == nullptr) return;
+
+    const auto qd = catgpt::v2::SearchArena::load_qd(root);
+    auto [q, d] = catgpt::v2::unpack_qd(qd.qd_packed);
+    std::printf("    root_q=%.4f  root_max_depth=%.4f\n", q, d);
+
+    EXPECT(std::isfinite(q));
+    EXPECT(q >= -1.0f && q <= 1.0f);
+    EXPECT(std::isfinite(d));
+    // At least one full ID iter committed at root: depth >= start +
+    // delta. Workers stagger; the deepest one should reach a depth
+    // strictly above start_depth.
+    EXPECT(d >= 0.2f - 1e-4f);
+}
+
+void test_bestmove_is_legal() {
+    std::printf("[14] bestmove returns a legal move from the root position\n");
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*workers_per_gpu=*/1, /*coros_per_worker=*/8);
+    Recorder rec;
+
+    LksSearchConfig cfg;
+    cfg.max_evals = 64;
+    cfg.min_info_period_ms = 0;
+    cfg.on_uci_line = rec.callback();
+    search.search(std::move(cfg));
+    while (search.is_searching()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    search.quit();
+
+    const chess::Move best = search.bestmove();
+    EXPECT(best != chess::Move::NO_MOVE);
+
+    chess::Movelist legal;
+    chess::movegen::legalmoves(legal, search.board());
+    bool found = false;
+    for (const auto& m : legal) {
+        if (m == best) { found = true; break; }
+    }
+    EXPECT(found);
+}
+
 void test_id_depth_advances() {
     std::printf("[12] iterative-deepening depth advances + stays in sync\n");
     LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
@@ -533,6 +599,8 @@ int main() {
     test_real_gpu_evals();
     test_workers_reused();
     test_id_depth_advances();
+    test_root_qd_after_search();
+    test_bestmove_is_legal();
 
     if (g_failed == 0) {
         std::printf("\nAll tests passed.\n");
