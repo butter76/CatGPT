@@ -927,10 +927,21 @@ inline constexpr auto recursive_search =
         // (no TT re-find). For the next clamp iter, cs.depth is
         // exactly the depth the sub-recurse committed to (= the
         // clamped allocation we just passed in).
+        //
+        // Also promote `Unexpanded` -> `TTHit` for any forked child:
+        // after the descent committed (Q, depth) to the TT, this slot
+        // carries a real Q estimate, not an FPU value, so the final
+        // rollup's "drop Unexpanded" filter must no longer skip it.
+        // (Without this promotion, the forced_unexpanded slots — which
+        // always fork at iter 0 — would silently be excluded from the
+        // parent's Q rollup despite holding the largest allocations.)
         for (ChildState& cs : states) {
             if (cs.was_forked) {
                 cs.Q     = cs.child_result->Q;
                 cs.depth = cs.child_result->depth;
+                if (cs.status == ChildStatus::Unexpanded) {
+                    cs.status = ChildStatus::TTHit;
+                }
             }
         }
 
