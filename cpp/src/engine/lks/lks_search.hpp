@@ -142,6 +142,24 @@ namespace catgpt::lks {
 
 namespace fs = std::filesystem;
 
+namespace detail {
+
+/**
+ * Search-algorithm tunables piped from `LksSearchConfig` into
+ * `recursive_search` via `RecurseContext`. Treated as constant for
+ * the duration of a single `search()` call: the active config lives
+ * in `worker_main`'s frame for the whole search, so a `const
+ * SearchParams*` in the per-iteration context stays valid throughout.
+ *
+ * Add new descent-time knobs (CPUCT, FPU, ...) here and read them
+ * off `ctx->params` at the use site.
+ */
+struct SearchParams {
+    float policy_temp = 1.0f;  // softmax temperature; >1 flattens, <1 sharpens
+};
+
+}  // namespace detail
+
 /**
  * Per-search configuration.
  *
@@ -160,10 +178,15 @@ struct LksSearchConfig {
     float delta_depth = 0.2f;       // per-iteration depth step
     float max_depth   = 32.0f;      // absolute depth cap (e^32 ~= 8e13)
 
+    detail::SearchParams params{};  // descent-time tunables (see SearchParams)
+
     std::function<void(std::string_view)> on_uci_line;
 };
 
 namespace detail {
+
+// (SearchParams is declared earlier in this namespace — above
+// LksSearchConfig — so the config can embed it by value.)
 
 /**
  * Paired legal move + its softmax prior. Emitted by
@@ -186,29 +209,36 @@ struct MoveWithPrior {
 static_assert(sizeof(MoveWithPrior) == 8, "MoveWithPrior must be 8 bytes");
 
 /**
- * Mirror `coroutine_search.hpp::evaluate_node`'s temp-1.0 softmax over
- * legal-move policy logits, sorted by decreasing P. Output order is
- * what downstream descent expects (highest-prior first), and is also
- * the order we want in the arena's MoveInfo[].
+ * Tempered softmax over legal-move policy logits, sorted by decreasing
+ * P. Output order is what downstream descent expects (highest-prior
+ * first), and is also the order we want in the arena's MoveInfo[].
+ *
+ * `policy_temp` divides logits before the max-subtract / exp; T > 1
+ * flattens, T < 1 sharpens. T == 1.0 reproduces the plain softmax that
+ * mirrors `coroutine_search.hpp::evaluate_node`. The division is folded
+ * into `inv_temp` and applied in the first pass so the existing
+ * max-subtract / exp / normalize loop is unchanged.
  */
 inline void softmax_legal_sorted(const RawNNOutput& out,
                                  const chess::Board& board,
                                  const chess::Movelist& legal,
+                                 float policy_temp,
                                  std::vector<MoveWithPrior>& moves)
 {
     const bool flip = board.sideToMove() == chess::Color::BLACK;
     const int n = legal.size();
     moves.resize(static_cast<size_t>(n));
 
+    const float inv_temp = 1.0f / policy_temp;
     float max_logit = -std::numeric_limits<float>::infinity();
     for (int i = 0; i < n; ++i) {
         const auto [from_idx, to_idx] = encode_move_to_policy_index(legal[i], flip);
         const int flat = policy_flat_index(from_idx, to_idx);
-        const float logit = out.policy[flat];
+        const float scaled = out.policy[flat] * inv_temp;
         moves[i].move = static_cast<uint16_t>(legal[i].move());
         moves[i]._pad = 0;
-        moves[i].P = logit;
-        max_logit = std::max(max_logit, logit);
+        moves[i].P = scaled;
+        max_logit = std::max(max_logit, scaled);
     }
     float sum_exp = 0.0f;
     for (int i = 0; i < n; ++i) {
@@ -335,6 +365,7 @@ struct RecurseContext {
     BatchEvaluator*           evaluator;
     lfsync::LfAsyncSemaphore* sem;
     WorkerSearch*             w;
+    const SearchParams*       params;  // descent-time tunables; lives in worker_main's cfg
 };
 
 /**
@@ -382,7 +413,8 @@ inline constexpr auto recursive_search =
         // writes each MoveInfo exactly once in the order descent
         // will consume them.
         std::vector<MoveWithPrior> sorted_moves;
-        softmax_legal_sorted(out, board, legal, sorted_moves);
+        softmax_legal_sorted(out, board, legal,
+                             ctx->params->policy_temp, sorted_moves);
 
         // alloc + fill BEFORE attempting to claim — these bytes
         // are privately owned until the CAS, and orphaned if the
@@ -1108,7 +1140,7 @@ private:
         float depth = start;
         w.depth.store(depth, std::memory_order_relaxed);
         while (!w.should_abort() && depth < cfg.max_depth) {
-            run_iteration(w, depth);
+            run_iteration(w, cfg.params, depth);
             depth += cfg.delta_depth;
             w.depth.store(depth, std::memory_order_relaxed);
         }
@@ -1122,12 +1154,15 @@ private:
      * The runner is NOT a libfork worker thread, so calling sync_wait
      * (which would throw schedule_in_worker if called from one) is safe.
      */
-    void run_iteration(WorkerSearch& w, float depth) {
+    void run_iteration(WorkerSearch& w,
+                       const detail::SearchParams& params,
+                       float depth) {
         detail::RecurseContext ctx{
             /*arena=*/&*arena_,
             /*evaluator=*/w.evaluator.get(),
             /*sem=*/w.sem.get(),
             /*w=*/&w,
+            /*params=*/&params,
         };
         lf::sync_wait(*w.pool, detail::root_search, &ctx, board_, depth);
     }
