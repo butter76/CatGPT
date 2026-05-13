@@ -263,7 +263,6 @@ private:
 
         catgpt::lks::LksSearchConfig cfg;
         cfg.max_evals = max_evals;
-        cfg.min_info_period_ms = 100;
         cfg.on_uci_line = [](std::string_view s) { emit_line(s); };
 
         // search() returns immediately; worker_main runs on its own

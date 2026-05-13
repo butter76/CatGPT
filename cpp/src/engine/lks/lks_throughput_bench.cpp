@@ -67,7 +67,6 @@ Result run_one(int workers_per_gpu, int coros_per_worker, int max_batch_size, in
 
     LksSearchConfig cfg;
     cfg.max_evals = 1'000'000'000;
-    cfg.min_info_period_ms = 1'000'000;
     cfg.on_uci_line = [](std::string_view) {};
 
     // Warmup: ~50ms to let TRT build optimization caches.

@@ -109,7 +109,6 @@ void test_natural_completion() {
 
     LksSearchConfig cfg;
     cfg.max_evals = 40;
-    cfg.min_info_period_ms = 50;
     cfg.on_uci_line = rec.callback();
 
     search.search(std::move(cfg));
@@ -139,7 +138,6 @@ void test_quit_mid_search() {
 
     LksSearchConfig cfg;
     cfg.max_evals = 1'000'000;          // unbounded for the test window
-    cfg.min_info_period_ms = 0;
     cfg.on_uci_line = rec.callback();
 
     auto t0 = std::chrono::steady_clock::now();
@@ -180,7 +178,6 @@ void test_setboard_resets_after_search() {
 
     LksSearchConfig cfg;
     cfg.max_evals = 16;
-    cfg.min_info_period_ms = 50;
     cfg.on_uci_line = rec.callback();
     search.search(std::move(cfg));
     while (search.is_searching()) {
@@ -211,7 +208,6 @@ void test_makemove_preserves_arena() {
     Recorder rec;
     LksSearchConfig cfg;
     cfg.max_evals = 16;
-    cfg.min_info_period_ms = 50;
     cfg.on_uci_line = rec.callback();
     search.search(std::move(cfg));
     while (search.is_searching()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -235,7 +231,6 @@ void test_double_search_throws() {
 
     LksSearchConfig cfg;
     cfg.max_evals = 1'000'000;
-    cfg.min_info_period_ms = 0;
     cfg.on_uci_line = rec.callback();
     search.search(std::move(cfg));
 
@@ -282,7 +277,6 @@ void test_multi_worker_throughput() {
         Recorder rec;
         LksSearchConfig cfg;
         cfg.max_evals = 1'000'000;
-        cfg.min_info_period_ms = 0;
         cfg.on_uci_line = rec.callback();
         search.search(std::move(cfg));
         std::this_thread::sleep_for(std::chrono::milliseconds(run_ms));
@@ -313,7 +307,6 @@ void test_stop_with_busy_workers() {
     Recorder rec;
     LksSearchConfig cfg;
     cfg.max_evals = 1'000'000;
-    cfg.min_info_period_ms = 0;
     cfg.on_uci_line = rec.callback();
 
     auto t0 = std::chrono::steady_clock::now();
@@ -348,7 +341,6 @@ void test_concurrent_tt_writes() {
     Recorder rec;
     LksSearchConfig cfg;
     cfg.max_evals = 256;
-    cfg.min_info_period_ms = 0;
     cfg.on_uci_line = rec.callback();
 
     search.search(std::move(cfg));
@@ -385,7 +377,6 @@ void test_real_gpu_evals() {
     Recorder rec;
     LksSearchConfig cfg;
     cfg.max_evals = 200;
-    cfg.min_info_period_ms = 50;
     cfg.on_uci_line = rec.callback();
 
     search.search(std::move(cfg));
@@ -423,7 +414,6 @@ void test_workers_reused() {
     Recorder rec_a;
     LksSearchConfig cfg_a;
     cfg_a.max_evals = 64;
-    cfg_a.min_info_period_ms = 50;
     cfg_a.on_uci_line = rec_a.callback();
     auto t_a0 = std::chrono::steady_clock::now();
     search.search(std::move(cfg_a));
@@ -440,7 +430,6 @@ void test_workers_reused() {
     Recorder rec_b;
     LksSearchConfig cfg_b;
     cfg_b.max_evals = 64;
-    cfg_b.min_info_period_ms = 50;
     cfg_b.on_uci_line = rec_b.callback();
     auto t_b0 = std::chrono::steady_clock::now();
     search.search(std::move(cfg_b));
@@ -483,7 +472,6 @@ void test_id_depth_advances() {
 
     LksSearchConfig cfg;
     cfg.max_evals = 64;
-    cfg.min_info_period_ms = 0;
     cfg.start_depth = 0.0f;
     cfg.delta_depth = 0.2f;
     cfg.on_uci_line = rec.callback();

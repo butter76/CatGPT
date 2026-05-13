@@ -171,7 +171,6 @@ struct SearchParams {
  */
 struct LksSearchConfig {
     uint64_t max_evals = 800;       // total budget across all workers
-    int min_info_period_ms = 100;   // throttle for aggregated `info` lines
 
     // Iterative-deepening (log-scale). N = e^depth.
     float start_depth = 0.0f;       // worker 0's starting depth
@@ -1040,8 +1039,9 @@ private:
             });
         }
 
-        // Aggregator + UCI info loop.
-        auto last_info = t0;
+        // Aggregator + UCI info loop. Emit `info depth ...` only when the
+        // integer centi-depth derived from the minimum worker depth changes.
+        long last_depth_centi = std::numeric_limits<long>::min();
         while (true) {
             const bool stop_requested = st.stop_requested();
             bool all_done = true;
@@ -1057,11 +1057,6 @@ private:
 
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
-            const auto now = Clock::now();
-            const auto since_info = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - last_info).count();
-            if (since_info < cfg.min_info_period_ms) continue;
-
             uint64_t evals_sum = 0;
             uint64_t claims_sum = 0;
             float    min_d = std::numeric_limits<float>::infinity();
@@ -1072,9 +1067,6 @@ private:
             }
             total_evals_.store(evals_sum, std::memory_order_relaxed);
 
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - t0).count();
-            const long long mss = static_cast<long long>(ms);
             // UCI's `depth` field is integer-valued (cutechess parses via
             // QString::toInt and most other GUIs do the same). Encode our
             // log-scale fractional depth as centi-depth so two ID steps of
@@ -1082,16 +1074,38 @@ private:
             const long depth_centi = std::isfinite(min_d)
                 ? std::lround(min_d * 100.0f)
                 : 0L;
-            char buf[224];
+            if (depth_centi == last_depth_centi) continue;
+
+            const auto now = Clock::now();
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - t0).count();
+            const long long mss = static_cast<long long>(ms);
+
+            // Single-move PV from the current TT-derived best move.
+            // `bestmove()` is documented safe to call concurrently with a
+            // search in flight; cost is trivial here since emissions fire
+            // only on depth-step transitions.
+            char pv_field[16];
+            const chess::Move best_now = bestmove();
+            if (best_now != chess::Move::NO_MOVE) {
+                const std::string uci_move = chess::uci::moveToUci(best_now);
+                std::snprintf(pv_field, sizeof(pv_field),
+                              " pv %s", uci_move.c_str());
+            } else {
+                pv_field[0] = '\0';
+            }
+
+            char buf[256];
             std::snprintf(buf, sizeof(buf),
-                "info depth %ld nodes %llu tt_claims %llu time %lld nps %lld",
+                "info depth %ld nodes %llu tt_claims %llu time %lld nps %lld%s",
                 depth_centi,
                 static_cast<unsigned long long>(evals_sum),
                 static_cast<unsigned long long>(claims_sum),
                 mss,
-                mss > 0 ? static_cast<long long>(evals_sum) * 1000 / mss : 0);
+                mss > 0 ? static_cast<long long>(evals_sum) * 1000 / mss : 0,
+                pv_field);
             emit(buf);
-            last_info = now;
+            last_depth_centi = depth_centi;
         }
 
         // Stop fan-out + join runners. Do NOT shutdown the persistent
