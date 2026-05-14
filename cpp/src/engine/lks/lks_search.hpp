@@ -156,6 +156,19 @@ namespace detail {
  */
 struct SearchParams {
     float policy_temp = 1.0f;  // softmax temperature; >1 flattens, <1 sharpens
+
+    // Thresholds for compute_limit (mirrors FractionalMCTSConfig naming).
+    // `policy_coverage_threshold` is the cumulative-prior fraction that
+    // defines `limit`; `single_node_coverage_threshold` is the minimum
+    // top-prior required for `limit == 1` (else forced to >= 2).
+    float policy_coverage_threshold     = 0.0f;
+    float single_node_coverage_threshold = 0.75f;
+
+    // Heuristic for the initial max_depth stamped onto a freshly evaluated
+    // TT entry: default_max_depth = -log(variance * C / limit). Low-variance
+    // nodes get a high max_depth so early ID iterations skip re-descending
+    // them (trust the NN). C is this constant.
+    float default_depth_constant = 12.0f;
 };
 
 }  // namespace detail
@@ -281,6 +294,39 @@ inline float compute_value_variance(
         var += value_probs[i] * diff * diff;
     }
     return var;
+}
+
+/**
+ * Number of top children required to cover `coverage_threshold` of the
+ * policy mass. Mirrors `FractionalNode::get_limit` in
+ * `engine/fractional_mcts/node.hpp`, but takes advantage of the fact
+ * that `softmax_legal_sorted` already emits `sorted_moves` in descending
+ * P order, so no internal sort is needed.
+ *
+ * If the top prior alone covers the threshold but is below
+ * `single_node_threshold`, `limit` is forced to 2 (matches the prototype
+ * search's behavior of refusing to commit fully to a non-overwhelming
+ * top move).
+ */
+inline int compute_limit(const std::vector<MoveWithPrior>& sorted_moves,
+                         float coverage_threshold,
+                         float single_node_threshold) noexcept
+{
+    if (sorted_moves.empty()) return 0;
+
+    float cumsum = 0.0f;
+    int limit = static_cast<int>(sorted_moves.size());
+    for (size_t i = 0; i < sorted_moves.size(); ++i) {
+        cumsum += sorted_moves[i].P;
+        if (cumsum >= coverage_threshold) {
+            limit = static_cast<int>(i + 1);
+            break;
+        }
+    }
+    if (limit == 1 && sorted_moves[0].P < single_node_threshold) {
+        return 2;
+    }
+    return limit;
 }
 
 /**
@@ -436,17 +482,36 @@ inline constexpr auto recursive_search =
         // Per-node variance of the value distribution, in the same
         // [-1, 1] scale as Q. alloc_node_info pre-fills variance=0;
         // overwrite with the real value.
-        ctx->arena->info_at(off)->variance =
-            compute_value_variance(out.value_probs);
+        const float variance = compute_value_variance(out.value_probs);
+        ctx->arena->info_at(off)->variance = variance;
 
         const float Q = 2.0f * out.value - 1.0f;
 
-        // Single 128-bit CAS installs (key, qd_packed(Q, 0))
+        // Heuristic initial max_depth for this fresh TT entry:
+        //   default_max_depth = -log(variance * C / limit)
+        // Low-variance nodes get a HIGH max_depth so early ID iterations
+        // skip re-descending them via the re-deepen check below; trust
+        // the NN value. High-variance nodes get a LOW (possibly negative)
+        // max_depth so the very first descent proceeds and the rollup
+        // refines Q. Edge cases (variance == 0, limit == 0) produce
+        // -inf/+inf/NaN, all of which are safe:
+        //   * the re-deepen check uses `<=` (NaN -> false, descent runs)
+        //   * `update_qd` is monotonic and will overwrite -inf on the
+        //     first rollup that completes a descent.
+        const int limit = compute_limit(
+            sorted_moves,
+            ctx->params->policy_coverage_threshold,
+            ctx->params->single_node_coverage_threshold);
+        const float default_max_depth = -std::log(
+            variance * ctx->params->default_depth_constant
+            / static_cast<float>(limit));
+
+        // Single 128-bit CAS installs (key, qd_packed(Q, default_max_depth))
         // atomically, so any reader observing key == K necessarily
         // sees the matching qd. Then a single 128-bit release-store
         // of Cell B publishes (origQ, key_secondary, info_offset).
         auto [ce, claimed] = ctx->arena->find_or_claim(
-            key, sec, Q, /*max_depth=*/0.0f);
+            key, sec, Q, /*max_depth=*/default_max_depth);
         if (claimed) {
             v2::SearchArena::publish_info(
                 ce, /*origQ=*/Q, /*key_secondary=*/sec, off);
