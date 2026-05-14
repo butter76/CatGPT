@@ -135,6 +135,7 @@
 #include "../../tokenizer.hpp"
 #include "../policy.hpp"
 #include "../trt_runtime.hpp"
+#include "../fractional_mcts/search_stats.hpp"
 #include "../fractional_mcts/v2/board_secondary.hpp"
 #include "../fractional_mcts/v2/tt_arena.hpp"
 
@@ -1160,10 +1161,27 @@ private:
                 pv_field[0] = '\0';
             }
 
+            // Root-position score from the TT: report the root's own Q
+            // (side-to-move at the root), not the chosen child's Q. The
+            // acquire-load semantics of `find` / `load_qd` make this safe
+            // mid-search; see invariants in tt_arena.hpp.
+            char score_field[32];
+            if (const v2::TTEntry* root =
+                    arena_->find(root_key_, v2::secondary_hash(board_));
+                root != nullptr) {
+                auto [root_q, _] = v2::unpack_qd(
+                    v2::SearchArena::load_qd(root).qd_packed);
+                std::snprintf(score_field, sizeof(score_field),
+                              " score cp %d", q_to_cp(root_q));
+            } else {
+                score_field[0] = '\0';
+            }
+
             char buf[256];
             std::snprintf(buf, sizeof(buf),
-                "info depth %ld nodes %llu tt_claims %llu time %lld nps %lld%s",
+                "info depth %ld%s nodes %llu tt_claims %llu time %lld nps %lld%s",
                 depth_centi,
+                score_field,
                 static_cast<unsigned long long>(evals_sum),
                 static_cast<unsigned long long>(claims_sum),
                 mss,

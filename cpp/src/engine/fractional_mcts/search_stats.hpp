@@ -195,11 +195,17 @@ inline chess::Move best_move_from_allocations(
 }
 
 /**
+ * Convert a Q value (from the side-to-move's perspective) to centipawns.
+ */
+inline int q_to_cp(float q) {
+    return static_cast<int>(100.7066f * std::tan(q * 1.5637541897f));
+}
+
+/**
  * Convert a child's Q to centipawns (from parent's perspective).
  */
 inline int child_q_to_cp(float child_Q) {
-    float q = -child_Q;  // negate: child's Q is from opponent's perspective
-    return static_cast<int>(100.7066f * std::tan(q * 1.5637541897f));
+    return q_to_cp(-child_Q);  // negate: child's Q is from opponent's perspective
 }
 
 }  // namespace catgpt

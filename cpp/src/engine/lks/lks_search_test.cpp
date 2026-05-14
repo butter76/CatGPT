@@ -496,12 +496,17 @@ void test_id_depth_advances() {
     // At least one ID iteration should have completed by either worker.
     EXPECT(max_d > 0.0f);
 
-    // info lines should carry a `depth` field with a non-negative float.
+    // info lines should carry a `depth` field with a non-negative float,
+    // and at least one should carry a `score cp` field sourced from the
+    // root TT entry.
     bool saw_depth_field = false;
+    bool saw_score_cp = false;
     for (const auto& l : rec.snapshot()) {
-        if (starts_with(l, "info depth ")) { saw_depth_field = true; break; }
+        if (starts_with(l, "info depth ")) saw_depth_field = true;
+        if (l.find(" score cp ") != std::string::npos) saw_score_cp = true;
     }
     EXPECT(saw_depth_field);
+    EXPECT(saw_score_cp);
 }
 
 }  // namespace
