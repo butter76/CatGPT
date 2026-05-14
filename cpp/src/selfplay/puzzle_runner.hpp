@@ -35,8 +35,11 @@
 #include <coro/when_all.hpp>
 
 #include "../../external/chess-library/include/chess.hpp"
+#include "../engine/policy.hpp"
+#include "../tokenizer.hpp"
 #include "coroutine_search.hpp"
 #include "legacy/batch_evaluator.hpp"
+#include "legacy/eval_request.hpp"
 
 namespace catgpt {
 
@@ -60,11 +63,18 @@ struct PuzzleResult {
     int moves_total = 0;
 };
 
+enum class PuzzleEngineMode {
+    Search,       // Fractional MCTS (default)
+    PolicyOnly,   // One GPU eval; argmax of legal-move policy logits
+    ValueOnly,    // One GPU eval per legal child; pick move minimising opponent value
+};
+
 struct PuzzleEvalConfig {
     int num_concurrent = 128;
     int num_search_threads = 8;
     int max_batch_size = 64;
     int max_puzzles = 0;  // 0 = all
+    PuzzleEngineMode mode = PuzzleEngineMode::Search;
     FractionalMCTSConfig search_config{};
     std::string engine_path;
     std::string puzzle_csv;
@@ -218,8 +228,18 @@ public:
         std::println(stderr, "[PuzzleEval] Starting: {} puzzles, {} concurrent, {} threads, batch={}",
                      num_puzzles, config_.num_concurrent, config_.num_search_threads,
                      config_.max_batch_size);
-        std::println(stderr, "[PuzzleEval] Search: evals={}, cpuct={:.2f}",
-                     config_.search_config.min_total_evals, config_.search_config.c_puct);
+        switch (config_.mode) {
+        case PuzzleEngineMode::PolicyOnly:
+            std::println(stderr, "[PuzzleEval] Mode: policy-only (1 GPU eval per engine move)");
+            break;
+        case PuzzleEngineMode::ValueOnly:
+            std::println(stderr, "[PuzzleEval] Mode: value-only (1-ply lookahead, batched child evals)");
+            break;
+        case PuzzleEngineMode::Search:
+            std::println(stderr, "[PuzzleEval] Search: evals={}, cpuct={:.2f}",
+                         config_.search_config.min_total_evals, config_.search_config.c_puct);
+            break;
+        }
 
         coro::sync_wait(run_all_puzzles());
 
@@ -269,6 +289,133 @@ private:
     }
 
     /**
+     * Pick the move with the highest policy logit among legal moves,
+     * via a single batched GPU evaluation. No search.
+     */
+    coro::task<chess::Move> policy_pick_move(const chess::Board& pos) {
+        chess::Movelist moves;
+        chess::movegen::legalmoves(moves, pos);
+        if (moves.empty()) co_return chess::Move::NO_MOVE;
+        if (moves.size() == 1) co_return moves[0];
+
+        auto tokens = tokenize<BatchEvaluator::SEQ_LENGTH>(pos, NO_HALFMOVE_CONFIG);
+        RawNNOutput raw = co_await EvalAwaitable(*evaluator_, tokens);
+
+        bool flip = pos.sideToMove() == chess::Color::BLACK;
+        chess::Move best = chess::Move::NO_MOVE;
+        float best_logit = -std::numeric_limits<float>::infinity();
+        for (const auto& move : moves) {
+            auto [from_idx, to_idx] = encode_move_to_policy_index(move, flip);
+            float logit = raw.policy[policy_flat_index(from_idx, to_idx)];
+            if (logit > best_logit) {
+                best_logit = logit;
+                best = move;
+            }
+        }
+        co_return best;
+    }
+
+    /**
+     * One-ply value lookahead. For each legal move, push and:
+     *   - if the resulting position is checkmate → return move immediately
+     *   - if it's a forced or claimable draw (stalemate, insufficient
+     *     material, fifty-move rule, threefold, twofold repetition) →
+     *     score 0.5 without querying the network (these positions are
+     *     outside the training distribution)
+     *   - otherwise → queue a GPU eval for the child position
+     *
+     * All remaining GPU evals are awaited together via coro::when_all so
+     * the BatchEvaluator fuses them into a single (or few) batched
+     * inference(s).  Each child position returns the win probability for
+     * the side to move *there* (our opponent), so we pick the move with
+     * the lowest child value.
+     */
+    coro::task<chess::Move> value_pick_move(chess::Board board) {
+        chess::Movelist moves;
+        chess::movegen::legalmoves(moves, board);
+        if (moves.empty()) co_return chess::Move::NO_MOVE;
+        if (moves.size() == 1) co_return moves[0];
+
+        // Per-move score; if needs_eval, the value is written by a sibling
+        // task that all run concurrently under when_all.
+        struct MoveInfo {
+            chess::Move move;
+            float score = 0.0f;
+            bool needs_eval = false;
+        };
+        std::vector<MoveInfo> infos;
+        infos.reserve(moves.size());
+
+        // Tokens kept in a separate vector so pointers into `infos` stay
+        // stable across task construction.
+        std::vector<std::array<std::uint8_t, 64>> eval_tokens;
+        eval_tokens.reserve(moves.size());
+        std::vector<int> eval_info_idx;
+        eval_info_idx.reserve(moves.size());
+
+        for (const auto& move : moves) {
+            board.makeMove<true>(move);
+
+            auto [reason, game_result] = board.isGameOver();
+            bool twofold = board.isRepetition(1);  // matches python-chess can_claim_draw
+
+            if (reason == chess::GameResultReason::CHECKMATE) {
+                // Opponent is mated → we win. Take the move immediately.
+                board.unmakeMove(move);
+                co_return move;
+            }
+
+            bool is_draw =
+                reason == chess::GameResultReason::STALEMATE ||
+                reason == chess::GameResultReason::INSUFFICIENT_MATERIAL ||
+                reason == chess::GameResultReason::FIFTY_MOVE_RULE ||
+                reason == chess::GameResultReason::THREEFOLD_REPETITION ||
+                twofold;
+
+            if (is_draw) {
+                // Terminal/claimable draw — never ask the network.
+                infos.push_back({move, 0.5f, false});
+            } else {
+                eval_tokens.push_back(tokenize<BatchEvaluator::SEQ_LENGTH>(board, NO_HALFMOVE_CONFIG));
+                eval_info_idx.push_back(static_cast<int>(infos.size()));
+                infos.push_back({move, 0.0f, true});
+            }
+
+            board.unmakeMove(move);
+        }
+
+        // Submit all required child evaluations in parallel. They all go
+        // through the BatchEvaluator which fuses them — together with
+        // requests from other concurrent puzzle coroutines — into a
+        // single (or few) GPU inference(s).
+        if (!eval_tokens.empty()) {
+            std::vector<coro::task<void>> tasks;
+            tasks.reserve(eval_tokens.size());
+            for (size_t i = 0; i < eval_tokens.size(); ++i) {
+                tasks.push_back(eval_value_into(eval_tokens[i], &infos[eval_info_idx[i]].score));
+            }
+            co_await coro::when_all(std::move(tasks));
+        }
+
+        // Lowest opponent win probability = best for us.
+        chess::Move best = chess::Move::NO_MOVE;
+        float best_score = std::numeric_limits<float>::infinity();
+        for (const auto& info : infos) {
+            if (info.score < best_score) {
+                best_score = info.score;
+                best = info.move;
+            }
+        }
+        co_return best;
+    }
+
+    /** Submit a single eval and write the value-head output to `*dest`. */
+    coro::task<void> eval_value_into(std::array<std::uint8_t, 64> tokens, float* dest) {
+        RawNNOutput raw = co_await EvalAwaitable(*evaluator_, tokens);
+        *dest = raw.value;
+    }
+
+    /**
      * Solve a single puzzle: iterate through its moves, using the search
      * engine for "engine turns" (odd-indexed moves) and applying opponent
      * moves directly.
@@ -292,11 +439,24 @@ private:
                 // Engine must find this move
                 result.moves_total += 1;
 
-                CoroutineSearch search(*evaluator_, config_.search_config);
-                MoveResult move_result = co_await search.search_move(board);
+                chess::Move engine_move;
+                switch (config_.mode) {
+                case PuzzleEngineMode::PolicyOnly:
+                    engine_move = co_await policy_pick_move(board);
+                    break;
+                case PuzzleEngineMode::ValueOnly:
+                    engine_move = co_await value_pick_move(board);
+                    break;
+                case PuzzleEngineMode::Search: {
+                    CoroutineSearch search(*evaluator_, config_.search_config);
+                    MoveResult move_result = co_await search.search_move(board);
+                    engine_move = move_result.best_move;
+                    break;
+                }
+                }
 
                 auto expected = chess::uci::uciToMove(board, uci_move_str);
-                if (move_result.best_move == expected) {
+                if (engine_move == expected) {
                     result.moves_correct += 1;
                 }
 

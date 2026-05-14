@@ -614,17 +614,25 @@ def run_benchmark_batched(
             f"Build with: cd cpp/build && cmake .. && make catgpt_puzzle_eval -j$(nproc)"
         )
 
-    fmcts = cfg.engine.fractional_mcts
     cmd = [
         str(binary_path),
         str(trt_engine),
         str(puzzle_csv),
-        "--evals", str(fmcts.min_total_evals),
-        "--cpuct", str(fmcts.c_puct),
         "--concurrent", "128",
         "--threads", "8",
         "--batch", "64",
     ]
+
+    if cfg.engine.type == "policy":
+        cmd.append("--policy-only")
+    elif cfg.engine.type == "value":
+        cmd.append("--value-only")
+    else:
+        fmcts = cfg.engine.fractional_mcts
+        cmd.extend([
+            "--evals", str(fmcts.min_total_evals),
+            "--cpuct", str(fmcts.c_puct),
+        ])
 
     max_puzzles = cfg.benchmark.max_puzzles
     if max_puzzles is not None:
@@ -878,7 +886,7 @@ def main(cfg: DictConfig) -> None:
     elif cfg.engine.type == "fractional_mcts":
         logger.info(f"Fractional MCTS min_evals: {cfg.engine.fractional_mcts.min_total_evals}")
 
-    use_batched = cfg.engine.type == "fractional_mcts"
+    use_batched = cfg.engine.type in ("fractional_mcts", "policy", "value")
     num_workers = cfg.engine.num_workers
     use_parallel = num_workers > 1 and not use_batched
     if use_batched:
@@ -936,7 +944,12 @@ def main(cfg: DictConfig) -> None:
     try:
         # Determine engine name for display
         if use_batched:
-            engine_name = f"FractionalMCTS(evals={cfg.engine.fractional_mcts.min_total_evals}, batched)"
+            if cfg.engine.type == "policy":
+                engine_name = "Policy(batched)"
+            elif cfg.engine.type == "value":
+                engine_name = "Value(batched)"
+            else:
+                engine_name = f"FractionalMCTS(evals={cfg.engine.fractional_mcts.min_total_evals}, batched)"
         elif use_parallel:
             engine_name = f"{cfg.engine.type.upper()}(workers={num_workers})"
             if cfg.engine.type == "mcts":

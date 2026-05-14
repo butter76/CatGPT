@@ -55,6 +55,7 @@ import {
   Tag,
   ExternalLink,
   FlaskConical,
+  Gauge,
 } from "lucide-react";
 
 export default function PositionDetailPage({
@@ -130,6 +131,7 @@ export default function PositionDetailPage({
       <PositionTypeSelector
         type={position.type}
         expectedOutcome={position.expectedOutcome}
+        longBench={position.longBench}
         onChangeType={async (type) => {
           const updates: { type: PositionType; expectedOutcome?: null } = { type };
           if (type === "SHARP") updates.expectedOutcome = null;
@@ -138,6 +140,10 @@ export default function PositionDetailPage({
         }}
         onChangeOutcome={async (outcome) => {
           const updated = await updatePositionMetaAPI(position.id, { expectedOutcome: outcome });
+          setPosition(updated);
+        }}
+        onChangeLongBench={async (longBench) => {
+          const updated = await updatePositionMetaAPI(position.id, { longBench });
           setPosition(updated);
         }}
       />
@@ -571,14 +577,20 @@ const OUTCOME_OPTIONS: { value: Outcome; label: string }[] = [
 function PositionTypeSelector({
   type,
   expectedOutcome,
+  longBench,
   onChangeType,
   onChangeOutcome,
+  onChangeLongBench,
 }: {
   type: PositionType;
   expectedOutcome?: Outcome;
+  longBench: boolean;
   onChangeType: (type: PositionType) => void;
   onChangeOutcome: (outcome: Outcome | null) => void;
+  onChangeLongBench: (longBench: boolean) => void;
 }) {
+  const [toggling, setToggling] = useState(false);
+
   return (
     <div className="flex items-center gap-3 flex-wrap">
       <div className="flex items-center gap-2">
@@ -624,6 +636,27 @@ function PositionTypeSelector({
           </Select>
         </div>
       )}
+
+      {/* LongBench toggle */}
+      <Button
+        variant={longBench ? "secondary" : "outline"}
+        size="sm"
+        className={`h-7 text-xs gap-1.5 ${
+          longBench ? "border-indigo-500 text-indigo-600 bg-indigo-500/10" : ""
+        }`}
+        disabled={toggling}
+        onClick={async () => {
+          setToggling(true);
+          try {
+            await onChangeLongBench(!longBench);
+          } finally {
+            setToggling(false);
+          }
+        }}
+      >
+        <Gauge className="w-3.5 h-3.5" />
+        {longBench ? "In LongBench" : "Add to LongBench"}
+      </Button>
     </div>
   );
 }

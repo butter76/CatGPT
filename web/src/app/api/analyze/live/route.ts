@@ -37,8 +37,8 @@ export async function GET(request: NextRequest) {
     });
   }
 
-  if (isNaN(nodes) || nodes < 1 || nodes > 100_000_000) {
-    return new Response(JSON.stringify({ error: "nodes must be 1–100000000" }), {
+  if (isNaN(nodes) || nodes < 1) {
+    return new Response(JSON.stringify({ error: "nodes must be a positive integer" }), {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
