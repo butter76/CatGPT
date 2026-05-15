@@ -728,6 +728,163 @@ void test_syzygy_castling_guard() {
     }
 }
 
+// ── In-search Syzygy tests ───────────────────────────────────────────────
+
+// 6-piece position whose only capture move (Rf1xf8) lands the opponent
+// in a 5-piece KRRPvK position — TB-eligible and a clean Syzygy win.
+//   White: Ke1, Pe2, Rd1, Rf1.   Black: Ke8, Rf8.
+// Root is NOT TB-eligible (6 > 5), so root_shortcut declines and we
+// exercise the normal descent path; the capture child is what Syzygy
+// resolves mid-search.
+constexpr std::string_view kInSearchTbFen =
+    "4kr2/8/8/8/8/8/4P3/3RKR2 w - - 0 1";
+
+// Helper: find the MoveInfo entry for `m` in the root's published
+// move list. Returns nullptr if the root hasn't been expanded yet or
+// the move isn't present.
+const catgpt::v2::MoveInfo* find_move_info(const LksSearch& search,
+                                           const chess::Move& m)
+{
+    const auto* root = search.arena().find(
+        search.root_key(), catgpt::v2::secondary_hash(search.board()));
+    if (root == nullptr) return nullptr;
+    const auto info = catgpt::v2::SearchArena::load_info(root);
+    if (info.info_offset == catgpt::v2::kNoInfoOffset) return nullptr;
+    const auto* hdr   = search.arena().info_at(info.info_offset);
+    const auto* moves = search.arena().moves_at(info.info_offset);
+    for (uint16_t i = 0; i < hdr->num_moves; ++i) {
+        if (moves[i].move == static_cast<uint16_t>(m.move())) {
+            return &moves[i];
+        }
+    }
+    return nullptr;
+}
+
+// Helper: return true iff there is a TT entry for the position reached
+// by playing `m` from `search.board()`. Used to verify TB-resolved
+// children never get GPU-expanded (no TT claim).
+bool child_in_tt(const LksSearch& search, const chess::Move& m) {
+    chess::Board cb = search.board();
+    cb.makeMove<true>(m);
+    return search.arena().find(cb.hash(),
+                               catgpt::v2::secondary_hash(cb)) != nullptr;
+}
+
+void test_syzygy_in_search_marks_children() {
+    const fs::path syz = resolve_syzygy_path();
+    if (syz.empty() || !fs::exists(syz)) {
+        std::printf("[17] in-search syzygy classify — SKIPPED (no syzygy path)\n");
+        return;
+    }
+    std::printf("[17] in-search syzygy classify — capture child marked terminal\n");
+
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*workers_per_gpu=*/1, /*coros_per_worker=*/32,
+                     /*max_batch_size=*/32, syz);
+    if (!search.syzygy_available()) {
+        std::printf("    SKIPPED — SyzygyProber failed to load\n");
+        return;
+    }
+
+    search.setBoard(chess::Board{std::string(kInSearchTbFen)});
+
+    // The capture move that drops us into the 5-piece TB-won child.
+    const chess::Move rxf8 = chess::uci::uciToMove(
+        search.board(), std::string_view{"f1f8"});
+    EXPECT(rxf8 != chess::Move::NO_MOVE);
+    // A non-capture move that keeps piece count at 6 (TB-ineligible).
+    const chess::Move e2e3 = chess::uci::uciToMove(
+        search.board(), std::string_view{"e2e3"});
+    EXPECT(e2e3 != chess::Move::NO_MOVE);
+
+    Recorder rec;
+    LksSearchConfig cfg;
+    cfg.max_evals   = 32;        // a handful past root expansion
+    cfg.on_uci_line = rec.callback();
+    search.search(std::move(cfg));
+    wait_until_done(search);
+
+    const auto* mi_rxf8 = find_move_info(search, rxf8);
+    const auto* mi_e2e3 = find_move_info(search, e2e3);
+    EXPECT(mi_rxf8 != nullptr);
+    EXPECT(mi_e2e3 != nullptr);
+    if (mi_rxf8 && mi_e2e3) {
+        // From the child board's STM (black), Rxf8 leaves black in a
+        // TB-lost position ⇒ kTerminalLossForChild.
+        EXPECT(mi_rxf8->terminal_kind() == catgpt::v2::kTerminalLossForChild);
+        EXPECT(mi_e2e3->terminal_kind() == catgpt::v2::kTerminalNone);
+    }
+
+    // The TB-resolved child must never have been expanded (no GPU eval,
+    // no TT claim, no arena bytes attributed to it).
+    EXPECT(!child_in_tt(search, rxf8));
+}
+
+void test_syzygy_in_search_skips_gpu_eval() {
+    const fs::path syz = resolve_syzygy_path();
+    if (syz.empty() || !fs::exists(syz)) {
+        std::printf("[18] in-search syzygy skips GPU evals — SKIPPED\n");
+        return;
+    }
+    std::printf("[18] in-search syzygy skips GPU evals — Rxf8 child stays out of TT\n");
+
+    // Larger eval budget: enough for the search to descend deep through
+    // non-terminal children. Without Syzygy, descent would eventually
+    // GPU-evaluate the Rxf8 child too.
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*workers_per_gpu=*/1, /*coros_per_worker=*/32,
+                     /*max_batch_size=*/32, syz);
+    if (!search.syzygy_available()) {
+        std::printf("    SKIPPED — SyzygyProber failed to load\n");
+        return;
+    }
+
+    search.setBoard(chess::Board{std::string(kInSearchTbFen)});
+    const chess::Move rxf8 = chess::uci::uciToMove(
+        search.board(), std::string_view{"f1f8"});
+    EXPECT(rxf8 != chess::Move::NO_MOVE);
+
+    Recorder rec;
+    LksSearchConfig cfg;
+    cfg.max_evals   = 400;
+    cfg.on_uci_line = rec.callback();
+    search.search(std::move(cfg));
+    wait_until_done(search);
+
+    EXPECT(search.total_evals() > 0u);
+    // Even after 400 evals worth of descent, the TB-resolved child is
+    // never claimed.
+    EXPECT(!child_in_tt(search, rxf8));
+}
+
+void test_syzygy_disabled_in_search() {
+    std::printf("[19] in-search syzygy disabled — capture child gets normal None classification\n");
+
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*workers_per_gpu=*/1);
+    EXPECT(!search.syzygy_available());
+
+    search.setBoard(chess::Board{std::string(kInSearchTbFen)});
+    const chess::Move rxf8 = chess::uci::uciToMove(
+        search.board(), std::string_view{"f1f8"});
+    EXPECT(rxf8 != chess::Move::NO_MOVE);
+
+    Recorder rec;
+    LksSearchConfig cfg;
+    cfg.max_evals   = 32;
+    cfg.on_uci_line = rec.callback();
+    search.search(std::move(cfg));
+    wait_until_done(search);
+
+    const auto* mi = find_move_info(search, rxf8);
+    EXPECT(mi != nullptr);
+    if (mi) {
+        // No Syzygy prober ⇒ classify_terminal returns kTerminalNone for
+        // a non-mate / non-stalemate / sufficient-material child.
+        EXPECT(mi->terminal_kind() == catgpt::v2::kTerminalNone);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -749,6 +906,9 @@ int main() {
     test_syzygy_root_shortcut();
     test_syzygy_disabled_falls_through();
     test_syzygy_castling_guard();
+    test_syzygy_in_search_marks_children();
+    test_syzygy_in_search_skips_gpu_eval();
+    test_syzygy_disabled_in_search();
 
     if (g_failed == 0) {
         std::printf("\nAll tests passed.\n");

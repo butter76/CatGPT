@@ -345,11 +345,22 @@ inline int compute_limit(const std::vector<MoveWithPrior>& sorted_moves,
  * Both depend on data (path history / half-move clock) that is not
  * part of the Zobrist key, so two transpositions to the same key can
  * disagree on them. Only stable, position-only draws (insufficient
- * material) and mate/stalemate go into the TT-stored terminal_kind.
+ * material), mate/stalemate, and Syzygy-resolved WDL (theoretical,
+ * rule50=0) go into the TT-stored terminal_kind.
  *
  * Pre: `child_board` is the board AFTER `makeMove<true>(move)`.
+ *
+ * `syz` is optional; when non-null and the child board is Syzygy-eligible
+ * (piece-count + no-castling) the WDL probe runs after the natural-
+ * terminal checks. probe_wdl uses rule50=0 internally, so the resulting
+ * kind is path-independent (safe to cache in TT). Cursed/blessed are
+ * conservatively folded to Draw — under the 50-move rule they are
+ * theoretical draws and treating them as wins/losses risks the search
+ * trusting near-50-ply outcomes that won't actually materialize.
  */
-inline v2::TerminalKind classify_terminal(chess::Board& child_board) {
+inline v2::TerminalKind classify_terminal(chess::Board& child_board,
+                                          const catgpt::SyzygyProber* syz)
+{
     chess::Movelist child_legal;
     chess::movegen::legalmoves(child_legal, child_board);
     if (child_legal.empty()) {
@@ -359,6 +370,20 @@ inline v2::TerminalKind classify_terminal(chess::Board& child_board) {
     }
     if (child_board.isInsufficientMaterial()) {
         return v2::kTerminalDraw;
+    }
+    if (syz != nullptr && syz->is_eligible(child_board)) {
+        if (auto wdl = syz->probe_wdl(child_board); wdl) {
+            switch (*wdl) {
+                case catgpt::SyzygyWDL::WIN:
+                    return v2::kTerminalWinForChild;
+                case catgpt::SyzygyWDL::LOSS:
+                    return v2::kTerminalLossForChild;
+                case catgpt::SyzygyWDL::DRAW:
+                case catgpt::SyzygyWDL::CURSED_WIN:
+                case catgpt::SyzygyWDL::BLESSED_LOSS:
+                    return v2::kTerminalDraw;
+            }
+        }
     }
     return v2::kTerminalNone;
 }
@@ -419,6 +444,11 @@ struct RecurseContext {
     lfsync::LfAsyncSemaphore* sem;
     WorkerSearch*             w;
     const SearchParams*       params;  // descent-time tunables; lives in worker_main's cfg
+    // Optional Syzygy tablebase prober. nullptr when no Syzygy path was
+    // supplied to LksSearch. SyzygyProber::probe_wdl is thread-safe under
+    // Fathom's default compile (no TB_NO_THREADS), so the same instance
+    // feeds every worker's RecurseContext.
+    const catgpt::SyzygyProber* syzygy;
 };
 
 /**
@@ -477,9 +507,11 @@ inline constexpr auto recursive_search =
         for (uint16_t i = 0; i < num_moves; ++i) {
             const chess::Move m{sorted_moves[i].move};
 
-            // Per-move position-only terminal detection.
+            // Per-move position-only terminal detection. With a Syzygy
+            // prober wired in, TB-resolved WDL also lands here (cached
+            // in the child's MoveInfo so re-visits skip the probe).
             board.makeMove<true>(m);
-            const v2::TerminalKind tk = classify_terminal(board);
+            const v2::TerminalKind tk = classify_terminal(board, ctx->syzygy);
             board.unmakeMove(m);
 
             mi[i] = v2::MoveInfo::pack(sorted_moves[i].move,
@@ -612,6 +644,13 @@ inline constexpr auto recursive_search =
         }
         if (m_tk == v2::kTerminalLossForChild) {
             plans.push_back({Mode::ReadOnly, m_P, /*Q=*/-1.0f, 0, 0});
+            continue;
+        }
+        if (m_tk == v2::kTerminalWinForChild) {
+            // Reachable only via Syzygy: this move drops STM at the child
+            // into a TB-won position, so child_Q = +1 (and the parent's
+            // -child_Q rollup correctly penalizes the move as a loss).
+            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/+1.0f, 0, 0});
             continue;
         }
 
@@ -1058,6 +1097,10 @@ public:
                 child_Q = 0.0f;
             } else if (tk == v2::kTerminalLossForChild) {
                 child_Q = -1.0f;  // child loses ⇒ we win
+            } else if (tk == v2::kTerminalWinForChild) {
+                // Syzygy: child position is a TB win for STM-at-child ⇒
+                // this move loses for us. Score reflects that directly.
+                child_Q = +1.0f;
             } else {
                 chess::Board cb = board_;
                 cb.makeMove<true>(m);
@@ -1255,14 +1298,24 @@ private:
 
         // Aggregator + UCI info loop. Emit `info depth ...` only when the
         // integer centi-depth derived from the minimum worker depth changes.
+        // A worker is "done" if it has either exhausted its per-worker eval
+        // budget OR advanced its iterative-deepening depth past
+        // `cfg.max_depth` (the runner's ID loop exits on either condition,
+        // but a depth-exit with budget remaining must still let
+        // worker_main wind down). Without the depth check, in-search
+        // Syzygy can leave the search spinning on terminal children that
+        // never trigger GPU evals, so budget alone never trips.
         long last_depth_centi = std::numeric_limits<long>::min();
         while (true) {
             const bool stop_requested = st.stop_requested();
             bool all_done = true;
             for (const auto& w : workers_) {
-                if (w->runner.joinable()
-                    && w->evals.load(std::memory_order_relaxed)
-                       < w->budget.load(std::memory_order_relaxed)) {
+                const bool under_budget =
+                    w->evals.load(std::memory_order_relaxed)
+                    < w->budget.load(std::memory_order_relaxed);
+                const bool under_depth =
+                    w->depth.load(std::memory_order_relaxed) < cfg.max_depth;
+                if (under_budget && under_depth) {
                     all_done = false;
                     break;
                 }
@@ -1414,6 +1467,7 @@ private:
             /*sem=*/w.sem.get(),
             /*w=*/&w,
             /*params=*/&params,
+            /*syzygy=*/syzygy_.get(),
         };
         lf::sync_wait(*w.pool, detail::root_search, &ctx, board_, depth);
     }
