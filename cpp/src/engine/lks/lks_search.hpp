@@ -132,6 +132,7 @@
 #include "../../lf/async_semaphore.hpp"
 #include "../../selfplay/batch_evaluator.hpp"
 #include "../../selfplay/eval_request.hpp"
+#include "../../syzygy.hpp"
 #include "../../tokenizer.hpp"
 #include "../policy.hpp"
 #include "../trt_runtime.hpp"
@@ -729,12 +730,20 @@ public:
      *                            recursive_search invocations. Bounds
      *                            both orchestration frames and GPU evals.
      * @param max_batch_size      Cap on positions per GPU batch.
+     * @param syzygy_path         Filesystem path to a directory containing
+     *                            Syzygy .rtbw/.rtbz endgame tablebase files.
+     *                            Empty (the default) disables Syzygy entirely;
+     *                            non-empty constructs a single per-LksSearch
+     *                            `SyzygyProber`. Fathom holds global state,
+     *                            so at most one `LksSearch` per process
+     *                            should be constructed with a non-empty path.
      */
     explicit LksSearch(fs::path trt_engine_path,
                        uint64_t lifetime_max_evals = (1ULL << 20),
                        int workers_per_gpu = 1,
                        int coros_per_worker = 32,
-                       int max_batch_size = 32)
+                       int max_batch_size = 32,
+                       fs::path syzygy_path = {})
         : trt_engine_path_(std::move(trt_engine_path))
         , lifetime_max_evals_(lifetime_max_evals)
         , workers_per_gpu_(workers_per_gpu > 0 ? workers_per_gpu : 1)
@@ -742,6 +751,14 @@ public:
         , max_batch_size_(max_batch_size > 0 ? max_batch_size : 1)
         , board_(chess::constants::STARTPOS)
     {
+        if (!syzygy_path.empty()) {
+            // SyzygyProber ctor calls Fathom's tb_init (global state).
+            // If load fails, prober.is_available() will be false and the
+            // shortcut path silently disables itself.
+            syzygy_ = std::make_unique<catgpt::SyzygyProber>(
+                syzygy_path.string());
+        }
+
         // Discover GPU topology. CUDA_VISIBLE_DEVICES is the right knob
         // to restrict which devices participate; this just uses every
         // visible one.
@@ -899,6 +916,15 @@ public:
     [[nodiscard]] const chess::Board& board() const noexcept { return board_; }
     [[nodiscard]] uint64_t root_key() const noexcept { return root_key_; }
     [[nodiscard]] const v2::SearchArena& arena() const noexcept { return *arena_; }
+
+    /**
+     * Whether a SyzygyProber was constructed AND successfully loaded at
+     * least one tablebase file. False when no path was provided, when
+     * the path was empty of .rtbw/.rtbz files, or when tb_init failed.
+     */
+    [[nodiscard]] bool syzygy_available() const noexcept {
+        return syzygy_ && syzygy_->is_available();
+    }
 
     /**
      * Aggregated count of NN evals performed across all workers in the
@@ -1073,9 +1099,125 @@ public:
     }
 
 private:
+    /**
+     * One of the three "no search required" cases at the root:
+     *   - `move == NO_MOVE`         => no legal moves; emit `bestmove 0000`.
+     *   - `tb` empty, real move     => single-legal-move forced reply.
+     *   - `tb` set, real move       => Syzygy DTZ resolution.
+     *
+     * The caller is responsible for emitting the appropriate `info` /
+     * `bestmove` lines and skipping the rest of `worker_main`.
+     */
+    struct RootShortcut {
+        chess::Move                          move;
+        std::optional<catgpt::SyzygyRootResult> tb;
+    };
+
+    /**
+     * Detect whether the root can be resolved without spinning up the
+     * search workers. Order is fixed:
+     *   1. No legal moves (mate / stalemate) — terminal.
+     *   2. Exactly one legal move — forced reply.
+     *   3. Syzygy DTZ root probe (gated on prober availability +
+     *      piece-count + no-castling). The probe itself is cheap.
+     * Returns std::nullopt if a real search is needed.
+     *
+     * Must be called from `worker_main` only (single-threaded); Fathom's
+     * `tb_probe_root` is documented not-thread-safe.
+     */
+    [[nodiscard]] std::optional<RootShortcut> try_root_shortcut() const {
+        chess::Movelist legal;
+        chess::movegen::legalmoves(legal, board_);
+
+        if (legal.empty()) {
+            return RootShortcut{chess::Move::NO_MOVE, std::nullopt};
+        }
+        if (legal.size() == 1) {
+            return RootShortcut{legal[0], std::nullopt};
+        }
+        if (syzygy_ && syzygy_->is_eligible(board_)) {
+            if (auto r = syzygy_->probe_root_dtz(board_); r) {
+                return RootShortcut{r->move, std::move(r)};
+            }
+        }
+        return std::nullopt;
+    }
+
+    /**
+     * Stockfish-style mapping from Syzygy WDL to UCI `score cp` value.
+     * Cursed/blessed scores are small magnitudes (50cp) to indicate the
+     * 50-move rule will defang them. A real win/loss is reported as a
+     * large finite cp value rather than a fake `score mate` (DTZ is not
+     * DTM, so mate-in-N would mislead GUIs).
+     */
+    [[nodiscard]] static int syzygy_wdl_to_cp(catgpt::SyzygyWDL w) noexcept {
+        switch (w) {
+            case catgpt::SyzygyWDL::WIN:          return  12800;
+            case catgpt::SyzygyWDL::CURSED_WIN:   return     50;
+            case catgpt::SyzygyWDL::DRAW:         return      0;
+            case catgpt::SyzygyWDL::BLESSED_LOSS: return    -50;
+            case catgpt::SyzygyWDL::LOSS:         return -12800;
+        }
+        return 0;
+    }
+
+    /**
+     * Emit the UCI lines for a root shortcut and return. Splits into
+     * separate `info` lines because the UCI spec says `string` consumes
+     * the rest of the line — keeping it on its own line is robust to
+     * future field additions.
+     */
+    void emit_root_shortcut(const RootShortcut& sc,
+                            const std::function<void(std::string_view)>& emit) const
+    {
+        if (!emit) return;
+
+        if (sc.move == chess::Move::NO_MOVE) {
+            emit("bestmove 0000");
+            return;
+        }
+
+        const std::string uci_move = chess::uci::moveToUci(sc.move);
+        char buf[256];
+
+        if (sc.tb) {
+            const int cp = syzygy_wdl_to_cp(sc.tb->wdl);
+            std::snprintf(buf, sizeof(buf),
+                          "info depth 0 score cp %d pv %s",
+                          cp, uci_move.c_str());
+            emit(buf);
+            const std::string_view wdl_s = catgpt::to_string(sc.tb->wdl);
+            std::snprintf(buf, sizeof(buf),
+                          "info string syzygy wdl=%.*s dtz=%d",
+                          static_cast<int>(wdl_s.size()), wdl_s.data(),
+                          sc.tb->dtz);
+            emit(buf);
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                          "info depth 0 pv %s", uci_move.c_str());
+            emit(buf);
+            emit("info string forced move");
+        }
+
+        std::snprintf(buf, sizeof(buf), "bestmove %s", uci_move.c_str());
+        emit(buf);
+    }
+
     void worker_main(std::stop_token st, LksSearchConfig cfg) {
         auto& cb = cfg.on_uci_line;
         auto emit = [&](std::string_view s) { if (cb) cb(s); };
+
+        // ── Root fast-paths ────────────────────────────────────────────
+        // Cheap deterministic answers (no legal moves, single legal move,
+        // Syzygy-resolvable root) short-circuit before any per-worker
+        // counter reset or runner spawn — saves multi-second worker
+        // spin-up and the GPU eval that would otherwise happen.
+        if (auto sc = try_root_shortcut()) {
+            emit_root_shortcut(*sc, cb);
+            total_evals_.store(0, std::memory_order_relaxed);
+            running_.store(false, std::memory_order_release);
+            return;
+        }
 
         using Clock = std::chrono::steady_clock;
         const auto t0 = Clock::now();
@@ -1281,6 +1423,12 @@ private:
     std::jthread                               worker_;
     std::atomic<bool>                          running_{false};
     std::atomic<uint64_t>                      total_evals_{0};
+
+    // Syzygy tablebase prober — owns Fathom's global tb_init/tb_free
+    // lifecycle. Null when no Syzygy path was provided. Probed once at
+    // the top of every `worker_main` (before runners spawn) so the
+    // not-thread-safe `tb_probe_root` is safe.
+    std::unique_ptr<catgpt::SyzygyProber> syzygy_;
 };
 
 }  // namespace catgpt::lks

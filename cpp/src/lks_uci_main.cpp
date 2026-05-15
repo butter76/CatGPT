@@ -22,6 +22,11 @@
  *   LKS_COROS_PER_WORKER    (default 112)
  *   LKS_MAX_BATCH_SIZE      (default 56)
  *   LKS_LIFETIME_MAX_EVALS  (default 1<<20)
+ *   LKS_SYZYGY_PATH         (default $SYZYGY_HOME, else "" = disabled)
+ *                           Directory of .rtbw/.rtbz Syzygy endgame
+ *                           tablebase files. When set, eligible root
+ *                           positions are resolved via DTZ probe
+ *                           instead of running the GPU search.
  */
 
 #include <chrono>
@@ -88,9 +93,11 @@ public:
                  uint64_t lifetime_max_evals,
                  int workers_per_gpu,
                  int coros_per_worker,
-                 int max_batch_size)
+                 int max_batch_size,
+                 fs::path syzygy_path)
         : search_(std::move(engine_path), lifetime_max_evals,
-                  workers_per_gpu, coros_per_worker, max_batch_size)
+                  workers_per_gpu, coros_per_worker, max_batch_size,
+                  std::move(syzygy_path))
     {}
 
     void run() {
@@ -331,17 +338,27 @@ int main(int argc, char* argv[]) {
     const uint64_t lifetime_max_evals =
         catgpt::env_u64("LKS_LIFETIME_MAX_EVALS", 1ULL << 20);
 
+    // Syzygy path resolution: LKS_SYZYGY_PATH overrides; otherwise fall
+    // back to $SYZYGY_HOME (the conventional name); empty = disabled.
+    fs::path syzygy_path;
+    if (const char* p = std::getenv("LKS_SYZYGY_PATH"); p && *p) {
+        syzygy_path = p;
+    } else if (const char* p = std::getenv("SYZYGY_HOME"); p && *p) {
+        syzygy_path = p;
+    }
+
     try {
         std::println(stderr, "Loading TensorRT engine: {}",
                      engine_path.string());
         std::println(
             stderr,
-            "Config: workers_per_gpu={} coros_per_worker={} max_batch={} arena_capacity={}",
-            workers_per_gpu, coros_per_worker, max_batch_size, lifetime_max_evals);
+            "Config: workers_per_gpu={} coros_per_worker={} max_batch={} arena_capacity={} syzygy_path={}",
+            workers_per_gpu, coros_per_worker, max_batch_size, lifetime_max_evals,
+            syzygy_path.empty() ? std::string{"<disabled>"} : syzygy_path.string());
 
         catgpt::LksUciDriver driver(engine_path, lifetime_max_evals,
                                     workers_per_gpu, coros_per_worker,
-                                    max_batch_size);
+                                    max_batch_size, std::move(syzygy_path));
         std::println(stderr, "Engine loaded; entering UCI loop");
         driver.run();
     } catch (const std::exception& e) {

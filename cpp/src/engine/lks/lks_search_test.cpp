@@ -509,6 +509,225 @@ void test_id_depth_advances() {
     EXPECT(saw_score_cp);
 }
 
+// ── Root fast-path tests ─────────────────────────────────────────────────
+
+// Black-to-move position with exactly one legal reply: Ka8 (only square
+// not attacked by the white queen / king).
+//   White Kd8, Qb6, Black Kb8 — in check by Qb6.
+constexpr std::string_view kSingleMoveFen =
+    "1k1K4/8/1Q6/8/8/8/8/8 b - - 0 1";
+
+// 3-piece KRvK win for White (DTZ-reachable in Syzygy 3-piece tables).
+// White Kd1, Rd2, Black Ke5 — kings well apart, rook doesn't check the
+// black king (d-file empty above black king's rank), so neither side is
+// in check with White to move.
+constexpr std::string_view kKrkWinFen =
+    "8/8/8/4k3/8/8/3R4/3K4 w - - 0 1";
+
+// Few pieces + castling rights → ineligible for Syzygy (must fall through
+// to real search).
+constexpr std::string_view kCastlingFewPiecesFen =
+    "r3k3/8/8/8/8/8/8/4K2R w K - 0 1";
+
+fs::path resolve_syzygy_path() {
+    if (const char* env = std::getenv("LKS_SYZYGY_PATH")) {
+        if (*env) return env;
+    }
+    if (const char* env = std::getenv("SYZYGY_HOME")) {
+        if (*env) return env;
+    }
+    return {};
+}
+
+void wait_until_done(LksSearch& search) {
+    auto t0 = std::chrono::steady_clock::now();
+    while (search.is_searching()) {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(10)) {
+            std::fprintf(stderr, "  timed out waiting for search to finish\n");
+            ++g_failed;
+            search.quit();
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
+void test_single_legal_move_shortcut() {
+    std::printf("[13] single-legal-move fast path (no GPU eval)\n");
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*workers_per_gpu=*/1);
+
+    search.setBoard(chess::Board(std::string(kSingleMoveFen)));
+    const uint64_t gpu_before = search.lifetime_gpu_evals();
+
+    Recorder rec;
+    LksSearchConfig cfg;
+    cfg.max_evals = 1'000'000;          // would be huge if search ran
+    cfg.on_uci_line = rec.callback();
+
+    auto t0 = std::chrono::steady_clock::now();
+    search.search(std::move(cfg));
+    wait_until_done(search);
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    const uint64_t gpu_after = search.lifetime_gpu_evals();
+    auto lines = rec.snapshot();
+
+    // The shortcut must skip the GPU entirely.
+    EXPECT(gpu_after == gpu_before);
+    EXPECT(search.total_evals() == 0u);
+    EXPECT(elapsed_ms < 200);
+
+    // bestmove must be the unique legal reply Ka8 (b8a8).
+    EXPECT(!lines.empty());
+    EXPECT(starts_with(lines.back(), "bestmove b8a8"));
+
+    bool saw_forced = false;
+    for (const auto& l : lines) {
+        if (l.find("info string forced move") != std::string::npos) {
+            saw_forced = true;
+            break;
+        }
+    }
+    EXPECT(saw_forced);
+}
+
+void test_syzygy_root_shortcut() {
+    const fs::path syz = resolve_syzygy_path();
+    if (syz.empty() || !fs::exists(syz)) {
+        std::printf("[14] syzygy root fast path — SKIPPED (no LKS_SYZYGY_PATH/SYZYGY_HOME)\n");
+        return;
+    }
+    std::printf("[14] syzygy root fast path (DTZ probe at root, no GPU eval)\n");
+
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*workers_per_gpu=*/1, /*coros_per_worker=*/32,
+                     /*max_batch_size=*/32, syz);
+
+    if (!search.syzygy_available()) {
+        std::printf("    SKIPPED — SyzygyProber failed to load tables at %s\n",
+                    syz.string().c_str());
+        return;
+    }
+
+    search.setBoard(chess::Board(std::string(kKrkWinFen)));
+    const uint64_t gpu_before = search.lifetime_gpu_evals();
+
+    Recorder rec;
+    LksSearchConfig cfg;
+    cfg.max_evals = 1'000'000;
+    cfg.on_uci_line = rec.callback();
+
+    auto t0 = std::chrono::steady_clock::now();
+    search.search(std::move(cfg));
+    wait_until_done(search);
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    EXPECT(search.lifetime_gpu_evals() == gpu_before);
+    EXPECT(search.total_evals() == 0u);
+    EXPECT(elapsed_ms < 200);
+
+    auto lines = rec.snapshot();
+    EXPECT(!lines.empty());
+
+    bool saw_syzygy_info = false;
+    bool saw_win_score = false;
+    std::string bestmove_uci;
+    for (const auto& l : lines) {
+        if (l.find("info string syzygy ") != std::string::npos) {
+            saw_syzygy_info = true;
+            EXPECT(l.find("wdl=win") != std::string::npos);
+        }
+        if (l.find("score cp 12800") != std::string::npos) {
+            saw_win_score = true;
+        }
+        if (starts_with(l, "bestmove ")) {
+            bestmove_uci = l.substr(std::string_view("bestmove ").size());
+        }
+    }
+    EXPECT(saw_syzygy_info);
+    EXPECT(saw_win_score);
+    EXPECT(!bestmove_uci.empty());
+
+    // Sanity: the chosen move must be legal on the root position.
+    chess::Board b{std::string(kKrkWinFen)};
+    chess::Move m = chess::uci::uciToMove(b, std::string_view{bestmove_uci});
+    EXPECT(m != chess::Move::NO_MOVE);
+}
+
+void test_syzygy_disabled_falls_through() {
+    std::printf("[15] syzygy disabled — KRvK falls through to real search\n");
+    // No syzygy_path → real GPU search even though the position is
+    // tablebase-eligible.
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*workers_per_gpu=*/1);
+
+    EXPECT(!search.syzygy_available());
+
+    search.setBoard(chess::Board(std::string(kKrkWinFen)));
+    const uint64_t gpu_before = search.lifetime_gpu_evals();
+
+    Recorder rec;
+    LksSearchConfig cfg;
+    cfg.max_evals = 32;
+    cfg.on_uci_line = rec.callback();
+    search.search(std::move(cfg));
+    wait_until_done(search);
+
+    // Real search ran ⇒ at least one GPU eval (root expansion).
+    EXPECT(search.lifetime_gpu_evals() > gpu_before);
+    EXPECT(search.total_evals() > 0u);
+
+    auto lines = rec.snapshot();
+    EXPECT(!lines.empty());
+    EXPECT(starts_with(lines.back(), "bestmove "));
+    // No syzygy info string should appear.
+    for (const auto& l : lines) {
+        EXPECT(l.find("info string syzygy ") == std::string::npos);
+    }
+}
+
+void test_syzygy_castling_guard() {
+    const fs::path syz = resolve_syzygy_path();
+    if (syz.empty() || !fs::exists(syz)) {
+        std::printf("[16] syzygy castling guard — SKIPPED (no syzygy path)\n");
+        return;
+    }
+    std::printf("[16] syzygy castling guard — castling rights bypass TB\n");
+
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*workers_per_gpu=*/1, /*coros_per_worker=*/32,
+                     /*max_batch_size=*/32, syz);
+
+    if (!search.syzygy_available()) {
+        std::printf("    SKIPPED — SyzygyProber failed to load tables\n");
+        return;
+    }
+
+    search.setBoard(chess::Board(std::string(kCastlingFewPiecesFen)));
+    const uint64_t gpu_before = search.lifetime_gpu_evals();
+
+    Recorder rec;
+    LksSearchConfig cfg;
+    cfg.max_evals = 32;
+    cfg.on_uci_line = rec.callback();
+    search.search(std::move(cfg));
+    wait_until_done(search);
+
+    // Castling-rights bit forces the TB path to skip; real search must run.
+    EXPECT(search.lifetime_gpu_evals() > gpu_before);
+    EXPECT(search.total_evals() > 0u);
+
+    auto lines = rec.snapshot();
+    EXPECT(!lines.empty());
+    EXPECT(starts_with(lines.back(), "bestmove "));
+    for (const auto& l : lines) {
+        EXPECT(l.find("info string syzygy ") == std::string::npos);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -526,6 +745,10 @@ int main() {
     test_real_gpu_evals();
     test_workers_reused();
     test_id_depth_advances();
+    test_single_legal_move_shortcut();
+    test_syzygy_root_shortcut();
+    test_syzygy_disabled_falls_through();
+    test_syzygy_castling_guard();
 
     if (g_failed == 0) {
         std::printf("\nAll tests passed.\n");

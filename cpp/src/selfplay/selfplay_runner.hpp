@@ -45,7 +45,7 @@
 #include "selfplay_config.hpp"
 #include "lc0_pool.hpp"
 #include "stockfish_pool.hpp"
-#include "syzygy.hpp"
+#include "../syzygy.hpp"
 
 namespace catgpt {
 

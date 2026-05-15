@@ -323,12 +323,14 @@ target_include_directories(lks_search_test PRIVATE
     ${CHESS_LIBRARY_INCLUDE_DIR}
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
+    ${FATHOM_SRC_DIR}
 )
 target_compile_options(lks_search_test PRIVATE -O2 -g -fcoroutines -mcx16)
 target_link_libraries(lks_search_test PRIVATE
     libfork::libfork
     ${NVINFER_LIB}
     ${CUDART_LIB}
+    fathom
     pthread
     atomic
 )
@@ -345,12 +347,14 @@ target_include_directories(lks_throughput_bench PRIVATE
     ${CHESS_LIBRARY_INCLUDE_DIR}
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
+    ${FATHOM_SRC_DIR}
 )
 target_compile_options(lks_throughput_bench PRIVATE -O3 -march=native -fcoroutines -mcx16)
 target_link_libraries(lks_throughput_bench PRIVATE
     libfork::libfork
     ${NVINFER_LIB}
     ${CUDART_LIB}
+    fathom
     pthread
     atomic
 )
@@ -383,11 +387,13 @@ target_include_directories(lks_uci PRIVATE
     ${CHESS_LIBRARY_INCLUDE_DIR}
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
+    ${FATHOM_SRC_DIR}
 )
 target_link_libraries(lks_uci PRIVATE
     libfork::libfork
     ${NVINFER_LIB}
     ${CUDART_LIB}
+    fathom
     pthread
     atomic
 )
