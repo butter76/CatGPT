@@ -17,7 +17,7 @@
 
 #include "../../../external/chess-library/include/chess.hpp"
 #include "../move_hash.hpp"
-#include "../trt_evaluator.hpp"  // For VALUE_NUM_BINS
+#include "../nn_constants.hpp"
 
 namespace catgpt {
 
@@ -36,8 +36,8 @@ class FractionalNode {
 public:
     FractionalNode() = default;
 
-    explicit FractionalNode(float prior, float prior_alloc = 0.0f, float prior_optimistic = 0.0f)
-        : P(prior), P_alloc(prior_alloc), P_optimistic(prior_optimistic) {}
+    explicit FractionalNode(float prior, float prior_alloc = 0.0f)
+        : P(prior), P_alloc(prior_alloc) {}
 
     /**
      * Compute how many children cover the given fraction of policy mass.
@@ -186,20 +186,12 @@ public:
     // Empty when not used (baseline search ignores this).
     std::unordered_map<chess::Move, float, MoveHash> policy_priors_alloc;
 
-    // Optimistic policy priors (from NN's optimistic_policy head).
-    // Used for exploration during search iterations.
-    std::unordered_map<chess::Move, float, MoveHash> policy_priors_optimistic;
-
     // Prior probability of this move (from parent's policy output)
     float P = 0.0f;
 
     // Warm prior for PUCT allocation (from parent's policy_priors_alloc).
     // Falls back to P when not explicitly set.
     float P_alloc = 0.0f;
-
-    // Optimistic prior for exploration (from parent's policy_priors_optimistic).
-    // Falls back to P_alloc when not explicitly set.
-    float P_optimistic = 0.0f;
 
     // Q value: initially from NN evaluation, updated after recursion
     // Range: [-1, 1] where -1=loss, 0=draw, 1=win (from this node's perspective)

@@ -36,13 +36,15 @@
 
 #include "../../external/chess-library/include/chess.hpp"
 #include "../engine/policy.hpp"
-#include "../engine/trt_evaluator.hpp"
 #include "../tokenizer.hpp"
-#include "batch_evaluator.hpp"
 #include "coroutine_search.hpp"
-#include "eval_request.hpp"
+#include "legacy/batch_evaluator.hpp"
+#include "legacy/eval_request.hpp"
 
 namespace catgpt {
+
+using namespace legacy;  // libcoro-flavored BatchEvaluator/EvalAwaitable/RawNNOutput live in catgpt::legacy
+
 
 // ─── Puzzle data structures ─────────────────────────────────────────────────
 
@@ -296,7 +298,7 @@ private:
         if (moves.empty()) co_return chess::Move::NO_MOVE;
         if (moves.size() == 1) co_return moves[0];
 
-        auto tokens = tokenize<TrtEvaluator::SEQ_LENGTH>(pos, NO_HALFMOVE_CONFIG);
+        auto tokens = tokenize<BatchEvaluator::SEQ_LENGTH>(pos, NO_HALFMOVE_CONFIG);
         RawNNOutput raw = co_await EvalAwaitable(*evaluator_, tokens);
 
         bool flip = pos.sideToMove() == chess::Color::BLACK;
@@ -374,7 +376,7 @@ private:
                 // Terminal/claimable draw — never ask the network.
                 infos.push_back({move, 0.5f, false});
             } else {
-                eval_tokens.push_back(tokenize<TrtEvaluator::SEQ_LENGTH>(board, NO_HALFMOVE_CONFIG));
+                eval_tokens.push_back(tokenize<BatchEvaluator::SEQ_LENGTH>(board, NO_HALFMOVE_CONFIG));
                 eval_info_idx.push_back(static_cast<int>(infos.size()));
                 infos.push_back({move, 0.0f, true});
             }

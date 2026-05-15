@@ -1,34 +1,35 @@
 /**
- * Batched TensorRT Evaluator with libfork-coroutine integration.
+ * Batched TensorRT Evaluator with coroutine integration (libcoro legacy).
  *
  * Runs on a dedicated GPU thread. Search coroutines submit EvalRequests
  * to a thread-safe queue; the GPU thread drains the queue, batches
- * positions, runs TensorRT inference, distributes results, and hands
- * each suspended task's lf::submit_handle back to the libfork
- * lazy_pool via pool_->schedule(h). The pool's notifier wakes a
- * worker which then runs lf::resume(h) and the task continues.
+ * positions, runs TensorRT inference, distributes results, and resumes
+ * the coroutines on the worker thread pool.
  *
- * Multi-engine bucketed batching:
- *   - The .network file (built by scripts/trt.sh + scripts/pack_network.py)
- *     contains ONE TensorRT engine PER bucket size in `kBucketSizes`. Each
- *     engine has a single optimization profile pinned at min == opt == max,
- *     so kernel selection is tuned for exactly that shape (no cross-profile
- *     compromise).
- *   - We deserialize one ICudaEngine per bucket and create one
- *     IExecutionContext per bucket. Each context has input shape and tensor
- *     addresses preset at construction. The H2D copy, enqueueV3, and D2H
- *     copies are then captured into a per-bucket cudaGraphExec, so the hot
- *     path is just:
+ * Bucketed batching:
+ *   - The engine is built with one optimization profile per bucket size
+ *     in `kBucketSizes` (see scripts/trt.sh). Each bucket has a profile
+ *     pinned at min == opt == max, so kernels are tuned for that exact
+ *     batch size.
+ *   - Each bucket gets its own IExecutionContext bound to its profile,
+ *     with input shape and tensor addresses preset at construction. The
+ *     H2D copy, enqueueV3, and D2H copies are then captured into a
+ *     per-bucket cudaGraphExec, so the hot path is just:
  *       host memcpy into pinned input → cudaGraphLaunch →
  *       cudaStreamSynchronize → host memcpy out of pinned outputs.
  *     No setInputShape, no setTensorAddress, no per-launch TRT setup,
  *     no padding.
  *   - The GPU thread drains exactly `pick_bucket(min(queue.size,
  *     max_batch_size))` requests per iteration. Leftovers stay queued.
+ *
+ * Lives in `catgpt::legacy` to coexist with the libfork canonical version
+ * (`catgpt::BatchEvaluator`) at cpp/src/selfplay/batch_evaluator.hpp. The
+ * subnamespace is `legacy` rather than `coro` so it does not shadow the
+ * libcoro `::coro::` namespace inside `namespace catgpt { ... }`.
  */
 
-#ifndef CATGPT_SELFPLAY_BATCH_EVALUATOR_HPP
-#define CATGPT_SELFPLAY_BATCH_EVALUATOR_HPP
+#ifndef CATGPT_SELFPLAY_LEGACY_BATCH_EVALUATOR_HPP
+#define CATGPT_SELFPLAY_LEGACY_BATCH_EVALUATOR_HPP
 
 #include <NvInfer.h>
 #include <cuda_runtime.h>
@@ -48,26 +49,23 @@
 #include <unordered_map>
 #include <vector>
 
-#include <libfork/core.hpp>
-#include <libfork/schedule.hpp>
+#include <coro/thread_pool.hpp>
 
-#include "../engine/network_file.hpp"
-#include "../engine/nn_constants.hpp"
-#include "../engine/policy.hpp"
-#include "../engine/trt_runtime.hpp"
+#include "../../engine/nn_constants.hpp"
+#include "../../engine/policy.hpp"
+#include "../../engine/trt_runtime.hpp"
 #include "eval_request.hpp"
 
 namespace fs = std::filesystem;
 
-namespace catgpt {
+namespace catgpt::legacy {
 
 /**
  * Batched TensorRT evaluator running on a dedicated GPU thread.
  *
  * Search coroutines call submit() to enqueue an evaluation request,
- * then suspend.  The GPU thread processes batches and hands each
- * suspended task's lf::submit_handle back to the libfork pool, which
- * resumes them on a worker.
+ * then suspend.  The GPU thread processes batches and resumes the
+ * coroutines on the thread pool.
  */
 class BatchEvaluator {
 public:
@@ -84,60 +82,28 @@ public:
     };
 
     /**
-     * @param network_path  Path to the serialized .network file (multi-engine
-     *                      bundle, one engine per bucket).
-     * @param pool          Non-owning pointer to the libfork lazy_pool
-     *                      (suspended tasks are handed back here after
-     *                      GPU eval via pool->schedule(handle)).
-     *                      Must outlive this BatchEvaluator.
+     * @param engine_path   Path to the serialized TensorRT engine.
+     * @param thread_pool   Shared pointer to the worker thread pool
+     *                      (coroutines are resumed here after GPU eval).
      * @param max_batch_size Soft cap on bucket selection. Only buckets
      *                      <= max_batch_size are usable. Effective max
      *                      batch is the largest bucket <= max_batch_size.
-     * @param device_id     CUDA device to bind this evaluator to. The ctor,
-     *                      the GPU thread, and the dtor all cudaSetDevice
-     *                      to this id before touching CUDA APIs.
      */
-    BatchEvaluator(const fs::path& network_path,
-                   lf::lazy_pool* pool,
-                   int max_batch_size,
-                   int device_id)
-        : pool_(pool)
+    BatchEvaluator(const fs::path& engine_path,
+                   std::shared_ptr<::coro::thread_pool> thread_pool,
+                   int max_batch_size = 32)
+        : thread_pool_(std::move(thread_pool))
         , max_batch_size_(max_batch_size > 0 ? max_batch_size : 1)
-        , device_id_(device_id)
         , shutdown_(false)
         , total_evals_(0)
     {
-        // Pin every CUDA call below — runtime/engine creation, buffer
-        // allocations, context setup, and graph capture — to our device.
-        // Per-thread state, so other threads bringing up sibling
-        // evaluators on different devices don't interfere.
-        CATGPT_CUDA_CHECK(cudaSetDevice(device_id_));
-
         compute_effective_buckets();
-        // Bulk-data phase: file read, engine deserialize (uploads ~GB
-        // of weights to GPU), and buffer allocation. Parallel-safe
-        // across BatchEvaluators on the same GPU (each owns its own
-        // runtime/engines/buffers; CUDA driver serializes overlapping
-        // memcpys at the bottom).
-        load_engines(network_path);
+        load_engine(engine_path);
         setup_io();
-        validate_profiles();
+        discover_profiles();
         allocate_buffers();
-
-        // GPU-stream-using phase: setup_contexts runs
-        // setOptimizationProfileAsync on stream_, capture_graphs runs
-        // a warmup enqueueV3 then captures the per-bucket graph.
-        // BOTH share Myelin/cuBLAS-like per-device state that is not
-        // safe to drive from two contexts in parallel on the same GPU
-        // (concurrent runs trip "[TRT ERROR] enqueueV3: ...
-        // executeMyelinGraph ... Platform (Cuda) error" and segfault).
-        // Serialize per device; cross-device init stays parallel.
-        {
-            std::lock_guard<std::mutex> init_lock(
-                per_device_init_mutex(device_id_));
-            setup_contexts();
-            capture_graphs();
-        }
+        setup_contexts();
+        capture_graphs();
 
         // Start the GPU thread
         gpu_thread_ = std::jthread([this](std::stop_token st) { gpu_loop(st); });
@@ -145,12 +111,6 @@ public:
 
     ~BatchEvaluator() {
         shutdown();
-
-        // Destruction can run on any thread (typically LksSearch's owner
-        // thread), so its CUDA current-device may be wrong. Pin it before
-        // calling cudaGraphExecDestroy / cudaStreamDestroy / cudaFree* —
-        // freeing buffers under the wrong device is undefined.
-        cudaSetDevice(device_id_);
 
         // Destroy captured graph executables first; each holds references
         // to TRT context state, the stream, and the d_*/h_* buffers.
@@ -160,9 +120,8 @@ public:
         graph_execs_.clear();
 
         // Destroy execution contexts before freeing the stream/buffers
-        // they were bound to (and before the engines that produced them).
+        // they were bound to (and before the engine that produced them).
         contexts_.clear();
-        engines_.clear();
 
         // Free CUDA resources
         if (stream_) cudaStreamDestroy(stream_);
@@ -224,11 +183,6 @@ private:
     // ─── GPU thread main loop ───────────────────────────────────────────
 
     void gpu_loop(std::stop_token stop) {
-        // A freshly-spawned std::jthread starts on CUDA device 0; the
-        // parent thread's current-device is NOT inherited. Pin to ours
-        // before touching any CUDA API on this thread.
-        CATGPT_CUDA_CHECK(cudaSetDevice(device_id_));
-
         std::vector<EvalRequest*> batch;
         batch.reserve(largest_effective_bucket());
 
@@ -295,13 +249,8 @@ private:
                         h_policy_ + b * POLICY_SIZE,
                         POLICY_SIZE * sizeof(float));
 
-            // Hand the submit_handle back to the libfork pool. The pool's
-            // notifier wakes a sleeping worker, which calls lf::resume(h)
-            // and the suspended task continues from EvalAwaitable::await_resume.
-            // pool_->schedule is documented as concurrent-safe; the GPU
-            // thread is NOT a libfork worker so we must NOT call
-            // lf::resume() directly here.
-            pool_->schedule(req->continuation);
+            // Resume the coroutine on the worker thread pool
+            thread_pool_->resume(req->continuation);
         }
 
         total_evals_.fetch_add(batch_size, std::memory_order_relaxed);
@@ -310,61 +259,37 @@ private:
 
     // ─── TensorRT setup ─────────────────────────────────────────────────
 
-    void load_engines(const fs::path& network_path) {
-        NetworkFile file(network_path);
-        std::println(stderr,
-                     "[BatchEvaluator dev={}] Loaded {} ({:.1f} MB, {} sub-engine(s))",
-                     device_id_,
-                     network_path.string(),
-                     static_cast<double>(file.file_size()) / (1024.0 * 1024.0),
-                     file.sub_engines().size());
+    void load_engine(const fs::path& engine_path) {
+        std::ifstream file(engine_path, std::ios::binary | std::ios::ate);
+        if (!file) {
+            throw std::runtime_error("Failed to open engine file: " + engine_path.string());
+        }
+
+        auto size = file.tellg();
+        file.seekg(0, std::ios::beg);
+
+        std::vector<char> engine_data(size);
+        if (!file.read(engine_data.data(), size)) {
+            throw std::runtime_error("Failed to read engine file");
+        }
+
+        std::println(stderr, "[BatchEvaluator] Loaded engine: {} ({:.1f} MB)",
+                     engine_path.string(), static_cast<double>(size) / (1024.0 * 1024.0));
 
         runtime_.reset(nvinfer1::createInferRuntime(logger_));
         if (!runtime_) throw std::runtime_error("Failed to create TensorRT runtime");
 
-        engines_.clear();
-        for (const auto& sub : file.sub_engines()) {
-            std::unique_ptr<nvinfer1::ICudaEngine> engine(
-                runtime_->deserializeCudaEngine(sub.blob.data(), sub.blob.size()));
-            if (!engine) {
-                throw std::runtime_error(std::format(
-                    "Failed to deserialize sub-engine for bucket {}", sub.bucket_size));
-            }
-            engines_.emplace(sub.bucket_size, std::move(engine));
-        }
-
-        // Validate every effective bucket has a corresponding sub-engine.
-        for (int b : effective_buckets_) {
-            if (!engines_.contains(b)) {
-                std::string expected;
-                for (int e : effective_buckets_) {
-                    if (!expected.empty()) expected += ", ";
-                    expected += std::to_string(e);
-                }
-                std::string discovered;
-                for (const auto& [k, _] : engines_) {
-                    if (!discovered.empty()) discovered += ", ";
-                    discovered += std::to_string(k);
-                }
-                throw std::runtime_error(std::format(
-                    "NetworkFile {} missing sub-engine for bucket {}. "
-                    "Expected (effective): [{}]. Found in file: [{}]. "
-                    "Rebuild with scripts/trt.sh.",
-                    network_path.string(), b, expected, discovered));
-            }
-        }
+        engine_.reset(runtime_->deserializeCudaEngine(engine_data.data(), engine_data.size()));
+        if (!engine_) throw std::runtime_error("Failed to deserialize CUDA engine");
     }
 
     void setup_io() {
-        // IO tensor names are identical across all sub-engines (same ONNX
-        // source). Use any engine — pick the one for the smallest bucket.
-        nvinfer1::ICudaEngine& engine = *engines_.begin()->second;
-        int num_io = engine.getNbIOTensors();
+        int num_io = engine_->getNbIOTensors();
 
         for (int i = 0; i < num_io; ++i) {
-            const char* name = engine.getIOTensorName(i);
-            auto mode = engine.getTensorIOMode(name);
-            auto dims = engine.getTensorShape(name);
+            const char* name = engine_->getIOTensorName(i);
+            auto mode = engine_->getTensorIOMode(name);
+            auto dims = engine_->getTensorShape(name);
             std::string name_str(name);
 
             if (mode == nvinfer1::TensorIOMode::kINPUT) {
@@ -422,9 +347,7 @@ private:
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_value_probs_, B * VALUE_NUM_BINS * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_policy_, B * POLICY_SIZE * sizeof(float)));
 
-        std::println(stderr,
-                     "[BatchEvaluator dev={}] Allocated buffers for max effective bucket={}",
-                     device_id_, B);
+        std::println(stderr, "[BatchEvaluator] Allocated buffers for max effective bucket={}", B);
     }
 
     /**
@@ -468,39 +391,55 @@ private:
     }
 
     /**
-     * Sanity-check each per-bucket sub-engine: must contain exactly one
-     * optimization profile pinned at min == opt == max == bucket. If the
-     * .network file was built by scripts/pack_network.py from per-bucket
-     * trtexec runs, this is automatically true; this validation guards
-     * against hand-crafted or stale .network files.
+     * Enumerate optimization profiles in the engine and build
+     * bucket_to_profile_. Throws if any expected bucket (in
+     * effective_buckets_) is missing.
      */
-    void validate_profiles() {
+    void discover_profiles() {
+        const int num_profiles = engine_->getNbOptimizationProfiles();
+        if (num_profiles < 1) {
+            throw std::runtime_error("Engine has no optimization profiles");
+        }
+
+        bucket_to_profile_.clear();
+        for (int i = 0; i < num_profiles; ++i) {
+            auto opt_dims = engine_->getProfileShape(
+                input_name_.c_str(), i, nvinfer1::OptProfileSelector::kOPT);
+            if (opt_dims.nbDims < 1) continue;
+            const int batch = static_cast<int>(opt_dims.d[0]);
+            bucket_to_profile_[batch] = i;
+        }
+
+        // Validate: every effective bucket has a matching profile.
         for (int b : effective_buckets_) {
-            auto& engine = *engines_.at(b);
-            const int n = engine.getNbOptimizationProfiles();
-            if (n != 1) {
+            if (!bucket_to_profile_.contains(b)) {
+                std::string expected;
+                for (int e : effective_buckets_) {
+                    if (!expected.empty()) expected += ", ";
+                    expected += std::to_string(e);
+                }
+                std::string discovered;
+                for (const auto& [k, v] : bucket_to_profile_) {
+                    if (!discovered.empty()) discovered += ", ";
+                    discovered += std::to_string(k);
+                }
                 throw std::runtime_error(std::format(
-                    "Sub-engine for bucket {} has {} optimization profile(s); "
-                    "expected exactly 1 (rebuild with scripts/trt.sh).", b, n));
-            }
-            auto opt = engine.getProfileShape(
-                input_name_.c_str(), 0, nvinfer1::OptProfileSelector::kOPT);
-            if (opt.nbDims < 1 || opt.d[0] != b) {
-                throw std::runtime_error(std::format(
-                    "Sub-engine for bucket {} has profile opt batch {}, expected {}.",
-                    b, opt.nbDims < 1 ? -1 : opt.d[0], b));
+                    "Engine missing optimization profile for bucket {}. "
+                    "Expected (effective): [{}]. Discovered (in engine): [{}]. "
+                    "Rebuild the engine with scripts/trt.sh.",
+                    b, expected, discovered));
             }
         }
-        std::println(stderr,
-                     "[BatchEvaluator] Validated {} per-bucket sub-engine(s)",
-                     effective_buckets_.size());
+
+        std::println(stderr, "[BatchEvaluator] Discovered {} optimization profile(s); "
+                             "all {} effective bucket(s) covered",
+                     num_profiles, effective_buckets_.size());
     }
 
     /**
-     * Create one IExecutionContext per effective bucket from that bucket's
-     * own per-bucket sub-engine, bind it to profile 0 (the only profile,
-     * pinned min == opt == max == bucket), set input shape, and bind tensor
-     * addresses to the shared d_* device buffers.
+     * Create one IExecutionContext per effective bucket, bind it to the
+     * bucket's profile, set input shape (min == opt == max), and bind
+     * tensor addresses to the shared d_* device buffers.
      *
      * After this, the hot path never touches setInputShape /
      * setTensorAddress / setOptimizationProfileAsync.
@@ -510,21 +449,23 @@ private:
         contexts_.reserve(effective_buckets_.size());
 
         for (int b : effective_buckets_) {
+            const int profile_idx = bucket_to_profile_.at(b);
+
             std::unique_ptr<nvinfer1::IExecutionContext> ctx(
-                engines_.at(b)->createExecutionContext());
+                engine_->createExecutionContext());
             if (!ctx) {
                 throw std::runtime_error(std::format(
                     "Failed to create IExecutionContext for bucket {}", b));
             }
 
-            // Each sub-engine has exactly one profile (index 0).
-            if (!ctx->setOptimizationProfileAsync(0, stream_)) {
+            if (!ctx->setOptimizationProfileAsync(profile_idx, stream_)) {
                 throw std::runtime_error(std::format(
-                    "Failed to bind optimization profile 0 for bucket {}", b));
+                    "Failed to bind optimization profile {} for bucket {}",
+                    profile_idx, b));
             }
             CATGPT_CUDA_CHECK(cudaStreamSynchronize(stream_));
 
-            // min == opt == max for this profile, so this is one-time.
+            // min == opt == max for these profiles, so this is one-time.
             nvinfer1::Dims input_dims;
             input_dims.nbDims = 2;
             input_dims.d[0] = b;
@@ -558,25 +499,6 @@ private:
      * + cudaStreamSynchronize. No per-launch TRT setup, no per-launch
      * cudaMemcpyAsync host calls.
      */
-    /**
-     * Per-device init mutex registry. Serializes the entire
-     * BatchEvaluator construction (engine deserialize, context setup,
-     * graph capture) across instances on the same GPU.
-     *
-     * Why per-device and not just per-process: TRT/Myelin keeps
-     * per-device shared state (JIT cache, cuBLAS-ish workspaces) that
-     * is unsafe to bring up concurrently from two contexts on one GPU.
-     * Acquired in the ctor; cross-device init runs fully in parallel.
-     */
-    static std::mutex& per_device_init_mutex(int device_id) {
-        static std::mutex map_mu;
-        static std::unordered_map<int, std::unique_ptr<std::mutex>> map;
-        std::lock_guard<std::mutex> lk(map_mu);
-        auto& slot = map[device_id];
-        if (!slot) slot = std::make_unique<std::mutex>();
-        return *slot;
-    }
-
     void capture_graphs() {
         graph_execs_.clear();
         graph_execs_.reserve(effective_buckets_.size());
@@ -610,14 +532,7 @@ private:
         const std::size_t vprobs_bytes = bucket * VALUE_NUM_BINS * sizeof(float);
         const std::size_t policy_bytes = bucket * POLICY_SIZE * sizeof(float);
 
-        // ThreadLocal (not Global) so concurrent BatchEvaluator init on
-        // the same GPU doesn't trip cudaErrorStreamCaptureUnsupported.
-        // Global mode makes any "unsafe-to-capture" CUDA call in any
-        // thread (e.g. another BatchEvaluator's enqueueV3 warmup, which
-        // syncs constant buffers) abort the whole process during our
-        // capture window. ThreadLocal scopes the restriction to this
-        // thread only.
-        CATGPT_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+        CATGPT_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
 
         // H2D
         CATGPT_CUDA_CHECK(cudaMemcpyAsync(d_input_, h_input_, input_bytes,
@@ -664,14 +579,11 @@ private:
 
     // ─── Members ────────────────────────────────────────────────────────
 
-    // Libfork lazy_pool to which suspended tasks are handed back after
-    // their GPU eval completes. Non-owning; the LksSearch (or whoever
-    // owns this BatchEvaluator) owns the pool and must outlive us.
-    lf::lazy_pool* pool_;
+    // Thread pool for resuming coroutines
+    std::shared_ptr<::coro::thread_pool> thread_pool_;
 
     // Configuration
     int max_batch_size_;
-    int device_id_;
 
     // Request queue
     std::deque<EvalRequest*> queue_;
@@ -689,20 +601,18 @@ private:
     // TensorRT state
     TrtLogger logger_;
     std::unique_ptr<nvinfer1::IRuntime> runtime_;
-
-    // bucket_size -> ICudaEngine. One sub-engine per bucket, deserialized
-    // from a packed .network file (see scripts/pack_network.py). Each engine
-    // has exactly one optimization profile pinned at min == opt == max ==
-    // bucket, so kernels are tuned for that exact shape.
-    std::unordered_map<int, std::unique_ptr<nvinfer1::ICudaEngine>> engines_;
+    std::unique_ptr<nvinfer1::ICudaEngine> engine_;
 
     // Buckets <= max_batch_size_, ascending. Source of truth for
     // pick_bucket and the keys of contexts_.
     std::vector<int> effective_buckets_;
 
-    // bucket_size -> IExecutionContext. Each context is created from its
-    // bucket's own sub-engine, bound to profile 0, with input shape and
-    // tensor addresses preset.
+    // bucket_size -> engine optimization profile index, populated by
+    // discover_profiles() at construction.
+    std::unordered_map<int, int> bucket_to_profile_;
+
+    // bucket_size -> IExecutionContext. Each context is bound to its
+    // bucket's profile with input shape and tensor addresses preset.
     std::unordered_map<int, std::unique_ptr<nvinfer1::IExecutionContext>> contexts_;
 
     // bucket_size -> captured cudaGraphExec wrapping H2D + enqueueV3 +
@@ -732,11 +642,11 @@ private:
 
 // ─── EvalAwaitable::await_suspend (needs BatchEvaluator to be complete) ────
 
-inline void EvalAwaitable::await_suspend(lf::submit_handle h) noexcept {
+inline void EvalAwaitable::await_suspend(std::coroutine_handle<> h) noexcept {
     request_.continuation = h;
     evaluator_.submit(&request_);
 }
 
-}  // namespace catgpt
+}  // namespace catgpt::legacy
 
-#endif  // CATGPT_SELFPLAY_BATCH_EVALUATOR_HPP
+#endif  // CATGPT_SELFPLAY_LEGACY_BATCH_EVALUATOR_HPP

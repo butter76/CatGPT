@@ -11,8 +11,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Compiler flags for modern C++ and optimization
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic -Wno-deprecated-declarations")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
 
@@ -21,18 +20,39 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
-# === vcpkg / libcoro ===
-# vcpkg doesn't provide a CMake config for libcoro, so we set paths manually
+# === vcpkg / libcoro (optional) ===
+# Only the legacy `catgpt_*` targets (see selfplay/legacy/) need libcoro.
+# The LKS family and standalone tests run on libfork only and must build
+# on machines without libcoro installed (e.g. fresh dev boxes / CI).
+# We probe for libcoro non-fatally and gate the legacy targets on
+# HAVE_LIBCORO further down.
 set(VCPKG_ROOT "$ENV{HOME}/vcpkg" CACHE PATH "vcpkg installation root")
 set(VCPKG_INSTALLED_DIR "${VCPKG_ROOT}/installed/x64-linux")
 
 set(LIBCORO_INCLUDE_DIR "${VCPKG_INSTALLED_DIR}/include")
 set(LIBCORO_LIB_DIR "${VCPKG_INSTALLED_DIR}/lib")
-find_library(LIBCORO_LIB coro PATHS ${LIBCORO_LIB_DIR} REQUIRED)
+find_library(LIBCORO_LIB coro PATHS ${LIBCORO_LIB_DIR})
 
-message(STATUS "vcpkg root: ${VCPKG_ROOT}")
-message(STATUS "libcoro include: ${LIBCORO_INCLUDE_DIR}")
-message(STATUS "libcoro library: ${LIBCORO_LIB}")
+if(LIBCORO_LIB AND EXISTS "${LIBCORO_INCLUDE_DIR}/coro/task.hpp")
+    set(HAVE_LIBCORO TRUE)
+    message(STATUS "vcpkg root: ${VCPKG_ROOT}")
+    message(STATUS "libcoro include: ${LIBCORO_INCLUDE_DIR}")
+    message(STATUS "libcoro library: ${LIBCORO_LIB}")
+else()
+    set(HAVE_LIBCORO FALSE)
+    message(STATUS "libcoro not found at ${LIBCORO_LIB_DIR} / ${LIBCORO_INCLUDE_DIR}; "
+                   "skipping legacy catgpt_* targets (catgpt_mcts, catgpt_search, "
+                   "catgpt_fractional_mcts, catgpt_selfplay, catgpt_puzzle_eval)")
+endif()
+
+# === libfork (header-only, git submodule) ===
+# Continuation-stealing fork-join coroutine runtime. Coexists with libcoro
+# during the in-progress migration; consume by linking `libfork::libfork`.
+# Disable hwloc auto-detection — no NUMA box and we want a quiet build.
+# Drop LF_NO_HWLOC=ON if/when hwloc dev headers are installed.
+set(LF_NO_HWLOC ON CACHE BOOL "Disable libfork's hwloc/NUMA support" FORCE)
+add_subdirectory(external/libfork EXCLUDE_FROM_ALL)
+message(STATUS "libfork: ${CMAKE_SOURCE_DIR}/external/libfork (target libfork::libfork)")
 
 # === Chess Library (header-only) ===
 set(CHESS_LIBRARY_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/external/chess-library/include")
@@ -96,6 +116,7 @@ set_target_properties(trt_benchmark PROPERTIES
 )
 
 # === CatGPT Fractional MCTS UCI Engine (coroutines + TensorRT) ===
+if(HAVE_LIBCORO)
 add_executable(catgpt_fractional_mcts
     src/fractional_mcts_uci_main.cpp
 )
@@ -121,8 +142,10 @@ set_target_properties(catgpt_fractional_mcts PROPERTIES
     BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
+endif()
 
 # === CatGPT MCTS UCI Engine (coroutines + TensorRT) ===
+if(HAVE_LIBCORO)
 add_executable(catgpt_mcts
     src/mcts_uci_main.cpp
 )
@@ -148,31 +171,11 @@ set_target_properties(catgpt_mcts PROPERTIES
     BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
-
-# === CatGPT FEN Analyzer (with TensorRT) ===
-add_executable(catgpt_analyze
-    src/analyze_fen_main.cpp
-)
-
-target_include_directories(catgpt_analyze PRIVATE
-    ${CHESS_LIBRARY_INCLUDE_DIR}
-    ${TENSORRT_INCLUDE_DIR}
-    ${CUDA_INCLUDE_DIR}
-)
-
-target_link_libraries(catgpt_analyze PRIVATE
-    ${NVINFER_LIB}
-    ${CUDART_LIB}
-    pthread
-)
-
-set_target_properties(catgpt_analyze PROPERTIES
-    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
-)
+endif()
 
 # === CatGPT Search Binary (standalone Fractional MCTS for web UI) ===
 # Uses CoroutineSearch (same algorithm as selfplay) with coroutine infrastructure
+if(HAVE_LIBCORO)
 add_executable(catgpt_search
     src/catgpt_search_main.cpp
 )
@@ -198,6 +201,7 @@ set_target_properties(catgpt_search PROPERTIES
     BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
+endif()
 
 # === Fathom (Syzygy tablebase probing, C library) ===
 set(FATHOM_SRC_DIR "${CMAKE_SOURCE_DIR}/external/fathom/src")
@@ -213,6 +217,7 @@ set_target_properties(fathom PROPERTIES
 target_compile_options(fathom PRIVATE -O3 -w)
 
 # === CatGPT Batched Self-Play (coroutines + TensorRT) ===
+if(HAVE_LIBCORO)
 add_executable(catgpt_selfplay
     src/selfplay_main.cpp
 )
@@ -240,8 +245,10 @@ set_target_properties(catgpt_selfplay PROPERTIES
     BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
+endif()
 
 # === CatGPT Batched Puzzle Evaluation (coroutines + TensorRT) ===
+if(HAVE_LIBCORO)
 add_executable(catgpt_puzzle_eval
     src/puzzle_eval_main.cpp
 )
@@ -266,16 +273,145 @@ set_target_properties(catgpt_puzzle_eval PROPERTIES
     BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
     INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
 )
+endif()
+
+# === Fractional MCTS v2 TT/Arena PoC microbenchmark ===
+# Standalone — no TRT, no libcoro, no chess-library deps. Just C++23 + pthread.
+add_executable(tt_arena_bench
+    src/engine/fractional_mcts/v2/tt_arena_bench.cpp
+)
+target_compile_options(tt_arena_bench PRIVATE -O3 -march=native -mcx16)
+# libatomic provides __atomic_*_16 (gcc-14 emits libcalls for 16-byte
+# atomics rather than inlining cmpxchg16b; libatomic uses cmpxchg16b
+# internally so the ops remain lock-free).
+target_link_libraries(tt_arena_bench PRIVATE pthread atomic)
+set_target_properties(tt_arena_bench PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR}"
+)
+
+# === Lock-free TT/Arena multi-threaded stress + bench ===
+# Standalone — no TRT, no libcoro, no chess-library deps.
+add_executable(tt_arena_concurrent_bench
+    src/engine/fractional_mcts/v2/tt_arena_concurrent_bench.cpp
+)
+target_compile_options(tt_arena_concurrent_bench PRIVATE -O3 -march=native -mcx16)
+target_link_libraries(tt_arena_concurrent_bench PRIVATE pthread atomic)
+set_target_properties(tt_arena_concurrent_bench PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR}"
+)
+
+# === v2::MoveInfo encoding unit tests ===
+# Standalone — no TRT, no libcoro, no chess-library deps. Just C++23.
+add_executable(tt_arena_test
+    src/engine/fractional_mcts/v2/tt_arena_test.cpp
+)
+target_compile_options(tt_arena_test PRIVATE -O2 -g -march=native -mcx16)
+target_link_libraries(tt_arena_test PRIVATE atomic)
+set_target_properties(tt_arena_test PROPERTIES
+    BUILD_RPATH "${GCC14_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR}"
+)
+
+# === LKS search lifecycle + GPU test ===
+# Real TensorRT-backed BatchEvaluator per worker. Now libfork-backed.
+add_executable(lks_search_test
+    src/engine/lks/lks_search_test.cpp
+)
+target_include_directories(lks_search_test PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+)
+target_compile_options(lks_search_test PRIVATE -O2 -g -fcoroutines -mcx16)
+target_link_libraries(lks_search_test PRIVATE
+    libfork::libfork
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    pthread
+    atomic
+)
+set_target_properties(lks_search_test PROPERTIES
+    BUILD_RPATH   "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+)
+
+# === LKS throughput sweep (real TRT) ===
+add_executable(lks_throughput_bench
+    src/engine/lks/lks_throughput_bench.cpp
+)
+target_include_directories(lks_throughput_bench PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+)
+target_compile_options(lks_throughput_bench PRIVATE -O3 -march=native -fcoroutines -mcx16)
+target_link_libraries(lks_throughput_bench PRIVATE
+    libfork::libfork
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    pthread
+    atomic
+)
+set_target_properties(lks_throughput_bench PROPERTIES
+    BUILD_RPATH   "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+)
+
+# === libfork smoke test ===
+# Standalone PoC for libfork + custom context_switcher awaitable that
+# bridges to a fake batched "GPU" evaluator thread. No TRT, no libcoro,
+# no chess deps.
+add_executable(libfork_smoke_test
+    src/libfork_smoke_test.cpp
+)
+target_link_libraries(libfork_smoke_test PRIVATE
+    libfork::libfork
+    pthread
+)
+set_target_properties(libfork_smoke_test PROPERTIES
+    BUILD_RPATH   "${GCC14_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR}"
+)
+
+# === CatGPT LKS UCI Engine (Lazy-SMP, log-scale ID, TRT-batched) ===
+add_executable(lks_uci
+    src/lks_uci_main.cpp
+)
+target_include_directories(lks_uci PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+)
+target_link_libraries(lks_uci PRIVATE
+    libfork::libfork
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+    pthread
+    atomic
+)
+target_compile_options(lks_uci PRIVATE -fcoroutines -mcx16)
+set_target_properties(lks_uci PROPERTIES
+    BUILD_RPATH   "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+)
 
 # Enable colored output
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)
     target_compile_options(trt_benchmark PRIVATE -fdiagnostics-color=always)
     target_compile_options(chess_lib_tests PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_fractional_mcts PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_mcts PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_analyze PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_selfplay PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_search PRIVATE -fdiagnostics-color=always)
-    target_compile_options(catgpt_puzzle_eval PRIVATE -fdiagnostics-color=always)
+    target_compile_options(tt_arena_bench PRIVATE -fdiagnostics-color=always)
+    target_compile_options(tt_arena_concurrent_bench PRIVATE -fdiagnostics-color=always)
+    target_compile_options(tt_arena_test PRIVATE -fdiagnostics-color=always)
+    target_compile_options(lks_search_test PRIVATE -fdiagnostics-color=always)
+    target_compile_options(lks_uci PRIVATE -fdiagnostics-color=always)
+    if(HAVE_LIBCORO)
+        target_compile_options(catgpt_fractional_mcts PRIVATE -fdiagnostics-color=always)
+        target_compile_options(catgpt_mcts PRIVATE -fdiagnostics-color=always)
+        target_compile_options(catgpt_selfplay PRIVATE -fdiagnostics-color=always)
+        target_compile_options(catgpt_search PRIVATE -fdiagnostics-color=always)
+        target_compile_options(catgpt_puzzle_eval PRIVATE -fdiagnostics-color=always)
+    endif()
 endif()
