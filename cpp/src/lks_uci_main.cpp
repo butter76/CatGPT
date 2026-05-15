@@ -247,8 +247,12 @@ private:
         // Defaults: effectively-infinite eval budget. Overridden by
         // `nodes X`. `infinite` is the same as the default. `movetime X`
         // leaves the eval budget huge and asks the watchdog to call
-        // quit() after X ms.
-        uint64_t max_evals = 1'000'000'000ULL;
+        // quit() after X ms. `depth N` is interpreted as centi-depth
+        // (N=800 -> stop when min_depth() >= 8.00), matching the
+        // encoding used by `info depth ...` in worker_main.
+        catgpt::lks::LksSearchConfig cfg;
+        cfg.max_evals = 1'000'000'000ULL;
+        cfg.on_uci_line = [](std::string_view s) { emit_line(s); };
         std::int64_t movetime_ms = -1;
 
         for (std::size_t i = 1; i < tokens.size(); ++i) {
@@ -257,20 +261,24 @@ private:
                 // already huge
             } else if (t == "nodes" && i + 1 < tokens.size()) {
                 try {
-                    max_evals = std::stoull(tokens[++i]);
+                    cfg.max_evals = std::stoull(tokens[++i]);
                 } catch (...) {}
             } else if (t == "movetime" && i + 1 < tokens.size()) {
                 try {
                     movetime_ms = std::stoll(tokens[++i]);
                 } catch (...) {}
+            } else if (t == "depth" && i + 1 < tokens.size()) {
+                try {
+                    const long d_centi = std::stol(tokens[++i]);
+                    if (d_centi > 0) {
+                        cfg.target_min_depth =
+                            static_cast<float>(d_centi) / 100.0f;
+                    }
+                } catch (...) {}
             }
-            // Other tokens (depth/wtime/btime/winc/binc/movestogo/etc.)
-            // are silently ignored.
+            // Other tokens (wtime/btime/winc/binc/movestogo/etc.) are
+            // silently ignored.
         }
-
-        catgpt::lks::LksSearchConfig cfg;
-        cfg.max_evals = max_evals;
-        cfg.on_uci_line = [](std::string_view s) { emit_line(s); };
 
         // search() returns immediately; worker_main runs on its own
         // jthread and emits info+bestmove via on_uci_line.

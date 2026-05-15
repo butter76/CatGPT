@@ -192,6 +192,12 @@ struct LksSearchConfig {
     float delta_depth = 0.2f;       // per-iteration depth step
     float max_depth   = 32.0f;      // absolute depth cap (e^32 ~= 8e13)
 
+    // Stop the search the moment min_depth() across workers reaches this
+    // value. `+infinity` (default) disables the check. The UCI driver
+    // maps `go depth N` to `N / 100.0f` (centi-depth, matching the
+    // encoding used in `info depth ...`).
+    float target_min_depth = std::numeric_limits<float>::infinity();
+
     detail::SearchParams params{};  // descent-time tunables (see SearchParams)
 
     std::function<void(std::string_view)> on_uci_line;
@@ -1274,6 +1280,12 @@ private:
                 min_d = std::min(min_d, w->depth.load(std::memory_order_relaxed));
             }
             total_evals_.store(evals_sum, std::memory_order_relaxed);
+
+            // Depth-target termination: end the search the moment every
+            // worker has reached `target_min_depth`. Checked here (before
+            // the no-change `continue` below) so a tick that doesn't
+            // advance centi-depth can still terminate.
+            if (std::isfinite(min_d) && min_d >= cfg.target_min_depth) break;
 
             // UCI's `depth` field is integer-valued (cutechess parses via
             // QString::toInt and most other GUIs do the same). Encode our
