@@ -139,6 +139,7 @@
 #include "../fractional_mcts/search_stats.hpp"
 #include "../fractional_mcts/v2/board_secondary.hpp"
 #include "../fractional_mcts/v2/tt_arena.hpp"
+#include "compute_allocations.hpp"
 
 namespace catgpt::lks {
 
@@ -171,6 +172,17 @@ struct SearchParams {
     // nodes get a high max_depth so early ID iterations skip re-descending
     // them (trust the NN). C is this constant.
     float default_depth_constant = 12.0f;
+
+    // PUCT allocation constant. Feeds Halley-in-delta dual solve:
+    //   log N_i = log P_i + 2d/3 + log(c_puct/3) - log(e^u + Δ_i),
+    // where u = log(K - q_max), Δ_i = q_max - q_i, q_i = -Q_i.
+    float c_puct = 1.0f;
+
+    // FPU reduction. For unexpanded children we synthesize a parent-POV Q via
+    //   Q_eff_parent_pov = parent_Q - fpu_reduction * sqrt(cumulative_P),
+    // where cumulative_P sums priors of preceding P-sorted children (expanded
+    // or not). Mirrors coroutine_search.hpp::compute_allocations exactly.
+    float fpu_reduction = 0.2f;
 };
 
 }  // namespace detail
@@ -600,79 +612,76 @@ inline constexpr auto recursive_search =
     const uint16_t num_moves = hdr->num_moves;
     const v2::MoveInfo* moves = ctx->arena->moves_at(info_cell.info_offset);
 
-    enum class Mode : uint8_t { Skip, RecurseThenRead, ReadOnly };
-    struct Plan {
-        Mode     mode;
-        float    P;
-        float    fixed_Q;     // valid for ReadOnly
-        uint64_t child_key;   // valid for RecurseThenRead
-        uint32_t child_sec;   // valid for RecurseThenRead (cached so
-                              // the post-fan-out rollup re-find can
-                              // run without re-deriving the board)
-    };
+    // Parent Q (from the same TT entry we just validated) feeds the FPU
+    // estimate for unexpanded children. For a freshly-claimed entry this
+    // is the NN's 2*value-1; for a TT-shared entry it's whatever the
+    // last rollup wrote. Both are well-defined and acquire-safe here.
+    const float parent_Q = [entry]() {
+        auto [q, _] = v2::unpack_qd(v2::SearchArena::load_qd(entry).qd_packed);
+        (void)_;
+        return q;
+    }();
+
+    // Variance-scaled depth floor: used as the per-child `depth` stamped
+    // on Unexpanded plans (the "current effort" for a never-visited
+    // child). It is no longer a hard descent cutoff — the gate is
+    // `alloc > depth` from the Halley allocation. Low-variance (high-
+    // confidence) parents raise the floor so unexpanded children need
+    // a larger allocation before we'll expand them; high-variance
+    // parents lower it (possibly below 0) so expansion happens easily
+    // and the rollup refines Q.
+    const float depth_floor = -std::log(
+        hdr->variance * ctx->params->default_depth_constant);
+
+    // ── Pass 1: classify children, populate Plan rows (no co_await) ──
     std::vector<Plan> plans;
     plans.reserve(num_moves);
 
-    // first_fork tracks whether we've consumed the inherited permit yet.
-    // any_fork tracks whether we've opened a fork-join scope (must lf::join
-    // before returning iff any_fork is true).
-    bool first_fork = true;
-    bool any_fork   = false;
-
-    // Loop-invariant depth floor — applies to EVERY child regardless of
-    // kind. With child_depth = depth + log(P), each level of recursion
-    // strictly decreases depth. Without a floor the recursion would run
-    // forever as priors compound below e^0 = 1 visit. The floor is
-    // variance-scaled (-log(variance * C)) so that low-variance (high-
-    // confidence) parents raise the floor and cut off descent earlier,
-    // while high-variance parents lower it (possibly below 0) so descent
-    // proceeds and the rollup refines Q — mirroring the
-    // -log(variance * C / limit) heuristic used to stamp the initial
-    // max_depth on fresh TT entries. Cuts terminal_kind contributions
-    // too: a terminal child below the floor doesn't matter at this
-    // iteration's resolution.
-    const float depth_floor = -std::log(
-        hdr->variance * ctx->params->default_depth_constant);
+    const float fpu_reduction = ctx->params->fpu_reduction;
+    float cumulative_P = 0.0f;
+    constexpr float kPosInf = std::numeric_limits<float>::infinity();
 
     for (uint16_t i = 0; i < num_moves; ++i) {
         const auto& m = moves[i];
         const v2::TerminalKind m_tk = m.terminal_kind();
         const float m_P = m.P();
 
-        const float child_depth = (m_P > 0.0f)
-            ? depth + std::log(std::max(m_P, 1e-9f))
-            : -std::numeric_limits<float>::infinity();
-        if (child_depth < depth_floor) {
-            plans.push_back({Mode::Skip, m_P, 0.0f, 0, 0});
-            continue;
-        }
-
+        // Position-only terminals: Expanded with fixed Q and depth=+inf
+        // (so the "alloc > depth" gate never triggers a re-recurse).
+        // Q is stored in child-STM convention (same as TT): a child-loss
+        // is Q=-1 ⇒ parent's rollup -Q = +1 ⇒ we win.
         if (m_tk == v2::kTerminalDraw) {
-            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, 0, 0});
+            plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
+                             /*alloc=*/0.0f, 0, 0});
+            cumulative_P += m_P;
             continue;
         }
         if (m_tk == v2::kTerminalLossForChild) {
-            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/-1.0f, 0, 0});
+            plans.push_back({Mode::Expanded, m_P, /*Q=*/-1.0f, kPosInf,
+                             /*alloc=*/0.0f, 0, 0});
+            cumulative_P += m_P;
             continue;
         }
         if (m_tk == v2::kTerminalWinForChild) {
-            // Reachable only via Syzygy: this move drops STM at the child
-            // into a TB-won position, so child_Q = +1 (and the parent's
-            // -child_Q rollup correctly penalizes the move as a loss).
-            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/+1.0f, 0, 0});
+            // Reachable only via Syzygy: child-STM is in a TB-won position,
+            // so child_Q=+1 ⇒ parent rollup -Q = -1 ⇒ this move loses for us.
+            plans.push_back({Mode::Expanded, m_P, /*Q=*/+1.0f, kPosInf,
+                             /*alloc=*/0.0f, 0, 0});
+            cumulative_P += m_P;
             continue;
         }
 
         chess::Board cb = board;
         cb.makeMove<true>(chess::Move{m.move});
 
-        // Path-dependent: a 2-fold along this path or a 50-move
-        // expiration is NOT in terminal_kind (different paths
-        // hashing to the same key may disagree on repetition state
-        // / half-move clock since neither is part of the Zobrist
-        // key). Treat as a draw at this caller.
+        // Path-dependent: 3-fold along this path or 50-move expiration is
+        // NOT in terminal_kind (different paths hashing to the same key
+        // may disagree on repetition / half-move clock). Treat as a draw
+        // at this caller; Expanded with depth=+inf like terminals.
         if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
-            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, 0, 0});
+            plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
+                             /*alloc=*/0.0f, 0, 0});
+            cumulative_P += m_P;
             continue;
         }
 
@@ -680,35 +689,59 @@ inline constexpr auto recursive_search =
         const uint32_t child_sec = v2::secondary_hash(cb);
 
         if (v2::TTEntry* ce = ctx->arena->find(child_key, child_sec)) {
-            // (key, secondary) match verified by find — find only
-            // returns non-null after `secondary_matches` observed
-            // Cell B published with a matching key_secondary, so
-            // the child entry is fully published. Cell A's qd is
-            // atomic with the primary match; we never spin on the
-            // child's moveInfo from here, and we don't need it for
-            // the ReadOnly path (just q + max_depth).
+            // TT hit: Expanded, real Q + real depth from the child's entry.
+            // `find` only returns non-null after `secondary_matches`
+            // observed Cell B publish with matching key_secondary, so
+            // qd is consistent (Cell A is atomic with the key match).
             auto [q, child_max_d] = v2::unpack_qd(
                 v2::SearchArena::load_qd(ce).qd_packed);
-            if (child_depth <= child_max_d) {
-                plans.push_back({Mode::ReadOnly, m_P, q, child_key, child_sec});
-                continue;
-            }
+            plans.push_back({Mode::Expanded, m_P, q, child_max_d,
+                             /*alloc=*/0.0f, child_key, child_sec});
+            cumulative_P += m_P;
+            continue;
         }
 
-        // ── RecurseThenRead: fork with permit-passing ───────────────
-        // First fork inherits our permit (no acquire). Subsequent forks
-        // co_await sem->acquire() — when permits run out, the producer
-        // (this coroutine) suspends in acquire() before any new child
-        // frame is allocated. That's the real backpressure point.
+        // TT miss: Unexpanded. FPU (Leela-style, matching
+        // coroutine_search.hpp::compute_allocations):
+        //   Q_eff_parent_pov = parent_Q - fpu_reduction * sqrt(cumulative_P)
+        // Stored in child-STM convention as -Q_eff_parent_pov so the
+        // rollup's -Q yields back Q_eff_parent_pov.
+        const float Q_eff_parent_pov =
+            parent_Q - fpu_reduction * std::sqrt(cumulative_P);
+        plans.push_back({Mode::Unexpanded, m_P, /*Q=*/-Q_eff_parent_pov,
+                         /*depth=*/depth_floor, /*alloc=*/0.0f,
+                         child_key, child_sec});
+        cumulative_P += m_P;
+    }
+
+    // ── Halley A6c: compute per-child log allocations in place ──────
+    compute_log_allocations(plans.data(), static_cast<int>(plans.size()),
+                            depth, ctx->params->c_puct);
+
+    // ── Pass 2: fork on every plan where alloc > depth ──────────────
+    // First fork inherits this coroutine's permit; subsequent forks each
+    // co_await sem->acquire(). When permits run out the producer (this
+    // coroutine) suspends in acquire() before any new child frame is
+    // allocated — that's the per-worker backpressure point. Terminals
+    // and path-dep draws have depth=+inf so the gate excludes them
+    // automatically.
+    bool first_fork = true;
+    bool any_fork   = false;
+    for (uint16_t i = 0; i < num_moves; ++i) {
+        const Plan& p = plans[i];
+        if (!(p.alloc > p.depth)) continue;
+
+        chess::Board cb = board;
+        cb.makeMove<true>(chess::Move{moves[i].move});
+
         lfsync::Permit child_permit = first_fork
             ? std::move(permit)
             : co_await ctx->sem->acquire();
         first_fork = false;
         any_fork   = true;
 
-        plans.push_back({Mode::RecurseThenRead, m_P, 0.0f, child_key, child_sec});
         co_await lf::fork[recursive_search](
-            ctx, std::move(child_permit), std::move(cb), child_depth);
+            ctx, std::move(child_permit), std::move(cb), p.alloc);
     }
 
     if (any_fork) {
@@ -717,27 +750,38 @@ inline constexpr auto recursive_search =
 
     if (ctx->w->should_abort()) co_return;
 
-    // ── rollup: P-weighted average of -child_Q ──────────────────────
-    float num = 0.0f;
-    float den = 0.0f;
-    for (const Plan& p : plans) {
-        if (p.mode == Mode::Skip) continue;
-        float child_Q;
-        if (p.mode == Mode::ReadOnly) {
-            child_Q = p.fixed_Q;
-        } else {
-            v2::TTEntry* ce = ctx->arena->find(p.child_key, p.child_sec);
-            if (!ce) continue;       // child never claimed (e.g. stop fired)
-            auto [q, _] = v2::unpack_qd(
-                v2::SearchArena::load_qd(ce).qd_packed);
-            (void)_;
-            child_Q = q;
-        }
-        num += p.P * (-child_Q);
-        den += p.P;
+    // ── Pass 3: re-read TT for forked children, promote to Expanded ──
+    for (Plan& p : plans) {
+        if (!(p.alloc > p.depth)) continue;
+        v2::TTEntry* ce = ctx->arena->find(p.child_key, p.child_sec);
+        if (!ce) continue;  // child never claimed (e.g. abort raced)
+        auto [q, d] = v2::unpack_qd(v2::SearchArena::load_qd(ce).qd_packed);
+        p.Q     = q;
+        p.depth = d;
+        p.mode  = Mode::Expanded;
     }
-    if (den > 0.0f) {
-        v2::SearchArena::update_qd(entry, num / den, depth);
+
+    // ── Rollup: e^alloc-weighted average of -Q over Expanded plans ──
+    // Max-subtract LSE-style for numerical stability (alloc can reach
+    // depth + bias ≈ 20–40 at large N). Unexpanded children that never
+    // cleared the gate are dropped entirely.
+    float m_alloc = -std::numeric_limits<float>::infinity();
+    for (const Plan& p : plans) {
+        if (p.mode == Mode::Expanded && p.alloc > m_alloc) m_alloc = p.alloc;
+    }
+    if (!std::isfinite(m_alloc)) co_return;
+
+    double num = 0.0;
+    double den = 0.0;
+    for (const Plan& p : plans) {
+        if (p.mode != Mode::Expanded) continue;
+        const double w = std::exp(static_cast<double>(p.alloc - m_alloc));
+        num += w * static_cast<double>(-p.Q);
+        den += w;
+    }
+    if (den > 0.0) {
+        v2::SearchArena::update_qd(entry,
+                                   static_cast<float>(num / den), depth);
     }
 };
 
