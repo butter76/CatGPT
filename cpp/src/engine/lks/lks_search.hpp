@@ -619,21 +619,30 @@ inline constexpr auto recursive_search =
     bool first_fork = true;
     bool any_fork   = false;
 
+    // Loop-invariant depth floor — applies to EVERY child regardless of
+    // kind. With child_depth = depth + log(P), each level of recursion
+    // strictly decreases depth. Without a floor the recursion would run
+    // forever as priors compound below e^0 = 1 visit. The floor is
+    // variance-scaled (-log(variance * C)) so that low-variance (high-
+    // confidence) parents raise the floor and cut off descent earlier,
+    // while high-variance parents lower it (possibly below 0) so descent
+    // proceeds and the rollup refines Q — mirroring the
+    // -log(variance * C / limit) heuristic used to stamp the initial
+    // max_depth on fresh TT entries. Cuts terminal_kind contributions
+    // too: a terminal child below the floor doesn't matter at this
+    // iteration's resolution.
+    const float depth_floor = -std::log(
+        hdr->variance * ctx->params->default_depth_constant);
+
     for (uint16_t i = 0; i < num_moves; ++i) {
         const auto& m = moves[i];
         const v2::TerminalKind m_tk = m.terminal_kind();
         const float m_P = m.P();
 
-        // Depth floor — applies to EVERY child regardless of kind.
-        // With child_depth = depth + log(P), each level of recursion
-        // strictly decreases depth. Without a floor at 0 the recursion
-        // would run forever as priors compound below e^0 = 1 visit.
-        // Cuts terminal_kind contributions too: a terminal child below
-        // the floor doesn't matter at this iteration's resolution.
         const float child_depth = (m_P > 0.0f)
             ? depth + std::log(std::max(m_P, 1e-9f))
             : -std::numeric_limits<float>::infinity();
-        if (child_depth < 0.0f) {
+        if (child_depth < depth_floor) {
             plans.push_back({Mode::Skip, m_P, 0.0f, 0, 0});
             continue;
         }
