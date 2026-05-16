@@ -132,6 +132,7 @@
 #include "../../lf/async_semaphore.hpp"
 #include "../../selfplay/batch_evaluator.hpp"
 #include "../../selfplay/eval_request.hpp"
+#include "../../syzygy.hpp"
 #include "../../tokenizer.hpp"
 #include "../policy.hpp"
 #include "../trt_runtime.hpp"
@@ -190,6 +191,12 @@ struct LksSearchConfig {
     float start_depth = 0.0f;       // worker 0's starting depth
     float delta_depth = 0.2f;       // per-iteration depth step
     float max_depth   = 32.0f;      // absolute depth cap (e^32 ~= 8e13)
+
+    // Stop the search the moment min_depth() across workers reaches this
+    // value. `+infinity` (default) disables the check. The UCI driver
+    // maps `go depth N` to `N / 100.0f` (centi-depth, matching the
+    // encoding used in `info depth ...`).
+    float target_min_depth = std::numeric_limits<float>::infinity();
 
     detail::SearchParams params{};  // descent-time tunables (see SearchParams)
 
@@ -338,11 +345,22 @@ inline int compute_limit(const std::vector<MoveWithPrior>& sorted_moves,
  * Both depend on data (path history / half-move clock) that is not
  * part of the Zobrist key, so two transpositions to the same key can
  * disagree on them. Only stable, position-only draws (insufficient
- * material) and mate/stalemate go into the TT-stored terminal_kind.
+ * material), mate/stalemate, and Syzygy-resolved WDL (theoretical,
+ * rule50=0) go into the TT-stored terminal_kind.
  *
  * Pre: `child_board` is the board AFTER `makeMove<true>(move)`.
+ *
+ * `syz` is optional; when non-null and the child board is Syzygy-eligible
+ * (piece-count + no-castling) the WDL probe runs after the natural-
+ * terminal checks. probe_wdl uses rule50=0 internally, so the resulting
+ * kind is path-independent (safe to cache in TT). Cursed/blessed are
+ * conservatively folded to Draw — under the 50-move rule they are
+ * theoretical draws and treating them as wins/losses risks the search
+ * trusting near-50-ply outcomes that won't actually materialize.
  */
-inline v2::TerminalKind classify_terminal(chess::Board& child_board) {
+inline v2::TerminalKind classify_terminal(chess::Board& child_board,
+                                          const catgpt::SyzygyProber* syz)
+{
     chess::Movelist child_legal;
     chess::movegen::legalmoves(child_legal, child_board);
     if (child_legal.empty()) {
@@ -352,6 +370,20 @@ inline v2::TerminalKind classify_terminal(chess::Board& child_board) {
     }
     if (child_board.isInsufficientMaterial()) {
         return v2::kTerminalDraw;
+    }
+    if (syz != nullptr && syz->is_eligible(child_board)) {
+        if (auto wdl = syz->probe_wdl(child_board); wdl) {
+            switch (*wdl) {
+                case catgpt::SyzygyWDL::WIN:
+                    return v2::kTerminalWinForChild;
+                case catgpt::SyzygyWDL::LOSS:
+                    return v2::kTerminalLossForChild;
+                case catgpt::SyzygyWDL::DRAW:
+                case catgpt::SyzygyWDL::CURSED_WIN:
+                case catgpt::SyzygyWDL::BLESSED_LOSS:
+                    return v2::kTerminalDraw;
+            }
+        }
     }
     return v2::kTerminalNone;
 }
@@ -412,6 +444,11 @@ struct RecurseContext {
     lfsync::LfAsyncSemaphore* sem;
     WorkerSearch*             w;
     const SearchParams*       params;  // descent-time tunables; lives in worker_main's cfg
+    // Optional Syzygy tablebase prober. nullptr when no Syzygy path was
+    // supplied to LksSearch. SyzygyProber::probe_wdl is thread-safe under
+    // Fathom's default compile (no TB_NO_THREADS), so the same instance
+    // feeds every worker's RecurseContext.
+    const catgpt::SyzygyProber* syzygy;
 };
 
 /**
@@ -470,9 +507,11 @@ inline constexpr auto recursive_search =
         for (uint16_t i = 0; i < num_moves; ++i) {
             const chess::Move m{sorted_moves[i].move};
 
-            // Per-move position-only terminal detection.
+            // Per-move position-only terminal detection. With a Syzygy
+            // prober wired in, TB-resolved WDL also lands here (cached
+            // in the child's MoveInfo so re-visits skip the probe).
             board.makeMove<true>(m);
-            const v2::TerminalKind tk = classify_terminal(board);
+            const v2::TerminalKind tk = classify_terminal(board, ctx->syzygy);
             board.unmakeMove(m);
 
             mi[i] = v2::MoveInfo::pack(sorted_moves[i].move,
@@ -580,21 +619,30 @@ inline constexpr auto recursive_search =
     bool first_fork = true;
     bool any_fork   = false;
 
+    // Loop-invariant depth floor — applies to EVERY child regardless of
+    // kind. With child_depth = depth + log(P), each level of recursion
+    // strictly decreases depth. Without a floor the recursion would run
+    // forever as priors compound below e^0 = 1 visit. The floor is
+    // variance-scaled (-log(variance * C)) so that low-variance (high-
+    // confidence) parents raise the floor and cut off descent earlier,
+    // while high-variance parents lower it (possibly below 0) so descent
+    // proceeds and the rollup refines Q — mirroring the
+    // -log(variance * C / limit) heuristic used to stamp the initial
+    // max_depth on fresh TT entries. Cuts terminal_kind contributions
+    // too: a terminal child below the floor doesn't matter at this
+    // iteration's resolution.
+    const float depth_floor = -std::log(
+        hdr->variance * ctx->params->default_depth_constant);
+
     for (uint16_t i = 0; i < num_moves; ++i) {
         const auto& m = moves[i];
         const v2::TerminalKind m_tk = m.terminal_kind();
         const float m_P = m.P();
 
-        // Depth floor — applies to EVERY child regardless of kind.
-        // With child_depth = depth + log(P), each level of recursion
-        // strictly decreases depth. Without a floor at 0 the recursion
-        // would run forever as priors compound below e^0 = 1 visit.
-        // Cuts terminal_kind contributions too: a terminal child below
-        // the floor doesn't matter at this iteration's resolution.
         const float child_depth = (m_P > 0.0f)
             ? depth + std::log(std::max(m_P, 1e-9f))
             : -std::numeric_limits<float>::infinity();
-        if (child_depth < 0.0f) {
+        if (child_depth < depth_floor) {
             plans.push_back({Mode::Skip, m_P, 0.0f, 0, 0});
             continue;
         }
@@ -605,6 +653,13 @@ inline constexpr auto recursive_search =
         }
         if (m_tk == v2::kTerminalLossForChild) {
             plans.push_back({Mode::ReadOnly, m_P, /*Q=*/-1.0f, 0, 0});
+            continue;
+        }
+        if (m_tk == v2::kTerminalWinForChild) {
+            // Reachable only via Syzygy: this move drops STM at the child
+            // into a TB-won position, so child_Q = +1 (and the parent's
+            // -child_Q rollup correctly penalizes the move as a loss).
+            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/+1.0f, 0, 0});
             continue;
         }
 
@@ -729,12 +784,20 @@ public:
      *                            recursive_search invocations. Bounds
      *                            both orchestration frames and GPU evals.
      * @param max_batch_size      Cap on positions per GPU batch.
+     * @param syzygy_path         Filesystem path to a directory containing
+     *                            Syzygy .rtbw/.rtbz endgame tablebase files.
+     *                            Empty (the default) disables Syzygy entirely;
+     *                            non-empty constructs a single per-LksSearch
+     *                            `SyzygyProber`. Fathom holds global state,
+     *                            so at most one `LksSearch` per process
+     *                            should be constructed with a non-empty path.
      */
     explicit LksSearch(fs::path trt_engine_path,
                        uint64_t lifetime_max_evals = (1ULL << 20),
                        int workers_per_gpu = 1,
                        int coros_per_worker = 32,
-                       int max_batch_size = 32)
+                       int max_batch_size = 32,
+                       fs::path syzygy_path = {})
         : trt_engine_path_(std::move(trt_engine_path))
         , lifetime_max_evals_(lifetime_max_evals)
         , workers_per_gpu_(workers_per_gpu > 0 ? workers_per_gpu : 1)
@@ -742,6 +805,14 @@ public:
         , max_batch_size_(max_batch_size > 0 ? max_batch_size : 1)
         , board_(chess::constants::STARTPOS)
     {
+        if (!syzygy_path.empty()) {
+            // SyzygyProber ctor calls Fathom's tb_init (global state).
+            // If load fails, prober.is_available() will be false and the
+            // shortcut path silently disables itself.
+            syzygy_ = std::make_unique<catgpt::SyzygyProber>(
+                syzygy_path.string());
+        }
+
         // Discover GPU topology. CUDA_VISIBLE_DEVICES is the right knob
         // to restrict which devices participate; this just uses every
         // visible one.
@@ -901,6 +972,15 @@ public:
     [[nodiscard]] const v2::SearchArena& arena() const noexcept { return *arena_; }
 
     /**
+     * Whether a SyzygyProber was constructed AND successfully loaded at
+     * least one tablebase file. False when no path was provided, when
+     * the path was empty of .rtbw/.rtbz files, or when tb_init failed.
+     */
+    [[nodiscard]] bool syzygy_available() const noexcept {
+        return syzygy_ && syzygy_->is_available();
+    }
+
+    /**
      * Aggregated count of NN evals performed across all workers in the
      * most recent (or in-flight) search. Cleared at the start of each
      * `search()` call.
@@ -1026,6 +1106,10 @@ public:
                 child_Q = 0.0f;
             } else if (tk == v2::kTerminalLossForChild) {
                 child_Q = -1.0f;  // child loses ⇒ we win
+            } else if (tk == v2::kTerminalWinForChild) {
+                // Syzygy: child position is a TB win for STM-at-child ⇒
+                // this move loses for us. Score reflects that directly.
+                child_Q = +1.0f;
             } else {
                 chess::Board cb = board_;
                 cb.makeMove<true>(m);
@@ -1073,9 +1157,125 @@ public:
     }
 
 private:
+    /**
+     * One of the three "no search required" cases at the root:
+     *   - `move == NO_MOVE`         => no legal moves; emit `bestmove 0000`.
+     *   - `tb` empty, real move     => single-legal-move forced reply.
+     *   - `tb` set, real move       => Syzygy DTZ resolution.
+     *
+     * The caller is responsible for emitting the appropriate `info` /
+     * `bestmove` lines and skipping the rest of `worker_main`.
+     */
+    struct RootShortcut {
+        chess::Move                          move;
+        std::optional<catgpt::SyzygyRootResult> tb;
+    };
+
+    /**
+     * Detect whether the root can be resolved without spinning up the
+     * search workers. Order is fixed:
+     *   1. No legal moves (mate / stalemate) — terminal.
+     *   2. Exactly one legal move — forced reply.
+     *   3. Syzygy DTZ root probe (gated on prober availability +
+     *      piece-count + no-castling). The probe itself is cheap.
+     * Returns std::nullopt if a real search is needed.
+     *
+     * Must be called from `worker_main` only (single-threaded); Fathom's
+     * `tb_probe_root` is documented not-thread-safe.
+     */
+    [[nodiscard]] std::optional<RootShortcut> try_root_shortcut() const {
+        chess::Movelist legal;
+        chess::movegen::legalmoves(legal, board_);
+
+        if (legal.empty()) {
+            return RootShortcut{chess::Move::NO_MOVE, std::nullopt};
+        }
+        if (legal.size() == 1) {
+            return RootShortcut{legal[0], std::nullopt};
+        }
+        if (syzygy_ && syzygy_->is_eligible(board_)) {
+            if (auto r = syzygy_->probe_root_dtz(board_); r) {
+                return RootShortcut{r->move, std::move(r)};
+            }
+        }
+        return std::nullopt;
+    }
+
+    /**
+     * Stockfish-style mapping from Syzygy WDL to UCI `score cp` value.
+     * Cursed/blessed scores are small magnitudes (50cp) to indicate the
+     * 50-move rule will defang them. A real win/loss is reported as a
+     * large finite cp value rather than a fake `score mate` (DTZ is not
+     * DTM, so mate-in-N would mislead GUIs).
+     */
+    [[nodiscard]] static int syzygy_wdl_to_cp(catgpt::SyzygyWDL w) noexcept {
+        switch (w) {
+            case catgpt::SyzygyWDL::WIN:          return  12800;
+            case catgpt::SyzygyWDL::CURSED_WIN:   return     50;
+            case catgpt::SyzygyWDL::DRAW:         return      0;
+            case catgpt::SyzygyWDL::BLESSED_LOSS: return    -50;
+            case catgpt::SyzygyWDL::LOSS:         return -12800;
+        }
+        return 0;
+    }
+
+    /**
+     * Emit the UCI lines for a root shortcut and return. Splits into
+     * separate `info` lines because the UCI spec says `string` consumes
+     * the rest of the line — keeping it on its own line is robust to
+     * future field additions.
+     */
+    void emit_root_shortcut(const RootShortcut& sc,
+                            const std::function<void(std::string_view)>& emit) const
+    {
+        if (!emit) return;
+
+        if (sc.move == chess::Move::NO_MOVE) {
+            emit("bestmove 0000");
+            return;
+        }
+
+        const std::string uci_move = chess::uci::moveToUci(sc.move);
+        char buf[256];
+
+        if (sc.tb) {
+            const int cp = syzygy_wdl_to_cp(sc.tb->wdl);
+            std::snprintf(buf, sizeof(buf),
+                          "info depth 0 score cp %d pv %s",
+                          cp, uci_move.c_str());
+            emit(buf);
+            const std::string_view wdl_s = catgpt::to_string(sc.tb->wdl);
+            std::snprintf(buf, sizeof(buf),
+                          "info string syzygy wdl=%.*s dtz=%d",
+                          static_cast<int>(wdl_s.size()), wdl_s.data(),
+                          sc.tb->dtz);
+            emit(buf);
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                          "info depth 0 pv %s", uci_move.c_str());
+            emit(buf);
+            emit("info string forced move");
+        }
+
+        std::snprintf(buf, sizeof(buf), "bestmove %s", uci_move.c_str());
+        emit(buf);
+    }
+
     void worker_main(std::stop_token st, LksSearchConfig cfg) {
         auto& cb = cfg.on_uci_line;
         auto emit = [&](std::string_view s) { if (cb) cb(s); };
+
+        // ── Root fast-paths ────────────────────────────────────────────
+        // Cheap deterministic answers (no legal moves, single legal move,
+        // Syzygy-resolvable root) short-circuit before any per-worker
+        // counter reset or runner spawn — saves multi-second worker
+        // spin-up and the GPU eval that would otherwise happen.
+        if (auto sc = try_root_shortcut()) {
+            emit_root_shortcut(*sc, cb);
+            total_evals_.store(0, std::memory_order_relaxed);
+            running_.store(false, std::memory_order_release);
+            return;
+        }
 
         using Clock = std::chrono::steady_clock;
         const auto t0 = Clock::now();
@@ -1107,14 +1307,24 @@ private:
 
         // Aggregator + UCI info loop. Emit `info depth ...` only when the
         // integer centi-depth derived from the minimum worker depth changes.
+        // A worker is "done" if it has either exhausted its per-worker eval
+        // budget OR advanced its iterative-deepening depth past
+        // `cfg.max_depth` (the runner's ID loop exits on either condition,
+        // but a depth-exit with budget remaining must still let
+        // worker_main wind down). Without the depth check, in-search
+        // Syzygy can leave the search spinning on terminal children that
+        // never trigger GPU evals, so budget alone never trips.
         long last_depth_centi = std::numeric_limits<long>::min();
         while (true) {
             const bool stop_requested = st.stop_requested();
             bool all_done = true;
             for (const auto& w : workers_) {
-                if (w->runner.joinable()
-                    && w->evals.load(std::memory_order_relaxed)
-                       < w->budget.load(std::memory_order_relaxed)) {
+                const bool under_budget =
+                    w->evals.load(std::memory_order_relaxed)
+                    < w->budget.load(std::memory_order_relaxed);
+                const bool under_depth =
+                    w->depth.load(std::memory_order_relaxed) < cfg.max_depth;
+                if (under_budget && under_depth) {
                     all_done = false;
                     break;
                 }
@@ -1132,6 +1342,12 @@ private:
                 min_d = std::min(min_d, w->depth.load(std::memory_order_relaxed));
             }
             total_evals_.store(evals_sum, std::memory_order_relaxed);
+
+            // Depth-target termination: end the search the moment every
+            // worker has reached `target_min_depth`. Checked here (before
+            // the no-change `continue` below) so a tick that doesn't
+            // advance centi-depth can still terminate.
+            if (std::isfinite(min_d) && min_d >= cfg.target_min_depth) break;
 
             // UCI's `depth` field is integer-valued (cutechess parses via
             // QString::toInt and most other GUIs do the same). Encode our
@@ -1260,6 +1476,7 @@ private:
             /*sem=*/w.sem.get(),
             /*w=*/&w,
             /*params=*/&params,
+            /*syzygy=*/syzygy_.get(),
         };
         lf::sync_wait(*w.pool, detail::root_search, &ctx, board_, depth);
     }
@@ -1281,6 +1498,12 @@ private:
     std::jthread                               worker_;
     std::atomic<bool>                          running_{false};
     std::atomic<uint64_t>                      total_evals_{0};
+
+    // Syzygy tablebase prober — owns Fathom's global tb_init/tb_free
+    // lifecycle. Null when no Syzygy path was provided. Probed once at
+    // the top of every `worker_main` (before runners spawn) so the
+    // not-thread-safe `tb_probe_root` is safe.
+    std::unique_ptr<catgpt::SyzygyProber> syzygy_;
 };
 
 }  // namespace catgpt::lks

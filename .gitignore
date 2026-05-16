@@ -146,3 +146,6 @@ Makefile
 
 # engines
 engines/
+
+# Cursor (contains secrets like MCP API keys)
+.cursor/mcp.json

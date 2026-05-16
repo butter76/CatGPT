@@ -332,6 +332,11 @@ enum TerminalKind : uint8_t {
     kTerminalNone = 0,
     kTerminalDraw = 1,
     kTerminalLossForChild = 2,
+    // Q = +1 at the child position (child's STM wins). Cannot arise from
+    // natural chess descent — moving never lands the opponent in their own
+    // mate — only Syzygy-resolved children produce this kind. Encoded in
+    // the 2-LSB mantissa field; see MoveInfo's class comment.
+    kTerminalWinForChild  = 3,
 };
 
 /**
@@ -342,15 +347,17 @@ enum TerminalKind : uint8_t {
  *   - Sign bit = 0  →  non-terminal.  P = fp16_to_f32(_packed).
  *                      `terminal_kind() == kTerminalNone`.
  *   - Sign bit = 1  →  terminal.      P = fp16_to_f32(|_packed| with the
- *                      least-significant mantissa bit forced to 0).
- *                      Terminal kind is encoded in that same LSB:
- *                          LSB = 0  →  kTerminalDraw
- *                          LSB = 1  →  kTerminalLossForChild
+ *                      two least-significant mantissa bits forced to 0).
+ *                      Terminal kind is encoded in those same 2 LSBs:
+ *                          0b00 → kTerminalDraw
+ *                          0b01 → kTerminalLossForChild
+ *                          0b10 → kTerminalWinForChild
+ *                          0b11 → reserved
  *
  * Why this works:
  *   - Legal softmax priors are in [0, 1]; the sign bit is otherwise unused
  *     so it's a free flag for "this child is terminal".
- *   - Stealing the mantissa LSB costs ~0.1% of the value near 1.0, which
+ *   - Stealing 2 mantissa LSBs costs <0.2% of the value near 1.0, which
  *     is far below the other sources of noise in the rollup.
  *   - `_Float16` on x86-64 compiles to F16C VCVTPS2PH/VCVTPH2PS (single
  *     cycle each) under -march=native; on hosts without F16C the compiler
@@ -367,15 +374,20 @@ struct MoveInfo {
 
     [[nodiscard]] TerminalKind terminal_kind() const noexcept {
         if ((_packed & kSignBit) == 0) return kTerminalNone;
-        return (_packed & kKindLSB) ? kTerminalLossForChild : kTerminalDraw;
+        switch (_packed & kKindMask) {
+            case 0x0000u: return kTerminalDraw;
+            case 0x0001u: return kTerminalLossForChild;
+            case 0x0002u: return kTerminalWinForChild;
+            default:      return kTerminalDraw;  // reserved 0b11 -> treat as draw
+        }
     }
 
     [[nodiscard]] float P() const noexcept {
         uint16_t bits = static_cast<uint16_t>(_packed & kMagnitudeMask);
-        // For terminals, the kind flag lived in the mantissa LSB; mask
-        // it out so the residual magnitude is a clean half-float.
+        // For terminals, the kind tag lives in the 2 mantissa LSBs; mask
+        // them out so the residual magnitude is a clean half-float.
         if ((_packed & kSignBit) != 0) {
-            bits = static_cast<uint16_t>(bits & ~static_cast<uint16_t>(kKindLSB));
+            bits = static_cast<uint16_t>(bits & ~kKindMask);
         }
         _Float16 h = std::bit_cast<_Float16>(bits);
         return static_cast<float>(h);
@@ -397,10 +409,14 @@ struct MoveInfo {
             case kTerminalNone:
                 break;
             case kTerminalDraw:
-                bits = static_cast<uint16_t>((bits | kSignBit) & ~static_cast<uint16_t>(kKindLSB));
+                // Clear both kind LSBs, set sign.
+                bits = static_cast<uint16_t>((bits & ~kKindMask) | kSignBit);
                 break;
             case kTerminalLossForChild:
-                bits = static_cast<uint16_t>(bits | kSignBit | kKindLSB);
+                bits = static_cast<uint16_t>(((bits & ~kKindMask) | kSignBit) | 0x0001u);
+                break;
+            case kTerminalWinForChild:
+                bits = static_cast<uint16_t>(((bits & ~kKindMask) | kSignBit) | 0x0002u);
                 break;
         }
         return MoveInfo{move, bits};
@@ -408,7 +424,7 @@ struct MoveInfo {
 
 private:
     static constexpr uint16_t kSignBit       = 0x8000u;
-    static constexpr uint16_t kKindLSB       = 0x0001u;
+    static constexpr uint16_t kKindMask      = 0x0003u;
     static constexpr uint16_t kMagnitudeMask = 0x7FFFu;
 };
 static_assert(sizeof(MoveInfo) == 4, "MoveInfo must be 4 bytes");
