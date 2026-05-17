@@ -1266,7 +1266,7 @@ public:
      * after `quit()`/runners join, when the result is stable.
      */
     [[nodiscard]] std::vector<chess::Move>
-    principal_variation(int max_len = 64) const {
+    principal_variation(int max_len = 100) const {
         std::vector<chess::Move> pv;
         if (max_len <= 0) return pv;
         pv.reserve(static_cast<size_t>(max_len));
@@ -1636,7 +1636,7 @@ private:
             }
 
             // Buffer sized for the fixed prefix + scores + a full PV. PV
-            // is capped to `principal_variation`'s max_len (64) plies of
+            // is capped to `principal_variation`'s max_len (100) plies of
             // up to 6 chars each ("e7e8q "), so 1KiB is comfortable.
             char buf[1024];
             std::snprintf(buf, sizeof(buf),

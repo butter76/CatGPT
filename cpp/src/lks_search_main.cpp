@@ -27,8 +27,9 @@
  *              mislead the chart).
  *   pv         Greedy best-child walk from the root using the same
  *              scoring rule as LksSearch::bestmove (-child_Q, tiebreak
- *              child max_depth, tiebreak prior). Capped at 16 plies and
- *              cut short at terminals, repetitions, or TT misses.
+ *              child max_depth, tiebreak prior). Capped at 100 plies and
+ *              cut short at terminals, repetitions, 50-move rule, or
+ *              TT misses (see LksSearch::principal_variation).
  *
  * Note: there is intentionally no `distQ` field — `v2::TTEntry` only
  * stores scalar (Q, max_depth), and the per-eval `value_probs` from the
@@ -107,6 +108,10 @@ uint64_t env_u64(const char* name, uint64_t fallback) {
  * "we have a real Q to report" from "child has never been touched"
  * (TT miss, no terminal shortcut). Q is stored in child-STM convention,
  * same as the TT.
+ *
+ * Used by `snapshot_root` to build per-child Plans for the policy
+ * weight chart; the PV walk now goes through
+ * `LksSearch::principal_variation` directly.
  */
 struct ChildClass {
     bool  expanded;     // false ⇒ TT miss with no terminal shortcut
@@ -145,98 +150,6 @@ ChildClass classify_child(const chess::Board& parent,
         return {true, q, d, false};
     }
     return {false, 0.0f, -kPosInf, false};
-}
-
-/**
- * Pick the best child of `entry` using the same lex-tiebreak rule as
- * `LksSearch::bestmove`: score = -child_Q, then child max_depth, then
- * prior P. `out_unreached` is set when the winner is a never-evaluated
- * child (caller uses it to stop PV walking past a fabricated tail).
- */
-chess::Move pick_best_child(const chess::Board& parent,
-                            const catgpt::v2::SearchArena& arena,
-                            const catgpt::v2::TTEntry* entry,
-                            bool& out_unreached)
-{
-    using namespace catgpt::v2;
-    out_unreached = false;
-    const InfoCell info = SearchArena::load_info(entry);
-    if (info.info_offset == kNoInfoOffset) return chess::Move::NO_MOVE;
-
-    const NodeInfoHeader* hdr = arena.info_at(info.info_offset);
-    const uint16_t num = hdr->num_moves;
-    const MoveInfo* mi = arena.moves_at(info.info_offset);
-    if (num == 0) return chess::Move::NO_MOVE;
-
-    chess::Move best{mi[0].move};
-    float best_score = -kPosInf;
-    float best_depth = -kPosInf;
-    float best_P     = -1.0f;
-    bool  best_unreached = false;
-
-    for (uint16_t i = 0; i < num; ++i) {
-        const chess::Move m{mi[i].move};
-        const ChildClass c = classify_child(parent, m, mi[i].terminal_kind(), arena);
-
-        float child_Q;
-        float child_depth;
-        bool  unreached;
-        if (c.expanded) {
-            child_Q     = c.Q_child;
-            child_depth = c.child_depth;
-            unreached   = false;
-        } else {
-            // Mirror LksSearch::bestmove(): score unreached children as
-            // "we lose" so any TT-evaluated sibling outranks them. P
-            // tiebreak still picks the highest-prior unreached move when
-            // nothing has a TT entry yet.
-            child_Q     = +1.0f;
-            child_depth = -kPosInf;
-            unreached   = true;
-        }
-
-        const float score = -child_Q;
-        const float mi_P  = mi[i].P();
-        const bool better =
-               score > best_score
-            || (score == best_score && child_depth > best_depth)
-            || (score == best_score && child_depth == best_depth && mi_P > best_P);
-        if (better) {
-            best_score = score;
-            best_depth = child_depth;
-            best_P     = mi_P;
-            best       = m;
-            best_unreached = unreached;
-        }
-    }
-    out_unreached = best_unreached;
-    return best;
-}
-
-/**
- * Greedy best-child PV walk from the root. Stops at terminals,
- * repetitions, TT misses, or once `max_len` moves are collected.
- * If `pick_best_child` returns an unreached-only choice, we still
- * record it (gives the UI a hint) but stop descending past it.
- */
-void walk_pv(const LksSearch& s, int max_len, std::vector<chess::Move>& pv) {
-    using namespace catgpt::v2;
-    pv.clear();
-    pv.reserve(max_len);
-
-    chess::Board b = s.board();
-    for (int i = 0; i < max_len; ++i) {
-        const TTEntry* entry = s.arena().find(b.hash(), secondary_hash(b));
-        if (!entry) break;
-        bool unreached = false;
-        const chess::Move m = pick_best_child(b, s.arena(), entry, unreached);
-        if (m == chess::Move::NO_MOVE) break;
-        pv.push_back(m);
-        if (unreached) break;
-        b.makeMove<true>(m);
-        if (b.isGameOver().second != chess::GameResult::NONE) break;
-        if (b.isRepetition(1) || b.isHalfMoveDraw()) break;
-    }
 }
 
 struct PolicyEntry {
@@ -361,7 +274,7 @@ bool snapshot_root(const LksSearch& s,
     }
 
     out.best_move = s.bestmove();
-    walk_pv(s, /*max_len=*/16, out.pv);
+    out.pv = s.principal_variation(/*max_len=*/100);
     return true;
 }
 
