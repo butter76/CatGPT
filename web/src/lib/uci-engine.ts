@@ -26,11 +26,10 @@ export function getAvailableEngines(): string[] {
       // not available
     }
   }
-  // Also check for catgpt (same binary supports both Fractional MCTS and standard MCTS)
+  // CatGPT (LKS-backed `catgpt_search` binary).
   const { isCatGPTAvailable } = require("./catgpt-engine");
   if (isCatGPTAvailable()) {
     available.push("catgpt");
-    available.push("catgpt_mcts");
   }
   return available;
 }

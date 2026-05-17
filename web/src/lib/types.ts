@@ -52,7 +52,7 @@ export interface EngineInfoLine {
 /** Final stored analysis from an engine (Leela / Stockfish / CatGPT) */
 export interface EngineAnalysis {
   id?: number;
-  engine: "leela" | "stockfish" | "catgpt" | "catgpt_mcts";
+  engine: "leela" | "stockfish" | "catgpt";
   bestMove: UCIMove;
   evaluation: number; // centipawns (or mate value)
   depth: number;
@@ -66,30 +66,42 @@ export interface EngineAnalysis {
   timestamp: string;
 }
 
-export type EngineKind = "leela" | "stockfish" | "catgpt" | "catgpt_mcts";
+export type EngineKind = "leela" | "stockfish" | "catgpt";
 
 // ─── CatGPT Search Stats ─────────────────────────────────────────
 
-/** A single move with its modified policy weight and Q value from the MCTS search */
+/**
+ * A single move at the root, with its allocation-derived weight and
+ * (when available) per-child Q value. Emitted by the LKS-backed
+ * `catgpt_search` binary.
+ */
 export interface CatGPTSearchPolicyEntry {
   move: UCIMove;
+  /** Softmax-normalized exp(log_alloc) over all legal moves at the root (sums to ~1). */
   weight: number;
-  /** Q value from parent's perspective [-1, 1]. Only present for expanded children. */
+  /**
+   * Q from the root side-to-move's perspective in [-1, 1]. Only present
+   * for children that have been expanded (TT-hit, position-only terminal,
+   * or path-dependent draw); never-evaluated children omit this.
+   */
   q?: number;
 }
 
-/** Stats emitted by the CatGPT search binary during analysis */
+/** Stats emitted by the LKS search binary (`catgpt_search`) during analysis. */
 export interface CatGPTSearchStats {
   type: "root_eval" | "search_update" | "search_complete";
   bestMove: UCIMove;
   cp: number;
   nodes: number;
+  /**
+   * Centi-depth: `round(max_depth() * 100)` from the LKS search. LKS has
+   * no global iteration counter — this is the closest analog and grows
+   * by ~20 per ID step (default delta_depth=0.2).
+   */
   iteration: number;
-  /** 81-bin distributional Q from the root's perspective */
-  distQ: number[];
-  /** Modified policy weights: allocation/N_adjusted for expanded, raw prior for unexpanded */
+  /** Per-move allocation-derived weights + per-child Q (when expanded). */
   policy: CatGPTSearchPolicyEntry[];
-  /** Principal variation (best line by allocation-based selection). Absent for root_eval. */
+  /** Greedy best-child PV walk. Absent only when the root has no TT entry yet. */
   pv?: UCIMove[];
 }
 

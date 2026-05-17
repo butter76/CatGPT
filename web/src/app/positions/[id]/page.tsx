@@ -686,9 +686,7 @@ function StoredEngineResultCard({
 
   const engineLabel =
     ea.engine === "catgpt"
-      ? "🐱 CatGPT (Fractional)"
-      : ea.engine === "catgpt_mcts"
-      ? "🐱 CatGPT (MCTS)"
+      ? "🐱 CatGPT (LKS)"
       : ea.engine === "stockfish"
       ? "Stockfish"
       : "Leela Chess Zero";
@@ -721,8 +719,8 @@ function StoredEngineResultCard({
           </div>
         </CardTitle>
         <p className="text-xs text-muted-foreground">
-          {ea.engine === "catgpt" || ea.engine === "catgpt_mcts"
-            ? `${ea.nodes.toLocaleString()} evals • iter ${ea.depth}`
+          {ea.engine === "catgpt"
+            ? `${ea.nodes.toLocaleString()} evals • centi-depth ${ea.depth}`
             : `depth ${ea.depth} • ${ea.nodes.toLocaleString()} nodes`}
         </p>
       </CardHeader>
@@ -744,7 +742,7 @@ function StoredEngineResultCard({
         </div>
 
         {/* PV (UCI engines only) */}
-        {ea.engine !== "catgpt" && ea.engine !== "catgpt_mcts" && ea.pv.length > 0 && (
+        {ea.engine !== "catgpt" && ea.pv.length > 0 && (
           <StoredPVLine fen={fen} pv={ea.pv} />
         )}
 
@@ -1083,44 +1081,6 @@ function StoredCatGPTHistoryViewer({
           );
         })}
       </div>
-
-      {/* DistQ mini histogram */}
-      {displayStats.distQ && displayStats.distQ.length > 0 && (
-        <div className="space-y-1">
-          <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wide">
-            Value Distribution
-          </span>
-          <div className="flex items-end gap-px h-12 bg-muted/30 rounded p-1">
-            {(() => {
-              const maxProb = Math.max(...displayStats.distQ, 0.001);
-              return displayStats.distQ.map((prob, i) => {
-                const height = (prob / maxProb) * 100;
-                const t = i / Math.max(displayStats.distQ.length - 1, 1);
-                const r = Math.round(239 * (1 - t) + 34 * t);
-                const g = Math.round(68 * (1 - t) + 197 * t);
-                const b = Math.round(68 * (1 - t) + 94 * t);
-                return (
-                  <div
-                    key={i}
-                    className="flex-1 rounded-t"
-                    style={{
-                      height: `${Math.max(height, 1)}%`,
-                      backgroundColor: `rgb(${r},${g},${b})`,
-                      opacity: prob > 0.001 ? 1 : 0.2,
-                    }}
-                    title={`Bin ${i}: ${(prob * 100).toFixed(1)}%`}
-                  />
-                );
-              });
-            })()}
-          </div>
-          <div className="flex justify-between text-[10px] text-muted-foreground font-mono">
-            <span>Loss</span>
-            <span>Draw</span>
-            <span>Win</span>
-          </div>
-        </div>
-      )}
 
       {/* Search history table (clickable) */}
       {history.length > 1 && (

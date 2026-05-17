@@ -302,7 +302,7 @@ export async function createNetworkAnalysis(
 export async function createEngineAnalysisRecord(
   positionId: string,
   data: {
-    engine: "leela" | "stockfish" | "catgpt" | "catgpt_mcts";
+    engine: "leela" | "stockfish" | "catgpt";
     bestMove: string;
     evaluation: number;
     depth: number;
@@ -312,7 +312,7 @@ export async function createEngineAnalysisRecord(
     catgptHistory?: CatGPTSearchStats[];
   }
 ): Promise<void> {
-  const isCatGPT = data.engine === "catgpt" || data.engine === "catgpt_mcts";
+  const isCatGPT = data.engine === "catgpt";
   const historyPayload = isCatGPT
     ? (data.catgptHistory ?? [])
     : (data.depthHistory ?? []);
@@ -379,7 +379,7 @@ function assemblePosition(
       pv: ea.pv ?? [],
       timestamp: ea.createdAt.toISOString(),
     };
-    if (ea.engine === "catgpt" || ea.engine === "catgpt_mcts") {
+    if (ea.engine === "catgpt") {
       return {
         ...base,
         catgptHistory: (ea.depthHistory as unknown as CatGPTSearchStats[]) ?? [],

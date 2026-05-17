@@ -59,7 +59,7 @@ export function EngineAnalysisPanel({
   const [nodes, setNodes] = useState(400);
   const [availableEngines, setAvailableEngines] = useState<string[]>([]);
 
-  const isCatGPTEngine = (eng: EngineKind) => eng === "catgpt" || eng === "catgpt_mcts";
+  const isCatGPTEngine = (eng: EngineKind) => eng === "catgpt";
 
   const handleEngineChange = (eng: EngineKind) => {
     setSelectedEngine(eng);
@@ -121,13 +121,7 @@ export function EngineAnalysisPanel({
                       value="catgpt"
                       disabled={!availableEngines.includes("catgpt")}
                     >
-                      🐱 CatGPT (Fractional)
-                    </SelectItem>
-                    <SelectItem
-                      value="catgpt_mcts"
-                      disabled={!availableEngines.includes("catgpt_mcts")}
-                    >
-                      🐱 CatGPT (MCTS)
+                      🐱 CatGPT (LKS)
                     </SelectItem>
                     <SelectItem
                       value="stockfish"
@@ -189,7 +183,7 @@ export function EngineAnalysisPanel({
         )}
 
         {/* ── CatGPT Analysis Display ── */}
-        {catgptStats && (engine === "catgpt" || engine === "catgpt_mcts") && (
+        {catgptStats && engine === "catgpt" && (
           <>
             <Separator />
             <CatGPTStatsDisplay
@@ -202,7 +196,7 @@ export function EngineAnalysisPanel({
         )}
 
         {/* ── UCI Engine Display (Stockfish / Leela) ── */}
-        {latestInfo && engine !== "catgpt" && engine !== "catgpt_mcts" && (
+        {latestInfo && engine !== "catgpt" && (
           <>
             <Separator />
             <UCIStatsDisplay
@@ -346,11 +340,6 @@ function CatGPTStatsDisplay({
         fen={fen}
       />
 
-      <Separator />
-
-      {/* DistQ Mini-Histogram */}
-      <DistQHistogram distQ={displayStats.distQ} />
-
       {/* Search history table */}
       {history.length > 1 && (
         <>
@@ -419,8 +408,6 @@ function CatGPTStatsDisplay({
     </div>
   );
 }
-
-// ─── DistQ Mini-Histogram ─────────────────────────────────────────
 
 // ─── Shared CatGPT Policy Chart (with Q values) ──────────────────
 
@@ -492,51 +479,6 @@ function CatGPTPolicyChart({
           </div>
         );
       })}
-    </div>
-  );
-}
-
-// ─── DistQ Mini-Histogram ─────────────────────────────────────────
-
-function DistQHistogram({ distQ }: { distQ: number[] }) {
-  const maxProb = useMemo(
-    () => Math.max(...distQ, 0.001),
-    [distQ]
-  );
-
-  // Show a compact 81-bar histogram
-  return (
-    <div className="space-y-1.5">
-      <h4 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">
-        Value Distribution (distQ)
-      </h4>
-      <div className="flex items-end gap-px h-16 bg-muted/30 rounded p-1">
-        {distQ.map((prob, i) => {
-          const height = (prob / maxProb) * 100;
-          // Color: red (loss) → gray (draw) → green (win)
-          const t = i / Math.max(distQ.length - 1, 1); // 0 to 1
-          const r = Math.round(239 * (1 - t) + 34 * t);
-          const g = Math.round(68 * (1 - t) + 197 * t);
-          const b = Math.round(68 * (1 - t) + 94 * t);
-          return (
-            <div
-              key={i}
-              className="flex-1 rounded-t transition-all duration-300"
-              style={{
-                height: `${Math.max(height, 1)}%`,
-                backgroundColor: `rgb(${r},${g},${b})`,
-                opacity: prob > 0.001 ? 1 : 0.2,
-              }}
-              title={`Bin ${i}: ${(prob * 100).toFixed(1)}%`}
-            />
-          );
-        })}
-      </div>
-      <div className="flex justify-between text-[10px] text-muted-foreground font-mono">
-        <span>Loss</span>
-        <span>Draw</span>
-        <span>Win</span>
-      </div>
     </div>
   );
 }

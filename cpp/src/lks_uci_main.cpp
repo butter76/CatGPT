@@ -21,7 +21,7 @@
  *   LKS_WORKERS_PER_GPU     (default 2; total workers = this * #CUDA devices)
  *   LKS_COROS_PER_WORKER    (default 112)
  *   LKS_MAX_BATCH_SIZE      (default 56)
- *   LKS_LIFETIME_MAX_EVALS  (default 1<<20)
+ *   LKS_LIFETIME_MAX_EVALS  (default 1<<27)
  *   LKS_SYZYGY_PATH         (default $SYZYGY_HOME, else "" = disabled)
  *                           Directory of .rtbw/.rtbz Syzygy endgame
  *                           tablebase files. When set, eligible root
@@ -344,7 +344,7 @@ int main(int argc, char* argv[]) {
     const int coros_per_worker = catgpt::env_int("LKS_COROS_PER_WORKER", 112);
     const int max_batch_size   = catgpt::env_int("LKS_MAX_BATCH_SIZE", 56);
     const uint64_t lifetime_max_evals =
-        catgpt::env_u64("LKS_LIFETIME_MAX_EVALS", 1ULL << 20);
+        catgpt::env_u64("LKS_LIFETIME_MAX_EVALS", 1ULL << 27);
 
     // Syzygy path resolution: LKS_SYZYGY_PATH overrides; otherwise fall
     // back to $SYZYGY_HOME (the conventional name); empty = disabled.

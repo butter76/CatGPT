@@ -383,7 +383,6 @@ class LongBenchRunner {
           const iter = runCatGPTAnalysis({
             fen: pos.fen,
             nodes: snapshot.maxNodes,
-            mcts: false,
             onSpawn: (child) => {
               active.currentChild = child;
             },

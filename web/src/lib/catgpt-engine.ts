@@ -1,8 +1,11 @@
 /**
- * CatGPT Engine Runner — spawns the catgpt_search binary and parses its output.
+ * CatGPT Engine Runner — spawns the catgpt_search binary (LKS-backed)
+ * and parses its output.
  *
- * Unlike the UCI engines (Stockfish/lc0), catgpt_search uses a simpler protocol:
- *   - JSON lines to stdout (search stats: root_eval, search_update, search_complete)
+ * Unlike the UCI engines (Stockfish/lc0), catgpt_search uses a simpler
+ * protocol:
+ *   - JSON lines to stdout (search stats: root_eval, search_update,
+ *     search_complete) emitted by cpp/src/lks_search_main.cpp
  *   - Final "bestmove <uci>" line
  *   - Stderr for loading/error messages (ignored by the web UI)
  *
@@ -19,7 +22,7 @@ const CATGPT_BINARY =
 
 const CATGPT_ENGINE =
   process.env.CATGPT_ENGINE_PATH ||
-  `${process.env.HOME}/CatGPT/main.trt`;
+  `${process.env.HOME}/CatGPT/main.network`;
 
 /** Check if catgpt_search binary is available */
 export function isCatGPTAvailable(): boolean {
@@ -36,8 +39,9 @@ export function isCatGPTAvailable(): boolean {
 
 export interface CatGPTSearchPolicyEntry {
   move: string;
+  /** Softmax-normalized exp(log_alloc) over all legal moves. */
   weight: number;
-  /** Q value from parent's perspective [-1, 1]. Only present for expanded children. */
+  /** Q from parent-STM perspective [-1, 1]. Only present for expanded children. */
   q?: number;
 }
 
@@ -46,10 +50,10 @@ export interface CatGPTSearchStats {
   bestMove: string;
   cp: number;
   nodes: number;
+  /** Centi-depth (round(LksSearch::max_depth() * 100)). */
   iteration: number;
-  distQ: number[];
   policy: CatGPTSearchPolicyEntry[];
-  /** Principal variation (best line by allocation-based selection). Absent for root_eval. */
+  /** Greedy best-child PV walk; absent only when the root has no TT entry yet. */
   pv?: string[];
 }
 
@@ -66,8 +70,6 @@ export type CatGPTEvent =
 export interface CatGPTAnalysisRequest {
   fen: string;
   nodes: number;
-  /** Use standard MCTS instead of Fractional MCTS */
-  mcts?: boolean;
   /**
    * Called once the child process is spawned. Lets the caller capture the
    * handle so it can kill the process for external cancellation. Only called
@@ -77,7 +79,7 @@ export interface CatGPTAnalysisRequest {
 }
 
 /**
- * Run CatGPT Fractional MCTS analysis on a position.
+ * Run CatGPT (LKS) search on a position.
  * Yields events as they arrive for SSE streaming.
  */
 export async function* runCatGPTAnalysis(
@@ -86,9 +88,6 @@ export async function* runCatGPTAnalysis(
   let proc: ChildProcess;
   try {
     const args = [CATGPT_ENGINE, request.fen, request.nodes.toString()];
-    if (request.mcts) {
-      args.push("--mcts");
-    }
     proc = spawn(CATGPT_BINARY, args, {
       stdio: ["pipe", "pipe", "pipe"],
     });

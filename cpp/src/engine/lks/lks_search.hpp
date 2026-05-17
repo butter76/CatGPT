@@ -1240,13 +1240,79 @@ public:
      * after `quit()`/runners join, when the result is stable.
      */
     [[nodiscard]] chess::Move bestmove() const {
+        return select_best_move(board_, /*fallback_to_first_legal=*/true);
+    }
+
+    /**
+     * Walk the TT from the root, picking the best move at each ply, to
+     * produce the principal variation. Stops early — and does NOT include
+     * a trailing move — once any of these holds AFTER playing the latest
+     * move (so the line truly ends at a game-over / TT boundary):
+     *   - no legal moves at the next position (checkmate / stalemate),
+     *   - 3-fold repetition along this PV (`isRepetition(1)`),
+     *   - 50-move expiration (`isHalfMoveDraw()`),
+     *   - insufficient material,
+     *   - the next position has no TT entry (search hadn't visited it),
+     *   - the next position's TT entry has no expanded children,
+     *   - `max_len` plies have been emitted (defensive cap).
+     *
+     * The terminal/path-dependent checks are run on the board after
+     * `makeMove<true>(m)`, so the path history kept by `chess::Board`
+     * accurately disambiguates repetitions that depend on the sequence
+     * of moves actually played.
+     *
+     * Safe to call concurrently with a search in flight (uses the same
+     * acquire-loaded TT reads as `bestmove()`); intended to be called
+     * after `quit()`/runners join, when the result is stable.
+     */
+    [[nodiscard]] std::vector<chess::Move>
+    principal_variation(int max_len = 64) const {
+        std::vector<chess::Move> pv;
+        if (max_len <= 0) return pv;
+        pv.reserve(static_cast<size_t>(max_len));
+
+        chess::Board b = board_;
+        for (int i = 0; i < max_len; ++i) {
+            const chess::Move m =
+                select_best_move(b, /*fallback_to_first_legal=*/false);
+            if (m == chess::Move::NO_MOVE) break;
+            pv.push_back(m);
+            b.makeMove<true>(m);
+            if (b.isRepetition(1) || b.isHalfMoveDraw()
+                || b.isInsufficientMaterial()) {
+                break;
+            }
+        }
+        return pv;
+    }
+
+private:
+    /**
+     * Core of `bestmove()` / `principal_variation()`: pick the highest-
+     * scoring move at `b`, where score = -child_Q with tiebreaks (child
+     * max_depth, then prior P). See `bestmove()` for the full scoring /
+     * tiebreak / fallback contract.
+     *
+     * `fallback_to_first_legal` controls the TT-miss behavior:
+     *   - true  (bestmove): return `legal[0]` when the root has no TT
+     *     entry, or its entry has zero MoveInfo rows. UCI requires a
+     *     bestmove even if we never got to expand the root.
+     *   - false (PV walking): return `NO_MOVE` in the same cases so the
+     *     PV terminates cleanly at the first unsearched position
+     *     instead of trailing off into a random legal-list-order move.
+     */
+    [[nodiscard]] chess::Move
+    select_best_move(const chess::Board& b,
+                     bool fallback_to_first_legal) const {
         chess::Movelist legal;
-        chess::movegen::legalmoves(legal, board_);
+        chess::movegen::legalmoves(legal, b);
         if (legal.empty()) return chess::Move::NO_MOVE;
 
         const v2::TTEntry* root =
-            arena_->find(root_key_, v2::secondary_hash(board_));
-        if (root == nullptr) return legal[0];
+            arena_->find(b.hash(), v2::secondary_hash(b));
+        if (root == nullptr) {
+            return fallback_to_first_legal ? legal[0] : chess::Move::NO_MOVE;
+        }
 
         // A non-null `find` already guarantees Cell B is published with
         // a matching key_secondary (the secondary check is gated on
@@ -1260,7 +1326,9 @@ public:
         const v2::NodeInfoHeader* hdr = arena_->info_at(info.info_offset);
         const uint16_t num_moves = hdr->num_moves;
         const v2::MoveInfo* moves = arena_->moves_at(info.info_offset);
-        if (num_moves == 0) return legal[0];
+        if (num_moves == 0) {
+            return fallback_to_first_legal ? legal[0] : chess::Move::NO_MOVE;
+        }
 
         chess::Move best       = chess::Move{moves[0].move};
         float       best_score = -std::numeric_limits<float>::infinity();
@@ -1285,7 +1353,7 @@ public:
                 // this move loses for us. Score reflects that directly.
                 child_Q = +1.0f;
             } else {
-                chess::Board cb = board_;
+                chess::Board cb = b;
                 cb.makeMove<true>(m);
                 if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
                     child_Q = 0.0f;
@@ -1330,7 +1398,6 @@ public:
         return best;
     }
 
-private:
     /**
      * One of the three "no search required" cases at the root:
      *   - `move == NO_MOVE`         => no legal moves; emit `bestmove 0000`.
@@ -1537,18 +1604,19 @@ private:
                 now - t0).count();
             const long long mss = static_cast<long long>(ms);
 
-            // Single-move PV from the current TT-derived best move.
-            // `bestmove()` is documented safe to call concurrently with a
-            // search in flight; cost is trivial here since emissions fire
-            // only on depth-step transitions.
-            char pv_field[16];
-            const chess::Move best_now = bestmove();
-            if (best_now != chess::Move::NO_MOVE) {
-                const std::string uci_move = chess::uci::moveToUci(best_now);
-                std::snprintf(pv_field, sizeof(pv_field),
-                              " pv %s", uci_move.c_str());
-            } else {
-                pv_field[0] = '\0';
+            // Full PV walked from the current TT. Cost is bounded by
+            // `principal_variation`'s max_len cap; emissions fire only
+            // on depth-step transitions so this is well-amortized.
+            // `principal_variation()` shares bestmove()'s acquire-loaded
+            // TT reads and is documented safe mid-search.
+            std::string pv_field;
+            const std::vector<chess::Move> pv_moves = principal_variation();
+            if (!pv_moves.empty()) {
+                pv_field = " pv";
+                for (const chess::Move& m : pv_moves) {
+                    pv_field += ' ';
+                    pv_field += chess::uci::moveToUci(m);
+                }
             }
 
             // Root-position score from the TT: report the root's own Q
@@ -1567,7 +1635,10 @@ private:
                 score_field[0] = '\0';
             }
 
-            char buf[256];
+            // Buffer sized for the fixed prefix + scores + a full PV. PV
+            // is capped to `principal_variation`'s max_len (64) plies of
+            // up to 6 chars each ("e7e8q "), so 1KiB is comfortable.
+            char buf[1024];
             std::snprintf(buf, sizeof(buf),
                 "info depth %ld%s nodes %llu tt_claims %llu time %lld nps %lld%s",
                 depth_centi,
@@ -1576,7 +1647,7 @@ private:
                 static_cast<unsigned long long>(claims_sum),
                 mss,
                 mss > 0 ? static_cast<long long>(evals_sum) * 1000 / mss : 0,
-                pv_field);
+                pv_field.c_str());
             emit(buf);
             last_depth_centi = depth_centi;
         }
