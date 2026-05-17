@@ -205,6 +205,15 @@ struct SearchParams {
     float clamp_step      = 0.4f;
     float break_eps       = 0.1f;
     int   clamp_max_iters = 1024;
+
+    // Rollup pruning. Children whose log-allocation is more than
+    // `rollup_log_gap` below the maximum Expanded alloc are excluded
+    // from the e^alloc-weighted Q average. e^-3.3 ~= 0.037, so the
+    // default trims any child contributing less than ~3% of the
+    // leader's weight — keeps a single dominant move from being
+    // diluted by long-tail children whose alloc is order-of-magnitude
+    // smaller. Set very large (e.g. +inf) to disable.
+    float rollup_log_gap  = 3.3f;
 };
 
 }  // namespace detail
@@ -862,16 +871,24 @@ inline constexpr auto recursive_search =
     // Max-subtract LSE-style for numerical stability (alloc can reach
     // depth + bias ≈ 20–40 at large N). Unexpanded children that never
     // cleared the gate are dropped entirely.
+    //
+    // Long-tail pruning: also drop any Expanded child whose log-alloc
+    // is more than `rollup_log_gap` below the leader, i.e. whose
+    // softmax weight would be < e^-rollup_log_gap of the max. This
+    // keeps a dominant move from being diluted by far-behind siblings
+    // that contribute trivial weight but non-trivial Q variation.
     float m_alloc = -std::numeric_limits<float>::infinity();
     for (const Plan& p : plans) {
         if (p.mode == Mode::Expanded && p.alloc > m_alloc) m_alloc = p.alloc;
     }
     if (!std::isfinite(m_alloc)) co_return;
 
+    const float rollup_log_gap = ctx->params->rollup_log_gap;
     double num = 0.0;
     double den = 0.0;
     for (const Plan& p : plans) {
         if (p.mode != Mode::Expanded) continue;
+        if (m_alloc - p.alloc > rollup_log_gap) continue;
         const double w = std::exp(static_cast<double>(p.alloc - m_alloc));
         num += w * static_cast<double>(-p.Q);
         den += w;
