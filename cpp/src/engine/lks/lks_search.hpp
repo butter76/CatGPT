@@ -838,6 +838,15 @@ inline constexpr auto recursive_search =
                     (iter == 0) && (i < hdr->limit) && (p.mode == Mode::Unexpanded);
                 if (!force_expand && !(p.alloc > p.depth)) continue;
 
+                // Iter > 0: never expand a still-Unexpanded child. The
+                // first-touch budget for new children is spent entirely
+                // on iter 0 (force-expand cohort + any plan whose initial
+                // alloc cleared depth_floor). Any plan still Unexpanded
+                // at iter 1+ has been re-allocated against fresh sibling
+                // Q's and its expansion is no longer worth the GPU eval —
+                // skip it and let rollup drop it as Unexpanded.
+                if (iter > 0 && p.mode == Mode::Unexpanded) continue;
+
                 const float target_depth =
                     std::min(p.alloc, p.depth + clamp_step);
 
