@@ -85,17 +85,26 @@
  *          `find_or_claim` and publish. CAS losers (peers that
  *          published during our eval await) adopt the peer's entry
  *          and orphan their bytes.
- *       3. Re-deepen check: if the entry's max_depth >= depth, return.
- *       4. Single-pass classify+fork: each child is either
- *          Skip / RecurseThenRead / ReadOnly. RecurseThenRead spawns a
- *          child `recursive_search` task via `lf::fork`. First fork
+ *       3. Re-deepen check: if the entry's max_depth >= depth, return
+ *          (handing the TT (Q, max_depth) back to the caller via the
+ *          `Plan* out` argument).
+ *       4. Pass 1: classify children into a local Plan vector
+ *          (terminal / path-dep draw / TT-hit / Unexpanded). Halley
+ *          allocator fills `alloc` in place.
+ *       5. Pass 2: for each plan with `alloc > depth`, pre-mark
+ *          `Mode::Expanded` and spawn a child `recursive_search` via
+ *          `lf::fork`, passing `&plan` as the out-param. First fork
  *          inherits the parent's permit; subsequent forks each
- *          `co_await sem.acquire()`.
- *       5. `lf::join` waits for all forked children.
- *       6. Rollup: P-weighted average of -child_Q over the same plan
- *          vector (terminal/repetition/50-move contribute fixed Q;
- *          RecurseThenRead reads the child's TT entry).
- *       7. `update_qd` with the new (Q, depth).
+ *          `co_await sem.acquire()`. `lf::join` waits for all forked
+ *          children. Each child writes its rolled-up `(Q, depth)`
+ *          straight back into the parent's plan row — no post-join TT
+ *          re-read.
+ *       6. Rollup: e^alloc-weighted average of -child_Q over Expanded
+ *          plans (terminal / path-dep draws contribute fixed Q;
+ *          forked children contribute the values their own rollup
+ *          wrote into the plan).
+ *       7. `update_qd` with the new (Q, depth); also forward (Q, depth)
+ *          to our caller through `*out`.
  */
 
 #ifndef CATGPT_ENGINE_LKS_LKS_SEARCH_HPP
@@ -468,17 +477,24 @@ struct RecurseContext {
  *
  * INVARIANT: every entry owns exactly one `Permit`. The permit covers
  * this entire invocation including any GPU eval. At fan-out the first
- * RecurseThenRead child inherits via std::move(permit); subsequent
- * children each co_await sem->acquire(). On exit (either co_return at
- * abort, base, or after lf::join) any permit still held is released by
- * RAII.
+ * forked child inherits via std::move(permit); subsequent children each
+ * co_await sem->acquire(). On exit (either co_return at abort, base, or
+ * after lf::join) any permit still held is released by RAII.
+ *
+ * `out` is the caller's Plan row for this child (null at the root). On
+ * the normal-return / re-deepen-exit paths this function writes the
+ * child's final `(Q, depth)` to `*out` so the parent can roll up
+ * without a second TT probe. Abort paths intentionally leave `*out`
+ * untouched — the parent's own `should_abort()` check fires in the
+ * same iteration and skips its rollup before the stale row is read.
  */
 inline constexpr auto recursive_search =
     [](auto recursive_search,
        RecurseContext* ctx,
        lfsync::Permit permit,
        chess::Board board,
-       float depth) -> lf::task<void>
+       float depth,
+       Plan* out) -> lf::task<void>
 {
     if (ctx->w->should_abort()) co_return;
 
@@ -586,13 +602,18 @@ inline constexpr auto recursive_search =
         // Cell A is atomic with the key match (find / find_or_claim
         // both ensure we observe a key from a successful CAS), so qd
         // is never torn here.
-        auto [_, cur_max_d] = v2::unpack_qd(
+        auto [cur_q, cur_max_d] = v2::unpack_qd(
             v2::SearchArena::load_qd(entry).qd_packed);
-        (void)_;
-        if (depth <= cur_max_d) co_return;
+        if (depth <= cur_max_d) {
+            // Hand the already-unpacked TT (Q, max_depth) back to the
+            // caller — same value the deleted post-join re-read would
+            // have produced.
+            if (out) { out->Q = cur_q; out->depth = cur_max_d; }
+            co_return;
+        }
     }
 
-    // ── single classify-and-fork pass over children ─────────────────
+    // ── load node info (move list + variance) for the upcoming passes ──
     // Cell B is provably published by the time we reach this point:
     //   * `find(key, sec)` only returns non-null after validating
     //     the secondary, which requires Cell B to be published
@@ -652,13 +673,13 @@ inline constexpr auto recursive_search =
         // is Q=-1 ⇒ parent's rollup -Q = +1 ⇒ we win.
         if (m_tk == v2::kTerminalDraw) {
             plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
-                             /*alloc=*/0.0f, 0, 0});
+                             /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
         }
         if (m_tk == v2::kTerminalLossForChild) {
             plans.push_back({Mode::Expanded, m_P, /*Q=*/-1.0f, kPosInf,
-                             /*alloc=*/0.0f, 0, 0});
+                             /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
         }
@@ -666,7 +687,7 @@ inline constexpr auto recursive_search =
             // Reachable only via Syzygy: child-STM is in a TB-won position,
             // so child_Q=+1 ⇒ parent rollup -Q = -1 ⇒ this move loses for us.
             plans.push_back({Mode::Expanded, m_P, /*Q=*/+1.0f, kPosInf,
-                             /*alloc=*/0.0f, 0, 0});
+                             /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
         }
@@ -680,15 +701,13 @@ inline constexpr auto recursive_search =
         // at this caller; Expanded with depth=+inf like terminals.
         if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
             plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
-                             /*alloc=*/0.0f, 0, 0});
+                             /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
         }
 
-        const uint64_t child_key = cb.hash();
-        const uint32_t child_sec = v2::secondary_hash(cb);
-
-        if (v2::TTEntry* ce = ctx->arena->find(child_key, child_sec)) {
+        if (v2::TTEntry* ce =
+                ctx->arena->find(cb.hash(), v2::secondary_hash(cb))) {
             // TT hit: Expanded, real Q + real depth from the child's entry.
             // `find` only returns non-null after `secondary_matches`
             // observed Cell B publish with matching key_secondary, so
@@ -696,7 +715,7 @@ inline constexpr auto recursive_search =
             auto [q, child_max_d] = v2::unpack_qd(
                 v2::SearchArena::load_qd(ce).qd_packed);
             plans.push_back({Mode::Expanded, m_P, q, child_max_d,
-                             /*alloc=*/0.0f, child_key, child_sec});
+                             /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
         }
@@ -709,8 +728,7 @@ inline constexpr auto recursive_search =
         const float Q_eff_parent_pov =
             parent_Q - fpu_reduction * std::sqrt(cumulative_P);
         plans.push_back({Mode::Unexpanded, m_P, /*Q=*/-Q_eff_parent_pov,
-                         /*depth=*/depth_floor, /*alloc=*/0.0f,
-                         child_key, child_sec});
+                         /*depth=*/depth_floor, /*alloc=*/0.0f});
         cumulative_P += m_P;
     }
 
@@ -725,10 +743,18 @@ inline constexpr auto recursive_search =
     // allocated — that's the per-worker backpressure point. Terminals
     // and path-dep draws have depth=+inf so the gate excludes them
     // automatically.
+    //
+    // Pre-marking: a forked child OVERWRITES p.Q / p.depth (via the
+    // `&p` out-param to recursive_search) before this coroutine resumes
+    // from lf::join, so we flip the row to Expanded here. The child's
+    // own normal-return / re-deepen paths both write through the
+    // pointer; abort paths leave it untouched but the parent's
+    // post-join should_abort() (below) skips rollup before any stale
+    // row would be observed.
     bool first_fork = true;
     bool any_fork   = false;
     for (uint16_t i = 0; i < num_moves; ++i) {
-        const Plan& p = plans[i];
+        Plan& p = plans[i];
         if (!(p.alloc > p.depth)) continue;
 
         chess::Board cb = board;
@@ -740,8 +766,9 @@ inline constexpr auto recursive_search =
         first_fork = false;
         any_fork   = true;
 
+        p.mode = Mode::Expanded;
         co_await lf::fork[recursive_search](
-            ctx, std::move(child_permit), std::move(cb), p.alloc);
+            ctx, std::move(child_permit), std::move(cb), p.alloc, &p);
     }
 
     if (any_fork) {
@@ -749,17 +776,6 @@ inline constexpr auto recursive_search =
     }
 
     if (ctx->w->should_abort()) co_return;
-
-    // ── Pass 3: re-read TT for forked children, promote to Expanded ──
-    for (Plan& p : plans) {
-        if (!(p.alloc > p.depth)) continue;
-        v2::TTEntry* ce = ctx->arena->find(p.child_key, p.child_sec);
-        if (!ce) continue;  // child never claimed (e.g. abort raced)
-        auto [q, d] = v2::unpack_qd(v2::SearchArena::load_qd(ce).qd_packed);
-        p.Q     = q;
-        p.depth = d;
-        p.mode  = Mode::Expanded;
-    }
 
     // ── Rollup: e^alloc-weighted average of -Q over Expanded plans ──
     // Max-subtract LSE-style for numerical stability (alloc can reach
@@ -780,8 +796,24 @@ inline constexpr auto recursive_search =
         den += w;
     }
     if (den > 0.0) {
-        v2::SearchArena::update_qd(entry,
-                                   static_cast<float>(num / den), depth);
+        const float Q_new = static_cast<float>(num / den);
+        v2::SearchArena::update_qd(entry, Q_new, depth);
+        // Hand the rolled-up (Q, depth) back to the parent's plan row.
+        // If update_qd above lost the CAS to a peer with a deeper
+        // entry, the parent still gets our local rollup — a fresh,
+        // self-consistent estimate from the same children we just
+        // descended into.
+        if (out) { out->Q = Q_new; out->depth = depth; }
+    } else if (out) {
+        // No Expanded child contributed (everything was Unexpanded
+        // and gated out of fan-out). Fall back to whatever TT holds
+        // for `entry` — typically the NN-Q from our own
+        // find_or_claim publish — so the parent's rollup doesn't
+        // average in the FPU stand-in we pre-marked above.
+        auto [q_tt, d_tt] = v2::unpack_qd(
+            v2::SearchArena::load_qd(entry).qd_packed);
+        out->Q     = q_tt;
+        out->depth = d_tt;
     }
 };
 
@@ -798,7 +830,7 @@ inline constexpr auto root_search =
 {
     lfsync::Permit p = co_await ctx->sem->acquire();
     co_await lf::call[recursive_search](
-        ctx, std::move(p), std::move(board), depth);
+        ctx, std::move(p), std::move(board), depth, /*out=*/nullptr);
     co_await lf::join;
 };
 

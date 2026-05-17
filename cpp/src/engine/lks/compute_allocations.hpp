@@ -41,16 +41,20 @@ namespace catgpt::lks::detail {
 
 /**
  * Per-child plan row built during the descent's pass 1 (classification),
- * mutated by the Halley allocator (fills `alloc`), then by pass 3
- * (re-read TT updates `Q`/`depth`/`mode` for forked children), and
- * consumed by the rollup.
+ * mutated by the Halley allocator (fills `alloc`), then — for forked
+ * children — overwritten in place by the child's `recursive_search`
+ * (which writes back `Q` / `depth` through its `Plan* out` argument)
+ * before the parent's rollup runs.
  *
  * Mode semantics:
  *   - Expanded: a usable `Q` is available for the rollup. Sources are
- *     a TT-hit child, a position-only terminal (draw / loss / win), or
- *     a path-dependent draw (3-fold / 50-move along this path). After
- *     pass 3, any unexpanded child we successfully recursed on is
- *     promoted to Expanded.
+ *     a TT-hit child, a position-only terminal (draw / loss / win), a
+ *     path-dependent draw (3-fold / 50-move along this path), or a
+ *     just-recursed child whose `recursive_search` wrote its rolled-up
+ *     `(Q, depth)` back through the parent's `&plans[i]`. Pass 2
+ *     pre-marks Expanded immediately before forking; abort paths leave
+ *     the row stale but the parent's own should_abort() check skips
+ *     rollup before any stale row is observed.
  *   - Unexpanded: no real Q yet; `Q` is the FPU stand-in
  *     (Q_eff_parent_pov = parent_Q - fpu_reduction * sqrt(cumulative_P),
  *      stored as -Q_eff_parent_pov in child-STM convention). Used only
@@ -62,21 +66,15 @@ namespace catgpt::lks::detail {
  *   - Expanded TT entry → child's stored max_depth
  *   - Terminal / path-dep draw → +infinity (never re-recurses)
  *   - Unexpanded → depth_floor (any alloc > floor triggers expansion)
- *
- * `child_key` / `child_sec` are cached so the post-join re-read doesn't
- * have to re-derive the child board. Zeroed for terminal / path-dep
- * plans where no recursion will ever happen.
  */
 enum class Mode : uint8_t { Expanded, Unexpanded };
 
 struct Plan {
-    Mode     mode;
-    float    P;
-    float    Q;
-    float    depth;
-    float    alloc;
-    uint64_t child_key;
-    uint32_t child_sec;
+    Mode  mode;
+    float P;
+    float Q;
+    float depth;
+    float alloc;
 };
 
 /**
