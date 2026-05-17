@@ -102,7 +102,7 @@ inline void compute_log_allocations(Plan* plans, int M,
     const double N        = std::exp(static_cast<double>(depth));
     const double cbrt_N   = std::cbrt(N);
     const double w_factor = static_cast<double>(c_puct)
-                          * (N * N) / (cbrt_N * cbrt_N) / 3.0;  // c_puct*N^(2/3)/3
+                          * cbrt_N * cbrt_N / 3.0;  // c_puct*N^(2/3)/3
     const double tol_g    = 1.0e-6 * N;
     const double log_w    = std::log(static_cast<double>(c_puct) / 3.0);
     const double bias     = (2.0 / 3.0) * static_cast<double>(depth) + log_w;
