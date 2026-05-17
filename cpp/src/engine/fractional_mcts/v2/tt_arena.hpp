@@ -312,11 +312,18 @@ static_assert(alignof(TTEntry) == 32, "TTEntry must be 32-byte aligned");
  * before the slot's `info` cell is release-published, so they are
  * visible to any reader who acquire-loads `info` and observes
  * `info_offset != kNoInfoOffset`.
+ *
+ * `limit` is the cached `compute_limit` result for this position: the
+ * number of top P-sorted children needed to cover
+ * `policy_coverage_threshold` (lifted to >= 2 when the top prior is
+ * below `single_node_coverage_threshold`). Stamped at expansion time
+ * and read by descent to drive iter-0 force-expansion of the top-K
+ * priors. Bounded by chess's 218 max legal moves, fits in uint16_t.
  */
 struct NodeInfoHeader {
     float    variance;   // 4: computed once from NN value distribution
     uint16_t num_moves;  // 2: <= 218 in chess
-    uint16_t flags;      // 2: reserved bits
+    uint16_t limit;      // 2: cached compute_limit result; <= num_moves
 };
 static_assert(sizeof(NodeInfoHeader) == 8, "NodeInfoHeader must be 8 bytes");
 
@@ -788,7 +795,7 @@ public:
         auto* header = std::launder(reinterpret_cast<NodeInfoHeader*>(arena_ + offset));
         header->variance = 0.0f;
         header->num_moves = num_moves;
-        header->flags = 0;
+        header->limit = 0;
         return offset;
     }
 

@@ -390,7 +390,7 @@ ThroughputResult run_p4_one(int num_threads, uint64_t per_thread_inserts) {
                     auto* hdr = arena.info_at(off);
                     hdr->variance = 0.05f;
                     hdr->num_moves = kMovesPerNode;
-                    hdr->flags = 0;
+                    hdr->limit = 0;
                     MoveInfo* moves = arena.moves_at(off);
                     for (uint16_t m = 0; m < kMovesPerNode; ++m) {
                         moves[m] = MoveInfo::pack(m, 1.0f / kMovesPerNode,

@@ -579,11 +579,18 @@ inline constexpr auto recursive_search =
                                        tk);
         }
 
-        // Per-node variance of the value distribution, in the same
-        // [-1, 1] scale as Q. alloc_node_info pre-fills variance=0;
-        // overwrite with the real value.
+        // Per-node variance + cached `limit` for this fresh TT entry.
+        // alloc_node_info pre-fills variance=0 and limit=0; overwrite
+        // both with the real values before publish so any reader
+        // observing this node sees them.
         const float variance = compute_value_variance(out.value_probs);
-        ctx->arena->info_at(off)->variance = variance;
+        const int limit = compute_limit(
+            sorted_moves,
+            ctx->params->policy_coverage_threshold,
+            ctx->params->single_node_coverage_threshold);
+        v2::NodeInfoHeader* hdr_w = ctx->arena->info_at(off);
+        hdr_w->variance = variance;
+        hdr_w->limit = static_cast<uint16_t>(limit);
 
         const float Q = 2.0f * out.value - 1.0f;
 
@@ -598,10 +605,6 @@ inline constexpr auto recursive_search =
         //   * the re-deepen check uses `<=` (NaN -> false, descent runs)
         //   * `update_qd` is monotonic and will overwrite -inf on the
         //     first rollup that completes a descent.
-        const int limit = compute_limit(
-            sorted_moves,
-            ctx->params->policy_coverage_threshold,
-            ctx->params->single_node_coverage_threshold);
         const float default_max_depth = -std::log(
             variance * ctx->params->default_depth_constant
             / static_cast<float>(limit));
@@ -777,11 +780,12 @@ inline constexpr auto recursive_search =
     //      incremental staircase. Children write their refreshed
     //      (Q, depth) back through `&p`, so the next iter's allocator
     //      sees the updated values and re-balances.
-    //      Carveout: on iter 0, if either of the first two children
-    //      (plans[0] / plans[1]) is still Unexpanded, recurse on it
-    //      regardless of the alloc/depth gate so the top-2 priors
-    //      always get at least one real descent before any later
-    //      iteration's break check can fire.
+    //      Carveout: on iter 0, if any of the first `hdr->limit`
+    //      children is still Unexpanded, recurse on it regardless of
+    //      the alloc/depth gate so the top-`limit` priors (the
+    //      cumulative-policy-coverage cohort cached on the node at
+    //      expansion time) always get at least one real descent before
+    //      any later iteration's break check can fire.
     //
     // Permits: only iter 0's FIRST fork inherits this coroutine's
     // entry permit (so K bounds permit-holding frames, not alive
@@ -822,14 +826,16 @@ inline constexpr auto recursive_search =
             for (uint16_t i = 0; i < num_moves; ++i) {
                 Plan& p = plans[i];
 
-                // Iter-0 force-expansion of the top-2 priors: if either
-                // of plans[0] or plans[1] is still Unexpanded going into
-                // iter 0, recurse on it regardless of whether the
+                // Iter-0 force-expansion of the top-`limit` priors:
+                // if any of plans[0..limit) is still Unexpanded going
+                // into iter 0, recurse on it regardless of whether the
                 // Halley alloc cleared its depth_floor. Guarantees the
-                // two highest-prior moves always get at least one real
-                // descent before the clamp loop's break check can fire.
+                // top-`limit` highest-prior moves (the cumulative-
+                // coverage cohort cached on the node at expansion time)
+                // always get at least one real descent before the
+                // clamp loop's break check can fire.
                 const bool force_expand =
-                    (iter == 0) && (i < 2) && (p.mode == Mode::Unexpanded);
+                    (iter == 0) && (i < hdr->limit) && (p.mode == Mode::Unexpanded);
                 if (!force_expand && !(p.alloc > p.depth)) continue;
 
                 const float target_depth =
