@@ -61,6 +61,7 @@ checkpoints/
 checkpoints_jax/
 outputs/
 runs/
+!web/src/app/api/longbench/runs/
 wandb/
 mlruns/
 lightning_logs/
