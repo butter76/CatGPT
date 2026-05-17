@@ -1245,15 +1245,22 @@ public:
 
     /**
      * Walk the TT from the root, picking the best move at each ply, to
-     * produce the principal variation. Stops early — and does NOT include
-     * a trailing move — once any of these holds AFTER playing the latest
-     * move (so the line truly ends at a game-over / TT boundary):
-     *   - no legal moves at the next position (checkmate / stalemate),
+     * produce the principal variation. The line ends — without emitting
+     * a move from the current position — at the first node satisfying
+     * any of:
+     *   - no legal moves (checkmate / stalemate),
+     *   - the position has no TT entry (search hadn't visited it),
+     *   - the position's TT entry has no children (`num_moves == 0`),
+     *   - the position's HIGHEST-POLICY child (`moves[0]`, by
+     *     construction — MoveInfo is P-sorted) is unexpanded (TT miss
+     *     with no terminal shortcut and no path-dependent draw at this
+     *     caller). This avoids the PV being driven by a low-P sibling
+     *     whose Q happens to be the only real value seen at this node.
+     * The line additionally ends — AFTER emitting the latest move —
+     * when the resulting position satisfies any of:
      *   - 3-fold repetition along this PV (`isRepetition(1)`),
      *   - 50-move expiration (`isHalfMoveDraw()`),
      *   - insufficient material,
-     *   - the next position has no TT entry (search hadn't visited it),
-     *   - the next position's TT entry has no expanded children,
      *   - `max_len` plies have been emitted (defensive cap).
      *
      * The terminal/path-dependent checks are run on the board after
@@ -1274,7 +1281,8 @@ public:
         chess::Board b = board_;
         for (int i = 0; i < max_len; ++i) {
             const chess::Move m =
-                select_best_move(b, /*fallback_to_first_legal=*/false);
+                select_best_move(b, /*fallback_to_first_legal=*/false,
+                                    /*require_top_child_expanded=*/true);
             if (m == chess::Move::NO_MOVE) break;
             pv.push_back(m);
             b.makeMove<true>(m);
@@ -1288,6 +1296,29 @@ public:
 
 private:
     /**
+     * "Is this child expanded?" — true when we have a definitive value
+     * for the child, in any of these ways:
+     *   - position-only terminal cached on the MoveInfo
+     *     (mate / stalemate / insufficient material / Syzygy WDL),
+     *   - path-dependent draw at this caller (3-fold along this PV
+     *     or 50-move expiration after `parent + mi.move`),
+     *   - the child's resulting position has a TT entry.
+     * Returns false only for a "TT miss with no terminal shortcut" —
+     * the same Unexpanded category `recursive_search` Pass 1 produces.
+     *
+     * Used by PV walking to refuse to descend through nodes whose
+     * highest-policy child has never been searched.
+     */
+    [[nodiscard]] bool is_child_expanded(const chess::Board& parent,
+                                         const v2::MoveInfo& mi) const {
+        if (mi.terminal_kind() != v2::kTerminalNone) return true;
+        chess::Board cb = parent;
+        cb.makeMove<true>(chess::Move{mi.move});
+        if (cb.isRepetition(1) || cb.isHalfMoveDraw()) return true;
+        return arena_->find(cb.hash(), v2::secondary_hash(cb)) != nullptr;
+    }
+
+    /**
      * Core of `bestmove()` / `principal_variation()`: pick the highest-
      * scoring move at `b`, where score = -child_Q with tiebreaks (child
      * max_depth, then prior P). See `bestmove()` for the full scoring /
@@ -1300,10 +1331,17 @@ private:
      *   - false (PV walking): return `NO_MOVE` in the same cases so the
      *     PV terminates cleanly at the first unsearched position
      *     instead of trailing off into a random legal-list-order move.
+     *
+     * `require_top_child_expanded` (PV walking): when true, return
+     * `NO_MOVE` if `moves[0]` (the highest-P child, by construction —
+     * `softmax_legal_sorted` writes MoveInfo in decreasing-P order)
+     * is unexpanded. Prevents the PV from being driven by a low-P
+     * sibling whose Q happens to be the only real value at this node.
      */
     [[nodiscard]] chess::Move
     select_best_move(const chess::Board& b,
-                     bool fallback_to_first_legal) const {
+                     bool fallback_to_first_legal,
+                     bool require_top_child_expanded = false) const {
         chess::Movelist legal;
         chess::movegen::legalmoves(legal, b);
         if (legal.empty()) return chess::Move::NO_MOVE;
@@ -1328,6 +1366,13 @@ private:
         const v2::MoveInfo* moves = arena_->moves_at(info.info_offset);
         if (num_moves == 0) {
             return fallback_to_first_legal ? legal[0] : chess::Move::NO_MOVE;
+        }
+
+        // PV-walking guard: if the highest-policy child hasn't been
+        // expanded yet, we don't trust any move from this node.
+        if (require_top_child_expanded
+            && !is_child_expanded(b, moves[0])) {
+            return chess::Move::NO_MOVE;
         }
 
         chess::Move best       = chess::Move{moves[0].move};
