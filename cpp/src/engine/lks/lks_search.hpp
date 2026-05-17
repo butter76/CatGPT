@@ -167,7 +167,7 @@ namespace detail {
  * off `ctx->params` at the use site.
  */
 struct SearchParams {
-    float policy_temp = 1.0f;  // softmax temperature; >1 flattens, <1 sharpens
+    float policy_temp = 1.2f;  // softmax temperature; >1 flattens, <1 sharpens
 
     // Thresholds for compute_limit (mirrors FractionalMCTSConfig naming).
     // `policy_coverage_threshold` is the cumulative-prior fraction that
@@ -185,13 +185,13 @@ struct SearchParams {
     // PUCT allocation constant. Feeds Halley-in-delta dual solve:
     //   log N_i = log P_i + 2d/3 + log(c_puct/3) - log(e^u + Δ_i),
     // where u = log(K - q_max), Δ_i = q_max - q_i, q_i = -Q_i.
-    float c_puct = 1.0f;
+    float c_puct = 1.75f;
 
     // FPU reduction. For unexpanded children we synthesize a parent-POV Q via
     //   Q_eff_parent_pov = parent_Q - fpu_reduction * sqrt(cumulative_P),
     // where cumulative_P sums priors of preceding P-sorted children (expanded
     // or not). Mirrors coroutine_search.hpp::compute_allocations exactly.
-    float fpu_reduction = 0.2f;
+    float fpu_reduction = 0.330f;
 };
 
 }  // namespace detail
