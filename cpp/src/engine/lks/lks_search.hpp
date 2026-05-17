@@ -167,7 +167,7 @@ namespace detail {
  * off `ctx->params` at the use site.
  */
 struct SearchParams {
-    float policy_temp = 1.2f;  // softmax temperature; >1 flattens, <1 sharpens
+    float policy_temp = 1.3f;  // softmax temperature; >1 flattens, <1 sharpens
 
     // Thresholds for compute_limit (mirrors FractionalMCTSConfig naming).
     // `policy_coverage_threshold` is the cumulative-prior fraction that
@@ -192,6 +192,19 @@ struct SearchParams {
     // where cumulative_P sums priors of preceding P-sorted children (expanded
     // or not). Mirrors coroutine_search.hpp::compute_allocations exactly.
     float fpu_reduction = 0.330f;
+
+    // Clamp loop: cap per-iteration depth growth and break-out tolerance.
+    //   - each forked child is dispatched at min(p.alloc, p.depth + clamp_step);
+    //   - loop breaks (after iter 0) once every plan has
+    //     p.alloc - p.depth <= break_eps (i.e. the Halley allocator is at
+    //     a fixed point and no child wants meaningfully more depth);
+    //   - clamp_max_iters is a defensive cap on the outer loop.
+    // Rationale: Halley allocations can swing wildly as FPU-optimistic
+    // siblings resolve; small per-iter growth + re-allocation avoids
+    // burning depth on children whose Q will collapse on first contact.
+    float clamp_step      = 0.4f;
+    float break_eps       = 0.1f;
+    int   clamp_max_iters = 1024;
 };
 
 }  // namespace detail
@@ -475,11 +488,21 @@ struct RecurseContext {
 /**
  * Recursive descent (libfork lambda).
  *
- * INVARIANT: every entry owns exactly one `Permit`. The permit covers
- * this entire invocation including any GPU eval. At fan-out the first
- * forked child inherits via std::move(permit); subsequent children each
- * co_await sem->acquire(). On exit (either co_return at abort, base, or
- * after lf::join) any permit still held is released by RAII.
+ * INVARIANT: every entry owns exactly one `Permit` on entry. The permit
+ * covers any GPU eval. At fan-out the FIRST forked child of the FIRST
+ * clamp-loop iteration inherits the parent's permit via std::move; every
+ * other fork (later iter-0 siblings, and every fork in iter 1+) does
+ * co_await sem->acquire() for its own permit. After iter 0's lf::join
+ * the parent is permit-less for the remainder of the call (same state
+ * the original single-shot code was in during rollup); iter 1+ forks
+ * acquire on demand. On exit any permit still held is released by RAII.
+ *
+ * This preserves the property that K = sem.count bounds "concurrently
+ * alive recursive_search frames that hold a permit", NOT "concurrently
+ * alive frames" — so descent depth is not constrained by K. A
+ * parent-retains-permit scheme would deadlock at depth K (parent holds
+ * one, fork-child acquires the K-th, child can't fan out because all
+ * permits are held by ancestor parents up the spine).
  *
  * `out` is the caller's Plan row for this child (null at the root). On
  * the normal-return / re-deepen-exit paths this function writes the
@@ -732,50 +755,108 @@ inline constexpr auto recursive_search =
         cumulative_P += m_P;
     }
 
-    // ── Halley A6c: compute per-child log allocations in place ──────
-    compute_log_allocations(plans.data(), static_cast<int>(plans.size()),
-                            depth, ctx->params->c_puct);
-
-    // ── Pass 2: fork on every plan where alloc > depth ──────────────
-    // First fork inherits this coroutine's permit; subsequent forks each
-    // co_await sem->acquire(). When permits run out the producer (this
-    // coroutine) suspends in acquire() before any new child frame is
-    // allocated — that's the per-worker backpressure point. Terminals
-    // and path-dep draws have depth=+inf so the gate excludes them
-    // automatically.
+    // ── Pass 2: clamped allocate+fork loop ──────────────────────────
+    // Halley allocations can swing wildly as FPU-optimistic siblings
+    // resolve. To avoid burning depth on a child whose Q will collapse
+    // on first contact, we iterate:
+    //
+    //   1. compute_log_allocations on the current (Q, depth) state.
+    //   2. If iter > 0 and every plan satisfies alloc - depth <=
+    //      break_eps (i.e. the allocator is at a fixed point), break.
+    //   3. Fork every plan with alloc > p.depth, clamping the child's
+    //      recursion depth to min(alloc, p.depth + clamp_step) — an
+    //      incremental staircase. Children write their refreshed
+    //      (Q, depth) back through `&p`, so the next iter's allocator
+    //      sees the updated values and re-balances.
+    //      Carveout: on iter 0, if either of the first two children
+    //      (plans[0] / plans[1]) is still Unexpanded, recurse on it
+    //      regardless of the alloc/depth gate so the top-2 priors
+    //      always get at least one real descent before any later
+    //      iteration's break check can fire.
+    //
+    // Permits: only iter 0's FIRST fork inherits this coroutine's
+    // entry permit (so K bounds permit-holding frames, not alive
+    // frames — keeping descent depth independent of K). Every other
+    // fork (later iter-0 siblings and every fork in iter 1+) does
+    // co_await sem->acquire(). After iter 0's lf::join this coroutine
+    // is permit-less for the rest of the call, same state the
+    // original single-shot code was in during rollup.
     //
     // Pre-marking: a forked child OVERWRITES p.Q / p.depth (via the
-    // `&p` out-param to recursive_search) before this coroutine resumes
-    // from lf::join, so we flip the row to Expanded here. The child's
-    // own normal-return / re-deepen paths both write through the
-    // pointer; abort paths leave it untouched but the parent's
-    // post-join should_abort() (below) skips rollup before any stale
-    // row would be observed.
-    bool first_fork = true;
-    bool any_fork   = false;
-    for (uint16_t i = 0; i < num_moves; ++i) {
-        Plan& p = plans[i];
-        if (!(p.alloc > p.depth)) continue;
+    // `&p` out-param) before this coroutine resumes from lf::join, so
+    // we flip the row to Expanded immediately before forking. Abort
+    // paths leave the row stale but the post-iter should_abort()
+    // check below skips later rollup before any stale row is observed.
+    {
+        const float clamp_step = ctx->params->clamp_step;
+        const float break_eps  = ctx->params->break_eps;
+        const int   max_iters  = ctx->params->clamp_max_iters;
 
-        chess::Board cb = board;
-        cb.makeMove<true>(chess::Move{moves[i].move});
+        for (int iter = 0; iter < max_iters; ++iter) {
+            compute_log_allocations(plans.data(),
+                                    static_cast<int>(plans.size()),
+                                    depth, ctx->params->c_puct);
 
-        lfsync::Permit child_permit = first_fork
-            ? std::move(permit)
-            : co_await ctx->sem->acquire();
-        first_fork = false;
-        any_fork   = true;
+            if (iter > 0) {
+                bool any_unsaturated = false;
+                for (const Plan& p : plans) {
+                    if (p.alloc - p.depth > break_eps) {
+                        any_unsaturated = true;
+                        break;
+                    }
+                }
+                if (!any_unsaturated) break;
+            }
 
-        p.mode = Mode::Expanded;
-        co_await lf::fork[recursive_search](
-            ctx, std::move(child_permit), std::move(cb), p.alloc, &p);
+            bool first_fork = (iter == 0);
+            bool any_fork   = false;
+            for (uint16_t i = 0; i < num_moves; ++i) {
+                Plan& p = plans[i];
+
+                // Iter-0 force-expansion of the top-2 priors: if either
+                // of plans[0] or plans[1] is still Unexpanded going into
+                // iter 0, recurse on it regardless of whether the
+                // Halley alloc cleared its depth_floor. Guarantees the
+                // two highest-prior moves always get at least one real
+                // descent before the clamp loop's break check can fire.
+                const bool force_expand =
+                    (iter == 0) && (i < 2) && (p.mode == Mode::Unexpanded);
+                if (!force_expand && !(p.alloc > p.depth)) continue;
+
+                const float target_depth =
+                    std::min(p.alloc, p.depth + clamp_step);
+
+                chess::Board cb = board;
+                cb.makeMove<true>(chess::Move{moves[i].move});
+
+                lfsync::Permit child_permit = first_fork
+                    ? std::move(permit)
+                    : co_await ctx->sem->acquire();
+                first_fork = false;
+                any_fork   = true;
+
+                p.mode = Mode::Expanded;
+                co_await lf::fork[recursive_search](
+                    ctx, std::move(child_permit), std::move(cb),
+                    target_depth, &p);
+            }
+
+            if (any_fork) {
+                co_await lf::join;
+            } else {
+                // Nothing past its depth gate this iter — either
+                // iter 0 with no fan-out at all (matches the original
+                // single-shot's "no any_fork" path) or iter 1+ where
+                // every plan that could grow is within break_eps.
+                // Either way, no later iter would change anything,
+                // so fall through to rollup. Without this guard the
+                // loop would spin doing no work.
+                break;
+            }
+
+            if (ctx->w->should_abort()) co_return;
+        }
     }
-
-    if (any_fork) {
-        co_await lf::join;
-    }
-
-    if (ctx->w->should_abort()) co_return;
 
     // ── Rollup: e^alloc-weighted average of -Q over Expanded plans ──
     // Max-subtract LSE-style for numerical stability (alloc can reach
