@@ -7,7 +7,8 @@
  * lifecycle tests that don't need parallelism.
  *
  * Tests:
- *   1. natural completion: search() runs to max_evals, emits bestmove last
+ *   1. natural completion: search() runs through max_evals plus the
+ *                          min-depth grace period, emits bestmove last
  *   2. quit-mid-search:    search() interrupted, bestmove still emitted,
  *                          no info lines after quit() returns
  *   3. setBoard-resets:    after a search, setBoard() drops arena_used_bytes to 0
@@ -451,7 +452,14 @@ void test_workers_reused() {
 
     // total_evals is per-search and resets at the start of each search.
     EXPECT(evals_after_b > 0);
-    EXPECT(evals_after_b <= evals_after_a + 64 + 32);  // sanity bound
+    // Sanity bound. The aggregate-budget grace period lets workers keep
+    // grinding past `max_evals` until min_depth() ticks up by one ID
+    // step, so the per-search count can overshoot the configured 64
+    // budget by an entire slow-worker iteration. Bound at 4x the
+    // A-search count plus a 256-eval slack — generous, but still
+    // catches runaway behavior (no cap, infinite-loop on a runner,
+    // etc.).
+    EXPECT(evals_after_b <= 4 * evals_after_a + 256);
 
     // lifetime_gpu_evals accumulates: search B's GPU evals stack on top of A.
     EXPECT(gpu_after_b > gpu_after_a);

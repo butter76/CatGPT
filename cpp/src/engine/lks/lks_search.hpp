@@ -228,7 +228,13 @@ struct SearchParams {
  * For tests install a recording lambda.
  */
 struct LksSearchConfig {
-    uint64_t max_evals = 800;       // total budget across all workers
+    // Aggregate eval budget across all workers. Enforced with a grace
+    // period in `worker_main`: once `sum(w->evals) >= max_evals`, the
+    // search keeps running until `min_depth()` strictly advances (i.e.
+    // the slowest worker finishes one more ID iteration), then stops.
+    // Expect the final `total_evals()` to overshoot this by up to one
+    // slow-worker iteration's worth of evals.
+    uint64_t max_evals = 800;
 
     // Iterative-deepening (log-scale). N = e^depth.
     float start_depth = 0.0f;       // worker 0's starting depth
@@ -438,7 +444,7 @@ inline v2::TerminalKind classify_terminal(chess::Board& child_board,
  *   - pool, evaluator, sem
  *
  * Per-search (reset by worker_main at the start of every search):
- *   - stop, evals, tt_claims, depth, budget
+ *   - stop, evals, tt_claims, depth
  *
  * Declaration order matters for safe destruction:
  *   sem        -> destroyed first  (no waiters by then; runners joined)
@@ -455,7 +461,6 @@ struct WorkerSearch {
     std::atomic<bool>     stop{false};
     std::atomic<uint64_t> evals{0};
     std::atomic<uint64_t> tt_claims{0};
-    std::atomic<uint64_t> budget{0};            // per-worker eval cap for this search
     std::atomic<float>    depth{0.0f};
 
     std::jthread runner;
@@ -466,12 +471,13 @@ struct WorkerSearch {
     WorkerSearch(WorkerSearch&&) = delete;
     WorkerSearch& operator=(WorkerSearch&&) = delete;
 
-    // Single common abort-check for both `stop` and budget exhaustion.
-    // Used at every `co_await` boundary so a search drains promptly.
+    // Cooperative stop check, hit at every `co_await` boundary so a search
+    // drains promptly once `worker_main` flips the flag. The aggregate eval
+    // ceiling (`cfg.max_evals`) is enforced centrally by `worker_main`'s
+    // grace-period state machine, not here — individual workers do NOT cap
+    // themselves on eval count.
     [[nodiscard]] bool should_abort() const noexcept {
-        return stop.load(std::memory_order_relaxed)
-            || evals.load(std::memory_order_relaxed)
-               >= budget.load(std::memory_order_relaxed);
+        return stop.load(std::memory_order_relaxed);
     }
 };
 
@@ -1582,16 +1588,14 @@ private:
         const auto t0 = Clock::now();
 
         // Reset per-search counters. Stagger each worker's starting depth.
-        const uint64_t per_worker_budget =
-            (cfg.max_evals + static_cast<uint64_t>(num_workers_) - 1)
-            / static_cast<uint64_t>(num_workers_);
+        // No per-worker eval slice is set: `cfg.max_evals` is enforced as
+        // a single aggregate budget by the loop below.
         total_evals_.store(0, std::memory_order_relaxed);
         for (int i = 0; i < num_workers_; ++i) {
             auto& w = *workers_[i];
             w.stop.store(false, std::memory_order_relaxed);
             w.evals.store(0, std::memory_order_relaxed);
             w.tt_claims.store(0, std::memory_order_relaxed);
-            w.budget.store(per_worker_budget, std::memory_order_relaxed);
             const float start = cfg.start_depth
                               + (static_cast<float>(i) / static_cast<float>(num_workers_))
                                 * cfg.delta_depth;
@@ -1608,47 +1612,61 @@ private:
 
         // Aggregator + UCI info loop. Emit `info depth ...` only when the
         // integer centi-depth derived from the minimum worker depth changes.
-        // A worker is "done" if it has either exhausted its per-worker eval
-        // budget OR advanced its iterative-deepening depth past
-        // `cfg.max_depth` (the runner's ID loop exits on either condition,
-        // but a depth-exit with budget remaining must still let
-        // worker_main wind down). Without the depth check, in-search
-        // Syzygy can leave the search spinning on terminal children that
-        // never trigger GPU evals, so budget alone never trips.
-        long last_depth_centi = std::numeric_limits<long>::min();
+        //
+        // Termination conditions (any one ends the loop):
+        //   1. `stop_token` requested (UCI `stop`, `quit()`, etc.) —
+        //      flips immediately at the top of every tick.
+        //   2. Every worker's depth has reached `cfg.max_depth` — no
+        //      runner has any more iterations to start. Needed because
+        //      in-search Syzygy can leave the search spinning on
+        //      terminal children that never trigger GPU evals, so an
+        //      eval-only termination would never trip.
+        //   3. `min_depth() >= cfg.target_min_depth` — explicit depth
+        //      target was hit.
+        //   4. Aggregate eval budget grace: once `evals_sum >=
+        //      cfg.max_evals` is observed we latch the current
+        //      `min_depth()` and keep running. Termination fires on the
+        //      next tick where `min_depth()` strictly exceeds the
+        //      latched value — i.e. the slowest worker has since
+        //      finished one more iteration. This evens out termination
+        //      depth across Lazy-SMP workers; expect a per-search eval
+        //      overshoot of one slow-worker iteration.
+        long  last_depth_centi    = std::numeric_limits<long>::min();
+        bool  budget_exhausted    = false;
+        float min_depth_at_budget =
+            -std::numeric_limits<float>::infinity();
         while (true) {
-            const bool stop_requested = st.stop_requested();
-            bool all_done = true;
-            for (const auto& w : workers_) {
-                const bool under_budget =
-                    w->evals.load(std::memory_order_relaxed)
-                    < w->budget.load(std::memory_order_relaxed);
-                const bool under_depth =
-                    w->depth.load(std::memory_order_relaxed) < cfg.max_depth;
-                if (under_budget && under_depth) {
-                    all_done = false;
-                    break;
-                }
-            }
-            if (stop_requested || all_done) break;
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (st.stop_requested()) break;
 
             uint64_t evals_sum = 0;
             uint64_t claims_sum = 0;
             float    min_d = std::numeric_limits<float>::infinity();
+            bool     all_at_max_depth = true;
             for (const auto& w : workers_) {
                 evals_sum  += w->evals.load(std::memory_order_relaxed);
                 claims_sum += w->tt_claims.load(std::memory_order_relaxed);
-                min_d = std::min(min_d, w->depth.load(std::memory_order_relaxed));
+                const float d = w->depth.load(std::memory_order_relaxed);
+                min_d = std::min(min_d, d);
+                if (d < cfg.max_depth) all_at_max_depth = false;
             }
             total_evals_.store(evals_sum, std::memory_order_relaxed);
 
-            // Depth-target termination: end the search the moment every
-            // worker has reached `target_min_depth`. Checked here (before
-            // the no-change `continue` below) so a tick that doesn't
-            // advance centi-depth can still terminate.
+            if (all_at_max_depth) break;
             if (std::isfinite(min_d) && min_d >= cfg.target_min_depth) break;
+
+            // Budget grace: latch min_d the first time we see the
+            // aggregate budget exhausted; on a subsequent tick where
+            // min_d has strictly advanced, terminate.
+            if (!budget_exhausted && evals_sum >= cfg.max_evals) {
+                budget_exhausted    = true;
+                min_depth_at_budget = std::isfinite(min_d)
+                    ? min_d
+                    : -std::numeric_limits<float>::infinity();
+            }
+            if (budget_exhausted && std::isfinite(min_d)
+                && min_d > min_depth_at_budget) {
+                break;
+            }
 
             // UCI's `depth` field is integer-valued (cutechess parses via
             // QString::toInt and most other GUIs do the same). Encode our
@@ -1657,7 +1675,10 @@ private:
             const long depth_centi = std::isfinite(min_d)
                 ? std::lround(min_d * 100.0f)
                 : 0L;
-            if (depth_centi == last_depth_centi) continue;
+            if (depth_centi == last_depth_centi) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
 
             const auto now = Clock::now();
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1710,6 +1731,8 @@ private:
                 pv_field.c_str());
             emit(buf);
             last_depth_centi = depth_centi;
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
 
         // Stop fan-out + join runners. Do NOT shutdown the persistent
@@ -1748,6 +1771,12 @@ private:
     /**
      * Runner body. Spawned per-search by worker_main on its own jthread.
      * Drives the iterative-deepening loop for this worker.
+     *
+     * The runner has no per-worker eval cap of its own — it keeps
+     * grinding iterations until either the cooperative `stop` flag
+     * flips (set by `worker_main` when the aggregate budget grace
+     * expires, a `stop_token` fires, or any other terminator) or the
+     * local ID depth reaches `cfg.max_depth`.
      */
     void run_worker_search(WorkerSearch& w, int worker_idx,
                            const LksSearchConfig& cfg)

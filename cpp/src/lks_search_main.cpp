@@ -43,11 +43,12 @@
  *   fen          FEN string (quoted)
  *   nodes        Optional: max GPU evaluations (default: 400)
  *
- * Tuning env vars (mirror lks_uci_main):
- *   LKS_WORKERS_PER_GPU     (default 1; small enough for short web requests)
- *   LKS_COROS_PER_WORKER    (default 32)
- *   LKS_MAX_BATCH_SIZE      (default 32)
- *   LKS_LIFETIME_MAX_EVALS  (default 1<<20)
+ * Tuning env vars (mirror lks_uci_main, except workers_per_gpu stays at
+ * 1 so a single web request doesn't saturate a multi-GPU host):
+ *   LKS_WORKERS_PER_GPU     (default 1; single Lazy-SMP worker per GPU)
+ *   LKS_COROS_PER_WORKER    (default 112)
+ *   LKS_MAX_BATCH_SIZE      (default 56)
+ *   LKS_LIFETIME_MAX_EVALS  (default 1<<27)
  *   LKS_SYZYGY_PATH         (default $SYZYGY_HOME, else "" = disabled)
  */
 
@@ -356,10 +357,10 @@ int main(int argc, char* argv[]) {
     }
 
     const int workers_per_gpu  = env_int("LKS_WORKERS_PER_GPU", 1);
-    const int coros_per_worker = env_int("LKS_COROS_PER_WORKER", 32);
-    const int max_batch_size   = env_int("LKS_MAX_BATCH_SIZE", 32);
+    const int coros_per_worker = env_int("LKS_COROS_PER_WORKER", 112);
+    const int max_batch_size   = env_int("LKS_MAX_BATCH_SIZE", 56);
     const uint64_t lifetime_max_evals =
-        env_u64("LKS_LIFETIME_MAX_EVALS", 1ULL << 20);
+        env_u64("LKS_LIFETIME_MAX_EVALS", 1ULL << 27);
 
     fs::path syzygy_path;
     if (const char* p = std::getenv("LKS_SYZYGY_PATH"); p && *p) {
