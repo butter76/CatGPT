@@ -26,8 +26,9 @@
  * 1e-6 log-tol; capped at 16 defensively.
  *
  * Lives next to lks_search.hpp because Plan / Mode are the same types
- * the descent uses end-to-end. The solver only reads Plan.P / Plan.Q
- * and writes Plan.alloc; it never touches Plan.mode / .depth / .child_*.
+ * the descent uses end-to-end. The solver only reads Plan.Q and either
+ * Plan.P (default) or Plan.P_opt (when `use_optimistic == true`), and
+ * writes Plan.alloc; it never touches Plan.mode / .depth / .child_*.
  */
 
 #ifndef CATGPT_ENGINE_LKS_COMPUTE_ALLOCATIONS_HPP
@@ -72,21 +73,30 @@ enum class Mode : uint8_t { Expanded, Unexpanded };
 struct Plan {
     Mode  mode;
     float P;
+    float P_opt;  // Optimistic-policy prior; drives PUCT during the clamp loop.
     float Q;
     float depth;
     float alloc;
 };
 
 /**
- * Halley-in-delta dual solve. Reads plans[i].P / plans[i].Q, writes
+ * Halley-in-delta dual solve. Reads plans[i].Q and either plans[i].P
+ * (default) or plans[i].P_opt (when `use_optimistic == true`); writes
  * plans[i].alloc = log N_i in place. M == 0 is a no-op.
+ *
+ * `use_optimistic == true` mirrors `coroutine_search.hpp`'s
+ * `compute_allocations(node, N, use_optimistic=true)` call inside its
+ * recursive clamp loop: P_opt-driven exploration during recursion,
+ * P-driven weights for the rollup (achieved by a second call here
+ * with use_optimistic == false).
  *
  * Numerics: inner loop is double-precision; cast to float only at the
  * final `alloc` write. Convergence: |g(delta)| <= 1e-6 * N or relative
  * step <= 1e-6.
  */
 inline void compute_log_allocations(Plan* plans, int M,
-                                    float depth, float c_puct) noexcept
+                                    float depth, float c_puct,
+                                    bool use_optimistic = false) noexcept
 {
     if (M <= 0) return;
 
@@ -106,11 +116,12 @@ inline void compute_log_allocations(Plan* plans, int M,
     const double bias     = (2.0 / 3.0) * static_cast<double>(depth) + log_w;
 
     // g(d), g'(d), g''(d) at delta = d. Δ_i = qmax_neg_q - (-Q_i) >= 0.
-    auto eval = [plans, M, w_factor, qmax_neg_q, N]
+    auto eval = [plans, M, w_factor, qmax_neg_q, N, use_optimistic]
                 (double d, double& g, double& gp, double& gpp) {
         double s = 0.0, s2 = 0.0, s3 = 0.0;
         for (int i = 0; i < M; ++i) {
-            const double p = static_cast<double>(plans[i].P);
+            const double p = static_cast<double>(
+                use_optimistic ? plans[i].P_opt : plans[i].P);
             if (p <= 0.0) continue;
             const double Delta_i = qmax_neg_q - (-static_cast<double>(plans[i].Q));
             const double di      = d + Delta_i;
@@ -153,7 +164,8 @@ inline void compute_log_allocations(Plan* plans, int M,
     // log N_i = log P_i + 2d/3 + log(c_puct/3) - log(e^u + Δ_i),
     // and since u = log(d), e^u + Δ_i = d + Δ_i directly.
     for (int i = 0; i < M; ++i) {
-        const double p = static_cast<double>(plans[i].P);
+        const double p = static_cast<double>(
+            use_optimistic ? plans[i].P_opt : plans[i].P);
         if (p <= 0.0) {
             plans[i].alloc = -std::numeric_limits<float>::infinity();
             continue;

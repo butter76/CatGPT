@@ -177,6 +177,7 @@ void run_one(uint64_t K, PhaseTimings& out) {
             uint64_t r = splitmix64(s);
             moves[j] = MoveInfo::pack(static_cast<uint16_t>(r),
                                       1.0f / static_cast<float>(nm),
+                                      /*P_opt=*/1.0f / static_cast<float>(nm),
                                       catgpt::v2::kTerminalNone);
         }
 

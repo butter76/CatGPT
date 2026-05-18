@@ -258,29 +258,30 @@ namespace detail {
 // LksSearchConfig — so the config can embed it by value.)
 
 /**
- * Paired legal move + its softmax prior. Emitted by
- * `softmax_legal_sorted` in decreasing-P order so downstream
- * MoveInfo fill is a single sequential pass and the arena
- * ends up P-sorted without an in-place shuffle.
+ * Paired legal move + its softmax priors (normal and optimistic).
+ * Emitted by `softmax_legal_sorted` in decreasing-P order (sort key
+ * is the normal policy P) so downstream MoveInfo fill is a single
+ * sequential pass and the arena ends up P-sorted without an in-place
+ * shuffle.
  *
- * Kept small (8 bytes) and mirrors MoveInfo's `move`/`P` layout:
- * sorting cost is the same as sorting MoveInfos, and we avoid
- * the makeMove/unmakeMove terminal work running in a soon-to-be-
- * thrown-away order. Stored as the raw `uint16_t` rather than a
- * `chess::Move` because the latter carries an unused 16-bit
- * score field that would bloat this struct.
+ * Stored as the raw `uint16_t` rather than a `chess::Move` because the
+ * latter carries an unused 16-bit score field that would bloat this
+ * struct.
  */
-struct MoveWithPrior {
-    uint16_t move;  // 2: chess::Move underlying u16
-    uint16_t _pad;  // 2
-    float    P;     // 4
+struct MoveWithPriors {
+    uint16_t move;   // 2: chess::Move underlying u16
+    uint16_t _pad;   // 2
+    float    P;      // 4: normal-policy prior (sort key)
+    float    P_opt;  // 4: optimistic-policy prior
 };
-static_assert(sizeof(MoveWithPrior) == 8, "MoveWithPrior must be 8 bytes");
+static_assert(sizeof(MoveWithPriors) == 12, "MoveWithPriors must be 12 bytes");
 
 /**
- * Tempered softmax over legal-move policy logits, sorted by decreasing
- * P. Output order is what downstream descent expects (highest-prior
- * first), and is also the order we want in the arena's MoveInfo[].
+ * Tempered softmax over legal-move policy logits — runs two parallel
+ * softmaxes (normal `out.policy` and `out.optimistic_policy`) at the
+ * same `policy_temp`, then sorts by decreasing normal `P`. Output
+ * order is what downstream descent expects (highest-prior first),
+ * and is also the order we want in the arena's MoveInfo[].
  *
  * `policy_temp` divides logits before the max-subtract / exp; T > 1
  * flattens, T < 1 sharpens. T == 1.0 reproduces the plain softmax that
@@ -292,35 +293,54 @@ inline void softmax_legal_sorted(const RawNNOutput& out,
                                  const chess::Board& board,
                                  const chess::Movelist& legal,
                                  float policy_temp,
-                                 std::vector<MoveWithPrior>& moves)
+                                 std::vector<MoveWithPriors>& moves)
 {
     const bool flip = board.sideToMove() == chess::Color::BLACK;
     const int n = legal.size();
     moves.resize(static_cast<size_t>(n));
 
     const float inv_temp = 1.0f / policy_temp;
-    float max_logit = -std::numeric_limits<float>::infinity();
+
+    // Pre-pass: gather per-move policy-table indices, write moves[i].move,
+    // and compute scaled logits for both heads. Track per-head max for
+    // the LSE max-subtract.
+    float max_logit     = -std::numeric_limits<float>::infinity();
+    float max_logit_opt = -std::numeric_limits<float>::infinity();
     for (int i = 0; i < n; ++i) {
         const auto [from_idx, to_idx] = encode_move_to_policy_index(legal[i], flip);
         const int flat = policy_flat_index(from_idx, to_idx);
-        const float scaled = out.policy[flat] * inv_temp;
-        moves[i].move = static_cast<uint16_t>(legal[i].move());
-        moves[i]._pad = 0;
-        moves[i].P = scaled;
-        max_logit = std::max(max_logit, scaled);
-    }
-    float sum_exp = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        moves[i].P = std::exp(moves[i].P - max_logit);
-        sum_exp += moves[i].P;
-    }
-    const float inv_sum = sum_exp > 0.0f ? 1.0f / sum_exp : 0.0f;
-    for (int i = 0; i < n; ++i) {
-        moves[i].P *= inv_sum;
+        const float scaled     = out.policy[flat]            * inv_temp;
+        const float scaled_opt = out.optimistic_policy[flat] * inv_temp;
+        moves[i].move  = static_cast<uint16_t>(legal[i].move());
+        moves[i]._pad  = 0;
+        moves[i].P     = scaled;
+        moves[i].P_opt = scaled_opt;
+        max_logit     = std::max(max_logit,     scaled);
+        max_logit_opt = std::max(max_logit_opt, scaled_opt);
     }
 
+    // exp(scaled - max) for both heads, accumulating per-head sums.
+    float sum_exp     = 0.0f;
+    float sum_exp_opt = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        moves[i].P     = std::exp(moves[i].P     - max_logit);
+        moves[i].P_opt = std::exp(moves[i].P_opt - max_logit_opt);
+        sum_exp     += moves[i].P;
+        sum_exp_opt += moves[i].P_opt;
+    }
+
+    // Normalize each head independently.
+    const float inv_sum     = sum_exp     > 0.0f ? 1.0f / sum_exp     : 0.0f;
+    const float inv_sum_opt = sum_exp_opt > 0.0f ? 1.0f / sum_exp_opt : 0.0f;
+    for (int i = 0; i < n; ++i) {
+        moves[i].P     *= inv_sum;
+        moves[i].P_opt *= inv_sum_opt;
+    }
+
+    // Sort by descending normal P (the optimistic prior is paired by
+    // index and rides along with the move).
     std::sort(moves.begin(), moves.end(),
-        [](const MoveWithPrior& a, const MoveWithPrior& b) {
+        [](const MoveWithPriors& a, const MoveWithPriors& b) {
             return a.P > b.P;
         });
 }
@@ -365,7 +385,7 @@ inline float compute_value_variance(
  * search's behavior of refusing to commit fully to a non-overwhelming
  * top move).
  */
-inline int compute_limit(const std::vector<MoveWithPrior>& sorted_moves,
+inline int compute_limit(const std::vector<MoveWithPriors>& sorted_moves,
                          float coverage_threshold,
                          float single_node_threshold) noexcept
 {
@@ -561,7 +581,7 @@ inline constexpr auto recursive_search =
         // pairs) so the arena fill below is a single pass that
         // writes each MoveInfo exactly once in the order descent
         // will consume them.
-        std::vector<MoveWithPrior> sorted_moves;
+        std::vector<MoveWithPriors> sorted_moves;
         softmax_legal_sorted(out, board, legal,
                              ctx->params->policy_temp, sorted_moves);
 
@@ -582,6 +602,7 @@ inline constexpr auto recursive_search =
 
             mi[i] = v2::MoveInfo::pack(sorted_moves[i].move,
                                        sorted_moves[i].P,
+                                       sorted_moves[i].P_opt,
                                        tk);
         }
 
@@ -706,20 +727,21 @@ inline constexpr auto recursive_search =
     for (uint16_t i = 0; i < num_moves; ++i) {
         const auto& m = moves[i];
         const v2::TerminalKind m_tk = m.terminal_kind();
-        const float m_P = m.P();
+        const float m_P     = m.P();
+        const float m_P_opt = m.P_opt();
 
         // Position-only terminals: Expanded with fixed Q and depth=+inf
         // (so the "alloc > depth" gate never triggers a re-recurse).
         // Q is stored in child-STM convention (same as TT): a child-loss
         // is Q=-1 ⇒ parent's rollup -Q = +1 ⇒ we win.
         if (m_tk == v2::kTerminalDraw) {
-            plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
+            plans.push_back({Mode::Expanded, m_P, m_P_opt, /*Q=*/0.0f, kPosInf,
                              /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
         }
         if (m_tk == v2::kTerminalLossForChild) {
-            plans.push_back({Mode::Expanded, m_P, /*Q=*/-1.0f, kPosInf,
+            plans.push_back({Mode::Expanded, m_P, m_P_opt, /*Q=*/-1.0f, kPosInf,
                              /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
@@ -727,7 +749,7 @@ inline constexpr auto recursive_search =
         if (m_tk == v2::kTerminalWinForChild) {
             // Reachable only via Syzygy: child-STM is in a TB-won position,
             // so child_Q=+1 ⇒ parent rollup -Q = -1 ⇒ this move loses for us.
-            plans.push_back({Mode::Expanded, m_P, /*Q=*/+1.0f, kPosInf,
+            plans.push_back({Mode::Expanded, m_P, m_P_opt, /*Q=*/+1.0f, kPosInf,
                              /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
@@ -741,7 +763,7 @@ inline constexpr auto recursive_search =
         // may disagree on repetition / half-move clock). Treat as a draw
         // at this caller; Expanded with depth=+inf like terminals.
         if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
-            plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
+            plans.push_back({Mode::Expanded, m_P, m_P_opt, /*Q=*/0.0f, kPosInf,
                              /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
@@ -755,7 +777,7 @@ inline constexpr auto recursive_search =
             // qd is consistent (Cell A is atomic with the key match).
             auto [q, child_max_d] = v2::unpack_qd(
                 v2::SearchArena::load_qd(ce).qd_packed);
-            plans.push_back({Mode::Expanded, m_P, q, child_max_d,
+            plans.push_back({Mode::Expanded, m_P, m_P_opt, q, child_max_d,
                              /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
@@ -766,9 +788,12 @@ inline constexpr auto recursive_search =
         //   Q_eff_parent_pov = parent_Q - fpu_reduction * sqrt(cumulative_P)
         // Stored in child-STM convention as -Q_eff_parent_pov so the
         // rollup's -Q yields back Q_eff_parent_pov.
+        // FPU's `cumulative_P` is summed over the NORMAL policy (matches
+        // coroutine_search.hpp), not over P_opt — it's about how much
+        // actual mass we've already conditioned on.
         const float Q_eff_parent_pov =
             parent_Q - fpu_reduction * std::sqrt(cumulative_P);
-        plans.push_back({Mode::Unexpanded, m_P, /*Q=*/-Q_eff_parent_pov,
+        plans.push_back({Mode::Unexpanded, m_P, m_P_opt, /*Q=*/-Q_eff_parent_pov,
                          /*depth=*/depth_floor, /*alloc=*/0.0f});
         cumulative_P += m_P;
     }
@@ -812,9 +837,13 @@ inline constexpr auto recursive_search =
         const int   max_iters  = ctx->params->clamp_max_iters;
 
         for (int iter = 0; iter < max_iters; ++iter) {
+            // Drive descent allocation with the optimistic policy: same
+            // role as `compute_allocations(..., use_optimistic=true)` in
+            // coroutine_search.hpp's clamp loop.
             compute_log_allocations(plans.data(),
                                     static_cast<int>(plans.size()),
-                                    depth, ctx->params->c_puct);
+                                    depth, ctx->params->c_puct,
+                                    /*use_optimistic=*/true);
 
             if (iter > 0) {
                 bool any_unsaturated = false;
@@ -887,6 +916,16 @@ inline constexpr auto recursive_search =
             if (ctx->w->should_abort()) co_return;
         }
     }
+
+    // ── Re-allocate with NORMAL policy for the rollup weights ──────────
+    // The clamp loop above used P_opt to drive exploration; for the
+    // weighted-Q rollup we want weights that reflect the actual policy
+    // distribution rather than the exploration-warmed one. Mirrors the
+    // `second_allocations = compute_allocations(node, N)` (default
+    // use_optimistic=false) call in coroutine_search.hpp::recursive_search.
+    compute_log_allocations(plans.data(), static_cast<int>(plans.size()),
+                            depth, ctx->params->c_puct,
+                            /*use_optimistic=*/false);
 
     // ── Rollup: e^alloc-weighted average of -Q over Expanded plans ──
     // Max-subtract LSE-style for numerical stability (alloc can reach
