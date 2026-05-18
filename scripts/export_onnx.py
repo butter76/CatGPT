@@ -167,6 +167,49 @@ def _format_attribute(attr) -> str:
         return f"<{attr.type}>"
 
 
+def rename_onnx_outputs(onnx_path: str | Path, new_names: list[str]) -> None:
+    """Rename the model's graph outputs in positional order.
+
+    `jax2onnx` assigns generic tensor names (e.g. ``reshape_out_105``) to a
+    tuple-returning function's outputs. The C++ runtime locates outputs by
+    substring match on names like ``policy``, ``optimistic_policy``,
+    ``bestq_probs``, ``value``; without renaming, two ``[batch, 4672]``
+    policy outputs are indistinguishable and loading fails.
+
+    Renames the i-th graph output to ``new_names[i]`` and rewrites every
+    node input/output that references the old tensor name so the graph
+    stays consistent. Saves in place.
+    """
+    import onnx
+
+    onnx_path = Path(onnx_path)
+    model = onnx.load(str(onnx_path))
+    graph = model.graph
+
+    if len(graph.output) != len(new_names):
+        raise ValueError(
+            f"rename_onnx_outputs: model has {len(graph.output)} outputs but "
+            f"got {len(new_names)} new names ({new_names})"
+        )
+
+    print(f"\n[Post-process] Renaming {len(new_names)} graph outputs...")
+    for out, new in zip(graph.output, new_names):
+        old = out.name
+        if old == new:
+            print(f"  '{old}' (unchanged)")
+            continue
+        for node in graph.node:
+            node.input[:] = [new if x == old else x for x in node.input]
+            node.output[:] = [new if x == old else x for x in node.output]
+        for vi in graph.value_info:
+            if vi.name == old:
+                vi.name = new
+        out.name = new
+        print(f"  '{old}' → '{new}'")
+
+    onnx.save(model, str(onnx_path))
+
+
 def make_onnx_dynamic_batch(onnx_path: str | Path, output_path: str | Path | None = None) -> str:
     """Post-process ONNX model to replace magic batch size with dynamic dimension.
 
@@ -467,6 +510,10 @@ def main() -> None:
     )
 
     print(f"  ONNX model saved to: {model_path}")
+
+    # Rename outputs to friendly names so the C++ runtime can locate them
+    # by substring (value / bestq_probs / policy / optimistic_policy).
+    rename_onnx_outputs(output_path, output_keys)
 
     # Post-process for dynamic batch
     if args.dynamic_batch:
