@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-TRT_ROOT=/home/shadeform/TensorRT-10.13.2.6
+TRT_ROOT=/home/shadeform/TensorRT-10.13.3.9
 TRTEXEC=${TRT_ROOT}/bin/trtexec
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:${TRT_ROOT}/lib
 
@@ -38,7 +38,6 @@ for b in "${BUCKETS[@]}"; do
     --onnx="${ONNX}" \
     --saveEngine="${out}" \
     --fp16 \
-    --builderOptimizationLevel=5 \
     --minShapes=in_0:${b}x64 \
     --optShapes=in_0:${b}x64 \
     --maxShapes=in_0:${b}x64
