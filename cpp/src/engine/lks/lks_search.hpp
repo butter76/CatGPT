@@ -85,17 +85,26 @@
  *          `find_or_claim` and publish. CAS losers (peers that
  *          published during our eval await) adopt the peer's entry
  *          and orphan their bytes.
- *       3. Re-deepen check: if the entry's max_depth >= depth, return.
- *       4. Single-pass classify+fork: each child is either
- *          Skip / RecurseThenRead / ReadOnly. RecurseThenRead spawns a
- *          child `recursive_search` task via `lf::fork`. First fork
+ *       3. Re-deepen check: if the entry's max_depth >= depth, return
+ *          (handing the TT (Q, max_depth) back to the caller via the
+ *          `Plan* out` argument).
+ *       4. Pass 1: classify children into a local Plan vector
+ *          (terminal / path-dep draw / TT-hit / Unexpanded). Halley
+ *          allocator fills `alloc` in place.
+ *       5. Pass 2: for each plan with `alloc > depth`, pre-mark
+ *          `Mode::Expanded` and spawn a child `recursive_search` via
+ *          `lf::fork`, passing `&plan` as the out-param. First fork
  *          inherits the parent's permit; subsequent forks each
- *          `co_await sem.acquire()`.
- *       5. `lf::join` waits for all forked children.
- *       6. Rollup: P-weighted average of -child_Q over the same plan
- *          vector (terminal/repetition/50-move contribute fixed Q;
- *          RecurseThenRead reads the child's TT entry).
- *       7. `update_qd` with the new (Q, depth).
+ *          `co_await sem.acquire()`. `lf::join` waits for all forked
+ *          children. Each child writes its rolled-up `(Q, depth)`
+ *          straight back into the parent's plan row — no post-join TT
+ *          re-read.
+ *       6. Rollup: e^alloc-weighted average of -child_Q over Expanded
+ *          plans (terminal / path-dep draws contribute fixed Q;
+ *          forked children contribute the values their own rollup
+ *          wrote into the plan).
+ *       7. `update_qd` with the new (Q, depth); also forward (Q, depth)
+ *          to our caller through `*out`.
  */
 
 #ifndef CATGPT_ENGINE_LKS_LKS_SEARCH_HPP
@@ -132,12 +141,14 @@
 #include "../../lf/async_semaphore.hpp"
 #include "../../selfplay/batch_evaluator.hpp"
 #include "../../selfplay/eval_request.hpp"
+#include "../../syzygy.hpp"
 #include "../../tokenizer.hpp"
 #include "../policy.hpp"
 #include "../trt_runtime.hpp"
 #include "../fractional_mcts/search_stats.hpp"
 #include "../fractional_mcts/v2/board_secondary.hpp"
 #include "../fractional_mcts/v2/tt_arena.hpp"
+#include "compute_allocations.hpp"
 
 namespace catgpt::lks {
 
@@ -156,7 +167,7 @@ namespace detail {
  * off `ctx->params` at the use site.
  */
 struct SearchParams {
-    float policy_temp = 1.0f;  // softmax temperature; >1 flattens, <1 sharpens
+    float policy_temp = 1.3f;  // softmax temperature; >1 flattens, <1 sharpens
 
     // Thresholds for compute_limit (mirrors FractionalMCTSConfig naming).
     // `policy_coverage_threshold` is the cumulative-prior fraction that
@@ -170,6 +181,39 @@ struct SearchParams {
     // nodes get a high max_depth so early ID iterations skip re-descending
     // them (trust the NN). C is this constant.
     float default_depth_constant = 12.0f;
+
+    // PUCT allocation constant. Feeds Halley-in-delta dual solve:
+    //   log N_i = log P_i + 2d/3 + log(c_puct/3) - log(e^u + Δ_i),
+    // where u = log(K - q_max), Δ_i = q_max - q_i, q_i = -Q_i.
+    float c_puct = 1.75f;
+
+    // FPU reduction. For unexpanded children we synthesize a parent-POV Q via
+    //   Q_eff_parent_pov = parent_Q - fpu_reduction * sqrt(cumulative_P),
+    // where cumulative_P sums priors of preceding P-sorted children (expanded
+    // or not). Mirrors coroutine_search.hpp::compute_allocations exactly.
+    float fpu_reduction = 0.330f;
+
+    // Clamp loop: cap per-iteration depth growth and break-out tolerance.
+    //   - each forked child is dispatched at min(p.alloc, p.depth + clamp_step);
+    //   - loop breaks (after iter 0) once every plan has
+    //     p.alloc - p.depth <= break_eps (i.e. the Halley allocator is at
+    //     a fixed point and no child wants meaningfully more depth);
+    //   - clamp_max_iters is a defensive cap on the outer loop.
+    // Rationale: Halley allocations can swing wildly as FPU-optimistic
+    // siblings resolve; small per-iter growth + re-allocation avoids
+    // burning depth on children whose Q will collapse on first contact.
+    float clamp_step      = 0.4f;
+    float break_eps       = 0.1f;
+    int   clamp_max_iters = 1024;
+
+    // Rollup pruning. Children whose log-allocation is more than
+    // `rollup_log_gap` below the maximum Expanded alloc are excluded
+    // from the e^alloc-weighted Q average. e^-3.3 ~= 0.037, so the
+    // default trims any child contributing less than ~3% of the
+    // leader's weight — keeps a single dominant move from being
+    // diluted by long-tail children whose alloc is order-of-magnitude
+    // smaller. Set very large (e.g. +inf) to disable.
+    float rollup_log_gap  = 3.3f;
 };
 
 }  // namespace detail
@@ -184,12 +228,24 @@ struct SearchParams {
  * For tests install a recording lambda.
  */
 struct LksSearchConfig {
-    uint64_t max_evals = 800;       // total budget across all workers
+    // Aggregate eval budget across all workers. Enforced with a grace
+    // period in `worker_main`: once `sum(w->evals) >= max_evals`, the
+    // search keeps running until `min_depth()` strictly advances (i.e.
+    // the slowest worker finishes one more ID iteration), then stops.
+    // Expect the final `total_evals()` to overshoot this by up to one
+    // slow-worker iteration's worth of evals.
+    uint64_t max_evals = 800;
 
     // Iterative-deepening (log-scale). N = e^depth.
     float start_depth = 0.0f;       // worker 0's starting depth
     float delta_depth = 0.2f;       // per-iteration depth step
     float max_depth   = 32.0f;      // absolute depth cap (e^32 ~= 8e13)
+
+    // Stop the search the moment min_depth() across workers reaches this
+    // value. `+infinity` (default) disables the check. The UCI driver
+    // maps `go depth N` to `N / 100.0f` (centi-depth, matching the
+    // encoding used in `info depth ...`).
+    float target_min_depth = std::numeric_limits<float>::infinity();
 
     detail::SearchParams params{};  // descent-time tunables (see SearchParams)
 
@@ -338,11 +394,22 @@ inline int compute_limit(const std::vector<MoveWithPrior>& sorted_moves,
  * Both depend on data (path history / half-move clock) that is not
  * part of the Zobrist key, so two transpositions to the same key can
  * disagree on them. Only stable, position-only draws (insufficient
- * material) and mate/stalemate go into the TT-stored terminal_kind.
+ * material), mate/stalemate, and Syzygy-resolved WDL (theoretical,
+ * rule50=0) go into the TT-stored terminal_kind.
  *
  * Pre: `child_board` is the board AFTER `makeMove<true>(move)`.
+ *
+ * `syz` is optional; when non-null and the child board is Syzygy-eligible
+ * (piece-count + no-castling) the WDL probe runs after the natural-
+ * terminal checks. probe_wdl uses rule50=0 internally, so the resulting
+ * kind is path-independent (safe to cache in TT). Cursed/blessed are
+ * conservatively folded to Draw — under the 50-move rule they are
+ * theoretical draws and treating them as wins/losses risks the search
+ * trusting near-50-ply outcomes that won't actually materialize.
  */
-inline v2::TerminalKind classify_terminal(chess::Board& child_board) {
+inline v2::TerminalKind classify_terminal(chess::Board& child_board,
+                                          const catgpt::SyzygyProber* syz)
+{
     chess::Movelist child_legal;
     chess::movegen::legalmoves(child_legal, child_board);
     if (child_legal.empty()) {
@@ -352,6 +419,20 @@ inline v2::TerminalKind classify_terminal(chess::Board& child_board) {
     }
     if (child_board.isInsufficientMaterial()) {
         return v2::kTerminalDraw;
+    }
+    if (syz != nullptr && syz->is_eligible(child_board)) {
+        if (auto wdl = syz->probe_wdl(child_board); wdl) {
+            switch (*wdl) {
+                case catgpt::SyzygyWDL::WIN:
+                    return v2::kTerminalWinForChild;
+                case catgpt::SyzygyWDL::LOSS:
+                    return v2::kTerminalLossForChild;
+                case catgpt::SyzygyWDL::DRAW:
+                case catgpt::SyzygyWDL::CURSED_WIN:
+                case catgpt::SyzygyWDL::BLESSED_LOSS:
+                    return v2::kTerminalDraw;
+            }
+        }
     }
     return v2::kTerminalNone;
 }
@@ -363,7 +444,7 @@ inline v2::TerminalKind classify_terminal(chess::Board& child_board) {
  *   - pool, evaluator, sem
  *
  * Per-search (reset by worker_main at the start of every search):
- *   - stop, evals, tt_claims, depth, budget
+ *   - stop, evals, tt_claims, depth
  *
  * Declaration order matters for safe destruction:
  *   sem        -> destroyed first  (no waiters by then; runners joined)
@@ -380,7 +461,6 @@ struct WorkerSearch {
     std::atomic<bool>     stop{false};
     std::atomic<uint64_t> evals{0};
     std::atomic<uint64_t> tt_claims{0};
-    std::atomic<uint64_t> budget{0};            // per-worker eval cap for this search
     std::atomic<float>    depth{0.0f};
 
     std::jthread runner;
@@ -391,12 +471,13 @@ struct WorkerSearch {
     WorkerSearch(WorkerSearch&&) = delete;
     WorkerSearch& operator=(WorkerSearch&&) = delete;
 
-    // Single common abort-check for both `stop` and budget exhaustion.
-    // Used at every `co_await` boundary so a search drains promptly.
+    // Cooperative stop check, hit at every `co_await` boundary so a search
+    // drains promptly once `worker_main` flips the flag. The aggregate eval
+    // ceiling (`cfg.max_evals`) is enforced centrally by `worker_main`'s
+    // grace-period state machine, not here — individual workers do NOT cap
+    // themselves on eval count.
     [[nodiscard]] bool should_abort() const noexcept {
-        return stop.load(std::memory_order_relaxed)
-            || evals.load(std::memory_order_relaxed)
-               >= budget.load(std::memory_order_relaxed);
+        return stop.load(std::memory_order_relaxed);
     }
 };
 
@@ -412,24 +493,46 @@ struct RecurseContext {
     lfsync::LfAsyncSemaphore* sem;
     WorkerSearch*             w;
     const SearchParams*       params;  // descent-time tunables; lives in worker_main's cfg
+    // Optional Syzygy tablebase prober. nullptr when no Syzygy path was
+    // supplied to LksSearch. SyzygyProber::probe_wdl is thread-safe under
+    // Fathom's default compile (no TB_NO_THREADS), so the same instance
+    // feeds every worker's RecurseContext.
+    const catgpt::SyzygyProber* syzygy;
 };
 
 /**
  * Recursive descent (libfork lambda).
  *
- * INVARIANT: every entry owns exactly one `Permit`. The permit covers
- * this entire invocation including any GPU eval. At fan-out the first
- * RecurseThenRead child inherits via std::move(permit); subsequent
- * children each co_await sem->acquire(). On exit (either co_return at
- * abort, base, or after lf::join) any permit still held is released by
- * RAII.
+ * INVARIANT: every entry owns exactly one `Permit` on entry. The permit
+ * covers any GPU eval. At fan-out the FIRST forked child of the FIRST
+ * clamp-loop iteration inherits the parent's permit via std::move; every
+ * other fork (later iter-0 siblings, and every fork in iter 1+) does
+ * co_await sem->acquire() for its own permit. After iter 0's lf::join
+ * the parent is permit-less for the remainder of the call (same state
+ * the original single-shot code was in during rollup); iter 1+ forks
+ * acquire on demand. On exit any permit still held is released by RAII.
+ *
+ * This preserves the property that K = sem.count bounds "concurrently
+ * alive recursive_search frames that hold a permit", NOT "concurrently
+ * alive frames" — so descent depth is not constrained by K. A
+ * parent-retains-permit scheme would deadlock at depth K (parent holds
+ * one, fork-child acquires the K-th, child can't fan out because all
+ * permits are held by ancestor parents up the spine).
+ *
+ * `out` is the caller's Plan row for this child (null at the root). On
+ * the normal-return / re-deepen-exit paths this function writes the
+ * child's final `(Q, depth)` to `*out` so the parent can roll up
+ * without a second TT probe. Abort paths intentionally leave `*out`
+ * untouched — the parent's own `should_abort()` check fires in the
+ * same iteration and skips its rollup before the stale row is read.
  */
 inline constexpr auto recursive_search =
     [](auto recursive_search,
        RecurseContext* ctx,
        lfsync::Permit permit,
        chess::Board board,
-       float depth) -> lf::task<void>
+       float depth,
+       Plan* out) -> lf::task<void>
 {
     if (ctx->w->should_abort()) co_return;
 
@@ -470,9 +573,11 @@ inline constexpr auto recursive_search =
         for (uint16_t i = 0; i < num_moves; ++i) {
             const chess::Move m{sorted_moves[i].move};
 
-            // Per-move position-only terminal detection.
+            // Per-move position-only terminal detection. With a Syzygy
+            // prober wired in, TB-resolved WDL also lands here (cached
+            // in the child's MoveInfo so re-visits skip the probe).
             board.makeMove<true>(m);
-            const v2::TerminalKind tk = classify_terminal(board);
+            const v2::TerminalKind tk = classify_terminal(board, ctx->syzygy);
             board.unmakeMove(m);
 
             mi[i] = v2::MoveInfo::pack(sorted_moves[i].move,
@@ -480,11 +585,18 @@ inline constexpr auto recursive_search =
                                        tk);
         }
 
-        // Per-node variance of the value distribution, in the same
-        // [-1, 1] scale as Q. alloc_node_info pre-fills variance=0;
-        // overwrite with the real value.
+        // Per-node variance + cached `limit` for this fresh TT entry.
+        // alloc_node_info pre-fills variance=0 and limit=0; overwrite
+        // both with the real values before publish so any reader
+        // observing this node sees them.
         const float variance = compute_value_variance(out.value_probs);
-        ctx->arena->info_at(off)->variance = variance;
+        const int limit = compute_limit(
+            sorted_moves,
+            ctx->params->policy_coverage_threshold,
+            ctx->params->single_node_coverage_threshold);
+        v2::NodeInfoHeader* hdr_w = ctx->arena->info_at(off);
+        hdr_w->variance = variance;
+        hdr_w->limit = static_cast<uint16_t>(limit);
 
         const float Q = 2.0f * out.value - 1.0f;
 
@@ -499,10 +611,6 @@ inline constexpr auto recursive_search =
         //   * the re-deepen check uses `<=` (NaN -> false, descent runs)
         //   * `update_qd` is monotonic and will overwrite -inf on the
         //     first rollup that completes a descent.
-        const int limit = compute_limit(
-            sorted_moves,
-            ctx->params->policy_coverage_threshold,
-            ctx->params->single_node_coverage_threshold);
         const float default_max_depth = -std::log(
             variance * ctx->params->default_depth_constant
             / static_cast<float>(limit));
@@ -535,13 +643,18 @@ inline constexpr auto recursive_search =
         // Cell A is atomic with the key match (find / find_or_claim
         // both ensure we observe a key from a successful CAS), so qd
         // is never torn here.
-        auto [_, cur_max_d] = v2::unpack_qd(
+        auto [cur_q, cur_max_d] = v2::unpack_qd(
             v2::SearchArena::load_qd(entry).qd_packed);
-        (void)_;
-        if (depth <= cur_max_d) co_return;
+        if (depth <= cur_max_d) {
+            // Hand the already-unpacked TT (Q, max_depth) back to the
+            // caller — same value the deleted post-join re-read would
+            // have produced.
+            if (out) { out->Q = cur_q; out->depth = cur_max_d; }
+            co_return;
+        }
     }
 
-    // ── single classify-and-fork pass over children ─────────────────
+    // ── load node info (move list + variance) for the upcoming passes ──
     // Cell B is provably published by the time we reach this point:
     //   * `find(key, sec)` only returns non-null after validating
     //     the secondary, which requires Cell B to be published
@@ -561,128 +674,265 @@ inline constexpr auto recursive_search =
     const uint16_t num_moves = hdr->num_moves;
     const v2::MoveInfo* moves = ctx->arena->moves_at(info_cell.info_offset);
 
-    enum class Mode : uint8_t { Skip, RecurseThenRead, ReadOnly };
-    struct Plan {
-        Mode     mode;
-        float    P;
-        float    fixed_Q;     // valid for ReadOnly
-        uint64_t child_key;   // valid for RecurseThenRead
-        uint32_t child_sec;   // valid for RecurseThenRead (cached so
-                              // the post-fan-out rollup re-find can
-                              // run without re-deriving the board)
-    };
+    // Parent Q (from the same TT entry we just validated) feeds the FPU
+    // estimate for unexpanded children. For a freshly-claimed entry this
+    // is the NN's 2*value-1; for a TT-shared entry it's whatever the
+    // last rollup wrote. Both are well-defined and acquire-safe here.
+    const float parent_Q = [entry]() {
+        auto [q, _] = v2::unpack_qd(v2::SearchArena::load_qd(entry).qd_packed);
+        (void)_;
+        return q;
+    }();
+
+    // Variance-scaled depth floor: used as the per-child `depth` stamped
+    // on Unexpanded plans (the "current effort" for a never-visited
+    // child). It is no longer a hard descent cutoff — the gate is
+    // `alloc > depth` from the Halley allocation. Low-variance (high-
+    // confidence) parents raise the floor so unexpanded children need
+    // a larger allocation before we'll expand them; high-variance
+    // parents lower it (possibly below 0) so expansion happens easily
+    // and the rollup refines Q.
+    const float depth_floor = -std::log(
+        hdr->variance * ctx->params->default_depth_constant);
+
+    // ── Pass 1: classify children, populate Plan rows (no co_await) ──
     std::vector<Plan> plans;
     plans.reserve(num_moves);
 
-    // first_fork tracks whether we've consumed the inherited permit yet.
-    // any_fork tracks whether we've opened a fork-join scope (must lf::join
-    // before returning iff any_fork is true).
-    bool first_fork = true;
-    bool any_fork   = false;
+    const float fpu_reduction = ctx->params->fpu_reduction;
+    float cumulative_P = 0.0f;
+    constexpr float kPosInf = std::numeric_limits<float>::infinity();
 
     for (uint16_t i = 0; i < num_moves; ++i) {
         const auto& m = moves[i];
         const v2::TerminalKind m_tk = m.terminal_kind();
         const float m_P = m.P();
 
-        // Depth floor — applies to EVERY child regardless of kind.
-        // With child_depth = depth + log(P), each level of recursion
-        // strictly decreases depth. Without a floor at 0 the recursion
-        // would run forever as priors compound below e^0 = 1 visit.
-        // Cuts terminal_kind contributions too: a terminal child below
-        // the floor doesn't matter at this iteration's resolution.
-        const float child_depth = (m_P > 0.0f)
-            ? depth + std::log(std::max(m_P, 1e-9f))
-            : -std::numeric_limits<float>::infinity();
-        if (child_depth < 0.0f) {
-            plans.push_back({Mode::Skip, m_P, 0.0f, 0, 0});
-            continue;
-        }
-
+        // Position-only terminals: Expanded with fixed Q and depth=+inf
+        // (so the "alloc > depth" gate never triggers a re-recurse).
+        // Q is stored in child-STM convention (same as TT): a child-loss
+        // is Q=-1 ⇒ parent's rollup -Q = +1 ⇒ we win.
         if (m_tk == v2::kTerminalDraw) {
-            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, 0, 0});
+            plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
+                             /*alloc=*/0.0f});
+            cumulative_P += m_P;
             continue;
         }
         if (m_tk == v2::kTerminalLossForChild) {
-            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/-1.0f, 0, 0});
+            plans.push_back({Mode::Expanded, m_P, /*Q=*/-1.0f, kPosInf,
+                             /*alloc=*/0.0f});
+            cumulative_P += m_P;
+            continue;
+        }
+        if (m_tk == v2::kTerminalWinForChild) {
+            // Reachable only via Syzygy: child-STM is in a TB-won position,
+            // so child_Q=+1 ⇒ parent rollup -Q = -1 ⇒ this move loses for us.
+            plans.push_back({Mode::Expanded, m_P, /*Q=*/+1.0f, kPosInf,
+                             /*alloc=*/0.0f});
+            cumulative_P += m_P;
             continue;
         }
 
         chess::Board cb = board;
         cb.makeMove<true>(chess::Move{m.move});
 
-        // Path-dependent: a 2-fold along this path or a 50-move
-        // expiration is NOT in terminal_kind (different paths
-        // hashing to the same key may disagree on repetition state
-        // / half-move clock since neither is part of the Zobrist
-        // key). Treat as a draw at this caller.
+        // Path-dependent: 3-fold along this path or 50-move expiration is
+        // NOT in terminal_kind (different paths hashing to the same key
+        // may disagree on repetition / half-move clock). Treat as a draw
+        // at this caller; Expanded with depth=+inf like terminals.
         if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
-            plans.push_back({Mode::ReadOnly, m_P, /*Q=*/0.0f, 0, 0});
+            plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
+                             /*alloc=*/0.0f});
+            cumulative_P += m_P;
             continue;
         }
 
-        const uint64_t child_key = cb.hash();
-        const uint32_t child_sec = v2::secondary_hash(cb);
-
-        if (v2::TTEntry* ce = ctx->arena->find(child_key, child_sec)) {
-            // (key, secondary) match verified by find — find only
-            // returns non-null after `secondary_matches` observed
-            // Cell B published with a matching key_secondary, so
-            // the child entry is fully published. Cell A's qd is
-            // atomic with the primary match; we never spin on the
-            // child's moveInfo from here, and we don't need it for
-            // the ReadOnly path (just q + max_depth).
+        if (v2::TTEntry* ce =
+                ctx->arena->find(cb.hash(), v2::secondary_hash(cb))) {
+            // TT hit: Expanded, real Q + real depth from the child's entry.
+            // `find` only returns non-null after `secondary_matches`
+            // observed Cell B publish with matching key_secondary, so
+            // qd is consistent (Cell A is atomic with the key match).
             auto [q, child_max_d] = v2::unpack_qd(
                 v2::SearchArena::load_qd(ce).qd_packed);
-            if (child_depth <= child_max_d) {
-                plans.push_back({Mode::ReadOnly, m_P, q, child_key, child_sec});
-                continue;
+            plans.push_back({Mode::Expanded, m_P, q, child_max_d,
+                             /*alloc=*/0.0f});
+            cumulative_P += m_P;
+            continue;
+        }
+
+        // TT miss: Unexpanded. FPU (Leela-style, matching
+        // coroutine_search.hpp::compute_allocations):
+        //   Q_eff_parent_pov = parent_Q - fpu_reduction * sqrt(cumulative_P)
+        // Stored in child-STM convention as -Q_eff_parent_pov so the
+        // rollup's -Q yields back Q_eff_parent_pov.
+        const float Q_eff_parent_pov =
+            parent_Q - fpu_reduction * std::sqrt(cumulative_P);
+        plans.push_back({Mode::Unexpanded, m_P, /*Q=*/-Q_eff_parent_pov,
+                         /*depth=*/depth_floor, /*alloc=*/0.0f});
+        cumulative_P += m_P;
+    }
+
+    // ── Pass 2: clamped allocate+fork loop ──────────────────────────
+    // Halley allocations can swing wildly as FPU-optimistic siblings
+    // resolve. To avoid burning depth on a child whose Q will collapse
+    // on first contact, we iterate:
+    //
+    //   1. compute_log_allocations on the current (Q, depth) state.
+    //   2. If iter > 0 and every plan satisfies alloc - depth <=
+    //      break_eps (i.e. the allocator is at a fixed point), break.
+    //   3. Fork every plan with alloc > p.depth, clamping the child's
+    //      recursion depth to min(alloc, p.depth + clamp_step) — an
+    //      incremental staircase. Children write their refreshed
+    //      (Q, depth) back through `&p`, so the next iter's allocator
+    //      sees the updated values and re-balances.
+    //      Carveout: on iter 0, if any of the first `hdr->limit`
+    //      children is still Unexpanded, recurse on it regardless of
+    //      the alloc/depth gate so the top-`limit` priors (the
+    //      cumulative-policy-coverage cohort cached on the node at
+    //      expansion time) always get at least one real descent before
+    //      any later iteration's break check can fire.
+    //
+    // Permits: only iter 0's FIRST fork inherits this coroutine's
+    // entry permit (so K bounds permit-holding frames, not alive
+    // frames — keeping descent depth independent of K). Every other
+    // fork (later iter-0 siblings and every fork in iter 1+) does
+    // co_await sem->acquire(). After iter 0's lf::join this coroutine
+    // is permit-less for the rest of the call, same state the
+    // original single-shot code was in during rollup.
+    //
+    // Pre-marking: a forked child OVERWRITES p.Q / p.depth (via the
+    // `&p` out-param) before this coroutine resumes from lf::join, so
+    // we flip the row to Expanded immediately before forking. Abort
+    // paths leave the row stale but the post-iter should_abort()
+    // check below skips later rollup before any stale row is observed.
+    {
+        const float clamp_step = ctx->params->clamp_step;
+        const float break_eps  = ctx->params->break_eps;
+        const int   max_iters  = ctx->params->clamp_max_iters;
+
+        for (int iter = 0; iter < max_iters; ++iter) {
+            compute_log_allocations(plans.data(),
+                                    static_cast<int>(plans.size()),
+                                    depth, ctx->params->c_puct);
+
+            if (iter > 0) {
+                bool any_unsaturated = false;
+                for (const Plan& p : plans) {
+                    if (p.alloc - p.depth > break_eps) {
+                        any_unsaturated = true;
+                        break;
+                    }
+                }
+                if (!any_unsaturated) break;
             }
+
+            bool first_fork = (iter == 0);
+            bool any_fork   = false;
+            for (uint16_t i = 0; i < num_moves; ++i) {
+                Plan& p = plans[i];
+
+                // Iter-0 force-expansion of the top-`limit` priors:
+                // if any of plans[0..limit) is still Unexpanded going
+                // into iter 0, recurse on it regardless of whether the
+                // Halley alloc cleared its depth_floor. Guarantees the
+                // top-`limit` highest-prior moves (the cumulative-
+                // coverage cohort cached on the node at expansion time)
+                // always get at least one real descent before the
+                // clamp loop's break check can fire.
+                const bool force_expand =
+                    (iter == 0) && (i < hdr->limit) && (p.mode == Mode::Unexpanded);
+                if (!force_expand && !(p.alloc > p.depth)) continue;
+
+                // Iter > 0: never expand a still-Unexpanded child. The
+                // first-touch budget for new children is spent entirely
+                // on iter 0 (force-expand cohort + any plan whose initial
+                // alloc cleared depth_floor). Any plan still Unexpanded
+                // at iter 1+ has been re-allocated against fresh sibling
+                // Q's and its expansion is no longer worth the GPU eval —
+                // skip it and let rollup drop it as Unexpanded.
+                if (iter > 0 && p.mode == Mode::Unexpanded) continue;
+
+                const float target_depth =
+                    std::min(p.alloc, p.depth + clamp_step);
+
+                chess::Board cb = board;
+                cb.makeMove<true>(chess::Move{moves[i].move});
+
+                lfsync::Permit child_permit = first_fork
+                    ? std::move(permit)
+                    : co_await ctx->sem->acquire();
+                first_fork = false;
+                any_fork   = true;
+
+                p.mode = Mode::Expanded;
+                co_await lf::fork[recursive_search](
+                    ctx, std::move(child_permit), std::move(cb),
+                    target_depth, &p);
+            }
+
+            if (any_fork) {
+                co_await lf::join;
+            } else {
+                // Nothing past its depth gate this iter — either
+                // iter 0 with no fan-out at all (matches the original
+                // single-shot's "no any_fork" path) or iter 1+ where
+                // every plan that could grow is within break_eps.
+                // Either way, no later iter would change anything,
+                // so fall through to rollup. Without this guard the
+                // loop would spin doing no work.
+                break;
+            }
+
+            if (ctx->w->should_abort()) co_return;
         }
-
-        // ── RecurseThenRead: fork with permit-passing ───────────────
-        // First fork inherits our permit (no acquire). Subsequent forks
-        // co_await sem->acquire() — when permits run out, the producer
-        // (this coroutine) suspends in acquire() before any new child
-        // frame is allocated. That's the real backpressure point.
-        lfsync::Permit child_permit = first_fork
-            ? std::move(permit)
-            : co_await ctx->sem->acquire();
-        first_fork = false;
-        any_fork   = true;
-
-        plans.push_back({Mode::RecurseThenRead, m_P, 0.0f, child_key, child_sec});
-        co_await lf::fork[recursive_search](
-            ctx, std::move(child_permit), std::move(cb), child_depth);
     }
 
-    if (any_fork) {
-        co_await lf::join;
-    }
-
-    if (ctx->w->should_abort()) co_return;
-
-    // ── rollup: P-weighted average of -child_Q ──────────────────────
-    float num = 0.0f;
-    float den = 0.0f;
+    // ── Rollup: e^alloc-weighted average of -Q over Expanded plans ──
+    // Max-subtract LSE-style for numerical stability (alloc can reach
+    // depth + bias ≈ 20–40 at large N). Unexpanded children that never
+    // cleared the gate are dropped entirely.
+    //
+    // Long-tail pruning: also drop any Expanded child whose log-alloc
+    // is more than `rollup_log_gap` below the leader, i.e. whose
+    // softmax weight would be < e^-rollup_log_gap of the max. This
+    // keeps a dominant move from being diluted by far-behind siblings
+    // that contribute trivial weight but non-trivial Q variation.
+    float m_alloc = -std::numeric_limits<float>::infinity();
     for (const Plan& p : plans) {
-        if (p.mode == Mode::Skip) continue;
-        float child_Q;
-        if (p.mode == Mode::ReadOnly) {
-            child_Q = p.fixed_Q;
-        } else {
-            v2::TTEntry* ce = ctx->arena->find(p.child_key, p.child_sec);
-            if (!ce) continue;       // child never claimed (e.g. stop fired)
-            auto [q, _] = v2::unpack_qd(
-                v2::SearchArena::load_qd(ce).qd_packed);
-            (void)_;
-            child_Q = q;
-        }
-        num += p.P * (-child_Q);
-        den += p.P;
+        if (p.mode == Mode::Expanded && p.alloc > m_alloc) m_alloc = p.alloc;
     }
-    if (den > 0.0f) {
-        v2::SearchArena::update_qd(entry, num / den, depth);
+    if (!std::isfinite(m_alloc)) co_return;
+
+    const float rollup_log_gap = ctx->params->rollup_log_gap;
+    double num = 0.0;
+    double den = 0.0;
+    for (const Plan& p : plans) {
+        if (p.mode != Mode::Expanded) continue;
+        if (m_alloc - p.alloc > rollup_log_gap) continue;
+        const double w = std::exp(static_cast<double>(p.alloc - m_alloc));
+        num += w * static_cast<double>(-p.Q);
+        den += w;
+    }
+    if (den > 0.0) {
+        const float Q_new = static_cast<float>(num / den);
+        v2::SearchArena::update_qd(entry, Q_new, depth);
+        // Hand the rolled-up (Q, depth) back to the parent's plan row.
+        // If update_qd above lost the CAS to a peer with a deeper
+        // entry, the parent still gets our local rollup — a fresh,
+        // self-consistent estimate from the same children we just
+        // descended into.
+        if (out) { out->Q = Q_new; out->depth = depth; }
+    } else if (out) {
+        // No Expanded child contributed (everything was Unexpanded
+        // and gated out of fan-out). Fall back to whatever TT holds
+        // for `entry` — typically the NN-Q from our own
+        // find_or_claim publish — so the parent's rollup doesn't
+        // average in the FPU stand-in we pre-marked above.
+        auto [q_tt, d_tt] = v2::unpack_qd(
+            v2::SearchArena::load_qd(entry).qd_packed);
+        out->Q     = q_tt;
+        out->depth = d_tt;
     }
 };
 
@@ -699,7 +949,7 @@ inline constexpr auto root_search =
 {
     lfsync::Permit p = co_await ctx->sem->acquire();
     co_await lf::call[recursive_search](
-        ctx, std::move(p), std::move(board), depth);
+        ctx, std::move(p), std::move(board), depth, /*out=*/nullptr);
     co_await lf::join;
 };
 
@@ -729,12 +979,20 @@ public:
      *                            recursive_search invocations. Bounds
      *                            both orchestration frames and GPU evals.
      * @param max_batch_size      Cap on positions per GPU batch.
+     * @param syzygy_path         Filesystem path to a directory containing
+     *                            Syzygy .rtbw/.rtbz endgame tablebase files.
+     *                            Empty (the default) disables Syzygy entirely;
+     *                            non-empty constructs a single per-LksSearch
+     *                            `SyzygyProber`. Fathom holds global state,
+     *                            so at most one `LksSearch` per process
+     *                            should be constructed with a non-empty path.
      */
     explicit LksSearch(fs::path trt_engine_path,
                        uint64_t lifetime_max_evals = (1ULL << 20),
                        int workers_per_gpu = 1,
                        int coros_per_worker = 32,
-                       int max_batch_size = 32)
+                       int max_batch_size = 32,
+                       fs::path syzygy_path = {})
         : trt_engine_path_(std::move(trt_engine_path))
         , lifetime_max_evals_(lifetime_max_evals)
         , workers_per_gpu_(workers_per_gpu > 0 ? workers_per_gpu : 1)
@@ -742,6 +1000,14 @@ public:
         , max_batch_size_(max_batch_size > 0 ? max_batch_size : 1)
         , board_(chess::constants::STARTPOS)
     {
+        if (!syzygy_path.empty()) {
+            // SyzygyProber ctor calls Fathom's tb_init (global state).
+            // If load fails, prober.is_available() will be false and the
+            // shortcut path silently disables itself.
+            syzygy_ = std::make_unique<catgpt::SyzygyProber>(
+                syzygy_path.string());
+        }
+
         // Discover GPU topology. CUDA_VISIBLE_DEVICES is the right knob
         // to restrict which devices participate; this just uses every
         // visible one.
@@ -901,6 +1167,15 @@ public:
     [[nodiscard]] const v2::SearchArena& arena() const noexcept { return *arena_; }
 
     /**
+     * Whether a SyzygyProber was constructed AND successfully loaded at
+     * least one tablebase file. False when no path was provided, when
+     * the path was empty of .rtbw/.rtbz files, or when tb_init failed.
+     */
+    [[nodiscard]] bool syzygy_available() const noexcept {
+        return syzygy_ && syzygy_->is_available();
+    }
+
+    /**
      * Aggregated count of NN evals performed across all workers in the
      * most recent (or in-flight) search. Cleared at the start of each
      * `search()` call.
@@ -986,13 +1261,117 @@ public:
      * after `quit()`/runners join, when the result is stable.
      */
     [[nodiscard]] chess::Move bestmove() const {
+        return select_best_move(board_, /*fallback_to_first_legal=*/true);
+    }
+
+    /**
+     * Walk the TT from the root, picking the best move at each ply, to
+     * produce the principal variation. The line ends — without emitting
+     * a move from the current position — at the first node satisfying
+     * any of:
+     *   - no legal moves (checkmate / stalemate),
+     *   - the position has no TT entry (search hadn't visited it),
+     *   - the position's TT entry has no children (`num_moves == 0`),
+     *   - the position's HIGHEST-POLICY child (`moves[0]`, by
+     *     construction — MoveInfo is P-sorted) is unexpanded (TT miss
+     *     with no terminal shortcut and no path-dependent draw at this
+     *     caller). This avoids the PV being driven by a low-P sibling
+     *     whose Q happens to be the only real value seen at this node.
+     * The line additionally ends — AFTER emitting the latest move —
+     * when the resulting position satisfies any of:
+     *   - 3-fold repetition along this PV (`isRepetition(1)`),
+     *   - 50-move expiration (`isHalfMoveDraw()`),
+     *   - insufficient material,
+     *   - `max_len` plies have been emitted (defensive cap).
+     *
+     * The terminal/path-dependent checks are run on the board after
+     * `makeMove<true>(m)`, so the path history kept by `chess::Board`
+     * accurately disambiguates repetitions that depend on the sequence
+     * of moves actually played.
+     *
+     * Safe to call concurrently with a search in flight (uses the same
+     * acquire-loaded TT reads as `bestmove()`); intended to be called
+     * after `quit()`/runners join, when the result is stable.
+     */
+    [[nodiscard]] std::vector<chess::Move>
+    principal_variation(int max_len = 100) const {
+        std::vector<chess::Move> pv;
+        if (max_len <= 0) return pv;
+        pv.reserve(static_cast<size_t>(max_len));
+
+        chess::Board b = board_;
+        for (int i = 0; i < max_len; ++i) {
+            const chess::Move m =
+                select_best_move(b, /*fallback_to_first_legal=*/false,
+                                    /*require_top_child_expanded=*/true);
+            if (m == chess::Move::NO_MOVE) break;
+            pv.push_back(m);
+            b.makeMove<true>(m);
+            if (b.isRepetition(1) || b.isHalfMoveDraw()
+                || b.isInsufficientMaterial()) {
+                break;
+            }
+        }
+        return pv;
+    }
+
+private:
+    /**
+     * "Is this child expanded?" — true when we have a definitive value
+     * for the child, in any of these ways:
+     *   - position-only terminal cached on the MoveInfo
+     *     (mate / stalemate / insufficient material / Syzygy WDL),
+     *   - path-dependent draw at this caller (3-fold along this PV
+     *     or 50-move expiration after `parent + mi.move`),
+     *   - the child's resulting position has a TT entry.
+     * Returns false only for a "TT miss with no terminal shortcut" —
+     * the same Unexpanded category `recursive_search` Pass 1 produces.
+     *
+     * Used by PV walking to refuse to descend through nodes whose
+     * highest-policy child has never been searched.
+     */
+    [[nodiscard]] bool is_child_expanded(const chess::Board& parent,
+                                         const v2::MoveInfo& mi) const {
+        if (mi.terminal_kind() != v2::kTerminalNone) return true;
+        chess::Board cb = parent;
+        cb.makeMove<true>(chess::Move{mi.move});
+        if (cb.isRepetition(1) || cb.isHalfMoveDraw()) return true;
+        return arena_->find(cb.hash(), v2::secondary_hash(cb)) != nullptr;
+    }
+
+    /**
+     * Core of `bestmove()` / `principal_variation()`: pick the highest-
+     * scoring move at `b`, where score = -child_Q with tiebreaks (child
+     * max_depth, then prior P). See `bestmove()` for the full scoring /
+     * tiebreak / fallback contract.
+     *
+     * `fallback_to_first_legal` controls the TT-miss behavior:
+     *   - true  (bestmove): return `legal[0]` when the root has no TT
+     *     entry, or its entry has zero MoveInfo rows. UCI requires a
+     *     bestmove even if we never got to expand the root.
+     *   - false (PV walking): return `NO_MOVE` in the same cases so the
+     *     PV terminates cleanly at the first unsearched position
+     *     instead of trailing off into a random legal-list-order move.
+     *
+     * `require_top_child_expanded` (PV walking): when true, return
+     * `NO_MOVE` if `moves[0]` (the highest-P child, by construction —
+     * `softmax_legal_sorted` writes MoveInfo in decreasing-P order)
+     * is unexpanded. Prevents the PV from being driven by a low-P
+     * sibling whose Q happens to be the only real value at this node.
+     */
+    [[nodiscard]] chess::Move
+    select_best_move(const chess::Board& b,
+                     bool fallback_to_first_legal,
+                     bool require_top_child_expanded = false) const {
         chess::Movelist legal;
-        chess::movegen::legalmoves(legal, board_);
+        chess::movegen::legalmoves(legal, b);
         if (legal.empty()) return chess::Move::NO_MOVE;
 
         const v2::TTEntry* root =
-            arena_->find(root_key_, v2::secondary_hash(board_));
-        if (root == nullptr) return legal[0];
+            arena_->find(b.hash(), v2::secondary_hash(b));
+        if (root == nullptr) {
+            return fallback_to_first_legal ? legal[0] : chess::Move::NO_MOVE;
+        }
 
         // A non-null `find` already guarantees Cell B is published with
         // a matching key_secondary (the secondary check is gated on
@@ -1006,7 +1385,16 @@ public:
         const v2::NodeInfoHeader* hdr = arena_->info_at(info.info_offset);
         const uint16_t num_moves = hdr->num_moves;
         const v2::MoveInfo* moves = arena_->moves_at(info.info_offset);
-        if (num_moves == 0) return legal[0];
+        if (num_moves == 0) {
+            return fallback_to_first_legal ? legal[0] : chess::Move::NO_MOVE;
+        }
+
+        // PV-walking guard: if the highest-policy child hasn't been
+        // expanded yet, we don't trust any move from this node.
+        if (require_top_child_expanded
+            && !is_child_expanded(b, moves[0])) {
+            return chess::Move::NO_MOVE;
+        }
 
         chess::Move best       = chess::Move{moves[0].move};
         float       best_score = -std::numeric_limits<float>::infinity();
@@ -1026,8 +1414,12 @@ public:
                 child_Q = 0.0f;
             } else if (tk == v2::kTerminalLossForChild) {
                 child_Q = -1.0f;  // child loses ⇒ we win
+            } else if (tk == v2::kTerminalWinForChild) {
+                // Syzygy: child position is a TB win for STM-at-child ⇒
+                // this move loses for us. Score reflects that directly.
+                child_Q = +1.0f;
             } else {
-                chess::Board cb = board_;
+                chess::Board cb = b;
                 cb.makeMove<true>(m);
                 if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
                     child_Q = 0.0f;
@@ -1072,25 +1464,138 @@ public:
         return best;
     }
 
-private:
+    /**
+     * One of the three "no search required" cases at the root:
+     *   - `move == NO_MOVE`         => no legal moves; emit `bestmove 0000`.
+     *   - `tb` empty, real move     => single-legal-move forced reply.
+     *   - `tb` set, real move       => Syzygy DTZ resolution.
+     *
+     * The caller is responsible for emitting the appropriate `info` /
+     * `bestmove` lines and skipping the rest of `worker_main`.
+     */
+    struct RootShortcut {
+        chess::Move                          move;
+        std::optional<catgpt::SyzygyRootResult> tb;
+    };
+
+    /**
+     * Detect whether the root can be resolved without spinning up the
+     * search workers. Order is fixed:
+     *   1. No legal moves (mate / stalemate) — terminal.
+     *   2. Exactly one legal move — forced reply.
+     *   3. Syzygy DTZ root probe (gated on prober availability +
+     *      piece-count + no-castling). The probe itself is cheap.
+     * Returns std::nullopt if a real search is needed.
+     *
+     * Must be called from `worker_main` only (single-threaded); Fathom's
+     * `tb_probe_root` is documented not-thread-safe.
+     */
+    [[nodiscard]] std::optional<RootShortcut> try_root_shortcut() const {
+        chess::Movelist legal;
+        chess::movegen::legalmoves(legal, board_);
+
+        if (legal.empty()) {
+            return RootShortcut{chess::Move::NO_MOVE, std::nullopt};
+        }
+        if (legal.size() == 1) {
+            return RootShortcut{legal[0], std::nullopt};
+        }
+        if (syzygy_ && syzygy_->is_eligible(board_)) {
+            if (auto r = syzygy_->probe_root_dtz(board_); r) {
+                return RootShortcut{r->move, std::move(r)};
+            }
+        }
+        return std::nullopt;
+    }
+
+    /**
+     * Stockfish-style mapping from Syzygy WDL to UCI `score cp` value.
+     * Cursed/blessed scores are small magnitudes (50cp) to indicate the
+     * 50-move rule will defang them. A real win/loss is reported as a
+     * large finite cp value rather than a fake `score mate` (DTZ is not
+     * DTM, so mate-in-N would mislead GUIs).
+     */
+    [[nodiscard]] static int syzygy_wdl_to_cp(catgpt::SyzygyWDL w) noexcept {
+        switch (w) {
+            case catgpt::SyzygyWDL::WIN:          return  12800;
+            case catgpt::SyzygyWDL::CURSED_WIN:   return     50;
+            case catgpt::SyzygyWDL::DRAW:         return      0;
+            case catgpt::SyzygyWDL::BLESSED_LOSS: return    -50;
+            case catgpt::SyzygyWDL::LOSS:         return -12800;
+        }
+        return 0;
+    }
+
+    /**
+     * Emit the UCI lines for a root shortcut and return. Splits into
+     * separate `info` lines because the UCI spec says `string` consumes
+     * the rest of the line — keeping it on its own line is robust to
+     * future field additions.
+     */
+    void emit_root_shortcut(const RootShortcut& sc,
+                            const std::function<void(std::string_view)>& emit) const
+    {
+        if (!emit) return;
+
+        if (sc.move == chess::Move::NO_MOVE) {
+            emit("bestmove 0000");
+            return;
+        }
+
+        const std::string uci_move = chess::uci::moveToUci(sc.move);
+        char buf[256];
+
+        if (sc.tb) {
+            const int cp = syzygy_wdl_to_cp(sc.tb->wdl);
+            std::snprintf(buf, sizeof(buf),
+                          "info depth 0 score cp %d pv %s",
+                          cp, uci_move.c_str());
+            emit(buf);
+            const std::string_view wdl_s = catgpt::to_string(sc.tb->wdl);
+            std::snprintf(buf, sizeof(buf),
+                          "info string syzygy wdl=%.*s dtz=%d",
+                          static_cast<int>(wdl_s.size()), wdl_s.data(),
+                          sc.tb->dtz);
+            emit(buf);
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                          "info depth 0 pv %s", uci_move.c_str());
+            emit(buf);
+            emit("info string forced move");
+        }
+
+        std::snprintf(buf, sizeof(buf), "bestmove %s", uci_move.c_str());
+        emit(buf);
+    }
+
     void worker_main(std::stop_token st, LksSearchConfig cfg) {
         auto& cb = cfg.on_uci_line;
         auto emit = [&](std::string_view s) { if (cb) cb(s); };
+
+        // ── Root fast-paths ────────────────────────────────────────────
+        // Cheap deterministic answers (no legal moves, single legal move,
+        // Syzygy-resolvable root) short-circuit before any per-worker
+        // counter reset or runner spawn — saves multi-second worker
+        // spin-up and the GPU eval that would otherwise happen.
+        if (auto sc = try_root_shortcut()) {
+            emit_root_shortcut(*sc, cb);
+            total_evals_.store(0, std::memory_order_relaxed);
+            running_.store(false, std::memory_order_release);
+            return;
+        }
 
         using Clock = std::chrono::steady_clock;
         const auto t0 = Clock::now();
 
         // Reset per-search counters. Stagger each worker's starting depth.
-        const uint64_t per_worker_budget =
-            (cfg.max_evals + static_cast<uint64_t>(num_workers_) - 1)
-            / static_cast<uint64_t>(num_workers_);
+        // No per-worker eval slice is set: `cfg.max_evals` is enforced as
+        // a single aggregate budget by the loop below.
         total_evals_.store(0, std::memory_order_relaxed);
         for (int i = 0; i < num_workers_; ++i) {
             auto& w = *workers_[i];
             w.stop.store(false, std::memory_order_relaxed);
             w.evals.store(0, std::memory_order_relaxed);
             w.tt_claims.store(0, std::memory_order_relaxed);
-            w.budget.store(per_worker_budget, std::memory_order_relaxed);
             const float start = cfg.start_depth
                               + (static_cast<float>(i) / static_cast<float>(num_workers_))
                                 * cfg.delta_depth;
@@ -1107,31 +1612,61 @@ private:
 
         // Aggregator + UCI info loop. Emit `info depth ...` only when the
         // integer centi-depth derived from the minimum worker depth changes.
-        long last_depth_centi = std::numeric_limits<long>::min();
+        //
+        // Termination conditions (any one ends the loop):
+        //   1. `stop_token` requested (UCI `stop`, `quit()`, etc.) —
+        //      flips immediately at the top of every tick.
+        //   2. Every worker's depth has reached `cfg.max_depth` — no
+        //      runner has any more iterations to start. Needed because
+        //      in-search Syzygy can leave the search spinning on
+        //      terminal children that never trigger GPU evals, so an
+        //      eval-only termination would never trip.
+        //   3. `min_depth() >= cfg.target_min_depth` — explicit depth
+        //      target was hit.
+        //   4. Aggregate eval budget grace: once `evals_sum >=
+        //      cfg.max_evals` is observed we latch the current
+        //      `min_depth()` and keep running. Termination fires on the
+        //      next tick where `min_depth()` strictly exceeds the
+        //      latched value — i.e. the slowest worker has since
+        //      finished one more iteration. This evens out termination
+        //      depth across Lazy-SMP workers; expect a per-search eval
+        //      overshoot of one slow-worker iteration.
+        long  last_depth_centi    = std::numeric_limits<long>::min();
+        bool  budget_exhausted    = false;
+        float min_depth_at_budget =
+            -std::numeric_limits<float>::infinity();
         while (true) {
-            const bool stop_requested = st.stop_requested();
-            bool all_done = true;
-            for (const auto& w : workers_) {
-                if (w->runner.joinable()
-                    && w->evals.load(std::memory_order_relaxed)
-                       < w->budget.load(std::memory_order_relaxed)) {
-                    all_done = false;
-                    break;
-                }
-            }
-            if (stop_requested || all_done) break;
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (st.stop_requested()) break;
 
             uint64_t evals_sum = 0;
             uint64_t claims_sum = 0;
             float    min_d = std::numeric_limits<float>::infinity();
+            bool     all_at_max_depth = true;
             for (const auto& w : workers_) {
                 evals_sum  += w->evals.load(std::memory_order_relaxed);
                 claims_sum += w->tt_claims.load(std::memory_order_relaxed);
-                min_d = std::min(min_d, w->depth.load(std::memory_order_relaxed));
+                const float d = w->depth.load(std::memory_order_relaxed);
+                min_d = std::min(min_d, d);
+                if (d < cfg.max_depth) all_at_max_depth = false;
             }
             total_evals_.store(evals_sum, std::memory_order_relaxed);
+
+            if (all_at_max_depth) break;
+            if (std::isfinite(min_d) && min_d >= cfg.target_min_depth) break;
+
+            // Budget grace: latch min_d the first time we see the
+            // aggregate budget exhausted; on a subsequent tick where
+            // min_d has strictly advanced, terminate.
+            if (!budget_exhausted && evals_sum >= cfg.max_evals) {
+                budget_exhausted    = true;
+                min_depth_at_budget = std::isfinite(min_d)
+                    ? min_d
+                    : -std::numeric_limits<float>::infinity();
+            }
+            if (budget_exhausted && std::isfinite(min_d)
+                && min_d > min_depth_at_budget) {
+                break;
+            }
 
             // UCI's `depth` field is integer-valued (cutechess parses via
             // QString::toInt and most other GUIs do the same). Encode our
@@ -1140,25 +1675,29 @@ private:
             const long depth_centi = std::isfinite(min_d)
                 ? std::lround(min_d * 100.0f)
                 : 0L;
-            if (depth_centi == last_depth_centi) continue;
+            if (depth_centi == last_depth_centi) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
 
             const auto now = Clock::now();
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - t0).count();
             const long long mss = static_cast<long long>(ms);
 
-            // Single-move PV from the current TT-derived best move.
-            // `bestmove()` is documented safe to call concurrently with a
-            // search in flight; cost is trivial here since emissions fire
-            // only on depth-step transitions.
-            char pv_field[16];
-            const chess::Move best_now = bestmove();
-            if (best_now != chess::Move::NO_MOVE) {
-                const std::string uci_move = chess::uci::moveToUci(best_now);
-                std::snprintf(pv_field, sizeof(pv_field),
-                              " pv %s", uci_move.c_str());
-            } else {
-                pv_field[0] = '\0';
+            // Full PV walked from the current TT. Cost is bounded by
+            // `principal_variation`'s max_len cap; emissions fire only
+            // on depth-step transitions so this is well-amortized.
+            // `principal_variation()` shares bestmove()'s acquire-loaded
+            // TT reads and is documented safe mid-search.
+            std::string pv_field;
+            const std::vector<chess::Move> pv_moves = principal_variation();
+            if (!pv_moves.empty()) {
+                pv_field = " pv";
+                for (const chess::Move& m : pv_moves) {
+                    pv_field += ' ';
+                    pv_field += chess::uci::moveToUci(m);
+                }
             }
 
             // Root-position score from the TT: report the root's own Q
@@ -1177,7 +1716,10 @@ private:
                 score_field[0] = '\0';
             }
 
-            char buf[256];
+            // Buffer sized for the fixed prefix + scores + a full PV. PV
+            // is capped to `principal_variation`'s max_len (100) plies of
+            // up to 6 chars each ("e7e8q "), so 1KiB is comfortable.
+            char buf[1024];
             std::snprintf(buf, sizeof(buf),
                 "info depth %ld%s nodes %llu tt_claims %llu time %lld nps %lld%s",
                 depth_centi,
@@ -1186,9 +1728,11 @@ private:
                 static_cast<unsigned long long>(claims_sum),
                 mss,
                 mss > 0 ? static_cast<long long>(evals_sum) * 1000 / mss : 0,
-                pv_field);
+                pv_field.c_str());
             emit(buf);
             last_depth_centi = depth_centi;
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
 
         // Stop fan-out + join runners. Do NOT shutdown the persistent
@@ -1227,6 +1771,12 @@ private:
     /**
      * Runner body. Spawned per-search by worker_main on its own jthread.
      * Drives the iterative-deepening loop for this worker.
+     *
+     * The runner has no per-worker eval cap of its own — it keeps
+     * grinding iterations until either the cooperative `stop` flag
+     * flips (set by `worker_main` when the aggregate budget grace
+     * expires, a `stop_token` fires, or any other terminator) or the
+     * local ID depth reaches `cfg.max_depth`.
      */
     void run_worker_search(WorkerSearch& w, int worker_idx,
                            const LksSearchConfig& cfg)
@@ -1260,6 +1810,7 @@ private:
             /*sem=*/w.sem.get(),
             /*w=*/&w,
             /*params=*/&params,
+            /*syzygy=*/syzygy_.get(),
         };
         lf::sync_wait(*w.pool, detail::root_search, &ctx, board_, depth);
     }
@@ -1281,6 +1832,12 @@ private:
     std::jthread                               worker_;
     std::atomic<bool>                          running_{false};
     std::atomic<uint64_t>                      total_evals_{0};
+
+    // Syzygy tablebase prober — owns Fathom's global tb_init/tb_free
+    // lifecycle. Null when no Syzygy path was provided. Probed once at
+    // the top of every `worker_main` (before runners spawn) so the
+    // not-thread-safe `tb_probe_root` is safe.
+    std::unique_ptr<catgpt::SyzygyProber> syzygy_;
 };
 
 }  // namespace catgpt::lks

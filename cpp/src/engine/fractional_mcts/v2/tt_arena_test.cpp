@@ -42,6 +42,7 @@ using catgpt::v2::TerminalKind;
 using catgpt::v2::kTerminalNone;
 using catgpt::v2::kTerminalDraw;
 using catgpt::v2::kTerminalLossForChild;
+using catgpt::v2::kTerminalWinForChild;
 
 namespace {
 
@@ -83,9 +84,11 @@ float fp16_round_trip(float x) {
 float fp16_terminal_round_trip(float x) {
     _Float16 h = static_cast<_Float16>(x);
     uint16_t bits = std::bit_cast<uint16_t>(h);
-    // Strip any accidental sign bit (fp16 can produce -0) and clear LSB.
+    // Strip any accidental sign bit (fp16 can produce -0) and clear the
+    // two LSBs that MoveInfo's terminal encoding now uses for the kind
+    // discriminator.
     bits = static_cast<uint16_t>(bits & 0x7FFFu);
-    bits = static_cast<uint16_t>(bits & ~static_cast<uint16_t>(0x0001u));
+    bits = static_cast<uint16_t>(bits & ~static_cast<uint16_t>(0x0003u));
     _Float16 h2 = std::bit_cast<_Float16>(bits);
     return static_cast<float>(h2);
 }
@@ -95,6 +98,7 @@ constexpr const char* kind_name(TerminalKind k) {
         case kTerminalNone:         return "kTerminalNone";
         case kTerminalDraw:         return "kTerminalDraw";
         case kTerminalLossForChild: return "kTerminalLossForChild";
+        case kTerminalWinForChild:  return "kTerminalWinForChild";
     }
     return "?";
 }
@@ -155,13 +159,15 @@ void test_non_terminal_round_trip() {
 }
 
 void test_terminal_round_trip() {
-    std::printf("[3] terminal-Draw / terminal-LossForChild round-trip\n");
+    std::printf("[3] terminal-Draw / terminal-LossForChild / terminal-WinForChild round-trip\n");
 
     const float p_values[] = {
         0.0f, 1e-4f, 1e-3f, 0.01f, 0.05f, 0.1f, 0.25f, 0.5f, 0.75f, 0.9f,
         0.99f, 1.0f,
     };
-    const TerminalKind kinds[] = { kTerminalDraw, kTerminalLossForChild };
+    const TerminalKind kinds[] = {
+        kTerminalDraw, kTerminalLossForChild, kTerminalWinForChild
+    };
 
     for (TerminalKind tk : kinds) {
         for (float p : p_values) {
@@ -198,7 +204,7 @@ void test_move_field_independence() {
     // We spot-check every 17th u16 for speed (still >3800 samples).
     const float p_samples[] = { 0.0f, 0.001f, 0.5f, 1.0f };
     const TerminalKind tk_samples[] = {
-        kTerminalNone, kTerminalDraw, kTerminalLossForChild
+        kTerminalNone, kTerminalDraw, kTerminalLossForChild, kTerminalWinForChild
     };
 
     int samples = 0;
@@ -236,10 +242,14 @@ void test_edge_bit_patterns() {
         MoveInfo mil = MoveInfo::pack(0, 0.0f, kTerminalLossForChild);
         EXPECT(mil.terminal_kind() == kTerminalLossForChild);
         EXPECT_EQ_F(mil.P(), 0.0f);
+
+        MoveInfo miw = MoveInfo::pack(0, 0.0f, kTerminalWinForChild);
+        EXPECT(miw.terminal_kind() == kTerminalWinForChild);
+        EXPECT_EQ_F(miw.P(), 0.0f);
     }
 
-    // P = 1, every kind. Lossless for non-terminal; terminal form
-    // drops the mantissa LSB but 1.0's mantissa is all-zero so it's
+    // P = 1, every kind. Lossless for non-terminal; terminal form drops
+    // the two mantissa LSBs but 1.0's mantissa is all-zero so it's
     // lossless here too.
     {
         MoveInfo mi0 = MoveInfo::pack(0, 1.0f, kTerminalNone);
@@ -253,11 +263,15 @@ void test_edge_bit_patterns() {
         MoveInfo mil = MoveInfo::pack(0, 1.0f, kTerminalLossForChild);
         EXPECT(mil.terminal_kind() == kTerminalLossForChild);
         EXPECT_EQ_F(mil.P(), 1.0f);
+
+        MoveInfo miw = MoveInfo::pack(0, 1.0f, kTerminalWinForChild);
+        EXPECT(miw.terminal_kind() == kTerminalWinForChild);
+        EXPECT_EQ_F(miw.P(), 1.0f);
     }
 
-    // The 1-bit-precision-loss pattern. fp16(1.0 + 2^-10) has mantissa
-    // 0x001, so terminal encoding clears it back to 1.0 exactly, while
-    // non-terminal retains the extra ULP.
+    // 1-bit-precision-loss boundary. fp16(1.0 + 2^-10) has mantissa
+    // 0x001; terminal encoding clears the two LSBs so it rounds back to
+    // 1.0 exactly, while non-terminal retains the extra ULP.
     {
         const float boundary = 1.0f + std::ldexp(1.0f, -10);
         MoveInfo mi0 = MoveInfo::pack(0, boundary, kTerminalNone);
@@ -272,6 +286,28 @@ void test_edge_bit_patterns() {
         MoveInfo mil = MoveInfo::pack(0, boundary, kTerminalLossForChild);
         EXPECT(mil.terminal_kind() == kTerminalLossForChild);
         EXPECT_EQ_F(mil.P(), 1.0f);
+
+        MoveInfo miw = MoveInfo::pack(0, boundary, kTerminalWinForChild);
+        EXPECT(miw.terminal_kind() == kTerminalWinForChild);
+        EXPECT_EQ_F(miw.P(), 1.0f);
+    }
+
+    // 2-bit-precision-loss boundary. fp16(1.0 + 2*2^-10) has mantissa
+    // 0x002. Non-terminal retains both bits; terminal clears them, so it
+    // decodes back to exactly 1.0.
+    {
+        const float boundary = 1.0f + 2.0f * std::ldexp(1.0f, -10);
+        MoveInfo mi0 = MoveInfo::pack(0, boundary, kTerminalNone);
+        EXPECT(mi0.terminal_kind() == kTerminalNone);
+        EXPECT(mi0.P() > 1.0f);
+
+        MoveInfo mid = MoveInfo::pack(0, boundary, kTerminalDraw);
+        EXPECT(mid.terminal_kind() == kTerminalDraw);
+        EXPECT_EQ_F(mid.P(), 1.0f);
+
+        MoveInfo miw = MoveInfo::pack(0, boundary, kTerminalWinForChild);
+        EXPECT(miw.terminal_kind() == kTerminalWinForChild);
+        EXPECT_EQ_F(miw.P(), 1.0f);
     }
 }
 
@@ -298,15 +334,15 @@ void test_monotonicity() {
 }
 
 void test_randomized_round_trip() {
-    std::printf("[7] randomized softmax-like P inputs, all three kinds\n");
+    std::printf("[7] randomized softmax-like P inputs, all four kinds\n");
 
     std::mt19937_64 rng(0xCA7CA7CAFEFEFEFEULL);
     std::uniform_real_distribution<float> uni_p(0.0f, 1.0f);
-    std::uniform_int_distribution<int> uni_kind(0, 2);
+    std::uniform_int_distribution<int> uni_kind(0, 3);
     std::uniform_int_distribution<uint32_t> uni_move(0, 0xFFFFu);
 
     constexpr int N = 50000;
-    int kind_hits[3] = {0, 0, 0};
+    int kind_hits[4] = {0, 0, 0, 0};
 
     for (int i = 0; i < N; ++i) {
         // Simulate a softmax: draw a few logits, softmax them, pick one.
@@ -326,7 +362,8 @@ void test_randomized_round_trip() {
         const int k = uni_kind(rng);
         const TerminalKind tk = (k == 0) ? kTerminalNone
                               : (k == 1) ? kTerminalDraw
-                                         : kTerminalLossForChild;
+                              : (k == 2) ? kTerminalLossForChild
+                                         : kTerminalWinForChild;
         ++kind_hits[k];
 
         const uint16_t move = static_cast<uint16_t>(uni_move(rng));
@@ -348,10 +385,11 @@ void test_randomized_round_trip() {
         }
     }
 
-    // Sanity: all three kinds actually got exercised.
-    EXPECT(kind_hits[0] > N / 4);
-    EXPECT(kind_hits[1] > N / 4);
-    EXPECT(kind_hits[2] > N / 4);
+    // Sanity: all four kinds actually got exercised (each ~N/4).
+    EXPECT(kind_hits[0] > N / 8);
+    EXPECT(kind_hits[1] > N / 8);
+    EXPECT(kind_hits[2] > N / 8);
+    EXPECT(kind_hits[3] > N / 8);
 }
 
 void test_exhaustive_packed_patterns_never_crash() {
@@ -376,7 +414,8 @@ void test_exhaustive_packed_patterns_never_crash() {
         TerminalKind tk = mi.terminal_kind();
         EXPECT(tk == kTerminalNone
             || tk == kTerminalDraw
-            || tk == kTerminalLossForChild);
+            || tk == kTerminalLossForChild
+            || tk == kTerminalWinForChild);
 
         const float p = mi.P();
         if (std::isnan(p)) ++nan_count; else ++sane_count;

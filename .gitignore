@@ -11,6 +11,7 @@ downloads/
 eggs/
 .eggs/
 lib/
+!web/src/lib/
 lib64/
 parts/
 sdist/
@@ -60,6 +61,7 @@ checkpoints/
 checkpoints_jax/
 outputs/
 runs/
+!web/src/app/api/longbench/runs/
 wandb/
 mlruns/
 lightning_logs/
@@ -146,3 +148,6 @@ Makefile
 
 # engines
 engines/
+
+# Cursor (contains secrets like MCP API keys)
+.cursor/mcp.json

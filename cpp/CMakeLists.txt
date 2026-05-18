@@ -41,7 +41,7 @@ if(LIBCORO_LIB AND EXISTS "${LIBCORO_INCLUDE_DIR}/coro/task.hpp")
 else()
     set(HAVE_LIBCORO FALSE)
     message(STATUS "libcoro not found at ${LIBCORO_LIB_DIR} / ${LIBCORO_INCLUDE_DIR}; "
-                   "skipping legacy catgpt_* targets (catgpt_mcts, catgpt_search, "
+                   "skipping legacy catgpt_* targets (catgpt_mcts, "
                    "catgpt_fractional_mcts, catgpt_selfplay, catgpt_puzzle_eval)")
 endif()
 
@@ -173,35 +173,36 @@ set_target_properties(catgpt_mcts PROPERTIES
 )
 endif()
 
-# === CatGPT Search Binary (standalone Fractional MCTS for web UI) ===
-# Uses CoroutineSearch (same algorithm as selfplay) with coroutine infrastructure
-if(HAVE_LIBCORO)
+# === CatGPT Search Binary (standalone LKS search for web UI) ===
+# Wraps catgpt::lks::LksSearch and emits JSON-per-line stats that the
+# Next.js backend in web/ parses for live SSE updates. Pure libfork
+# path — no libcoro dependency.
 add_executable(catgpt_search
-    src/catgpt_search_main.cpp
+    src/lks_search_main.cpp
 )
 
 target_include_directories(catgpt_search PRIVATE
     ${CHESS_LIBRARY_INCLUDE_DIR}
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
-    ${LIBCORO_INCLUDE_DIR}
+    ${FATHOM_SRC_DIR}
 )
 
 target_link_libraries(catgpt_search PRIVATE
+    libfork::libfork
     ${NVINFER_LIB}
     ${CUDART_LIB}
-    ${LIBCORO_LIB}
+    fathom
     pthread
+    atomic
 )
 
-# libcoro requires -fcoroutines on GCC
-target_compile_options(catgpt_search PRIVATE -fcoroutines)
+target_compile_options(catgpt_search PRIVATE -fcoroutines -mcx16)
 
 set_target_properties(catgpt_search PROPERTIES
-    BUILD_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
-    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR};${LIBCORO_LIB_DIR}"
+    BUILD_RPATH   "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
 )
-endif()
 
 # === Fathom (Syzygy tablebase probing, C library) ===
 set(FATHOM_SRC_DIR "${CMAKE_SOURCE_DIR}/external/fathom/src")
@@ -323,12 +324,14 @@ target_include_directories(lks_search_test PRIVATE
     ${CHESS_LIBRARY_INCLUDE_DIR}
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
+    ${FATHOM_SRC_DIR}
 )
 target_compile_options(lks_search_test PRIVATE -O2 -g -fcoroutines -mcx16)
 target_link_libraries(lks_search_test PRIVATE
     libfork::libfork
     ${NVINFER_LIB}
     ${CUDART_LIB}
+    fathom
     pthread
     atomic
 )
@@ -345,12 +348,14 @@ target_include_directories(lks_throughput_bench PRIVATE
     ${CHESS_LIBRARY_INCLUDE_DIR}
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
+    ${FATHOM_SRC_DIR}
 )
 target_compile_options(lks_throughput_bench PRIVATE -O3 -march=native -fcoroutines -mcx16)
 target_link_libraries(lks_throughput_bench PRIVATE
     libfork::libfork
     ${NVINFER_LIB}
     ${CUDART_LIB}
+    fathom
     pthread
     atomic
 )
@@ -383,11 +388,13 @@ target_include_directories(lks_uci PRIVATE
     ${CHESS_LIBRARY_INCLUDE_DIR}
     ${TENSORRT_INCLUDE_DIR}
     ${CUDA_INCLUDE_DIR}
+    ${FATHOM_SRC_DIR}
 )
 target_link_libraries(lks_uci PRIVATE
     libfork::libfork
     ${NVINFER_LIB}
     ${CUDART_LIB}
+    fathom
     pthread
     atomic
 )
@@ -407,11 +414,11 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(tt_arena_test PRIVATE -fdiagnostics-color=always)
     target_compile_options(lks_search_test PRIVATE -fdiagnostics-color=always)
     target_compile_options(lks_uci PRIVATE -fdiagnostics-color=always)
+    target_compile_options(catgpt_search PRIVATE -fdiagnostics-color=always)
     if(HAVE_LIBCORO)
         target_compile_options(catgpt_fractional_mcts PRIVATE -fdiagnostics-color=always)
         target_compile_options(catgpt_mcts PRIVATE -fdiagnostics-color=always)
         target_compile_options(catgpt_selfplay PRIVATE -fdiagnostics-color=always)
-        target_compile_options(catgpt_search PRIVATE -fdiagnostics-color=always)
         target_compile_options(catgpt_puzzle_eval PRIVATE -fdiagnostics-color=always)
     endif()
 endif()

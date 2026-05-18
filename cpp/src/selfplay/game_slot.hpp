@@ -16,7 +16,7 @@
 
 #include "../../external/chess-library/include/chess.hpp"
 #include "selfplay_config.hpp"
-#include "syzygy.hpp"
+#include "../syzygy.hpp"
 
 namespace catgpt {
 
