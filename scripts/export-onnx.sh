@@ -6,9 +6,10 @@
 # occurrences with dynamic dimension (-1).
 #
 # Outputs (in order):
-#   wdl_value    — WDL-derived Q value, scalar (batch,)
-#   bestq_probs  — BestQ HL-Gauss distribution (batch, 81)
-#   policy_logit — Move distribution logits (batch, 4672)
+#   wdl_value               — WDL-derived Q value, scalar (batch,)
+#   bestq_probs             — BestQ HL-Gauss distribution (batch, 81)
+#   policy_logit            — Move distribution logits (batch, 4672)
+#   optimistic_policy_logit — Optimistic policy logits (batch, 4672)
 #
 # Usage: ./export-onnx.sh [checkpoint_path]
 
@@ -17,7 +18,7 @@ set -e
 uv run python scripts/export_onnx.py \
     --checkpoint ./checkpoints_jax/S2/shard_12 \
     --output-path main.onnx \
-    --output-keys wdl_value bestq_probs policy_logit \
+    --output-keys wdl_value bestq_probs policy_logit optimistic_policy_logit \
     --dynamic-batch \
     --opset 20 \
     --validate

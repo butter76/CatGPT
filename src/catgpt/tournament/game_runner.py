@@ -108,14 +108,14 @@ class GameResult:
         # Build PGN header
         lines = [
             f'[Event "{event}"]',
-            f'[Site "Local"]',
+            '[Site "Local"]',
             f'[Date "{datetime.now().strftime("%Y.%m.%d")}"]',
             f'[Round "{round_num}"]',
             f'[White "{white_name}"]',
             f'[Black "{black_name}"]',
             f'[Result "{self.result}"]',
             f'[FEN "{self.opening_fen}"]',
-            f'[SetUp "1"]',
+            '[SetUp "1"]',
             f'[Termination "{self.termination.value}"]',
             f'[WhiteNodes "{self.nodes_white}"]',
             f'[BlackNodes "{self.nodes_black}"]',

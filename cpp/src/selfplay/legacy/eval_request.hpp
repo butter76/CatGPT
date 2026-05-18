@@ -40,14 +40,16 @@ class BatchEvaluator;
  * This is what the GPU thread writes after batched inference.
  *
  * The model exports:
- *   value            — WDL-derived Q value P(W)+0.5*P(D) in [0, 1]
- *   value_probs      — BestQ HL-Gauss distribution (81 bins)
- *   policy           — Move distribution logits (4672)
+ *   value             — WDL-derived Q value P(W)+0.5*P(D) in [0, 1]
+ *   value_probs       — BestQ HL-Gauss distribution (81 bins)
+ *   policy            — Move distribution logits (4672)
+ *   optimistic_policy — Optimistic policy logits (4672)
  */
 struct RawNNOutput {
-    float value;                                    // WDL-derived Q value [0, 1]
-    std::array<float, VALUE_NUM_BINS> value_probs;  // BestQ distribution (81 bins)
-    std::array<float, POLICY_SIZE> policy;          // Policy logits (4672)
+    float value;                                          // WDL-derived Q value [0, 1]
+    std::array<float, VALUE_NUM_BINS> value_probs;        // BestQ distribution (81 bins)
+    std::array<float, POLICY_SIZE> policy;                // Policy logits (4672)
+    std::array<float, POLICY_SIZE> optimistic_policy;     // Optimistic policy logits (4672)
 };
 
 /**

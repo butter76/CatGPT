@@ -13,13 +13,14 @@
 #     any expected bucket is missing from the .network file.
 #
 # ONNX outputs (auto-detected by TRT):
-#   wdl_value    — WDL-derived Q value, scalar (batch,)
-#   bestq_probs  — BestQ HL-Gauss distribution (batch, 81)
-#   policy_logit — Move distribution logits (batch, 4672)
+#   wdl_value               — WDL-derived Q value, scalar (batch,)
+#   bestq_probs             — BestQ HL-Gauss distribution (batch, 81)
+#   policy_logit            — Move distribution logits (batch, 4672)
+#   optimistic_policy_logit — Optimistic policy logits (batch, 4672)
 
 set -euo pipefail
 
-TRT_ROOT=/home/shadeform/TensorRT-10.13.3.9
+TRT_ROOT=/home/shadeform/TensorRT-10.13.2.6
 TRTEXEC=${TRT_ROOT}/bin/trtexec
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:${TRT_ROOT}/lib
 
