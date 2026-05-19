@@ -660,16 +660,11 @@ class BidirectionalTransformer(nn.Module):
             # Softmax to get probability distributions
             rootq_probs = jax.nn.softmax(rootq_logits, axis=-1)  # (batch, num_bins)
             bestq_probs = jax.nn.softmax(bestq_logits, axis=-1)  # (batch, num_bins)
-            wdl_probs = jax.nn.softmax(wdl_logits, axis=-1)  # (batch, 3)
-
             # Expected value: weighted sum of bin centers
             # Bins span [0, 1], so centers are at (i + 0.5) / num_bins for i in [0, num_bins)
             bin_centers = (jnp.arange(num_bins) + 0.5) / num_bins  # (num_bins,)
             rootq_expected = jnp.sum(rootq_probs * bin_centers, axis=-1)  # (batch,)
             bestq_expected = jnp.sum(bestq_probs * bin_centers, axis=-1)  # (batch,)
-
-            # WDL value: P(W)*1 + P(D)*0.5 + P(L)*0
-            wdl_value = wdl_probs[:, 0] + 0.5 * wdl_probs[:, 1]  # (batch,)
 
             # Variance of bestQ distribution: Var(X) = E[X^2] - E[X]^2
             bestq_var = jnp.sum(bestq_probs * bin_centers**2, axis=-1) - bestq_expected**2  # (batch,)
@@ -677,9 +672,7 @@ class BidirectionalTransformer(nn.Module):
             outputs["value_logit"] = value_logits  # Full concatenated logits
             outputs["rootq_logit"] = rootq_logits  # For rootQ cross-entropy loss
             outputs["bestq_logit"] = bestq_logits  # For bestQ cross-entropy loss
-            outputs["wdl_logit"] = wdl_logits  # For WDL cross-entropy loss (batch, 3)
-            outputs["wdl_value"] = wdl_value  # WDL-derived value for metrics (batch,)
-            outputs["wdl_probs"] = wdl_probs  # WDL probabilities [W, D, L] (batch, 3)
+            outputs["wdl_logit"] = wdl_logits  # For WDL CE loss + C++ inference (batch, 3)
             outputs["value"] = rootq_expected  # RootQ scalar for metrics/inference
             outputs["best_value"] = bestq_expected  # BestQ scalar for metrics
             outputs["bestq_probs"] = bestq_probs  # BestQ probability distribution (batch, num_bins)

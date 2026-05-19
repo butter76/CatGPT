@@ -22,8 +22,8 @@
 #define CATGPT_SELFPLAY_EVAL_REQUEST_HPP
 
 #include <array>
+#include <cmath>
 #include <cstdint>
-
 #include <libfork/core.hpp>
 
 #include "../engine/nn_constants.hpp"
@@ -34,17 +34,42 @@ namespace catgpt {
 // Forward declaration — defined in batch_evaluator.hpp
 class BatchEvaluator;
 
+/** Number of WDL classes: [Win, Draw, Loss] from current side to move. */
+inline constexpr std::size_t WDL_NUM_CLASSES = 3;
+
+/**
+ * Q in [-1, 1] from raw WDL logits. Stable softmax in fp32; equivalent to
+ * 2 * (P(W) + 0.5*P(D)) - 1 = (P(W) - P(L)) on the simplex.
+ */
+inline float wdl_logits_to_q(const std::array<float, WDL_NUM_CLASSES>& logits) noexcept
+{
+    const float m = std::max({logits[0], logits[1], logits[2]});
+    const float ew = std::exp(logits[0] - m);
+    const float ed = std::exp(logits[1] - m);
+    const float el = std::exp(logits[2] - m);
+    const float inv_z = 1.0f / (ew + ed + el);
+    return (ew - el) * inv_z;
+}
+
+/**
+ * WDL-derived scalar in [0, 1]: P(W) + 0.5*P(D).
+ */
+inline float wdl_logits_to_value(const std::array<float, WDL_NUM_CLASSES>& logits) noexcept
+{
+    return 0.5f * (wdl_logits_to_q(logits) + 1.0f);
+}
+
 /**
  * Raw neural-network output for a single position.
  * This is what the GPU thread writes after batched inference.
  *
  * The model exports:
- *   value       — WDL-derived Q value P(W)+0.5*P(D) in [0, 1]
+ *   wdl_logits  — raw WDL logits [W, D, L] (softmax + Q on host)
  *   value_probs — BestQ HL-Gauss distribution (81 bins)
  *   policy      — Optimistic policy logits (4672)
  */
 struct RawNNOutput {
-    float value;                                          // WDL-derived Q value [0, 1]
+    std::array<float, WDL_NUM_CLASSES> wdl_logits;        // raw WDL logits [W, D, L]
     std::array<float, VALUE_NUM_BINS> value_probs;        // BestQ distribution (81 bins)
     std::array<float, POLICY_SIZE> policy;                // Optimistic policy logits (4672)
 };

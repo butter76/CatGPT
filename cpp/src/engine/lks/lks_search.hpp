@@ -324,7 +324,7 @@ inline void softmax_legal_sorted(const RawNNOutput& out,
 
 /**
  * Variance of the NN value distribution, measured in the same
- * [-1, 1] scale as `Q = 2*out.value - 1`. The HL-Gauss head's 81
+ * [-1, 1] scale as Q from WDL logits. The HL-Gauss head's 81
  * bins are taken as equal-width over [-1, 1] with the i-th center
  * at `-1 + (i + 0.5) * (2 / VALUE_NUM_BINS)`.
  *
@@ -556,7 +556,7 @@ inline constexpr auto recursive_search =
         v2::NodeInfoHeader* hdr_w = ctx->arena->info_at(off);
         hdr_w->variance = variance;
 
-        const float Q = 2.0f * out.value - 1.0f;
+        const float Q = catgpt::wdl_logits_to_q(out.wdl_logits);
 
         // Heuristic initial max_depth for this fresh TT entry:
         //   default_max_depth = -log(variance * C)

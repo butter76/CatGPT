@@ -4,7 +4,7 @@
  * Loads a TensorRT engine and benchmarks inference at various batch sizes.
  * The model expects:
  *   - Input:                int32   (batch, 64)   - chess position tokens
- *   - Output wdl_value:     float32 (batch,)      - WDL-derived Q value [-1, 1] (or [0, 1])
+ *   - Output wdl_logit:     float32 (batch, 3)    - raw WDL logits [W, D, L]
  *   - Output bestq_probs:   float32 (batch, 81)   - HL-Gauss value distribution
  *   - Output policy:        float32 (batch, 4672) - policy logits
  */
@@ -292,9 +292,21 @@ private:
 
 // Number of bins in the HL-Gauss value distribution
 static constexpr int32_t VALUE_NUM_BINS = 81;
+static constexpr int32_t WDL_NUM_CLASSES = 3;
+
+inline float wdl_logits_to_q(const float* logits) noexcept
+{
+    const float m = std::max({logits[0], logits[1], logits[2]});
+    const float ew = std::exp(logits[0] - m);
+    const float ed = std::exp(logits[1] - m);
+    const float el = std::exp(logits[2] - m);
+    const float inv_z = 1.0f / (ew + ed + el);
+    return (ew - el) * inv_z;
+}
+
 // Inference result containing all model outputs
 struct InferenceResult {
-    std::vector<float> values;                     // (batch,) - WDL-derived Q value
+    std::vector<float> wdl_logits;                 // (batch * 3) - raw WDL logits
     std::vector<float> value_probs;                // (batch * VALUE_NUM_BINS) - bestq HL-Gauss distribution
     std::vector<float> policy_logits;              // (batch * POLICY_SIZE) - policy logits
 };
@@ -388,22 +400,22 @@ private:
     struct CachedBatchResources {
         std::unique_ptr<nvinfer1::IExecutionContext> context;
         CudaBuffer<int32_t> input_buffer;
-        CudaBuffer<float> value_buffer;
+        CudaBuffer<float> wdl_buffer;
         CudaBuffer<float> value_probs_buffer;
         CudaBuffer<float> policy_buffer;
         PinnedBuffer<int32_t> pinned_input;
-        PinnedBuffer<float> pinned_value;
+        PinnedBuffer<float> pinned_wdl;
         PinnedBuffer<float> pinned_value_probs;
         PinnedBuffer<float> pinned_policy;
         CudaGraphExec graph_exec;
 
         CachedBatchResources(int32_t batch_size)
             : input_buffer(batch_size * SEQ_LENGTH),
-              value_buffer(batch_size),
+              wdl_buffer(batch_size * WDL_NUM_CLASSES),
               value_probs_buffer(batch_size * VALUE_NUM_BINS),
               policy_buffer(batch_size * POLICY_SIZE),
               pinned_input(batch_size * SEQ_LENGTH),
-              pinned_value(batch_size),
+              pinned_wdl(batch_size * WDL_NUM_CLASSES),
               pinned_value_probs(batch_size * VALUE_NUM_BINS),
               pinned_policy(batch_size * POLICY_SIZE) {}
     };
@@ -426,10 +438,11 @@ private:
 
         // Copy from pinned output buffers (CPU-side, not part of graph)
         InferenceResult result;
-        result.values.resize(batch_size);
+        result.wdl_logits.resize(batch_size * WDL_NUM_CLASSES);
         result.value_probs.resize(batch_size * VALUE_NUM_BINS);
         result.policy_logits.resize(batch_size * POLICY_SIZE);
-        std::memcpy(result.values.data(), res.pinned_value.get(), batch_size * sizeof(float));
+        std::memcpy(result.wdl_logits.data(), res.pinned_wdl.get(),
+                    batch_size * WDL_NUM_CLASSES * sizeof(float));
         std::memcpy(result.value_probs.data(), res.pinned_value_probs.get(),
                     batch_size * VALUE_NUM_BINS * sizeof(float));
         std::memcpy(result.policy_logits.data(), res.pinned_policy.get(),
@@ -444,7 +457,7 @@ private:
 
         // Set up tensor addresses and shapes before capture (all outputs must be bound)
         ctx.setTensorAddress(input_name_.c_str(), res.input_buffer.get());
-        ctx.setTensorAddress(value_output_name_.c_str(), res.value_buffer.get());
+        ctx.setTensorAddress(wdl_output_name_.c_str(), res.wdl_buffer.get());
         if (!value_probs_output_name_.empty()) {
             ctx.setTensorAddress(value_probs_output_name_.c_str(), res.value_probs_buffer.get());
         }
@@ -474,7 +487,8 @@ private:
         }
 
         // D2H transfer (async, captured)
-        res.value_buffer.copy_to_host_async(res.pinned_value.get(), batch_size, stream_.get());
+        res.wdl_buffer.copy_to_host_async(res.pinned_wdl.get(),
+                                          batch_size * WDL_NUM_CLASSES, stream_.get());
         if (!value_probs_output_name_.empty()) {
             res.value_probs_buffer.copy_to_host_async(res.pinned_value_probs.get(), value_probs_count, stream_.get());
         }
@@ -538,13 +552,13 @@ public:
     }
 
     const std::string& input_name() const { return input_name_; }
-    const std::string& value_output_name() const { return value_output_name_; }
+    const std::string& wdl_output_name() const { return wdl_output_name_; }
     const std::string& value_probs_output_name() const { return value_probs_output_name_; }
     const std::string& policy_output_name() const { return policy_output_name_; }
 
     // Pipelined inference result
     struct PipelinedResult {
-        std::vector<float> values;
+        std::vector<float> wdl_logits;
         std::vector<float> value_probs;
         std::vector<float> policies;
     };
@@ -564,7 +578,7 @@ public:
         auto& db = it->second;
 
         PipelinedResult result;
-        result.values.reserve(batches.size() * batch_size);
+        result.wdl_logits.reserve(batches.size() * batch_size * WDL_NUM_CLASSES);
         result.value_probs.reserve(batches.size() * batch_size * VALUE_NUM_BINS);
         result.policies.reserve(batches.size() * batch_size * POLICY_SIZE);
 
@@ -589,9 +603,9 @@ public:
                 size_t out_idx = i - NUM_BUFFERS;
                 int out_slot = out_idx % NUM_BUFFERS;
                 auto& out_buf = db.buffers[out_slot];
-                result.values.insert(result.values.end(),
-                                     out_buf.pinned_value.get(),
-                                     out_buf.pinned_value.get() + batch_size);
+                result.wdl_logits.insert(result.wdl_logits.end(),
+                                         out_buf.pinned_wdl.get(),
+                                         out_buf.pinned_wdl.get() + batch_size * WDL_NUM_CLASSES);
                 result.value_probs.insert(result.value_probs.end(),
                                           out_buf.pinned_value_probs.get(),
                                           out_buf.pinned_value_probs.get() + value_probs_count);
@@ -616,9 +630,9 @@ public:
             int slot = i % NUM_BUFFERS;
             auto& buf = db.buffers[slot];
             buf.done_event.synchronize();
-            result.values.insert(result.values.end(),
-                                 buf.pinned_value.get(),
-                                 buf.pinned_value.get() + batch_size);
+            result.wdl_logits.insert(result.wdl_logits.end(),
+                                     buf.pinned_wdl.get(),
+                                     buf.pinned_wdl.get() + batch_size * WDL_NUM_CLASSES);
             result.value_probs.insert(result.value_probs.end(),
                                       buf.pinned_value_probs.get(),
                                       buf.pinned_value_probs.get() + value_probs_count);
@@ -684,21 +698,21 @@ private:
         std::unique_ptr<nvinfer1::IExecutionContext> context;
         CudaGraphExec graph_exec;
         CudaBuffer<int32_t> input_buffer;
-        CudaBuffer<float> value_buffer;
+        CudaBuffer<float> wdl_buffer;
         CudaBuffer<float> value_probs_buffer;
         CudaBuffer<float> policy_buffer;
         PinnedBuffer<int32_t> pinned_input;
-        PinnedBuffer<float> pinned_value;
+        PinnedBuffer<float> pinned_wdl;
         PinnedBuffer<float> pinned_value_probs;
         PinnedBuffer<float> pinned_policy;
 
         DoubleBufferSlot(int32_t batch_size)
             : input_buffer(batch_size * SEQ_LENGTH),
-              value_buffer(batch_size),
+              wdl_buffer(batch_size * WDL_NUM_CLASSES),
               value_probs_buffer(batch_size * VALUE_NUM_BINS),
               policy_buffer(batch_size * POLICY_SIZE),
               pinned_input(batch_size * SEQ_LENGTH),
-              pinned_value(batch_size),
+              pinned_wdl(batch_size * WDL_NUM_CLASSES),
               pinned_value_probs(batch_size * VALUE_NUM_BINS),
               pinned_policy(batch_size * POLICY_SIZE) {}
     };
@@ -780,7 +794,7 @@ private:
             // These persist on the context so the captured kernels reference the
             // correct device pointers.
             slot.context->setTensorAddress(input_name_.c_str(), slot.input_buffer.get());
-            slot.context->setTensorAddress(value_output_name_.c_str(), slot.value_buffer.get());
+            slot.context->setTensorAddress(wdl_output_name_.c_str(), slot.wdl_buffer.get());
             if (!value_probs_output_name_.empty()) {
                 slot.context->setTensorAddress(value_probs_output_name_.c_str(),
                                                slot.value_probs_buffer.get());
@@ -799,7 +813,8 @@ private:
                 throw std::runtime_error("TensorRT inference failed during pipelined graph capture");
             }
 
-            slot.value_buffer.copy_to_host_async(slot.pinned_value.get(), batch_size, slot.stream.get());
+            slot.wdl_buffer.copy_to_host_async(slot.pinned_wdl.get(),
+                                               batch_size * WDL_NUM_CLASSES, slot.stream.get());
             if (!value_probs_output_name_.empty()) {
                 slot.value_probs_buffer.copy_to_host_async(slot.pinned_value_probs.get(),
                                                            value_probs_count, slot.stream.get());
@@ -898,19 +913,16 @@ private:
             if (name_str.find("bestq_probs") != std::string::npos ||
                 name_str.find("value_probs") != std::string::npos) {
                 value_probs_output_name_ = name;
-            } else if (name_str.find("value") != std::string::npos ||
-                       name_str.find("Value") != std::string::npos) {
-                value_output_name_ = name;
+            } else if (name_str.find("wdl_logit") != std::string::npos ||
+                       name_str.find("wdl") != std::string::npos) {
+                wdl_output_name_ = name;
             } else if (name_str.find("policy") != std::string::npos ||
                        name_str.find("Policy") != std::string::npos) {
                 policy_output_name_ = name;
             } else {
                 // Fallback: detect by shape
-                //   wdl_value:   (batch,) or (batch, 1)
-                //   value_probs: (batch, 81)
-                //   policy:      (batch, 4672)
-                if (dims.nbDims == 1 || (dims.nbDims == 2 && dims.d[1] == 1)) {
-                    if (value_output_name_.empty()) value_output_name_ = name;
+                if (dims.nbDims == 2 && dims.d[1] == WDL_NUM_CLASSES) {
+                    if (wdl_output_name_.empty()) wdl_output_name_ = name;
                 } else if (dims.nbDims == 2 && dims.d[1] == VALUE_NUM_BINS) {
                     if (value_probs_output_name_.empty()) value_probs_output_name_ = name;
                 } else if (dims.nbDims == 2 && dims.d[1] == POLICY_SIZE) {
@@ -928,15 +940,15 @@ private:
         if (input_name_.empty()) {
             throw std::runtime_error("Could not find input tensor");
         }
-        if (value_output_name_.empty()) {
-            throw std::runtime_error("Could not find value output tensor");
+        if (wdl_output_name_.empty()) {
+            throw std::runtime_error("Could not find WDL output tensor (wdl_logit)");
         }
         if (policy_output_name_.empty()) {
             throw std::runtime_error("Could not find policy output tensor");
         }
 
         std::println("  -> Input: '{}'", input_name_);
-        std::println("  -> Value output: '{}'", value_output_name_);
+        std::println("  -> WDL output: '{}'", wdl_output_name_);
         std::println("  -> Value probs output: '{}'",
                      value_probs_output_name_.empty() ? "(not found)" : value_probs_output_name_);
         std::println("  -> Policy output: '{}'", policy_output_name_);
@@ -992,7 +1004,7 @@ private:
     std::unordered_map<int32_t, std::unique_ptr<nvinfer1::ICudaEngine>> engines_;
 
     std::string input_name_;
-    std::string value_output_name_;
+    std::string wdl_output_name_;
     std::string value_probs_output_name_;
     std::string policy_output_name_;
 
@@ -1095,7 +1107,8 @@ int main(int argc, char* argv[]) {
             std::vector<int32_t> test_input(TrtEngine::SEQ_LENGTH, 1);  // Simple test input
             auto result = engine.infer(test_input, 1);
             std::println("│ Single inference test:");
-            std::println("│   Value (Q from WDL): {:.6f}", result.values[0]);
+            std::println("│   Value (Q from WDL): {:.6f}",
+                         wdl_logits_to_q(result.wdl_logits.data()));
 
             // Show value distribution summary
             if (!result.value_probs.empty()) {

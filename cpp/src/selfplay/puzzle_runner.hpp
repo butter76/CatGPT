@@ -412,7 +412,7 @@ private:
     /** Submit a single eval and write the value-head output to `*dest`. */
     coro::task<void> eval_value_into(std::array<std::uint8_t, 64> tokens, float* dest) {
         RawNNOutput raw = co_await EvalAwaitable(*evaluator_, tokens);
-        *dest = raw.value;
+        *dest = wdl_logits_to_value(raw.wdl_logits);
     }
 
     /**

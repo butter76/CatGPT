@@ -24,6 +24,7 @@
 #define CATGPT_SELFPLAY_LEGACY_EVAL_REQUEST_HPP
 
 #include <array>
+#include <cmath>
 #include <coroutine>
 #include <cstdint>
 
@@ -35,21 +36,38 @@ namespace catgpt::legacy {
 // Forward declaration — defined in batch_evaluator.hpp
 class BatchEvaluator;
 
+inline constexpr std::size_t WDL_NUM_CLASSES = 3;
+
+inline float wdl_logits_to_q(const std::array<float, WDL_NUM_CLASSES>& logits) noexcept
+{
+    const float m = std::max({logits[0], logits[1], logits[2]});
+    const float ew = std::exp(logits[0] - m);
+    const float ed = std::exp(logits[1] - m);
+    const float el = std::exp(logits[2] - m);
+    const float inv_z = 1.0f / (ew + ed + el);
+    return (ew - el) * inv_z;
+}
+
+inline float wdl_logits_to_value(const std::array<float, WDL_NUM_CLASSES>& logits) noexcept
+{
+    return 0.5f * (wdl_logits_to_q(logits) + 1.0f);
+}
+
 /**
  * Raw neural-network output for a single position.
  * This is what the GPU thread writes after batched inference.
  *
  * The model exports:
- *   value             — WDL-derived Q value P(W)+0.5*P(D) in [0, 1]
- *   value_probs       — BestQ HL-Gauss distribution (81 bins)
- *   policy            — Move distribution logits (4672)
- *   optimistic_policy — Optimistic policy logits (4672)
+ *   wdl_logits          — raw WDL logits [W, D, L]
+ *   value_probs         — BestQ HL-Gauss distribution (81 bins)
+ *   policy              — Move distribution logits (4672)
+ *   optimistic_policy   — Optimistic policy logits (4672)
  */
 struct RawNNOutput {
-    float value;                                          // WDL-derived Q value [0, 1]
-    std::array<float, VALUE_NUM_BINS> value_probs;        // BestQ distribution (81 bins)
-    std::array<float, POLICY_SIZE> policy;                // Policy logits (4672)
-    std::array<float, POLICY_SIZE> optimistic_policy;     // Optimistic policy logits (4672)
+    std::array<float, WDL_NUM_CLASSES> wdl_logits;
+    std::array<float, VALUE_NUM_BINS> value_probs;
+    std::array<float, POLICY_SIZE> policy;
+    std::array<float, POLICY_SIZE> optimistic_policy;
 };
 
 /**

@@ -13,7 +13,7 @@
 #     any expected bucket is missing from the .network file.
 #
 # ONNX outputs (auto-detected by TRT):
-#   wdl_value               — WDL-derived Q value, scalar (batch,)
+#   wdl_logit               — raw WDL logits [W, D, L] (batch, 3)
 #   bestq_probs             — BestQ HL-Gauss distribution (batch, 81)
 #   optimistic_policy_logit — Optimistic policy logits (batch, 4672)
 
