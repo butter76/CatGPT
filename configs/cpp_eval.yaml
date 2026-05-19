@@ -8,6 +8,9 @@
 #   # Use MCTS engine with custom simulations
 #   uv run python scripts/evaluate_cpp.py engine.type=mcts engine.mcts.num_simulations=1600
 #
+#   # Use LKS engine (single worker, single GPU; UCI sequential path)
+#   uv run python scripts/evaluate_cpp.py engine.type=lks engine.lks.min_total_evals=800
+#
 #   # Run on all benchmarks
 #   uv run python scripts/evaluate_cpp.py benchmark.names=[puzzles,high_rated_puzzles]
 #
@@ -15,14 +18,14 @@
 #   uv run python scripts/evaluate_cpp.py benchmark.max_puzzles=100
 
 # TensorRT engine path
-trt_engine: "main.trt"
+trt_engine: "main.network"
 
 # C++ binary paths (relative to cpp/build/bin/)
 cpp_build_dir: "cpp/build/bin"
 
 # Engine configuration
 engine:
-  type: "fractional_mcts"  # Options: "value", "policy", "mcts", "fractional_mcts"
+  type: "lks"  # Options: "value", "policy", "mcts", "fractional_mcts", "lks"
 
   # MCTS-specific settings (only used when type=mcts)
   mcts:
@@ -31,7 +34,21 @@ engine:
   # Fractional MCTS settings (only used when type=fractional_mcts)
   fractional_mcts:
     c_puct: 1.75
-    min_total_evals: 400
+    min_total_evals: 1000
+
+  # LKS settings (only used when type=lks). Routed through the lks_uci binary
+  # via the sequential UCI path (single worker on a single GPU).
+  lks:
+    min_total_evals: 1000    # → go nodes N → cfg.max_evals
+    delta_depth: 0.02       # log-scale ID step (matches coroutine_search)
+    c_puct: 1.75
+    max_depth: 13.0         # log-scale ID ceiling (LKS_MAX_DEPTH); N cap ≈ e^13
+    coros_per_worker: 32    # per-worker libfork permit count
+    max_batch_size: 32      # per-worker GPU batch cap
+    lifetime_max_evals: 524288  # 1 << 19; SearchArena capacity. TT table is
+                                # 2 * bit_ceil(this) * 32 B and is zero-filled
+                                # on every `position` command — keep small so
+                                # per-move reset() is milliseconds, not seconds.
 
   # UCI timeout in seconds
   timeout: 120.0

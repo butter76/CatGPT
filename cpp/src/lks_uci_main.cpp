@@ -22,6 +22,14 @@
  *   LKS_COROS_PER_WORKER    (default 112)
  *   LKS_MAX_BATCH_SIZE      (default 56)
  *   LKS_LIFETIME_MAX_EVALS  (default 1<<27)
+ *   LKS_DELTA_DEPTH         (default 0.2; per-iteration log-scale ID step
+ *                            piped into LksSearchConfig::delta_depth on
+ *                            every `go`)
+ *   LKS_C_PUCT              (default 1.75; PUCT exploration constant piped
+ *                            into LksSearchConfig::params.c_puct on every
+ *                            `go`)
+ *   LKS_MAX_DEPTH           (default 32; log-scale ID ceiling on every
+ *                            `go` → LksSearchConfig::max_depth)
  *   LKS_SYZYGY_PATH         (default $SYZYGY_HOME, else "" = disabled)
  *                           Directory of .rtbw/.rtbz Syzygy endgame
  *                           tablebase files. When set, eligible root
@@ -87,6 +95,12 @@ static uint64_t env_u64(const char* name, uint64_t fallback) {
     try { return std::stoull(s); } catch (...) { return fallback; }
 }
 
+static float env_float(const char* name, float fallback) {
+    const char* s = std::getenv(name);
+    if (!s || !*s) return fallback;
+    try { return std::stof(s); } catch (...) { return fallback; }
+}
+
 class LksUciDriver {
 public:
     LksUciDriver(fs::path engine_path,
@@ -94,10 +108,16 @@ public:
                  int workers_per_gpu,
                  int coros_per_worker,
                  int max_batch_size,
-                 fs::path syzygy_path)
+                 fs::path syzygy_path,
+                 float delta_depth,
+                 float c_puct,
+                 float max_depth)
         : search_(std::move(engine_path), lifetime_max_evals,
                   workers_per_gpu, coros_per_worker, max_batch_size,
                   std::move(syzygy_path))
+        , delta_depth_(delta_depth)
+        , c_puct_(c_puct)
+        , max_depth_(max_depth)
     {}
 
     void run() {
@@ -252,6 +272,9 @@ private:
         // encoding used by `info depth ...` in worker_main.
         catgpt::lks::LksSearchConfig cfg;
         cfg.max_evals = 1'000'000'000ULL;
+        cfg.delta_depth = delta_depth_;
+        cfg.max_depth = max_depth_;
+        cfg.params.c_puct = c_puct_;
         cfg.on_uci_line = [](std::string_view s) { emit_line(s); };
         std::int64_t movetime_ms = -1;
 
@@ -313,6 +336,9 @@ private:
     // (canceling any pending quit() callback), then search_ tears down
     // its workers/evaluators/CUDA buffers.
     catgpt::lks::LksSearch search_;
+    float delta_depth_;
+    float c_puct_;
+    float max_depth_;
     std::string prev_fen_;
     std::vector<std::string> prev_moves_;
     std::jthread movetime_watchdog_;
@@ -345,6 +371,9 @@ int main(int argc, char* argv[]) {
     const int max_batch_size   = catgpt::env_int("LKS_MAX_BATCH_SIZE", 56);
     const uint64_t lifetime_max_evals =
         catgpt::env_u64("LKS_LIFETIME_MAX_EVALS", 1ULL << 27);
+    const float delta_depth = catgpt::env_float("LKS_DELTA_DEPTH", 0.2f);
+    const float c_puct      = catgpt::env_float("LKS_C_PUCT", 1.75f);
+    const float max_depth   = catgpt::env_float("LKS_MAX_DEPTH", 32.0f);
 
     // Syzygy path resolution: LKS_SYZYGY_PATH overrides; otherwise fall
     // back to $SYZYGY_HOME (the conventional name); empty = disabled.
@@ -360,13 +389,15 @@ int main(int argc, char* argv[]) {
                      engine_path.string());
         std::println(
             stderr,
-            "Config: workers_per_gpu={} coros_per_worker={} max_batch={} arena_capacity={} syzygy_path={}",
+            "Config: workers_per_gpu={} coros_per_worker={} max_batch={} arena_capacity={} delta_depth={} max_depth={} c_puct={} syzygy_path={}",
             workers_per_gpu, coros_per_worker, max_batch_size, lifetime_max_evals,
+            delta_depth, max_depth, c_puct,
             syzygy_path.empty() ? std::string{"<disabled>"} : syzygy_path.string());
 
         catgpt::LksUciDriver driver(engine_path, lifetime_max_evals,
                                     workers_per_gpu, coros_per_worker,
-                                    max_batch_size, std::move(syzygy_path));
+                                    max_batch_size, std::move(syzygy_path),
+                                    delta_depth, c_puct, max_depth);
         std::println(stderr, "Engine loaded; entering UCI loop");
         driver.run();
     } catch (const std::exception& e) {

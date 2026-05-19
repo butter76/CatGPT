@@ -281,6 +281,15 @@ def _config_to_dict(cfg: DictConfig, project_root: Path) -> dict[str, Any]:
             "fractional_mcts": {
                 "min_total_evals": cfg.engine.fractional_mcts.min_total_evals,
             },
+            "lks": {
+                "min_total_evals": cfg.engine.lks.min_total_evals,
+                "delta_depth": cfg.engine.lks.delta_depth,
+                "c_puct": cfg.engine.lks.c_puct,
+                "coros_per_worker": cfg.engine.lks.coros_per_worker,
+                "max_batch_size": cfg.engine.lks.max_batch_size,
+                "lifetime_max_evals": cfg.engine.lks.lifetime_max_evals,
+                "max_depth": cfg.engine.lks.max_depth,
+            },
         },
     }
 
@@ -305,6 +314,7 @@ def _worker_init(config_dict: dict[str, Any]) -> None:
         "fractional_mcts": "catgpt_fractional_mcts",
         "value": "catgpt_value",
         "policy": "catgpt_policy",
+        "lks": "lks_uci",
     }
 
     binary_path = cpp_build_dir / binary_map[engine_type]
@@ -324,6 +334,21 @@ def _worker_init(config_dict: dict[str, Any]) -> None:
             binary_path,
             trt_engine,
             min_total_evals=min_total_evals,
+            timeout=timeout,
+        )
+    elif engine_type == "lks":
+        from catgpt.cpp.uci_engine import LksEngine
+        lks_cfg = config_dict["engine"]["lks"]
+        _worker_engine = LksEngine(
+            binary_path,
+            trt_engine,
+            min_total_evals=lks_cfg["min_total_evals"],
+            delta_depth=lks_cfg["delta_depth"],
+            c_puct=lks_cfg["c_puct"],
+            coros_per_worker=lks_cfg["coros_per_worker"],
+            max_batch_size=lks_cfg["max_batch_size"],
+            lifetime_max_evals=lks_cfg["lifetime_max_evals"],
+            max_depth=lks_cfg["max_depth"],
             timeout=timeout,
         )
     elif engine_type == "value":
@@ -784,6 +809,7 @@ def create_engine(cfg: DictConfig, project_root: Path):
     """
     from catgpt.cpp.uci_engine import (
         FractionalMCTSEngine,
+        LksEngine,
         MCTSEngine,
         PolicyEngine,
         ValueEngine,
@@ -800,6 +826,7 @@ def create_engine(cfg: DictConfig, project_root: Path):
         "fractional_mcts": "catgpt_fractional_mcts",
         "value": "catgpt_value",
         "policy": "catgpt_policy",
+        "lks": "lks_uci",
     }
 
     if engine_type not in binary_map:
@@ -834,6 +861,26 @@ def create_engine(cfg: DictConfig, project_root: Path):
             min_total_evals=min_total_evals,
             timeout=timeout,
         )
+    elif engine_type == "lks":
+        lks = cfg.engine.lks
+        logger.info(
+            f"Creating LKS engine (evals={lks.min_total_evals}, "
+            f"delta_depth={lks.delta_depth}, c_puct={lks.c_puct}, "
+            f"coros_per_worker={lks.coros_per_worker}, max_batch_size={lks.max_batch_size}, "
+            f"lifetime_max_evals={lks.lifetime_max_evals}, max_depth={lks.max_depth})"
+        )
+        return LksEngine(
+            binary_path,
+            trt_engine,
+            min_total_evals=lks.min_total_evals,
+            delta_depth=lks.delta_depth,
+            c_puct=lks.c_puct,
+            coros_per_worker=lks.coros_per_worker,
+            max_batch_size=lks.max_batch_size,
+            lifetime_max_evals=lks.lifetime_max_evals,
+            max_depth=lks.max_depth,
+            timeout=timeout,
+        )
     elif engine_type == "value":
         logger.info("Creating Value engine (1-ply lookahead)")
         return ValueEngine(binary_path, trt_engine, timeout=timeout)
@@ -862,7 +909,7 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
 
     # Validate engine type
-    valid_engines = ("value", "policy", "mcts", "fractional_mcts")
+    valid_engines = ("value", "policy", "mcts", "fractional_mcts", "lks")
     if cfg.engine.type not in valid_engines:
         logger.error(f"Invalid engine type: {cfg.engine.type}")
         logger.info(f"Valid options: {valid_engines}")
@@ -885,6 +932,11 @@ def main(cfg: DictConfig) -> None:
         logger.info(f"MCTS simulations: {cfg.engine.mcts.num_simulations}")
     elif cfg.engine.type == "fractional_mcts":
         logger.info(f"Fractional MCTS min_evals: {cfg.engine.fractional_mcts.min_total_evals}")
+    elif cfg.engine.type == "lks":
+        logger.info(
+            f"LKS evals/move: {cfg.engine.lks.min_total_evals} "
+            f"(delta_depth={cfg.engine.lks.delta_depth})"
+        )
 
     use_batched = cfg.engine.type in ("fractional_mcts", "policy", "value")
     num_workers = cfg.engine.num_workers
@@ -912,6 +964,10 @@ def main(cfg: DictConfig) -> None:
                     "engine_type": cfg.engine.type,
                     "mcts_simulations": cfg.engine.mcts.num_simulations if cfg.engine.type == "mcts" else None,
                     "fractional_mcts_min_evals": cfg.engine.fractional_mcts.min_total_evals if cfg.engine.type == "fractional_mcts" else None,
+                    "lks_min_total_evals": cfg.engine.lks.min_total_evals if cfg.engine.type == "lks" else None,
+                    "lks_delta_depth": cfg.engine.lks.delta_depth if cfg.engine.type == "lks" else None,
+                    "lks_c_puct": cfg.engine.lks.c_puct if cfg.engine.type == "lks" else None,
+                    "lks_max_depth": cfg.engine.lks.max_depth if cfg.engine.type == "lks" else None,
                     "num_workers": num_workers,
                 },
             )
@@ -956,6 +1012,11 @@ def main(cfg: DictConfig) -> None:
                 engine_name = f"MCTS(nodes={cfg.engine.mcts.num_simulations}, workers={num_workers})"
             elif cfg.engine.type == "fractional_mcts":
                 engine_name = f"FractionalMCTS(evals={cfg.engine.fractional_mcts.min_total_evals}, workers={num_workers})"
+            elif cfg.engine.type == "lks":
+                engine_name = (
+                    f"LKS(evals={cfg.engine.lks.min_total_evals}, "
+                    f"dd={cfg.engine.lks.delta_depth}, workers={num_workers})"
+                )
         else:
             engine_name = engine.name
 

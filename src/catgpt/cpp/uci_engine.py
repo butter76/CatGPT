@@ -8,6 +8,7 @@ Uses pexpect for reliable interactive communication with the subprocess,
 which handles PTY allocation and buffering correctly.
 """
 
+import os
 import re
 import threading
 from pathlib import Path
@@ -46,6 +47,7 @@ class UCIEngine:
         *,
         timeout: float = 60.0,
         go_options: dict[str, int | str] | None = None,
+        env: dict[str, str] | None = None,
     ) -> None:
         """Initialize the UCI engine.
 
@@ -54,11 +56,15 @@ class UCIEngine:
             engine_path: Path to the TensorRT engine file (passed as CLI arg).
             timeout: Timeout in seconds for UCI responses.
             go_options: Options for the 'go' command (e.g., {'nodes': 100, 'movetime': 1000}).
+            env: Extra environment variables to layer on top of os.environ for
+                the spawned engine subprocess (e.g., LKS_* tunables for
+                lks_uci). None = inherit os.environ unmodified.
         """
         self.binary_path = Path(binary_path)
         self.engine_path = Path(engine_path) if engine_path else None
         self.timeout = timeout
         self.go_options = go_options or {}
+        self.env_overrides = env or {}
 
         if not self.binary_path.exists():
             raise FileNotFoundError(f"Engine binary not found: {self.binary_path}")
@@ -80,10 +86,15 @@ class UCIEngine:
 
         logger.debug(f"Starting UCI engine: {cmd}")
 
+        spawn_env: dict[str, str] | None = None
+        if self.env_overrides:
+            spawn_env = {**os.environ, **self.env_overrides}
+
         self._child = pexpect.spawn(
             cmd,
             encoding="utf-8",
             timeout=self.timeout,
+            env=spawn_env,
         )
 
         # Initialize UCI protocol
@@ -335,6 +346,78 @@ class FractionalMCTSEngine(UCIEngine):
     @property
     def name(self) -> str:
         return f"FractionalMCTS(evals={self._min_total_evals})"
+
+
+class LksEngine(UCIEngine):
+    """UCI engine wrapper for LKS (Lazy-SMP, log-scale ID, libfork)."""
+
+    def __init__(
+        self,
+        binary_path: str | Path,
+        engine_path: str | Path | None = None,
+        *,
+        min_total_evals: int = 400,
+        delta_depth: float = 0.02,
+        c_puct: float = 1.75,
+        coros_per_worker: int = 32,
+        max_batch_size: int = 32,
+        lifetime_max_evals: int = 1 << 19,
+        max_depth: float = 32.0,
+        timeout: float = 120.0,
+    ) -> None:
+        """Initialize LKS engine.
+
+        Plumbs LKS-specific tunables into the lks_uci subprocess via env
+        vars (which lks_uci_main.cpp reads at startup). LKS_WORKERS_PER_GPU
+        is hard-coded to 1 — the puzzle pipeline is single-GPU and a second
+        worker would just contend for the same device.
+
+        Args:
+            binary_path: Path to the lks_uci binary.
+            engine_path: Path to the TensorRT engine file.
+            min_total_evals: Min GPU evaluations per move; sent as `go nodes N`
+                and consumed by lks_uci as cfg.max_evals.
+            delta_depth: Per-iteration log-scale ID step (LKS_DELTA_DEPTH).
+            c_puct: PUCT exploration constant (LKS_C_PUCT).
+            coros_per_worker: Per-worker libfork permit count
+                (LKS_COROS_PER_WORKER).
+            max_batch_size: Per-worker GPU batch cap (LKS_MAX_BATCH_SIZE).
+            lifetime_max_evals: SearchArena capacity (LKS_LIFETIME_MAX_EVALS).
+                The TT table is `2 * bit_ceil(this) * 32` bytes and is
+                zero-filled on every `position` command, so for puzzle
+                eval keep it just above min_total_evals (the LKS UCI
+                tournament default of 1<<27 zero-fills 8.6 GiB per move).
+            max_depth: Log-scale iterative-deepening ceiling (LKS_MAX_DEPTH).
+                Workers stop when local depth reaches this value
+                (budget N ≈ exp(max_depth)).
+            timeout: Timeout in seconds for UCI responses.
+        """
+        env = {
+            "LKS_WORKERS_PER_GPU":   "1",
+            "LKS_COROS_PER_WORKER":  str(coros_per_worker),
+            "LKS_MAX_BATCH_SIZE":    str(max_batch_size),
+            "LKS_DELTA_DEPTH":       f"{delta_depth:.6f}",
+            "LKS_C_PUCT":            f"{c_puct:.6f}",
+            "LKS_LIFETIME_MAX_EVALS": str(lifetime_max_evals),
+            "LKS_MAX_DEPTH":         f"{max_depth:.6f}",
+        }
+        super().__init__(
+            binary_path,
+            engine_path,
+            timeout=timeout,
+            go_options={"nodes": min_total_evals},
+            env=env,
+        )
+        self._min_total_evals = min_total_evals
+        self._delta_depth = delta_depth
+        self._max_depth = max_depth
+
+    @property
+    def name(self) -> str:
+        return (
+            f"LKS(evals={self._min_total_evals},dd={self._delta_depth},"
+            f"max_d={self._max_depth})"
+        )
 
 
 class ValueEngine(UCIEngine):
