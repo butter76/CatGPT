@@ -270,36 +270,37 @@ struct MoveWithPriors {
 static_assert(sizeof(MoveWithPriors) == 8, "MoveWithPriors must be 8 bytes");
 
 /**
- * Tempered softmax over legal-move policy logits — runs one softmax
- * over `out.policy` (the optimistic-policy head; the only one LKS
- * consumes) at `policy_temp`, then sorts by decreasing `P`. Output
- * order is what downstream descent expects (highest-prior first),
- * and is also the order we want in the arena's MoveInfo[].
+ * Tempered softmax over legal-move policy logits — runs one softmax over
+ * the GPU-gathered `out.legal_policy[0..num_moves)` at `policy_temp`, then
+ * sorts by decreasing `P`. Output order is what downstream descent expects
+ * (highest-prior first), and is also the order we want in the arena's
+ * MoveInfo[].
  *
- * `policy_temp` divides logits before the max-subtract / exp; T > 1
- * flattens, T < 1 sharpens. T == 1.0 reproduces the plain softmax.
- * The division is folded into `inv_temp` and applied in the first
- * pass so the existing max-subtract / exp / normalize loop is unchanged.
+ * The flat (4672) policy tensor never reaches the C++ side anymore: the
+ * exporter does a Gather inside TRT against the caller-supplied legal_indices,
+ * and `out.legal_policy[i]` is already the logit for `legal[i]`. Padding
+ * entries past `legal.size()` are dont-care.
+ *
+ * `policy_temp` divides logits before the max-subtract / exp; T > 1 flattens,
+ * T < 1 sharpens. T == 1.0 reproduces the plain softmax. The division is
+ * folded into `inv_temp` and applied in the first pass so the existing
+ * max-subtract / exp / normalize loop is unchanged.
  */
 inline void softmax_legal_sorted(const RawNNOutput& out,
-                                 const chess::Board& board,
                                  const chess::Movelist& legal,
                                  float policy_temp,
                                  std::vector<MoveWithPriors>& moves)
 {
-    const bool flip = board.sideToMove() == chess::Color::BLACK;
     const int n = legal.size();
     moves.resize(static_cast<size_t>(n));
 
     const float inv_temp = 1.0f / policy_temp;
 
-    // Pre-pass: gather per-move policy-table indices, write moves[i].move,
-    // and compute scaled logits. Track the max for the LSE max-subtract.
+    // Pre-pass: copy legal moves and scaled logits. Track the max for the
+    // LSE max-subtract.
     float max_logit = -std::numeric_limits<float>::infinity();
     for (int i = 0; i < n; ++i) {
-        const auto [from_idx, to_idx] = encode_move_to_policy_index(legal[i], flip);
-        const int flat = policy_flat_index(from_idx, to_idx);
-        const float scaled = out.policy[flat] * inv_temp;
+        const float scaled = out.legal_policy[i] * inv_temp;
         moves[i].move  = static_cast<uint16_t>(legal[i].move());
         moves[i]._pad  = 0;
         moves[i].P     = scaled;
@@ -313,10 +314,16 @@ inline void softmax_legal_sorted(const RawNNOutput& out,
         sum_exp   += moves[i].P;
     }
 
-    // Normalize.
-    const float inv_sum = sum_exp > 0.0f ? 1.0f / sum_exp : 0.0f;
-    for (int i = 0; i < n; ++i) {
-        moves[i].P *= inv_sum;
+    // Normalize. If TRT produced non-finite logits we'd otherwise get NaN
+    // priors and poison every subsequent allocator call; fall back to uniform
+    // priors over legal moves so a misbehaving NN can't brick search.
+    const float inv_sum =
+        (std::isfinite(sum_exp) && sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+    if (inv_sum == 0.0f) {
+        const float uniform = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
+        for (int i = 0; i < n; ++i) moves[i].P = uniform;
+    } else {
+        for (int i = 0; i < n; ++i) moves[i].P *= inv_sum;
     }
 
     // Sort by descending P.
@@ -324,6 +331,30 @@ inline void softmax_legal_sorted(const RawNNOutput& out,
         [](const MoveWithPriors& a, const MoveWithPriors& b) {
             return a.P > b.P;
         });
+}
+
+/**
+ * Build the (padded) flat-policy-index array consumed by the GPU's
+ * end-of-policy-head gather. Mirrors `softmax_legal_sorted`'s legal-move
+ * iteration order — `legal[i]` ↔ `out.legal_policy[i]` ↔ `indices[i]`.
+ *
+ * Padding slots beyond `legal.size()` are filled with 0; the GPU still
+ * gathers them but the C++ softmax only reads the first `legal.size()`
+ * entries. Any in-range index works as padding.
+ */
+inline void build_legal_indices(
+    const chess::Movelist& legal,
+    bool flip_for_black,
+    std::array<std::int32_t, MAX_LEGAL_MOVES>& indices) noexcept
+{
+    const int n = legal.size();
+    for (int i = 0; i < n; ++i) {
+        const auto [from_idx, to_idx] =
+            encode_move_to_policy_index(legal[i], flip_for_black);
+        indices[i] = static_cast<std::int32_t>(
+            policy_flat_index(from_idx, to_idx));
+    }
+    for (int i = n; i < MAX_LEGAL_MOVES; ++i) indices[i] = 0;
 }
 
 /**
@@ -516,22 +547,33 @@ inline constexpr auto recursive_search =
         // where a peer could publish without us noticing. The CAS in
         // find_or_claim is the sole source of truth for ownership;
         // the eval-await window's race is handled there.
-        auto tokens = catgpt::tokenize<BatchEvaluator::SEQ_LENGTH>(
-            board, NO_HALFMOVE_CONFIG);
-        RawNNOutput out = co_await EvalAwaitable(*ctx->evaluator, tokens);
-        ctx->w->evals.fetch_add(1, std::memory_order_relaxed);
-
+        //
+        // Legal-move generation moves to BEFORE the eval submit so the
+        // GPU can gather only the legal-move logits (cuts policy D2H from
+        // POLICY_SIZE=4672 to MAX_LEGAL_MOVES=218 floats per request).
+        // The encoded flat indices ride along on the EvalRequest; the
+        // gathered logits arrive in `out.legal_policy[0..num_moves)`,
+        // already aligned with `legal[]`.
         chess::Movelist legal;
         chess::movegen::legalmoves(legal, board);
         const uint16_t num_moves = static_cast<uint16_t>(legal.size());
+
+        std::array<std::int32_t, MAX_LEGAL_MOVES> legal_indices;
+        const bool flip = board.sideToMove() == chess::Color::BLACK;
+        build_legal_indices(legal, flip, legal_indices);
+
+        auto tokens = catgpt::tokenize<BatchEvaluator::SEQ_LENGTH>(
+            board, NO_HALFMOVE_CONFIG);
+        RawNNOutput out = co_await EvalAwaitable(
+            *ctx->evaluator, tokens, legal_indices);
+        ctx->w->evals.fetch_add(1, std::memory_order_relaxed);
 
         // Sort moves by decreasing P up front (on compact 8-byte
         // pairs) so the arena fill below is a single pass that
         // writes each MoveInfo exactly once in the order descent
         // will consume them.
         std::vector<MoveWithPriors> sorted_moves;
-        softmax_legal_sorted(out, board, legal,
-                             ctx->params->policy_temp, sorted_moves);
+        softmax_legal_sorted(out, legal, ctx->params->policy_temp, sorted_moves);
 
         // alloc + fill BEFORE attempting to claim — these bytes
         // are privately owned until the CAS, and orphaned if the

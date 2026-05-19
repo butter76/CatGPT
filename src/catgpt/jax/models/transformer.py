@@ -508,6 +508,7 @@ class BidirectionalTransformer(nn.Module):
         self,
         x: jax.Array,
         *,
+        legal_indices: jax.Array | None = None,
         train: bool = False,
         compute_dtype: Dtype = jnp.float32,
     ) -> dict[str, jax.Array]:
@@ -515,6 +516,15 @@ class BidirectionalTransformer(nn.Module):
 
         Args:
             x: Input token indices, shape (batch, seq_len).
+            legal_indices: Optional int32 indices of legal moves into the flat
+                policy tensor, shape (batch, max_legal). When provided AND the
+                optimistic policy head is enabled, additionally exposes
+                ``optimistic_policy_legal_logit`` = gather(opt_policy, legal_indices)
+                so the C++ runtime can D2H only the legal-move logits instead
+                of the full 4672-element tensor. Padding entries (where the
+                caller has fewer than max_legal moves) are expected to be
+                in-range indices (e.g. 0); the consumer must read only the
+                first num_legal entries.
             train: Whether in training mode.
             compute_dtype: Dtype for intermediate computations (bfloat16 for mixed precision).
 
@@ -529,6 +539,9 @@ class BidirectionalTransformer(nn.Module):
             - "value": Expected rootQ win probability scalar (batch,) for metrics/inference
             - "best_value": Expected bestQ win probability scalar (batch,) for metrics
             - "policy_logit": Move distribution logits (batch, 64*73) if policy_head enabled
+            - "optimistic_policy_legal_logit": Gathered optimistic-policy logits at
+              ``legal_indices`` (batch, max_legal). Present only when
+              ``legal_indices`` is supplied AND the optimistic policy head is enabled.
         """
         batch_size, seq_len = x.shape
         head_config = self.config.output_heads
@@ -764,6 +777,18 @@ class BidirectionalTransformer(nn.Module):
 
             opt_policy_logits_flat = opt_policy_logits.reshape(batch_size, -1)
             outputs["optimistic_policy_logit"] = opt_policy_logits_flat
+
+            # Legal-move gather: when the C++ runtime supplies indices into
+            # the flat (4672-element) policy tensor, expose only those
+            # logits. This drops the policy D2H from 4672 to MAX_LEGAL_MOVES
+            # floats per batch sample (typically ~20× smaller). Padding
+            # indices (when the caller has fewer than max_legal real moves)
+            # must be in-range — 0 is fine because the C++ softmax only reads
+            # the first `num_legal` entries.
+            if legal_indices is not None:
+                outputs["optimistic_policy_legal_logit"] = jnp.take_along_axis(
+                    opt_policy_logits_flat, legal_indices, axis=-1
+                )
 
         # Uncertainty head: per-move log-variance prediction
         # Same Q·K^T attention architecture as policy head but predicts

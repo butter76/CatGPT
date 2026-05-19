@@ -64,26 +64,38 @@ inline float wdl_logits_to_value(const std::array<float, WDL_NUM_CLASSES>& logit
  * This is what the GPU thread writes after batched inference.
  *
  * The model exports:
- *   wdl_logits  — raw WDL logits [W, D, L] (softmax + Q on host)
- *   value_probs — BestQ HL-Gauss distribution (81 bins)
- *   policy      — Optimistic policy logits (4672)
+ *   wdl_logits   — raw WDL logits [W, D, L] (softmax + Q on host)
+ *   value_probs  — BestQ HL-Gauss distribution (81 bins)
+ *   legal_policy — Optimistic policy logits gathered at the caller-supplied
+ *                  legal-move indices, padded to MAX_LEGAL_MOVES. Only the
+ *                  first `num_legal` (== caller's Movelist.size()) entries
+ *                  are meaningful; the rest are dont-care padding from the
+ *                  GPU gather and must NOT be read.
  */
 struct RawNNOutput {
     std::array<float, WDL_NUM_CLASSES> wdl_logits;        // raw WDL logits [W, D, L]
     std::array<float, VALUE_NUM_BINS> value_probs;        // BestQ distribution (81 bins)
-    std::array<float, POLICY_SIZE> policy;                // Optimistic policy logits (4672)
+    std::array<float, MAX_LEGAL_MOVES> legal_policy;      // gathered policy logits
 };
 
 /**
  * A single evaluation request.
  *
  * Allocated inside the coroutine frame (via EvalAwaitable).
- * The GPU thread reads `tokens` and writes `result`, then resumes the
- * suspended task via `pool->schedule(continuation)`.
+ * The GPU thread reads `tokens` + `legal_indices` and writes `result`, then
+ * resumes the suspended task via `pool->schedule(continuation)`.
  */
 struct EvalRequest {
-    // --- Input (written by coroutine before suspend) ---
+    // --- Inputs (written by coroutine before suspend) ---
+
+    // Position tokens for the transformer input.
     std::array<std::int32_t, 64> tokens;
+
+    // Flat policy indices (into the model's (64, 73)=4672 optimistic-policy
+    // tensor) of every legal move at this position, padded to MAX_LEGAL_MOVES
+    // with 0 (any in-range index works; the C++ softmax only reads the first
+    // `num_legal` entries, set by the caller's Movelist.size()).
+    std::array<std::int32_t, MAX_LEGAL_MOVES> legal_indices;
 
     // --- Output (written by GPU thread before resuming coroutine) ---
     RawNNOutput result;
@@ -102,17 +114,24 @@ struct EvalRequest {
  * lf::task.
  *
  * Usage inside a libfork task:
- *   RawNNOutput output = co_await EvalAwaitable(evaluator, tokens);
+ *   RawNNOutput output = co_await EvalAwaitable(evaluator, tokens, legal_indices);
+ *
+ * `legal_indices` carries pre-computed flat policy indices for every legal
+ * move, padded to MAX_LEGAL_MOVES with 0. The first `num_legal` entries must
+ * be valid encodings (`policy_flat_index(encode_move_to_policy_index(...))`);
+ * the rest are dont-care so long as they're in [0, POLICY_SIZE).
  */
 class EvalAwaitable {
    public:
     EvalAwaitable(BatchEvaluator& evaluator,
-                  const std::array<std::uint8_t, 64>& tokens)
+                  const std::array<std::uint8_t, 64>& tokens,
+                  const std::array<std::int32_t, MAX_LEGAL_MOVES>& legal_indices)
         : evaluator_(evaluator) {
         // Convert uint8 tokens to int32 (TRT input format)
         for (int i = 0; i < 64; ++i) {
             request_.tokens[i] = static_cast<std::int32_t>(tokens[i]);
         }
+        request_.legal_indices = legal_indices;
     }
 
     bool await_ready() const noexcept { return false; }
