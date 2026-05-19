@@ -313,17 +313,14 @@ static_assert(alignof(TTEntry) == 32, "TTEntry must be 32-byte aligned");
  * visible to any reader who acquire-loads `info` and observes
  * `info_offset != kNoInfoOffset`.
  *
- * `limit` is the cached `compute_limit` result for this position: the
- * number of top P-sorted children needed to cover
- * `policy_coverage_threshold` (lifted to >= 2 when the top prior is
- * below `single_node_coverage_threshold`). Stamped at expansion time
- * and read by descent to drive iter-0 force-expansion of the top-K
- * priors. Bounded by chess's 218 max legal moves, fits in uint16_t.
+ * `_pad` is unused; it keeps `sizeof(NodeInfoHeader) == 8` so the
+ * arena's zero-offset reservation (`kArenaReservedBytes`) and the
+ * natural 2-byte alignment of the trailing `MoveInfo[]` are unchanged.
  */
 struct NodeInfoHeader {
     float    variance;   // 4: computed once from NN value distribution
     uint16_t num_moves;  // 2: <= 218 in chess
-    uint16_t limit;      // 2: cached compute_limit result; <= num_moves
+    uint16_t _pad;       // 2: reserved; kept zero on alloc_node_info
 };
 static_assert(sizeof(NodeInfoHeader) == 8, "NodeInfoHeader must be 8 bytes");
 
@@ -347,9 +344,8 @@ enum TerminalKind : uint8_t {
 };
 
 /**
- * Per-move slot — 8 bytes total. Layout-invisible to callers; go through
- * the `P()` / `P_opt()` / `terminal_kind()` accessors (and `pack()` to
- * construct).
+ * Per-move slot — 4 bytes total. Layout-invisible to callers; go through
+ * the `P()` / `terminal_kind()` accessors (and `pack()` to construct).
  *
  * Encoding of `_packed` (viewed as IEEE 754 binary16):
  *   - Sign bit = 0  →  non-terminal.  P = fp16_to_f32(_packed).
@@ -362,14 +358,6 @@ enum TerminalKind : uint8_t {
  *                          0b10 → kTerminalWinForChild
  *                          0b11 → reserved
  *
- * `_packed_opt` holds the optimistic-policy prior (also non-negative,
- * in [0, 1]) as a plain fp16 — no terminal-kind steal here, since the
- * kind is already carried in `_packed`. P_opt is only used to drive
- * exploration during the recursive clamp loop; the rollup uses P.
- *
- * `_reserved` is zero on pack and available for a future per-move field
- * (e.g. uncertainty head) without changing the arena layout.
- *
  * Why this works:
  *   - Legal softmax priors are in [0, 1]; the sign bit is otherwise unused
  *     so it's a free flag for "this child is terminal".
@@ -381,14 +369,12 @@ enum TerminalKind : uint8_t {
  *     (once per expansion, done pre-CAS while bytes are privately owned);
  *     unpacking is in the hot descent pre-pass but still cheap.
  *
- * One MoveInfo per 8-byte word, eight per 64B cacheline: the
+ * One MoveInfo per 4-byte word, sixteen per 64B cacheline: the
  * move-iteration hot loop in search reads these densely.
  */
 struct MoveInfo {
     uint16_t move;         // 2: chess::Move underlying u16
     uint16_t _packed;      // 2: opaque — holds P + terminal_kind, see above
-    uint16_t _packed_opt;  // 2: fp16 P_opt (no terminal_kind here)
-    uint16_t _reserved;    // 2: zero on pack; reserved for future use
 
     [[nodiscard]] TerminalKind terminal_kind() const noexcept {
         if ((_packed & kSignBit) == 0) return kTerminalNone;
@@ -411,20 +397,14 @@ struct MoveInfo {
         return static_cast<float>(h);
     }
 
-    [[nodiscard]] float P_opt() const noexcept {
-        _Float16 h = std::bit_cast<_Float16>(_packed_opt);
-        return static_cast<float>(h);
-    }
-
     /**
-     * Construct a MoveInfo from (move, P, P_opt, terminal_kind). Both P
-     * and P_opt must be non-negative; anything outside [0, fp16_max]
-     * saturates per the usual float-to-half conversion rules.
+     * Construct a MoveInfo from (move, P, terminal_kind). P must be
+     * non-negative; anything outside [0, fp16_max] saturates per the
+     * usual float-to-half conversion rules.
      */
-    [[nodiscard]] static MoveInfo pack(uint16_t move, float P, float P_opt,
+    [[nodiscard]] static MoveInfo pack(uint16_t move, float P,
                                        TerminalKind tk) noexcept {
         assert(P >= 0.0f && "MoveInfo::pack expects non-negative P");
-        assert(P_opt >= 0.0f && "MoveInfo::pack expects non-negative P_opt");
 
         _Float16 h = static_cast<_Float16>(P);
         uint16_t bits = std::bit_cast<uint16_t>(h);
@@ -446,13 +426,7 @@ struct MoveInfo {
                 break;
         }
 
-        // P_opt: plain fp16 with sign forced to 0 (defensive against the
-        // +0 → -0 edge case from the cast).
-        _Float16 h_opt = static_cast<_Float16>(P_opt);
-        uint16_t bits_opt = std::bit_cast<uint16_t>(h_opt);
-        bits_opt = static_cast<uint16_t>(bits_opt & kMagnitudeMask);
-
-        return MoveInfo{move, bits, bits_opt, /*_reserved=*/0};
+        return MoveInfo{move, bits};
     }
 
 private:
@@ -460,7 +434,7 @@ private:
     static constexpr uint16_t kKindMask      = 0x0003u;
     static constexpr uint16_t kMagnitudeMask = 0x7FFFu;
 };
-static_assert(sizeof(MoveInfo) == 8, "MoveInfo must be 8 bytes");
+static_assert(sizeof(MoveInfo) == 4, "MoveInfo must be 4 bytes");
 static_assert(alignof(MoveInfo) == 2, "MoveInfo must be 2-byte aligned");
 static_assert(std::is_trivially_copyable_v<MoveInfo>,
               "MoveInfo is held in arena bytes; must be trivially copyable");
@@ -821,7 +795,7 @@ public:
         auto* header = std::launder(reinterpret_cast<NodeInfoHeader*>(arena_ + offset));
         header->variance = 0.0f;
         header->num_moves = num_moves;
-        header->limit = 0;
+        header->_pad = 0;
         return offset;
     }
 

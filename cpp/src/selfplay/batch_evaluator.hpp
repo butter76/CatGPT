@@ -170,12 +170,10 @@ public:
         if (d_value_) cudaFree(d_value_);
         if (d_value_probs_) cudaFree(d_value_probs_);
         if (d_policy_) cudaFree(d_policy_);
-        if (d_optimistic_policy_) cudaFree(d_optimistic_policy_);
         if (h_input_) cudaFreeHost(h_input_);
         if (h_value_) cudaFreeHost(h_value_);
         if (h_value_probs_) cudaFreeHost(h_value_probs_);
         if (h_policy_) cudaFreeHost(h_policy_);
-        if (h_optimistic_policy_) cudaFreeHost(h_optimistic_policy_);
     }
 
     // Non-copyable, non-movable
@@ -296,9 +294,6 @@ private:
             std::memcpy(req->result.policy.data(),
                         h_policy_ + b * POLICY_SIZE,
                         POLICY_SIZE * sizeof(float));
-            std::memcpy(req->result.optimistic_policy.data(),
-                        h_optimistic_policy_ + b * POLICY_SIZE,
-                        POLICY_SIZE * sizeof(float));
 
             // Hand the submit_handle back to the libfork pool. The pool's
             // notifier wakes a sleeping worker, which calls lf::resume(h)
@@ -378,12 +373,11 @@ private:
             }
 
             // Match by name first (specific names before generic). The
-            // optimistic policy match must come BEFORE the plain "policy"
-            // match because "optimistic_policy_logit" contains "policy".
-            if (name_str.find("optimistic_policy") != std::string::npos) {
-                optimistic_policy_output_name_ = name;
-            } else if (name_str.find("policy") != std::string::npos ||
-                       name_str.find("Policy") != std::string::npos) {
+            // ONNX exports a single policy head named `optimistic_policy_logit`;
+            // either substring is accepted to keep this robust to future
+            // renamings.
+            if (name_str.find("policy") != std::string::npos ||
+                name_str.find("Policy") != std::string::npos) {
                 policy_output_name_ = name;
             } else if (name_str.find("value_probs") != std::string::npos ||
                        name_str.find("bestq_probs") != std::string::npos) {
@@ -408,15 +402,12 @@ private:
         if (input_name_.empty()) throw std::runtime_error("Could not find input tensor");
         if (value_output_name_.empty()) throw std::runtime_error("Could not find value output tensor");
         if (policy_output_name_.empty()) throw std::runtime_error("Could not find policy output tensor");
-        if (optimistic_policy_output_name_.empty()) {
-            throw std::runtime_error("Could not find optimistic_policy output tensor");
-        }
 
         std::println(stderr,
                      "[BatchEvaluator] IO: input='{}', value='{}', bestq_probs='{}', "
-                     "policy='{}', optimistic_policy='{}'",
+                     "policy='{}'",
                      input_name_, value_output_name_, value_probs_output_name_,
-                     policy_output_name_, optimistic_policy_output_name_);
+                     policy_output_name_);
     }
 
     void allocate_buffers() {
@@ -430,14 +421,12 @@ private:
         CATGPT_CUDA_CHECK(cudaMalloc(&d_value_, B * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_value_probs_, B * VALUE_NUM_BINS * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_policy_, B * POLICY_SIZE * sizeof(float)));
-        CATGPT_CUDA_CHECK(cudaMalloc(&d_optimistic_policy_, B * POLICY_SIZE * sizeof(float)));
 
         // Pinned host buffers
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_input_, B * SEQ_LENGTH * sizeof(std::int32_t)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_value_, B * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_value_probs_, B * VALUE_NUM_BINS * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_policy_, B * POLICY_SIZE * sizeof(float)));
-        CATGPT_CUDA_CHECK(cudaMallocHost(&h_optimistic_policy_, B * POLICY_SIZE * sizeof(float)));
 
         std::println(stderr,
                      "[BatchEvaluator dev={}] Allocated buffers for max effective bucket={}",
@@ -555,8 +544,6 @@ private:
                 ctx->setTensorAddress(value_probs_output_name_.c_str(), d_value_probs_);
             }
             ctx->setTensorAddress(policy_output_name_.c_str(), d_policy_);
-            ctx->setTensorAddress(optimistic_policy_output_name_.c_str(),
-                                  d_optimistic_policy_);
 
             contexts_.emplace(b, std::move(ctx));
         }
@@ -571,7 +558,7 @@ private:
      * Capture one cudaGraphExec per effective bucket. The graph wraps:
      *   - H2D: bucket * SEQ_LENGTH int32 tokens
      *   - enqueueV3 on the bucket's IExecutionContext
-     *   - D2H: value, value_probs, policy, optimistic_policy
+     *   - D2H: value, value_probs, policy
      *
      * After this, process_batch only does host memcpys + cudaGraphLaunch
      * + cudaStreamSynchronize. No per-launch TRT setup, no per-launch
@@ -628,7 +615,6 @@ private:
         const std::size_t value_bytes  = bucket * sizeof(float);
         const std::size_t vprobs_bytes = bucket * VALUE_NUM_BINS * sizeof(float);
         const std::size_t policy_bytes = bucket * POLICY_SIZE * sizeof(float);
-        const std::size_t opt_policy_bytes = bucket * POLICY_SIZE * sizeof(float);
 
         // ThreadLocal (not Global) so concurrent BatchEvaluator init on
         // the same GPU doesn't trip cudaErrorStreamCaptureUnsupported.
@@ -658,9 +644,6 @@ private:
         CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_value_probs_, d_value_probs_, vprobs_bytes,
                                           cudaMemcpyDeviceToHost, stream_));
         CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_policy_, d_policy_, policy_bytes,
-                                          cudaMemcpyDeviceToHost, stream_));
-        CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_optimistic_policy_, d_optimistic_policy_,
-                                          opt_policy_bytes,
                                           cudaMemcpyDeviceToHost, stream_));
 
         cudaGraph_t graph = nullptr;
@@ -737,7 +720,6 @@ private:
     std::string value_output_name_;
     std::string value_probs_output_name_;
     std::string policy_output_name_;
-    std::string optimistic_policy_output_name_;
 
     cudaStream_t stream_ = nullptr;
 
@@ -746,14 +728,12 @@ private:
     float* d_value_ = nullptr;
     float* d_value_probs_ = nullptr;
     float* d_policy_ = nullptr;
-    float* d_optimistic_policy_ = nullptr;
 
     // Pinned host buffers
     std::int32_t* h_input_ = nullptr;
     float* h_value_ = nullptr;
     float* h_value_probs_ = nullptr;
     float* h_policy_ = nullptr;
-    float* h_optimistic_policy_ = nullptr;
 };
 
 // ─── EvalAwaitable::await_suspend (needs BatchEvaluator to be complete) ────
