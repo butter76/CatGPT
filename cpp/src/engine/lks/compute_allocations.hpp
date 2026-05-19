@@ -58,14 +58,14 @@ namespace catgpt::lks::detail {
  *   - Unexpanded: no real Q yet; `Q` is the FPU stand-in
  *     (Q_eff_parent_pov = parent_Q - fpu_reduction * sqrt(cumulative_P),
  *      stored as -Q_eff_parent_pov in child-STM convention). Used only
- *     to bias the Halley allocation. If the alloc never exceeds the
- *     depth gate, the child stays Unexpanded and is dropped from the
- *     final rollup.
+ *     to bias the Halley allocation. Unexpanded children expand only
+ *     via iter-0 force expansion in pass 2; otherwise they stay
+ *     Unexpanded and are dropped from the final rollup.
  *
  * `depth` is the per-child "current effort" gate consulted by pass 2:
  *   - Expanded TT entry → child's stored max_depth
  *   - Terminal / path-dep draw → +infinity (never re-recurses)
- *   - Unexpanded → depth_floor (any alloc > floor triggers expansion)
+ *   - Unexpanded → -infinity (force-expand only on iter 0)
  */
 enum class Mode : uint8_t { Expanded, Unexpanded };
 

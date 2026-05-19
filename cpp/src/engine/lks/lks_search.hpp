@@ -91,9 +91,12 @@
  *       4. Pass 1: classify children into a local Plan vector
  *          (terminal / path-dep draw / TT-hit / Unexpanded). Halley
  *          allocator fills `alloc` in place.
- *       5. Pass 2: for each plan with `alloc > depth`, pre-mark
- *          `Mode::Expanded` and spawn a child `recursive_search` via
- *          `lf::fork`, passing `&plan` as the out-param. First fork
+ *       5. Pass 2: Expanded children fork when `alloc > p.depth`;
+ *          Unexpanded children expand only on iter 0 via force
+ *          (top `force_expand_count` priors, or all Unexpanded when
+ *          `depth > depth_floor + log(20)`). Pre-mark `Mode::Expanded`
+ *          and spawn a child `recursive_search` via `lf::fork`, passing
+ *          `&plan` as the out-param. First fork
  *          inherits the parent's permit; subsequent forks each
  *          `co_await sem.acquire()`. `lf::join` waits for all forked
  *          children. Each child writes its rolled-up `(Q, depth)`
@@ -188,9 +191,10 @@ struct SearchParams {
     float fpu_reduction = 0.330f;
 
     // Iter-0 force-expansion: always recurse on the first
-    // `force_expand_count` Unexpanded children regardless of the
-    // alloc/depth gate, so the top-prior moves always get at least one
-    // real descent before the clamp loop's break check can fire.
+    // `force_expand_count` Unexpanded children (no alloc gate). When
+    // parent `depth > depth_floor + log(20)`, force-expand every
+    // Unexpanded child on iter 0. Unexpanded plans never expand via
+    // `alloc > depth` on any iteration.
     int   force_expand_count = 8;
 
     // Clamp loop: cap per-iteration depth growth and break-out tolerance.
@@ -640,16 +644,12 @@ inline constexpr auto recursive_search =
         return q;
     }();
 
-    // Variance-scaled depth floor: used as the per-child `depth` stamped
-    // on Unexpanded plans (the "current effort" for a never-visited
-    // child). It is no longer a hard descent cutoff — the gate is
-    // `alloc > depth` from the Halley allocation. Low-variance (high-
-    // confidence) parents raise the floor so unexpanded children need
-    // a larger allocation before we'll expand them; high-variance
-    // parents lower it (possibly below 0) so expansion happens easily
-    // and the rollup refines Q.
+    // Variance-scaled depth floor: threshold for iter-0 force-all
+    // Unexpanded expansion (`depth > depth_floor + log(20)`). Same
+    // formula as default_max_depth on fresh TT entries.
     const float depth_floor = -std::log(
         hdr->variance * ctx->params->default_depth_constant);
+    constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 
     // ── Pass 1: classify children, populate Plan rows (no co_await) ──
     std::vector<Plan> plans;
@@ -724,7 +724,7 @@ inline constexpr auto recursive_search =
         const float Q_eff_parent_pov =
             parent_Q - fpu_reduction * std::sqrt(cumulative_P);
         plans.push_back({Mode::Unexpanded, m_P, /*Q=*/-Q_eff_parent_pov,
-                         /*depth=*/depth_floor, /*alloc=*/0.0f});
+                         /*depth=*/kNegInf, /*alloc=*/0.0f});
         cumulative_P += m_P;
     }
 
@@ -734,18 +734,14 @@ inline constexpr auto recursive_search =
     // on first contact, we iterate:
     //
     //   1. compute_log_allocations on the current (Q, depth) state.
-    //   2. If iter > 0 and every plan satisfies alloc - depth <=
-    //      break_eps (i.e. the allocator is at a fixed point), break.
-    //   3. Fork every plan with alloc > p.depth, clamping the child's
-    //      recursion depth to min(alloc, p.depth + clamp_step) — an
-    //      incremental staircase. Children write their refreshed
-    //      (Q, depth) back through `&p`, so the next iter's allocator
-    //      sees the updated values and re-balances.
-    //      Carveout: on iter 0, if any of the first
-    //      `params->force_expand_count` children is still Unexpanded,
-    //      recurse on it regardless of the alloc/depth gate so the
-    //      top priors always get at least one real descent before any
-    //      later iteration's break check can fire.
+    //   2. If iter > 0 and every Expanded plan satisfies
+    //      alloc - depth <= break_eps, break.
+    //   3. Expanded plans fork when alloc > p.depth at
+    //      min(alloc, p.depth + clamp_step). Unexpanded plans never
+    //      use the alloc gate; on iter 0 only, force-expand the first
+    //      `force_expand_count` Unexpanded priors, or all Unexpanded
+    //      when `depth > depth_floor + log(20)`, at recursion depth
+    //      p.alloc. Children write (Q, depth) back through `&p`.
     //
     // Permits: only iter 0's FIRST fork inherits this coroutine's
     // entry permit (so K bounds permit-holding frames, not alive
@@ -774,6 +770,7 @@ inline constexpr auto recursive_search =
             if (iter > 0) {
                 bool any_unsaturated = false;
                 for (const Plan& p : plans) {
+                    if (p.mode != Mode::Expanded) continue;
                     if (p.alloc - p.depth > break_eps) {
                         any_unsaturated = true;
                         break;
@@ -782,34 +779,29 @@ inline constexpr auto recursive_search =
                 if (!any_unsaturated) break;
             }
 
+            const bool force_all_unexpanded =
+                (iter == 0)
+                && (depth > depth_floor + std::log(20.0f));
+
             bool first_fork = (iter == 0);
             bool any_fork   = false;
             for (uint16_t i = 0; i < num_moves; ++i) {
                 Plan& p = plans[i];
 
-                // Iter-0 force-expansion of the top `force_count`
-                // priors: if any of plans[0..force_count) is still
-                // Unexpanded going into iter 0, recurse on it
-                // regardless of whether the Halley alloc cleared its
-                // depth_floor. Guarantees the top-prior moves always
-                // get at least one real descent before the clamp
-                // loop's break check can fire.
-                const bool force_expand =
-                    (iter == 0) && (static_cast<int>(i) < force_count)
-                    && (p.mode == Mode::Unexpanded);
-                if (!force_expand && !(p.alloc > p.depth)) continue;
-
-                // Iter > 0: never expand a still-Unexpanded child. The
-                // first-touch budget for new children is spent entirely
-                // on iter 0 (force-expand cohort + any plan whose initial
-                // alloc cleared depth_floor). Any plan still Unexpanded
-                // at iter 1+ has been re-allocated against fresh sibling
-                // Q's and its expansion is no longer worth the GPU eval —
-                // skip it and let rollup drop it as Unexpanded.
-                if (iter > 0 && p.mode == Mode::Unexpanded) continue;
+                if (p.mode == Mode::Unexpanded) {
+                    if (iter != 0) continue;
+                    const bool force_expand =
+                        (static_cast<int>(i) < force_count)
+                        || force_all_unexpanded;
+                    if (!force_expand) continue;
+                } else if (!(p.alloc > p.depth)) {
+                    continue;
+                }
 
                 const float target_depth =
-                    std::min(p.alloc, p.depth + clamp_step);
+                    (p.mode == Mode::Unexpanded)
+                        ? p.alloc
+                        : std::min(p.alloc, p.depth + clamp_step);
 
                 chess::Board cb = board;
                 cb.makeMove<true>(chess::Move{moves[i].move});
