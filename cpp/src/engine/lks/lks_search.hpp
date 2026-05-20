@@ -851,6 +851,9 @@ inline constexpr auto recursive_search =
                 lfsync::Permit child_permit = first_fork
                     ? std::move(permit)
                     : co_await ctx->sem->acquire();
+                if (ctx->w->should_abort()) {
+                    break;
+                }
                 first_fork = false;
                 any_fork   = true;
 
@@ -1587,8 +1590,9 @@ private:
             });
         }
 
-        // Aggregator + UCI info loop. Emit `info depth ...` only when the
-        // integer centi-depth derived from the minimum worker depth changes.
+        // Aggregator + UCI info loop. Emit `info depth ...` when centi-depth
+        // advances during the loop, and once more after runners join (see
+        // below) so budget-grace exits still report final PV/score.
         //
         // Termination conditions (any one ends the loop):
         //   1. `stop_token` requested (UCI `stop`, `quit()`, etc.) —
@@ -1612,6 +1616,54 @@ private:
         bool  budget_exhausted    = false;
         float min_depth_at_budget =
             -std::numeric_limits<float>::infinity();
+
+        auto emit_progress = [&](float min_d,
+                                 uint64_t evals_sum,
+                                 uint64_t claims_sum) {
+            const long depth_centi = std::isfinite(min_d)
+                ? std::lround(min_d * 100.0f)
+                : 0L;
+            const auto now = Clock::now();
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - t0).count();
+            const long long mss = static_cast<long long>(ms);
+
+            std::string pv_field;
+            const std::vector<chess::Move> pv_moves = principal_variation();
+            if (!pv_moves.empty()) {
+                pv_field = " pv";
+                for (const chess::Move& m : pv_moves) {
+                    pv_field += ' ';
+                    pv_field += chess::uci::moveToUci(m);
+                }
+            }
+
+            char score_field[32];
+            if (const v2::TTEntry* root =
+                    arena_->find(root_key_, v2::secondary_hash(board_));
+                root != nullptr) {
+                auto [root_q, _] = v2::unpack_qd(
+                    v2::SearchArena::load_qd(root).qd_packed);
+                std::snprintf(score_field, sizeof(score_field),
+                              " score cp %d", q_to_cp(root_q));
+            } else {
+                score_field[0] = '\0';
+            }
+
+            char buf[1024];
+            std::snprintf(buf, sizeof(buf),
+                "info depth %ld%s nodes %llu tt_claims %llu time %lld nps %lld%s",
+                depth_centi,
+                score_field,
+                static_cast<unsigned long long>(evals_sum),
+                static_cast<unsigned long long>(claims_sum),
+                mss,
+                mss > 0 ? static_cast<long long>(evals_sum) * 1000 / mss : 0,
+                pv_field.c_str());
+            emit(buf);
+            last_depth_centi = depth_centi;
+        };
+
         while (true) {
             if (st.stop_requested()) break;
 
@@ -1652,62 +1704,9 @@ private:
             const long depth_centi = std::isfinite(min_d)
                 ? std::lround(min_d * 100.0f)
                 : 0L;
-            if (depth_centi == last_depth_centi) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                continue;
+            if (depth_centi != last_depth_centi) {
+                emit_progress(min_d, evals_sum, claims_sum);
             }
-
-            const auto now = Clock::now();
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - t0).count();
-            const long long mss = static_cast<long long>(ms);
-
-            // Full PV walked from the current TT. Cost is bounded by
-            // `principal_variation`'s max_len cap; emissions fire only
-            // on depth-step transitions so this is well-amortized.
-            // `principal_variation()` shares bestmove()'s acquire-loaded
-            // TT reads and is documented safe mid-search.
-            std::string pv_field;
-            const std::vector<chess::Move> pv_moves = principal_variation();
-            if (!pv_moves.empty()) {
-                pv_field = " pv";
-                for (const chess::Move& m : pv_moves) {
-                    pv_field += ' ';
-                    pv_field += chess::uci::moveToUci(m);
-                }
-            }
-
-            // Root-position score from the TT: report the root's own Q
-            // (side-to-move at the root), not the chosen child's Q. The
-            // acquire-load semantics of `find` / `load_qd` make this safe
-            // mid-search; see invariants in tt_arena.hpp.
-            char score_field[32];
-            if (const v2::TTEntry* root =
-                    arena_->find(root_key_, v2::secondary_hash(board_));
-                root != nullptr) {
-                auto [root_q, _] = v2::unpack_qd(
-                    v2::SearchArena::load_qd(root).qd_packed);
-                std::snprintf(score_field, sizeof(score_field),
-                              " score cp %d", q_to_cp(root_q));
-            } else {
-                score_field[0] = '\0';
-            }
-
-            // Buffer sized for the fixed prefix + scores + a full PV. PV
-            // is capped to `principal_variation`'s max_len (100) plies of
-            // up to 6 chars each ("e7e8q "), so 1KiB is comfortable.
-            char buf[1024];
-            std::snprintf(buf, sizeof(buf),
-                "info depth %ld%s nodes %llu tt_claims %llu time %lld nps %lld%s",
-                depth_centi,
-                score_field,
-                static_cast<unsigned long long>(evals_sum),
-                static_cast<unsigned long long>(claims_sum),
-                mss,
-                mss > 0 ? static_cast<long long>(evals_sum) * 1000 / mss : 0,
-                pv_field.c_str());
-            emit(buf);
-            last_depth_centi = depth_centi;
 
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
@@ -1729,7 +1728,24 @@ private:
             claims_sum += w->tt_claims.load(std::memory_order_relaxed);
         }
         total_evals_.store(evals_sum, std::memory_order_relaxed);
-        (void)claims_sum;
+
+        // Final `info depth` after runners join: stable TT for PV/score and
+        // covers budget grace (we break on min_depth advance before the loop
+        // body can emit that step) and other early exits at an unchanged
+        // centi-depth tick.
+        {
+            float min_d = std::numeric_limits<float>::infinity();
+            for (const auto& w : workers_) {
+                min_d = std::min(min_d,
+                    w->depth.load(std::memory_order_relaxed));
+            }
+            const long depth_centi = std::isfinite(min_d)
+                ? std::lround(min_d * 100.0f)
+                : 0L;
+            if (depth_centi != last_depth_centi || budget_exhausted) {
+                emit_progress(min_d, evals_sum, claims_sum);
+            }
+        }
 
         // Pick the best move from the TT now that all runners have joined.
         const chess::Move best = bestmove();
