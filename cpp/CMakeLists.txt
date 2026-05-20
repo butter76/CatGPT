@@ -82,6 +82,15 @@ add_executable(chess_engine
     src/main.cpp
 )
 
+# === Alpha-beta search (chess-library + dummy eval, no TRT) ===
+add_executable(alpha_beta_search
+    src/alpha_beta/alpha_beta_main.cpp
+)
+target_include_directories(alpha_beta_search PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+)
+target_compile_options(alpha_beta_search PRIVATE -O2 -g)
+
 # === Chess Library Tests ===
 add_executable(chess_lib_tests
     tests/chess_lib_tests.cpp
@@ -407,6 +416,7 @@ set_target_properties(lks_uci PROPERTIES
 # Enable colored output
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(chess_engine PRIVATE -fdiagnostics-color=always)
+    target_compile_options(alpha_beta_search PRIVATE -fdiagnostics-color=always)
     target_compile_options(trt_benchmark PRIVATE -fdiagnostics-color=always)
     target_compile_options(chess_lib_tests PRIVATE -fdiagnostics-color=always)
     target_compile_options(tt_arena_bench PRIVATE -fdiagnostics-color=always)
