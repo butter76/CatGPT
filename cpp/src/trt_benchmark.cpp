@@ -2,11 +2,18 @@
  * TensorRT Benchmark for CatGPT Chess Engine
  *
  * Loads a TensorRT engine and benchmarks inference at various batch sizes.
- * The model expects:
- *   - Input:                int32   (batch, 64)   - chess position tokens
- *   - Output wdl_logit:     float32 (batch, 3)    - raw WDL logits [W, D, L]
- *   - Output bestq_probs:   float32 (batch, 81)   - HL-Gauss value distribution
- *   - Output policy:        float32 (batch, 4672) - policy logits
+ * The model expects two inputs and three outputs:
+ *   - Input  in_0 (tokens):                       int32   (batch, 64)
+ *   - Input  in_1 (legal_indices):                int32   (batch, MAX_LEGAL_MOVES)
+ *   - Output wdl_logit:                           float32 (batch, 3)
+ *   - Output bestq_probs:                         float32 (batch, 81)
+ *   - Output optimistic_policy_legal_logit:       float32 (batch, MAX_LEGAL_MOVES)
+ *
+ * `legal_indices` carries flat indices into the (64*73=4672) policy tensor;
+ * the model gathers along that axis on the GPU so only the legal-move logits
+ * are D2H'd. For benchmarking we fill the indices with random in-range int32
+ * values — content doesn't matter, only shape/dtype, since we measure
+ * throughput rather than correctness.
  */
 
 #include <NvInfer.h>
@@ -30,6 +37,7 @@
 #include <vector>
 
 #include "engine/network_file.hpp"
+#include "engine/nn_constants.hpp"
 
 namespace fs = std::filesystem;
 
@@ -294,6 +302,11 @@ private:
 static constexpr int32_t VALUE_NUM_BINS = 81;
 static constexpr int32_t WDL_NUM_CLASSES = 3;
 
+// MAX_LEGAL_MOVES from cpp/src/engine/nn_constants.hpp; pulled in as int32_t
+// for the buffer-sizing arithmetic below.
+static constexpr int32_t MAX_LEGAL_MOVES =
+    static_cast<int32_t>(catgpt::MAX_LEGAL_MOVES);
+
 inline float wdl_logits_to_q(const float* logits) noexcept
 {
     const float m = std::max({logits[0], logits[1], logits[2]});
@@ -308,7 +321,7 @@ inline float wdl_logits_to_q(const float* logits) noexcept
 struct InferenceResult {
     std::vector<float> wdl_logits;                 // (batch * 3) - raw WDL logits
     std::vector<float> value_probs;                // (batch * VALUE_NUM_BINS) - bestq HL-Gauss distribution
-    std::vector<float> policy_logits;              // (batch * POLICY_SIZE) - policy logits
+    std::vector<float> policy_logits;              // (batch * MAX_LEGAL_MOVES) - gathered legal-move logits
 };
 
 // TensorRT Engine wrapper with CUDA Graph caching and double buffering
@@ -316,6 +329,9 @@ class TrtEngine {
 public:
     static constexpr int32_t SEQ_LENGTH = 64;
     static constexpr int32_t VOCAB_SIZE = 26;  // Must match catgpt::VOCAB_SIZE
+    // Width of the model's flat (un-gathered) optimistic-policy tensor; only
+    // used as the [0, POLICY_SIZE) range for the random legal_indices the
+    // benchmark feeds into the GPU gather.
     static constexpr int32_t POLICY_SIZE = 4672;  // 64 * 73 (from_sq * to_sq)
     static constexpr int NUM_BUFFERS = 2;  // Double buffering
 
@@ -400,10 +416,12 @@ private:
     struct CachedBatchResources {
         std::unique_ptr<nvinfer1::IExecutionContext> context;
         CudaBuffer<int32_t> input_buffer;
+        CudaBuffer<int32_t> legal_indices_buffer;
         CudaBuffer<float> wdl_buffer;
         CudaBuffer<float> value_probs_buffer;
         CudaBuffer<float> policy_buffer;
         PinnedBuffer<int32_t> pinned_input;
+        PinnedBuffer<int32_t> pinned_legal_indices;
         PinnedBuffer<float> pinned_wdl;
         PinnedBuffer<float> pinned_value_probs;
         PinnedBuffer<float> pinned_policy;
@@ -411,20 +429,26 @@ private:
 
         CachedBatchResources(int32_t batch_size)
             : input_buffer(batch_size * SEQ_LENGTH),
+              legal_indices_buffer(batch_size * MAX_LEGAL_MOVES),
               wdl_buffer(batch_size * WDL_NUM_CLASSES),
               value_probs_buffer(batch_size * VALUE_NUM_BINS),
-              policy_buffer(batch_size * POLICY_SIZE),
+              policy_buffer(batch_size * MAX_LEGAL_MOVES),
               pinned_input(batch_size * SEQ_LENGTH),
+              pinned_legal_indices(batch_size * MAX_LEGAL_MOVES),
               pinned_wdl(batch_size * WDL_NUM_CLASSES),
               pinned_value_probs(batch_size * VALUE_NUM_BINS),
-              pinned_policy(batch_size * POLICY_SIZE) {}
+              pinned_policy(batch_size * MAX_LEGAL_MOVES) {}
     };
 
     // Inference using cached CUDA graph
     InferenceResult infer_with_graph(std::span<const int32_t> input_tokens,
                                      int32_t batch_size,
                                      CachedBatchResources& res) {
-        // Copy input to pinned buffer (CPU-side, not part of graph)
+        // Copy input to pinned buffer (CPU-side, not part of graph). The
+        // pinned_legal_indices buffer was filled once at registration with
+        // random in-range int32; the captured graph H2Ds the same data every
+        // launch (correctness doesn't matter for benchmarking, only shape
+        // and that indices are in [0, POLICY_SIZE)).
         res.pinned_input.copy_from(input_tokens.data(), input_tokens.size());
 
         // Capture graph on first use
@@ -440,13 +464,13 @@ private:
         InferenceResult result;
         result.wdl_logits.resize(batch_size * WDL_NUM_CLASSES);
         result.value_probs.resize(batch_size * VALUE_NUM_BINS);
-        result.policy_logits.resize(batch_size * POLICY_SIZE);
+        result.policy_logits.resize(batch_size * MAX_LEGAL_MOVES);
         std::memcpy(result.wdl_logits.data(), res.pinned_wdl.get(),
                     batch_size * WDL_NUM_CLASSES * sizeof(float));
         std::memcpy(result.value_probs.data(), res.pinned_value_probs.get(),
                     batch_size * VALUE_NUM_BINS * sizeof(float));
         std::memcpy(result.policy_logits.data(), res.pinned_policy.get(),
-                    batch_size * POLICY_SIZE * sizeof(float));
+                    batch_size * MAX_LEGAL_MOVES * sizeof(float));
 
         return result;
     }
@@ -455,29 +479,41 @@ private:
     void capture_graph(int32_t batch_size, CachedBatchResources& res) {
         auto& ctx = *res.context;
 
-        // Set up tensor addresses and shapes before capture (all outputs must be bound)
+        // Set up tensor addresses and shapes before capture (all inputs and
+        // outputs must be bound).
         ctx.setTensorAddress(input_name_.c_str(), res.input_buffer.get());
+        ctx.setTensorAddress(legal_indices_input_name_.c_str(),
+                             res.legal_indices_buffer.get());
         ctx.setTensorAddress(wdl_output_name_.c_str(), res.wdl_buffer.get());
         if (!value_probs_output_name_.empty()) {
             ctx.setTensorAddress(value_probs_output_name_.c_str(), res.value_probs_buffer.get());
         }
         ctx.setTensorAddress(policy_output_name_.c_str(), res.policy_buffer.get());
 
-        nvinfer1::Dims input_dims;
-        input_dims.nbDims = 2;
-        input_dims.d[0] = batch_size;
-        input_dims.d[1] = SEQ_LENGTH;
-        ctx.setInputShape(input_name_.c_str(), input_dims);
+        nvinfer1::Dims tokens_dims;
+        tokens_dims.nbDims = 2;
+        tokens_dims.d[0] = batch_size;
+        tokens_dims.d[1] = SEQ_LENGTH;
+        ctx.setInputShape(input_name_.c_str(), tokens_dims);
 
-        size_t input_count = batch_size * SEQ_LENGTH;
-        size_t value_probs_count = batch_size * VALUE_NUM_BINS;
-        size_t policy_count = batch_size * POLICY_SIZE;
+        nvinfer1::Dims legal_dims;
+        legal_dims.nbDims = 2;
+        legal_dims.d[0] = batch_size;
+        legal_dims.d[1] = MAX_LEGAL_MOVES;
+        ctx.setInputShape(legal_indices_input_name_.c_str(), legal_dims);
+
+        const size_t input_count       = batch_size * SEQ_LENGTH;
+        const size_t legal_in_count    = batch_size * MAX_LEGAL_MOVES;
+        const size_t value_probs_count = batch_size * VALUE_NUM_BINS;
+        const size_t policy_count      = batch_size * MAX_LEGAL_MOVES;
 
         // Begin graph capture
         stream_.begin_capture();
 
-        // H2D transfer (async, captured)
+        // H2D transfers (async, captured): tokens + legal_indices
         res.input_buffer.copy_from_host_async(res.pinned_input.get(), input_count, stream_.get());
+        res.legal_indices_buffer.copy_from_host_async(
+            res.pinned_legal_indices.get(), legal_in_count, stream_.get());
 
         // TensorRT inference (captured)
         if (!ctx.enqueueV3(stream_.get())) {
@@ -499,6 +535,15 @@ private:
         res.graph_exec = CudaGraphExec(graph);
 
         std::println("  Captured CUDA graph for bucket {}", batch_size);
+    }
+
+    // Fill a pinned int32 buffer with deterministic in-range gather indices.
+    // Content doesn't matter for benchmarking — only that every value is in
+    // [0, POLICY_SIZE), so the GPU gather doesn't trip on out-of-range loads.
+    static void fill_random_legal_indices(std::int32_t* buf, std::size_t count) noexcept {
+        std::mt19937 rng(0xCA7CA7);
+        std::uniform_int_distribution<std::int32_t> dist(0, POLICY_SIZE - 1);
+        for (std::size_t i = 0; i < count; ++i) buf[i] = dist(rng);
     }
 
 public:
@@ -580,11 +625,11 @@ public:
         PipelinedResult result;
         result.wdl_logits.reserve(batches.size() * batch_size * WDL_NUM_CLASSES);
         result.value_probs.reserve(batches.size() * batch_size * VALUE_NUM_BINS);
-        result.policies.reserve(batches.size() * batch_size * POLICY_SIZE);
+        result.policies.reserve(batches.size() * batch_size * MAX_LEGAL_MOVES);
 
         const size_t input_count = batch_size * SEQ_LENGTH;
         const size_t value_probs_count = batch_size * VALUE_NUM_BINS;
-        const size_t policy_count = batch_size * POLICY_SIZE;
+        const size_t policy_count = batch_size * MAX_LEGAL_MOVES;
 
         // Lazily capture per-slot CUDA graphs on first call for this batch size.
         if (!db.buffers[0].graph_exec.valid()) {
@@ -698,23 +743,27 @@ private:
         std::unique_ptr<nvinfer1::IExecutionContext> context;
         CudaGraphExec graph_exec;
         CudaBuffer<int32_t> input_buffer;
+        CudaBuffer<int32_t> legal_indices_buffer;
         CudaBuffer<float> wdl_buffer;
         CudaBuffer<float> value_probs_buffer;
         CudaBuffer<float> policy_buffer;
         PinnedBuffer<int32_t> pinned_input;
+        PinnedBuffer<int32_t> pinned_legal_indices;
         PinnedBuffer<float> pinned_wdl;
         PinnedBuffer<float> pinned_value_probs;
         PinnedBuffer<float> pinned_policy;
 
         DoubleBufferSlot(int32_t batch_size)
             : input_buffer(batch_size * SEQ_LENGTH),
+              legal_indices_buffer(batch_size * MAX_LEGAL_MOVES),
               wdl_buffer(batch_size * WDL_NUM_CLASSES),
               value_probs_buffer(batch_size * VALUE_NUM_BINS),
-              policy_buffer(batch_size * POLICY_SIZE),
+              policy_buffer(batch_size * MAX_LEGAL_MOVES),
               pinned_input(batch_size * SEQ_LENGTH),
+              pinned_legal_indices(batch_size * MAX_LEGAL_MOVES),
               pinned_wdl(batch_size * WDL_NUM_CLASSES),
               pinned_value_probs(batch_size * VALUE_NUM_BINS),
-              pinned_policy(batch_size * POLICY_SIZE) {}
+              pinned_policy(batch_size * MAX_LEGAL_MOVES) {}
     };
 
     struct DoubleBufferResources {
@@ -739,7 +788,9 @@ private:
     }
 
     // Create the cached-batch context from this bucket's sub-engine and bind
-    // it to profile 0 (the only profile in a per-bucket sub-engine).
+    // it to profile 0 (the only profile in a per-bucket sub-engine). Also
+    // seeds the pinned legal_indices buffer once (random in-range int32) so
+    // the captured graph's H2D always reads valid gather indices.
     void create_cached_context(CachedBatchResources& res, int32_t bucket_size) {
         if (res.context) return;
         res.context.reset(engines_.at(bucket_size)->createExecutionContext());
@@ -748,12 +799,15 @@ private:
                 "Failed to create cached IExecutionContext for bucket {}", bucket_size));
         }
         bind_profile_zero(*res.context, stream_);
+        fill_random_legal_indices(res.pinned_legal_indices.get(),
+                                  static_cast<std::size_t>(bucket_size) * MAX_LEGAL_MOVES);
     }
 
     // Create a dedicated IExecutionContext for each slot in `db` from this
     // bucket's sub-engine. Separate contexts give each stream its own
     // activation memory, enabling true concurrent execution of the two
-    // pipelined inferences.
+    // pipelined inferences. Each slot's legal_indices pinned buffer is seeded
+    // with random in-range int32 (deterministic) at creation.
     void create_slot_contexts(DoubleBufferResources& db, int32_t bucket_size) {
         for (auto& slot : db.buffers) {
             if (slot.context) continue;  // Already created
@@ -763,6 +817,8 @@ private:
                     "Failed to create slot IExecutionContext for bucket {}", bucket_size));
             }
             bind_profile_zero(*slot.context, slot.stream);
+            fill_random_legal_indices(slot.pinned_legal_indices.get(),
+                                      static_cast<std::size_t>(bucket_size) * MAX_LEGAL_MOVES);
         }
     }
 
@@ -780,32 +836,43 @@ private:
     // Each slot uses its own context + buffers so the two graphs share no
     // mutable state and can be launched concurrently on separate streams.
     void capture_double_buffer_graph(int32_t batch_size, DoubleBufferResources& db) {
-        const size_t input_count = batch_size * SEQ_LENGTH;
+        const size_t input_count       = batch_size * SEQ_LENGTH;
+        const size_t legal_in_count    = batch_size * MAX_LEGAL_MOVES;
         const size_t value_probs_count = batch_size * VALUE_NUM_BINS;
-        const size_t policy_count = batch_size * POLICY_SIZE;
+        const size_t policy_count      = batch_size * MAX_LEGAL_MOVES;
 
-        nvinfer1::Dims input_dims;
-        input_dims.nbDims = 2;
-        input_dims.d[0] = batch_size;
-        input_dims.d[1] = SEQ_LENGTH;
+        nvinfer1::Dims tokens_dims;
+        tokens_dims.nbDims = 2;
+        tokens_dims.d[0] = batch_size;
+        tokens_dims.d[1] = SEQ_LENGTH;
+
+        nvinfer1::Dims legal_dims;
+        legal_dims.nbDims = 2;
+        legal_dims.d[0] = batch_size;
+        legal_dims.d[1] = MAX_LEGAL_MOVES;
 
         for (auto& slot : db.buffers) {
             // Bind tensor addresses & shape on this slot's context (host-side state).
             // These persist on the context so the captured kernels reference the
             // correct device pointers.
             slot.context->setTensorAddress(input_name_.c_str(), slot.input_buffer.get());
+            slot.context->setTensorAddress(legal_indices_input_name_.c_str(),
+                                           slot.legal_indices_buffer.get());
             slot.context->setTensorAddress(wdl_output_name_.c_str(), slot.wdl_buffer.get());
             if (!value_probs_output_name_.empty()) {
                 slot.context->setTensorAddress(value_probs_output_name_.c_str(),
                                                slot.value_probs_buffer.get());
             }
             slot.context->setTensorAddress(policy_output_name_.c_str(), slot.policy_buffer.get());
-            slot.context->setInputShape(input_name_.c_str(), input_dims);
+            slot.context->setInputShape(input_name_.c_str(), tokens_dims);
+            slot.context->setInputShape(legal_indices_input_name_.c_str(), legal_dims);
 
             // Capture: H2D -> compute -> D2H, all on this slot's stream.
             slot.stream.begin_capture();
 
             slot.input_buffer.copy_from_host_async(slot.pinned_input.get(), input_count, slot.stream.get());
+            slot.legal_indices_buffer.copy_from_host_async(
+                slot.pinned_legal_indices.get(), legal_in_count, slot.stream.get());
 
             if (!slot.context->enqueueV3(slot.stream.get())) {
                 cudaGraph_t dummy;
@@ -877,9 +944,6 @@ private:
         int num_io = engine.getNbIOTensors();
         std::println("Engine has {} I/O tensors:", num_io);
 
-        // Collect all policy-shaped outputs (batch x POLICY_SIZE) for ordered assignment
-        std::vector<std::string> policy_outputs;
-
         for (int i = 0; i < num_io; ++i) {
             const char* name = engine.getIOTensorName(i);
             auto mode = engine.getTensorIOMode(name);
@@ -899,17 +963,31 @@ private:
                                                                           : "other";
 
             if (mode == nvinfer1::TensorIOMode::kINPUT) {
-                input_name_ = name;
                 std::println("  Input '{}': {} {}", name, dims_str, dtype_str);
+                // Two inputs: tokens (batch, SEQ_LENGTH) and legal_indices
+                // (batch, MAX_LEGAL_MOVES). jax2onnx names them positionally
+                // (e.g. "in_0", "in_1") so we disambiguate by trailing dim.
+                if (dims.nbDims == 2 && dims.d[1] == SEQ_LENGTH) {
+                    input_name_ = name;
+                } else if (dims.nbDims == 2 && dims.d[1] == MAX_LEGAL_MOVES) {
+                    legal_indices_input_name_ = name;
+                } else {
+                    throw std::runtime_error(std::format(
+                        "Unexpected input tensor '{}' with shape {} {}; "
+                        "expected (batch, {}) tokens or (batch, {}) legal_indices.",
+                        name, dims_str, dtype_str, SEQ_LENGTH, MAX_LEGAL_MOVES));
+                }
                 continue;
             }
 
             std::string name_str(name);
             std::println("  Output '{}': {} {}", name, dims_str, dtype_str);
 
-            // Try to match by name first (order matters: check specific names before generic).
-            // jax2onnx auto-generates names like "softmax_out_33", so we fall through
-            // to shape-based detection for those.
+            // Try to match by name first (order matters: check specific names
+            // before generic). The gather-aware export emits
+            // `optimistic_policy_legal_logit` so a "policy" substring catches
+            // it. The bestq distribution and WDL logits are name-detected
+            // first; ambiguous fallbacks land on shape-based matching.
             if (name_str.find("bestq_probs") != std::string::npos ||
                 name_str.find("value_probs") != std::string::npos) {
                 value_probs_output_name_ = name;
@@ -925,33 +1003,36 @@ private:
                     if (wdl_output_name_.empty()) wdl_output_name_ = name;
                 } else if (dims.nbDims == 2 && dims.d[1] == VALUE_NUM_BINS) {
                     if (value_probs_output_name_.empty()) value_probs_output_name_ = name;
-                } else if (dims.nbDims == 2 && dims.d[1] == POLICY_SIZE) {
-                    policy_outputs.push_back(name_str);
+                } else if (dims.nbDims == 2 && dims.d[1] == MAX_LEGAL_MOVES) {
+                    if (policy_output_name_.empty()) policy_output_name_ = name;
                 }
             }
         }
 
-        for (const auto& pname : policy_outputs) {
-            if (policy_output_name_.empty()) {
-                policy_output_name_ = pname;
-            }
-        }
-
         if (input_name_.empty()) {
-            throw std::runtime_error("Could not find input tensor");
+            throw std::runtime_error(
+                "Could not find tokens input tensor (batch, 64) int32");
+        }
+        if (legal_indices_input_name_.empty()) {
+            throw std::runtime_error(std::format(
+                "Could not find legal_indices input tensor (batch, {}) int32. "
+                "Re-export ONNX with the gather-aware export-onnx.sh.",
+                MAX_LEGAL_MOVES));
         }
         if (wdl_output_name_.empty()) {
             throw std::runtime_error("Could not find WDL output tensor (wdl_logit)");
         }
         if (policy_output_name_.empty()) {
-            throw std::runtime_error("Could not find policy output tensor");
+            throw std::runtime_error(
+                "Could not find policy output tensor (optimistic_policy_legal_logit)");
         }
 
-        std::println("  -> Input: '{}'", input_name_);
-        std::println("  -> WDL output: '{}'", wdl_output_name_);
-        std::println("  -> Value probs output: '{}'",
+        std::println("  -> Tokens input:        '{}'", input_name_);
+        std::println("  -> Legal-indices input: '{}'", legal_indices_input_name_);
+        std::println("  -> WDL output:          '{}'", wdl_output_name_);
+        std::println("  -> Value probs output:  '{}'",
                      value_probs_output_name_.empty() ? "(not found)" : value_probs_output_name_);
-        std::println("  -> Policy output: '{}'", policy_output_name_);
+        std::println("  -> Policy output:       '{}'", policy_output_name_);
     }
 
     // Build the buckets_ list from loaded sub-engines and validate that each
@@ -976,22 +1057,29 @@ private:
                     "Sub-engine for bucket {} has {} optimization profile(s); "
                     "expected exactly 1 (rebuild with scripts/trt.sh).", b, n));
             }
-            auto min_dims = engine.getProfileShape(
-                input_name_.c_str(), 0, nvinfer1::OptProfileSelector::kMIN);
-            auto opt_dims = engine.getProfileShape(
-                input_name_.c_str(), 0, nvinfer1::OptProfileSelector::kOPT);
-            auto max_dims = engine.getProfileShape(
-                input_name_.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
-            if (opt_dims.d[0] != b || min_dims.d[0] != b || max_dims.d[0] != b) {
-                throw std::runtime_error(std::format(
-                    "Sub-engine for bucket {} has profile (min={}, opt={}, max={}); "
-                    "expected all == {}.",
-                    b, min_dims.d[0], opt_dims.d[0], max_dims.d[0], b));
+            // Validate batch (d[0]) on both inputs; trailing dims are baked in
+            // and validated when setInputShape is called against opt at capture.
+            for (const char* in_name : {input_name_.c_str(),
+                                        legal_indices_input_name_.c_str()}) {
+                auto min_dims = engine.getProfileShape(
+                    in_name, 0, nvinfer1::OptProfileSelector::kMIN);
+                auto opt_dims = engine.getProfileShape(
+                    in_name, 0, nvinfer1::OptProfileSelector::kOPT);
+                auto max_dims = engine.getProfileShape(
+                    in_name, 0, nvinfer1::OptProfileSelector::kMAX);
+                if (opt_dims.d[0] != b || min_dims.d[0] != b || max_dims.d[0] != b) {
+                    throw std::runtime_error(std::format(
+                        "Sub-engine for bucket {} input '{}' has profile (min={}, "
+                        "opt={}, max={}); expected all == {}.",
+                        b, in_name, min_dims.d[0], opt_dims.d[0], max_dims.d[0], b));
+                }
             }
+            // Print using the tokens-input opt for the human-readable summary.
+            auto opt_tokens = engine.getProfileShape(
+                input_name_.c_str(), 0, nvinfer1::OptProfileSelector::kOPT);
             buckets_.push_back(BucketInfo{b});
             max_batch_size_ = std::max(max_batch_size_, b);
-            std::println("    Bucket {:>3} (min={}, opt={}, max={})",
-                         b, min_dims.d[0], opt_dims.d[0], max_dims.d[0]);
+            std::println("    Bucket {:>3} (opt batch={})", b, opt_tokens.d[0]);
         }
         std::println("  Overall max batch size: {}", max_batch_size_);
     }
@@ -1003,7 +1091,12 @@ private:
     // from a packed .network file.
     std::unordered_map<int32_t, std::unique_ptr<nvinfer1::ICudaEngine>> engines_;
 
+    // Input tensor names (auto-detected by shape in setup_io). The model has
+    // two inputs: tokens (batch, SEQ_LENGTH) and legal_indices (batch,
+    // MAX_LEGAL_MOVES); jax2onnx names them positionally so we disambiguate
+    // by trailing dim.
     std::string input_name_;
+    std::string legal_indices_input_name_;
     std::string wdl_output_name_;
     std::string value_probs_output_name_;
     std::string policy_output_name_;
@@ -1123,7 +1216,10 @@ int main(int argc, char* argv[]) {
                              mode_bin, mode_value, max_prob);
             }
 
-            // Show top-5 policy logits (argmax)
+            // Show top-5 gathered policy logits. The benchmark feeds random
+            // in-range gather indices, so positions in `policy_logits` don't
+            // correspond to real (from, to) squares — only the values'
+            // distribution is meaningful here.
             auto& policy = result.policy_logits;
             std::vector<std::pair<int, float>> indexed_logits;
             indexed_logits.reserve(policy.size());
@@ -1133,12 +1229,10 @@ int main(int argc, char* argv[]) {
             std::partial_sort(indexed_logits.begin(), indexed_logits.begin() + 5, indexed_logits.end(),
                               [](const auto& a, const auto& b) { return a.second > b.second; });
 
-            std::println("│   Top-5 policy logits:");
+            std::println("│   Top-5 gathered policy logits (random indices, values only):");
             for (int i = 0; i < 5; ++i) {
-                int from_sq = indexed_logits[i].first / 73;
-                int to_sq = indexed_logits[i].first % 73;
-                std::println("│     [{}] from={}, to={}: {:.4f}",
-                             i + 1, from_sq, to_sq, indexed_logits[i].second);
+                std::println("│     [{}] slot={}: {:.4f}",
+                             i + 1, indexed_logits[i].first, indexed_logits[i].second);
             }
         }
         std::println("└───────────────────────────────────────────────────────────────┘");
