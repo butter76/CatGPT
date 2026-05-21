@@ -380,6 +380,24 @@ set_target_properties(libfork_smoke_test PROPERTIES
     INSTALL_RPATH "${GCC14_LIB_DIR}"
 )
 
+# === CatGPT FEN Analyzer (pretty-prints raw NN output for one position) ===
+add_executable(catgpt_analyze
+    src/analyze_fen_main.cpp
+)
+target_include_directories(catgpt_analyze PRIVATE
+    ${CHESS_LIBRARY_INCLUDE_DIR}
+    ${TENSORRT_INCLUDE_DIR}
+    ${CUDA_INCLUDE_DIR}
+)
+target_link_libraries(catgpt_analyze PRIVATE
+    ${NVINFER_LIB}
+    ${CUDART_LIB}
+)
+set_target_properties(catgpt_analyze PROPERTIES
+    BUILD_RPATH   "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+    INSTALL_RPATH "${GCC14_LIB_DIR};${TENSORRT_LIB_DIR};${CUDA_LIB_DIR}"
+)
+
 # === CatGPT LKS UCI Engine (Lazy-SMP, log-scale ID, TRT-batched) ===
 add_executable(lks_uci
     src/lks_uci_main.cpp
@@ -415,6 +433,7 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(lks_search_test PRIVATE -fdiagnostics-color=always)
     target_compile_options(lks_uci PRIVATE -fdiagnostics-color=always)
     target_compile_options(catgpt_search PRIVATE -fdiagnostics-color=always)
+    target_compile_options(catgpt_analyze PRIVATE -fdiagnostics-color=always)
     if(HAVE_LIBCORO)
         target_compile_options(catgpt_fractional_mcts PRIVATE -fdiagnostics-color=always)
         target_compile_options(catgpt_mcts PRIVATE -fdiagnostics-color=always)
