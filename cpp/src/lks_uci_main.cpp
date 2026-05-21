@@ -356,7 +356,7 @@ int main(int argc, char* argv[]) {
     } else if (const char* env = std::getenv("CATGPT_TRT_ENGINE")) {
         engine_path = env;
     } else {
-        engine_path = "/home/shadeform/CatGPT/main.trt";
+        engine_path = "/home/shadeform/CatGPT/main.network";
     }
 
     if (!fs::exists(engine_path)) {
