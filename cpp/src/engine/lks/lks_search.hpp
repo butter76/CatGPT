@@ -85,9 +85,9 @@
  *          `find_or_claim` and publish. CAS losers (peers that
  *          published during our eval await) adopt the peer's entry
  *          and orphan their bytes.
- *       3. Re-deepen check: if the entry's max_depth >= depth, return
- *          (handing the TT (Q, max_depth) back to the caller via the
- *          `Plan* out` argument).
+ *       3. Re-deepen check: if `rec_depth` >= 196 or the entry's
+ *          max_depth >= depth, return (handing the TT (Q, max_depth)
+ *          back to the caller via the `Plan* out` argument).
  *       4. Pass 1: classify children into a local Plan vector
  *          (terminal / path-dep draw / TT-hit / Unexpanded). Halley
  *          allocator fills `alloc` in place.
@@ -525,12 +525,15 @@ struct RecurseContext {
  * untouched — the parent's own `should_abort()` check fires in the
  * same iteration and skips its rollup before the stale row is read.
  */
+inline constexpr uint32_t kRecursiveDepthLimit = 196;
+
 inline constexpr auto recursive_search =
     [](auto recursive_search,
        RecurseContext* ctx,
        lfsync::Permit permit,
        chess::Board board,
        float depth,
+       uint32_t rec_depth,
        Plan* out) -> lf::task<void>
 {
     if (ctx->w->should_abort()) co_return;
@@ -647,10 +650,11 @@ inline constexpr auto recursive_search =
         // is never torn here.
         auto [cur_q, cur_max_d] = v2::unpack_qd(
             v2::SearchArena::load_qd(entry).qd_packed);
-        if (depth <= cur_max_d) {
+        if (rec_depth >= kRecursiveDepthLimit || depth <= cur_max_d) {
             // Hand the already-unpacked TT (Q, max_depth) back to the
             // caller — same value the deleted post-join re-read would
-            // have produced.
+            // have produced. At the recursion cap, skip Pass 1+ as if
+            // re-deepened.
             if (out) { out->Q = cur_q; out->depth = cur_max_d; }
             co_return;
         }
@@ -860,7 +864,7 @@ inline constexpr auto recursive_search =
                 p.mode = Mode::Expanded;
                 co_await lf::fork[recursive_search](
                     ctx, std::move(child_permit), std::move(cb),
-                    target_depth, &p);
+                    target_depth, rec_depth + 1, &p);
             }
 
             if (any_fork) {
@@ -929,7 +933,8 @@ inline constexpr auto root_search =
 {
     lfsync::Permit p = co_await ctx->sem->acquire();
     co_await lf::call[recursive_search](
-        ctx, std::move(p), std::move(board), depth, /*out=*/nullptr);
+        ctx, std::move(p), std::move(board), depth,
+        /*rec_depth=*/0u, /*out=*/nullptr);
     co_await lf::join;
 };
 
