@@ -96,7 +96,8 @@
  *          (top `hdr->force_expand` priors — a per-position dynamic
  *          count computed at first-eval from a temp-1.0 policy via
  *          a 95%-of-modified-entropy rule, capped at 8 — or all
- *          Unexpanded when `depth > depth_floor + log(20)`).
+ *          Unexpanded when `depth > depth_floor +
+ *          log(force_all_unexpanded_log_arg)`).
  *          Pre-mark `Mode::Expanded`
  *          and spawn a child `recursive_search` via `lf::fork`, passing
  *          `&plan` as the out-param. First fork
@@ -205,6 +206,10 @@ struct SearchParams {
     float clamp_step      = 0.4f;
     float break_eps       = 0.1f;
     int   clamp_max_iters = 1024;
+
+    // Iter-0 clamp loop: force-expand every Unexpanded child (not just the
+    // top hdr->force_expand priors) when depth > depth_floor + log(this).
+    float force_all_unexpanded_log_arg = 40.0f;
 };
 
 }  // namespace detail
@@ -782,7 +787,8 @@ inline constexpr auto recursive_search =
     }();
 
     // Variance-scaled depth floor: threshold for iter-0 force-all
-    // Unexpanded expansion (`depth > depth_floor + log(20)`). Same
+    // Unexpanded expansion (`depth > depth_floor +
+    // log(force_all_unexpanded_log_arg)`). Same
     // formula as default_max_depth on fresh TT entries.
     const float depth_floor = -std::log(
         hdr->variance * ctx->params->default_depth_constant);
@@ -878,7 +884,8 @@ inline constexpr auto recursive_search =
     //      use the alloc gate; on iter 0 only, force-expand the first
     //      `hdr->force_expand` Unexpanded priors (per-position dynamic
     //      count, computed at first-eval from a temp-1.0 policy), or
-    //      all Unexpanded when `depth > depth_floor + log(20)`, at
+    //      all Unexpanded when `depth > depth_floor +
+    //      log(force_all_unexpanded_log_arg)`, at
     //      recursion depth p.alloc. Children write (Q, depth) back
     //      through `&p`.
     //
@@ -898,6 +905,8 @@ inline constexpr auto recursive_search =
     {
         const float clamp_step  = ctx->params->clamp_step;
         const float break_eps   = ctx->params->break_eps;
+        const float force_all_log_arg =
+            ctx->params->force_all_unexpanded_log_arg;
         const int   max_iters   = ctx->params->clamp_max_iters;
         const int   force_count = static_cast<int>(hdr->force_expand);
 
@@ -920,7 +929,7 @@ inline constexpr auto recursive_search =
 
             const bool force_all_unexpanded =
                 (iter == 0)
-                && (depth > depth_floor + std::log(20.0f));
+                && (depth > depth_floor + std::log(force_all_log_arg));
 
             bool first_fork = (iter == 0);
             bool any_fork   = false;
