@@ -93,8 +93,11 @@
  *          allocator fills `alloc` in place.
  *       5. Pass 2: Expanded children fork when `alloc > p.depth`;
  *          Unexpanded children expand only on iter 0 via force
- *          (top `force_expand_count` priors, or all Unexpanded when
- *          `depth > depth_floor + log(20)`). Pre-mark `Mode::Expanded`
+ *          (top `hdr->force_expand` priors — a per-position dynamic
+ *          count computed at first-eval from a temp-1.0 policy via
+ *          a 95%-of-modified-entropy rule, capped at 8 — or all
+ *          Unexpanded when `depth > depth_floor + log(20)`).
+ *          Pre-mark `Mode::Expanded`
  *          and spawn a child `recursive_search` via `lf::fork`, passing
  *          `&plan` as the out-param. First fork
  *          inherits the parent's permit; subsequent forks each
@@ -189,13 +192,6 @@ struct SearchParams {
     // where cumulative_P sums priors of preceding P-sorted children (expanded
     // or not).
     float fpu_reduction = 0.330f;
-
-    // Iter-0 force-expansion: always recurse on the first
-    // `force_expand_count` Unexpanded children (no alloc gate). When
-    // parent `depth > depth_floor + log(20)`, force-expand every
-    // Unexpanded child on iter 0. Unexpanded plans never expand via
-    // `alloc > depth` on any iteration.
-    int   force_expand_count = 8;
 
     // Clamp loop: cap per-iteration depth growth and break-out tolerance.
     //   - each forked child is dispatched at min(p.alloc, p.depth + clamp_step);
@@ -383,6 +379,100 @@ inline float compute_value_variance(
         var += value_probs[i] * diff * diff;
     }
     return var;
+}
+
+/**
+ * Per-position iter-0 force-expand count, computed once at first
+ * evaluation from the GPU's legal-move policy logits.
+ *
+ * Intuition: rather than a fixed `force_expand_count` knob, we let
+ * each position's policy decide how many top-prior children deserve
+ * an unconditional iter-0 expansion. Sharp tactical positions (one
+ * dominant move) get a small count; quiet, diffuse positions (many
+ * plausible replies) get more.
+ *
+ * Algorithm:
+ *   1. Temp-1.0 softmax over `out.legal_policy[0..n)` -> p[i].
+ *   2. Subtract a noise floor of 1/300 from every entry, capped at 0:
+ *        q_i = max(0, p_i - 1/300)
+ *      Renormalize q to sum to 1 (when the sum is > 0).
+ *   3. Entropy H = -sum(q * log q) of the renormalized q.
+ *   4. Sort q descending; pick the smallest k whose top-k partial
+ *      sum of -q*log(q) is >= 0.95 * H.
+ *   5. Clamp to [1, 8] when n > 0; return 0 when n == 0.
+ *
+ * The 1/300 floor strips out long-tail near-zero priors so they
+ * don't pad the entropy, and the 95% cover keeps the count
+ * concentrated on moves that meaningfully share the policy mass.
+ */
+inline uint16_t compute_force_expand(const RawNNOutput& out, int num_moves) noexcept {
+    constexpr uint16_t kMinForce  = 1;
+    constexpr uint16_t kMaxForce  = 8;
+    constexpr float    kNoiseFloor = 1.0f / 300.0f;
+    constexpr float    kCover      = 0.95f;
+
+    if (num_moves <= 0) return 0;
+
+    // Temp-1.0 softmax (LSE max-subtract for numerical stability).
+    std::array<float, MAX_LEGAL_MOVES> q{};
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < num_moves; ++i) {
+        max_logit = std::max(max_logit, out.legal_policy[i]);
+    }
+    float sum_exp = 0.0f;
+    for (int i = 0; i < num_moves; ++i) {
+        const float e = std::exp(out.legal_policy[i] - max_logit);
+        q[i] = e;
+        sum_exp += e;
+    }
+    if (!std::isfinite(sum_exp) || sum_exp <= 0.0f) {
+        // Degenerate logits (NaN / -inf max). Match softmax_legal_sorted's
+        // uniform fallback so the floor kicks in.
+        const float uniform = 1.0f / static_cast<float>(num_moves);
+        for (int i = 0; i < num_moves; ++i) q[i] = uniform;
+    } else {
+        const float inv_sum = 1.0f / sum_exp;
+        for (int i = 0; i < num_moves; ++i) q[i] *= inv_sum;
+    }
+
+    // Noise-floor subtract + renormalize.
+    float s = 0.0f;
+    for (int i = 0; i < num_moves; ++i) {
+        const float v = q[i] - kNoiseFloor;
+        q[i] = (v > 0.0f) ? v : 0.0f;
+        s += q[i];
+    }
+    if (s <= 0.0f) {
+        return std::min<uint16_t>(kMinForce, static_cast<uint16_t>(num_moves));
+    }
+    const float inv_s = 1.0f / s;
+    for (int i = 0; i < num_moves; ++i) q[i] *= inv_s;
+
+    // Sort descending (only the first `num_moves` entries are valid).
+    std::sort(q.begin(), q.begin() + num_moves, std::greater<float>());
+
+    // Entropy of the renormalized q.
+    float H = 0.0f;
+    for (int i = 0; i < num_moves; ++i) {
+        if (q[i] > 0.0f) H -= q[i] * std::log(q[i]);
+    }
+    if (H <= 0.0f) {
+        return std::min<uint16_t>(kMinForce, static_cast<uint16_t>(num_moves));
+    }
+
+    // Smallest k with top-k entropy mass >= 0.95 * H.
+    const float target = kCover * H;
+    float partial = 0.0f;
+    int k = 0;
+    for (int i = 0; i < num_moves; ++i) {
+        if (q[i] > 0.0f) partial -= q[i] * std::log(q[i]);
+        ++k;
+        if (partial >= target) break;
+    }
+
+    const int clamped = std::clamp(k, static_cast<int>(kMinForce),
+                                      static_cast<int>(kMaxForce));
+    return static_cast<uint16_t>(std::min(clamped, num_moves));
 }
 
 /**
@@ -604,6 +694,7 @@ inline constexpr auto recursive_search =
         const float variance = compute_value_variance(out.value_probs);
         v2::NodeInfoHeader* hdr_w = ctx->arena->info_at(off);
         hdr_w->variance = variance;
+        hdr_w->force_expand = compute_force_expand(out, static_cast<int>(num_moves));
 
         const float Q = catgpt::wdl_logits_to_q(out.wdl_logits);
 
@@ -785,9 +876,11 @@ inline constexpr auto recursive_search =
     //   3. Expanded plans fork when alloc > p.depth at
     //      min(alloc, p.depth + clamp_step). Unexpanded plans never
     //      use the alloc gate; on iter 0 only, force-expand the first
-    //      `force_expand_count` Unexpanded priors, or all Unexpanded
-    //      when `depth > depth_floor + log(20)`, at recursion depth
-    //      p.alloc. Children write (Q, depth) back through `&p`.
+    //      `hdr->force_expand` Unexpanded priors (per-position dynamic
+    //      count, computed at first-eval from a temp-1.0 policy), or
+    //      all Unexpanded when `depth > depth_floor + log(20)`, at
+    //      recursion depth p.alloc. Children write (Q, depth) back
+    //      through `&p`.
     //
     // Permits: only iter 0's FIRST fork inherits this coroutine's
     // entry permit (so K bounds permit-holding frames, not alive
@@ -806,7 +899,7 @@ inline constexpr auto recursive_search =
         const float clamp_step  = ctx->params->clamp_step;
         const float break_eps   = ctx->params->break_eps;
         const int   max_iters   = ctx->params->clamp_max_iters;
-        const int   force_count = ctx->params->force_expand_count;
+        const int   force_count = static_cast<int>(hdr->force_expand);
 
         for (int iter = 0; iter < max_iters; ++iter) {
             compute_log_allocations(plans.data(),

@@ -313,14 +313,16 @@ static_assert(alignof(TTEntry) == 32, "TTEntry must be 32-byte aligned");
  * visible to any reader who acquire-loads `info` and observes
  * `info_offset != kNoInfoOffset`.
  *
- * `_pad` is unused; it keeps `sizeof(NodeInfoHeader) == 8` so the
- * arena's zero-offset reservation (`kArenaReservedBytes`) and the
- * natural 2-byte alignment of the trailing `MoveInfo[]` are unchanged.
+ * `force_expand` is the per-position iter-0 force-expand count: the
+ * number of top-prior Unexpanded children that descent should always
+ * recurse into on iter 0 (no alloc gate). Computed once at first
+ * evaluation from a temp-1.0 policy via a modified-entropy rule (see
+ * `compute_force_expand` in lks_search.hpp); 0 <= force_expand <= 8.
  */
 struct NodeInfoHeader {
-    float    variance;   // 4: computed once from NN value distribution
-    uint16_t num_moves;  // 2: <= 218 in chess
-    uint16_t _pad;       // 2: reserved; kept zero on alloc_node_info
+    float    variance;      // 4: computed once from NN value distribution
+    uint16_t num_moves;     // 2: <= 218 in chess
+    uint16_t force_expand;  // 2: dynamic iter-0 force-expand count, [0, 8]
 };
 static_assert(sizeof(NodeInfoHeader) == 8, "NodeInfoHeader must be 8 bytes");
 
@@ -795,7 +797,7 @@ public:
         auto* header = std::launder(reinterpret_cast<NodeInfoHeader*>(arena_ + offset));
         header->variance = 0.0f;
         header->num_moves = num_moves;
-        header->_pad = 0;
+        header->force_expand = 0;
         return offset;
     }
 
