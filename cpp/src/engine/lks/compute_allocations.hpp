@@ -61,7 +61,7 @@ namespace catgpt::lks::detail {
  * Mode semantics:
  *   - Expanded: a usable `Q` is available for the rollup. Sources are
  *     a TT-hit child, a position-only terminal (draw / loss / win), a
- *     path-dependent draw (3-fold / 50-move along this path), or a
+ *     path-dependent draw (2-fold repetition / 50-move along this path), or a
  *     just-recursed child whose `recursive_search` wrote its rolled-up
  *     `(Q, depth)` back through the parent's `&plans[i]`. Pass 2
  *     pre-marks Expanded immediately before forking; abort paths leave

@@ -485,7 +485,8 @@ inline uint16_t compute_force_expand(const RawNNOutput& out, int num_moves) noex
 /**
  * Position-only terminal classification for a child move at expansion
  * time. Path-dependent terminal conditions are NOT considered here:
- *   - repetitions: handled at descent time via `isRepetition(1)`.
+ *   - repetitions: handled at descent time via `isRepetition(1)`
+ *     (2-fold draw policy; not cached in terminal_kind).
  *   - 50-move rule: handled at descent time via `isHalfMoveDraw()`.
  * Both depend on data (path history / half-move clock) that is not
  * part of the Zobrist key, so two transpositions to the same key can
@@ -837,9 +838,10 @@ inline constexpr auto recursive_search =
         chess::Board cb = board;
         cb.makeMove<true>(chess::Move{m.move});
 
-        // Path-dependent: 3-fold along this path or 50-move expiration is
-        // NOT in terminal_kind (different paths hashing to the same key
-        // may disagree on repetition / half-move clock). Treat as a draw
+        // Path-dependent: 2-fold repetition as a draw along this path
+        // (`isRepetition(1)`) or 50-move expiration is NOT in
+        // terminal_kind (different paths hashing to the same key may
+        // disagree on repetition / half-move clock). Treat as a draw
         // at this caller; Expanded with depth=+inf like terminals.
         if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
             plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
@@ -1368,7 +1370,7 @@ public:
      *     whose Q happens to be the only real value seen at this node.
      * The line additionally ends — AFTER emitting the latest move —
      * when the resulting position satisfies any of:
-     *   - 3-fold repetition along this PV (`isRepetition(1)`),
+     *   - 2-fold (twofold) repetition along this PV (`isRepetition(1)`),
      *   - 50-move expiration (`isHalfMoveDraw()`),
      *   - insufficient material,
      *   - `max_len` plies have been emitted (defensive cap).
@@ -1410,8 +1412,9 @@ private:
      * for the child, in any of these ways:
      *   - position-only terminal cached on the MoveInfo
      *     (mate / stalemate / insufficient material / Syzygy WDL),
-     *   - path-dependent draw at this caller (3-fold along this PV
-     *     or 50-move expiration after `parent + mi.move`),
+     *   - path-dependent draw at this caller (2-fold along this PV
+     *     via `isRepetition(1)`, or 50-move expiration after
+     *     `parent + mi.move`),
      *   - the child's resulting position has a TT entry.
      * Returns false only for a "TT miss with no terminal shortcut" —
      * the same Unexpanded category `recursive_search` Pass 1 produces.
