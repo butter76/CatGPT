@@ -12,18 +12,29 @@
  *   with q_i = -Q_i (parent-loss POV). K is unique on (q_max, +inf) — LHS
  *   is strictly decreasing in K. Output is log N_i per child.
  *
- * Solver: Halley in delta = K - q_max, monotone-from-above starting at
- *   delta_hi = c_puct / (3 N^(1/3))
- * (the Delta_i = 0 closed form, which is a proven upper bound on delta*).
- * g(delta) = sum_i w_i / (delta + Delta_i) - N is strictly convex and
- * decreasing on (0, infinity), so the Halley step
+ * Solver: bracketed Halley in delta = K - q_max. The bracket is
+ *   [lo, hi] = [0, c_puct / (3 N^(1/3))]
+ * (lo is exclusive; hi is the Delta_i = 0 closed form, a proven upper
+ * bound on delta*). Each iteration evaluates g at the current delta,
+ * tightens the bracket by the sign of g (g is strictly monotone
+ * decreasing), and either accepts the Halley step
  *   delta_new = delta - 2 g g' / (2 g'^2 - g g'')
- * stays above delta* throughout; no bracket safeguard needed. Inner
- * kernel: M (1 div + 3 mul + 2 add) per iter, no transcendentals.
+ * if it lands strictly inside the bracket, or falls back to bisection
+ * (midpoint). This preserves Halley's cubic convergence on well-
+ * conditioned distributions while guaranteeing convergence in the
+ * pathological "one large-prior child far from q_max + the rest
+ * clustered at q_max" case, where the prior monotone-from-above-only
+ * iteration would halve d unboundedly toward zero and overshoot the
+ * true delta* by 4+ orders of magnitude. Inner kernel: M (1 div + 3 mul
+ * + 2 add) per iter, no transcendentals.
  *
- * This is the "A6c" winner from the compute_alloc_gym referenced in the
- * design commit (e13d41c4). Per-call iteration count typically <= 4 at
- * 1e-6 log-tol; capped at 16 defensively.
+ * The "A6c" winner from the compute_alloc_gym referenced in the design
+ * commit (e13d41c4) was the unbracketed Halley variant; the bracket and
+ * bisection fallback were added later after the dual collapse was
+ * traced to that path. Per-call iteration count typically <= 4 at
+ * 1e-6 log-tol on healthy inputs; capped at 32 defensively (each
+ * bisection halves the bracket, so 32 iterations is 1e-9 of the
+ * starting width).
  *
  * Lives next to lks_search.hpp because Plan / Mode are the same types
  * the descent uses end-to-end. The solver only reads Plan.P and Plan.Q
@@ -33,6 +44,7 @@
 #ifndef CATGPT_ENGINE_LKS_COMPUTE_ALLOCATIONS_HPP
 #define CATGPT_ENGINE_LKS_COMPUTE_ALLOCATIONS_HPP
 
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -78,12 +90,38 @@ struct Plan {
 };
 
 /**
- * Halley-in-delta dual solve. Reads plans[i].Q / plans[i].P and writes
+ * Bracketed-Halley dual solve. Reads plans[i].Q / plans[i].P and writes
  * plans[i].alloc = log N_i in place. M == 0 is a no-op.
  *
+ * Bracketing leverages the structural properties of g(d):
+ *   - g is continuous and strictly monotone decreasing on (0, infinity),
+ *     since g'(d) = -sum w_i / (d + Δ_i)^2 < 0;
+ *   - g(0+) > 0 (>= 0 when no Δ_i is zero) and g(+inf) = -N < 0, so the
+ *     unique root d* lies in (0, +inf);
+ *   - delta_hi = c_puct / (3 N^(1/3)) is a proven upper bound on d*
+ *     (the Δ_i = 0 closed form; LHS is strictly decreasing in K, and any
+ *     positive Δ_i only shrinks the sum).
+ * So [lo=0, hi=delta_hi] is a guaranteed sign-changing bracket. Each
+ * iteration evaluates g at the current d, tightens [lo, hi] by the sign,
+ * and accepts the Halley step ONLY if it lands strictly inside the
+ * bracket; otherwise it falls back to bisection (midpoint of [lo, hi]).
+ *
+ * This is the cubic-when-it-works / bisection-when-it-doesn't pattern from
+ * boost::math::tools::halley_iterate. It preserves Halley's fast
+ * convergence on well-conditioned distributions while guaranteeing the
+ * pathological case (one large-prior child far from q_max + the rest
+ * clustered at q_max, where denom = 2 g'^2 - g g'' collapses or flips
+ * sign and the old fallback halved d unboundedly toward zero) converges
+ * within log2(delta_hi / eps) ~= 30 bisection steps even if Halley is
+ * rejected every iteration.
+ *
  * Numerics: inner loop is double-precision; cast to float only at the
- * final `alloc` write. Convergence: |g(delta)| <= 1e-6 * N or relative
- * step <= 1e-6.
+ * final `alloc` write. Convergence: |g(delta)| <= 1e-6 * N or bracket
+ * width below 1e-12 relative to hi.
+ *
+ * Debug-only post-condition: when the solver converges, sum(exp(alloc_i))
+ * must equal N within a generous relative tolerance. NDEBUG-gated to
+ * keep the release-build hot path free of the extra exp() loop.
  */
 inline void compute_log_allocations(Plan* plans, int M,
                                     float depth, float c_puct) noexcept
@@ -125,27 +163,39 @@ inline void compute_log_allocations(Plan* plans, int M,
         gpp = 2.0 * s3;
     };
 
-    // delta_hi = c_puct / (3 N^(1/3)): proven upper bound from Δ_i = 0.
-    double d = static_cast<double>(c_puct) / (3.0 * cbrt_N);
+    // Guaranteed sign-changing bracket. lo=0 is exclusive (g may be +inf
+    // there when some Δ_i == 0); we never evaluate at lo. hi is the
+    // delta_hi upper bound, where g(hi) <= 0 by the proof above.
+    double lo = 0.0;
+    double hi = static_cast<double>(c_puct) / (3.0 * cbrt_N);
+    double d  = hi;
 
-    constexpr int kMaxIters = 16;
+    constexpr int kMaxIters = 32;
     for (int it = 0; it < kMaxIters; ++it) {
         double g, gp, gpp;
         eval(d, g, gp, gpp);
         if (std::fabs(g) <= tol_g) break;
 
+        // Tighten bracket by sign of g (g is strictly monotone decreasing,
+        // so g > 0 means root is to the right of d, g < 0 means to the left).
+        if (g > 0.0) lo = d;
+        else         hi = d;
+        if (hi - lo <= 1.0e-12 * (hi + 1.0e-30)) break;
+
+        // Halley step: cubic-convergence when well-conditioned (denom > 0,
+        // gp < 0 always). Accept only if it lands strictly inside the
+        // bracket; otherwise fall back to bisection. This is what catches
+        // the pathological "one dominant child + cluster at q_max" case
+        // where denom collapses or the step overshoots below 0.
         const double denom = 2.0 * gp * gp - g * gpp;
         double d_new;
-        if (gp < 0.0 && std::isfinite(denom) && denom != 0.0) {
+        if (gp < 0.0 && std::isfinite(denom) && denom > 0.0) {
             d_new = d - (2.0 * g * gp) / denom;
-            if (d_new <= 0.0) d_new = d * 0.5;
+            if (!(d_new > lo && d_new < hi)) {
+                d_new = 0.5 * (lo + hi);
+            }
         } else {
-            // Shouldn't happen on the monotone-from-above path; defensive halve.
-            d_new = d * 0.5;
-        }
-        if (std::fabs(d_new - d) <= 1.0e-6 * (d + 1.0e-30)) {
-            d = d_new;
-            break;
+            d_new = 0.5 * (lo + hi);
         }
         d = d_new;
     }
@@ -162,6 +212,22 @@ inline void compute_log_allocations(Plan* plans, int M,
         const double log_ni  = std::log(p) - std::log(d + Delta_i) + bias;
         plans[i].alloc       = static_cast<float>(log_ni);
     }
+
+#ifndef NDEBUG
+    // Post-condition: sum exp(alloc_i) ~= N. Tolerance is generous (1%
+    // relative + 1.0 absolute) — anything that materially exceeds this
+    // means the dual solve failed and downstream depths will be unbounded.
+    // The 1.0 absolute slack handles the small-N regime where 1% of N is
+    // sub-floating-point noise.
+    double sum_ni = 0.0;
+    for (int i = 0; i < M; ++i) {
+        const double a = static_cast<double>(plans[i].alloc);
+        if (std::isfinite(a)) sum_ni += std::exp(a);
+    }
+    assert(std::fabs(sum_ni - N) <= 1.0e-2 * N + 1.0
+           && "compute_log_allocations: sum exp(alloc_i) deviates from N "
+              "by more than 1% — Halley/bisection solver failed to converge");
+#endif
 }
 
 }  // namespace catgpt::lks::detail
