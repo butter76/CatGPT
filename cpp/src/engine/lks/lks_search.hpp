@@ -412,6 +412,8 @@ inline float compute_value_variance(
  */
 inline uint16_t compute_force_expand(const RawNNOutput& out, int num_moves) noexcept {
     constexpr uint16_t kMinForce  = 1;
+    // Not generally load-bearing: clamping here typically moves nodes evaluated
+    // by only ~3%. A generous max is for pathological subtrees only.
     constexpr uint16_t kMaxForce  = 8;
     constexpr float    kNoiseFloor = 1.0f / 300.0f;
     constexpr float    kCover      = 0.95f;
