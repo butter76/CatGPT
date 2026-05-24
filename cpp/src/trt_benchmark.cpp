@@ -36,6 +36,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "catgpt_version.hpp"
 #include "engine/network_file.hpp"
 #include "engine/nn_constants.hpp"
 
@@ -1117,6 +1118,11 @@ void print_header() {
     std::println("╔════════════════════════════════════════════════════════════════╗");
     std::println("║         CatGPT Chess Engine - TensorRT Benchmark               ║");
     std::println("╚════════════════════════════════════════════════════════════════╝");
+    std::println("Version: {}  commit: {}{}  branch: {}",
+                 catgpt::version::GIT_DESCRIBE,
+                 catgpt::version::GIT_HASH_SHORT,
+                 catgpt::version::GIT_DIRTY ? " (dirty)" : "",
+                 catgpt::version::GIT_BRANCH);
 }
 
 void print_cuda_info() {

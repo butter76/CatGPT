@@ -27,7 +27,9 @@
 
 set -euo pipefail
 
-TRT_ROOT=/home/shadeform/TensorRT-10.13.3.9
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+TRT_ROOT="${TRT_ROOT:-/home/shadeform/TensorRT-10.13.3.9}"
 TRTEXEC=${TRT_ROOT}/bin/trtexec
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:${TRT_ROOT}/lib
 
@@ -56,7 +58,7 @@ done
 
 echo
 echo "=== Packing ${#TRT_FILES[@]} engines -> ${NETWORK_OUT} ==="
-uv run scripts/pack_network.py -o "${NETWORK_OUT}" "${TRT_FILES[@]}"
+"${PYTHON:-python3}" "${SCRIPT_DIR}/pack_network.py" -o "${NETWORK_OUT}" "${TRT_FILES[@]}"
 
 echo
 echo "=== Cleaning up per-bucket .trt files ==="

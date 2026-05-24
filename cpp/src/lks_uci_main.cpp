@@ -53,6 +53,7 @@
 #include <vector>
 
 #include "../external/chess-library/include/chess.hpp"
+#include "catgpt_version.hpp"
 #include "engine/lks/lks_search.hpp"
 
 namespace fs = std::filesystem;
@@ -162,7 +163,10 @@ private:
     }
 
     void handle_uci() {
-        std::println("id name {}", ENGINE_NAME);
+        std::println("id name {} {}{}",
+                     ENGINE_NAME,
+                     catgpt::version::GIT_DESCRIBE,
+                     catgpt::version::GIT_DIRTY ? "-dirty" : "");
         std::println("id author {}", ENGINE_AUTHOR);
         std::println("uciok");
         std::fflush(stdout);
@@ -349,6 +353,12 @@ private:
 int main(int argc, char* argv[]) {
     std::ios_base::sync_with_stdio(false);
     std::cin.tie(nullptr);
+
+    std::println(stderr, "CatGPT lks_uci  version={}  commit={}{}  branch={}",
+                 catgpt::version::GIT_DESCRIBE,
+                 catgpt::version::GIT_HASH_SHORT,
+                 catgpt::version::GIT_DIRTY ? " (dirty)" : "",
+                 catgpt::version::GIT_BRANCH);
 
     fs::path engine_path;
     if (argc > 1) {
