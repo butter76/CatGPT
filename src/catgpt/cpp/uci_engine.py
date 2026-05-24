@@ -48,6 +48,7 @@ class UCIEngine:
         timeout: float = 60.0,
         go_options: dict[str, int | str] | None = None,
         env: dict[str, str] | None = None,
+        stop_on_timeout: bool = False,
     ) -> None:
         """Initialize the UCI engine.
 
@@ -59,12 +60,19 @@ class UCIEngine:
             env: Extra environment variables to layer on top of os.environ for
                 the spawned engine subprocess (e.g., LKS_* tunables for
                 lks_uci). None = inherit os.environ unmodified.
+            stop_on_timeout: If True, when `select_move` does not see a
+                `bestmove` within `timeout` seconds, send a UCI `stop`
+                command and wait once more for the engine to flush whatever
+                move it has so far. Useful for engines like LKS where a
+                runaway search should yield a best-effort move rather than
+                kill the worker.
         """
         self.binary_path = Path(binary_path)
         self.engine_path = Path(engine_path) if engine_path else None
         self.timeout = timeout
         self.go_options = go_options or {}
         self.env_overrides = env or {}
+        self.stop_on_timeout = stop_on_timeout
 
         if not self.binary_path.exists():
             raise FileNotFoundError(f"Engine binary not found: {self.binary_path}")
@@ -133,6 +141,44 @@ class UCIEngine:
             raise UCIEngineError(f"Timeout waiting for '{expected}'")
         except pexpect.EOF:
             raise UCIEngineError("Engine process terminated unexpectedly")
+
+    def _wait_for_bestmove(self) -> None:
+        """Wait for a `bestmove` line, optionally sending `stop` on timeout.
+
+        Behaves like `_wait_for_response("bestmove")`, except that when
+        `stop_on_timeout` is set, a `pexpect.TIMEOUT` triggers a UCI
+        `stop` command followed by one more bounded wait. Per the UCI
+        spec, `stop` forces the engine to terminate its current search
+        and emit `bestmove` immediately, so the second wait should
+        return quickly unless the engine is wedged.
+        """
+        if self._child is None:
+            raise UCIEngineError("Engine not running")
+
+        try:
+            self._child.expect("bestmove", timeout=self.timeout)
+            return
+        except pexpect.TIMEOUT:
+            if not self.stop_on_timeout:
+                raise UCIEngineError(
+                    f"Timeout waiting for 'bestmove' after {self.timeout}s"
+                )
+        except pexpect.EOF:
+            raise UCIEngineError("Engine process terminated unexpectedly")
+
+        logger.warning(
+            f"UCI engine did not produce bestmove within {self.timeout}s; "
+            f"sending 'stop' to force a move"
+        )
+        self._send_command("stop")
+        try:
+            self._child.expect("bestmove", timeout=self.timeout)
+        except pexpect.TIMEOUT:
+            raise UCIEngineError(
+                f"Timeout waiting for 'bestmove' after 'stop' ({self.timeout}s)"
+            )
+        except pexpect.EOF:
+            raise UCIEngineError("Engine process terminated unexpectedly after 'stop'")
 
     def _parse_bestmove(self, text: str) -> chess.Move | None:
         """Parse the bestmove from engine output."""
@@ -228,10 +274,11 @@ class UCIEngine:
             self._send_command(" ".join(go_parts))
 
             # Wait for bestmove — everything before the match (info lines) is
-            # available in self._child.before after the expect call.
-            self._wait_for_response("bestmove")
+            # available in self._child.before after the expect call. If the
+            # engine misses the deadline and stop_on_timeout is enabled, ask
+            # it to halt the search and try once more before giving up.
+            self._wait_for_bestmove()
 
-            # Get the full line containing bestmove
             if self._child is None:
                 return None
 
@@ -407,6 +454,7 @@ class LksEngine(UCIEngine):
             timeout=timeout,
             go_options={"nodes": min_total_evals},
             env=env,
+            stop_on_timeout=True,
         )
         self._min_total_evals = min_total_evals
         self._delta_depth = delta_depth

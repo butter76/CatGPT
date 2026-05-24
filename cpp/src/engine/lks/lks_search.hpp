@@ -85,24 +85,32 @@
  *          `find_or_claim` and publish. CAS losers (peers that
  *          published during our eval await) adopt the peer's entry
  *          and orphan their bytes.
- *       3. Re-deepen check: if the entry's max_depth >= depth, return
- *          (handing the TT (Q, max_depth) back to the caller via the
- *          `Plan* out` argument).
+ *       3. Re-deepen check: if `rec_depth` >= 196 or the entry's
+ *          max_depth >= depth, return (handing the TT (Q, max_depth)
+ *          back to the caller via the `Plan* out` argument).
  *       4. Pass 1: classify children into a local Plan vector
  *          (terminal / path-dep draw / TT-hit / Unexpanded). Halley
  *          allocator fills `alloc` in place.
- *       5. Pass 2: for each plan with `alloc > depth`, pre-mark
- *          `Mode::Expanded` and spawn a child `recursive_search` via
- *          `lf::fork`, passing `&plan` as the out-param. First fork
+ *       5. Pass 2: Expanded children fork when `alloc > p.depth`;
+ *          Unexpanded children expand only on iter 0 via force
+ *          (top `hdr->force_expand` priors — a per-position dynamic
+ *          count computed at first-eval from a temp-1.0 policy via
+ *          a 95%-of-modified-entropy rule, capped at 8 — or all
+ *          Unexpanded when `depth > depth_floor +
+ *          log(force_all_unexpanded_log_arg)`).
+ *          Pre-mark `Mode::Expanded`
+ *          and spawn a child `recursive_search` via `lf::fork`, passing
+ *          `&plan` as the out-param. First fork
  *          inherits the parent's permit; subsequent forks each
  *          `co_await sem.acquire()`. `lf::join` waits for all forked
  *          children. Each child writes its rolled-up `(Q, depth)`
  *          straight back into the parent's plan row — no post-join TT
  *          re-read.
- *       6. Rollup: e^alloc-weighted average of -child_Q over Expanded
- *          plans (terminal / path-dep draws contribute fixed Q;
- *          forked children contribute the values their own rollup
- *          wrote into the plan).
+ *       6. Rollup: parent's Q is the negamax of children's Q
+ *          (`Q_new = max_i(-child_Q_i)`) over Expanded plans
+ *          (terminal / path-dep draws contribute fixed Q; forked
+ *          children contribute the values their own rollup wrote into
+ *          the plan).
  *       7. `update_qd` with the new (Q, depth); also forward (Q, depth)
  *          to our caller through `*out`.
  */
@@ -169,17 +177,10 @@ namespace detail {
 struct SearchParams {
     float policy_temp = 1.3f;  // softmax temperature; >1 flattens, <1 sharpens
 
-    // Thresholds for compute_limit (mirrors FractionalMCTSConfig naming).
-    // `policy_coverage_threshold` is the cumulative-prior fraction that
-    // defines `limit`; `single_node_coverage_threshold` is the minimum
-    // top-prior required for `limit == 1` (else forced to >= 2).
-    float policy_coverage_threshold     = 0.0f;
-    float single_node_coverage_threshold = 0.75f;
-
     // Heuristic for the initial max_depth stamped onto a freshly evaluated
-    // TT entry: default_max_depth = -log(variance * C / limit). Low-variance
-    // nodes get a high max_depth so early ID iterations skip re-descending
-    // them (trust the NN). C is this constant.
+    // TT entry: default_max_depth = -log(variance * C). Low-variance nodes
+    // get a high max_depth so early ID iterations skip re-descending them
+    // (trust the NN). C is this constant.
     float default_depth_constant = 12.0f;
 
     // PUCT allocation constant. Feeds Halley-in-delta dual solve:
@@ -190,7 +191,7 @@ struct SearchParams {
     // FPU reduction. For unexpanded children we synthesize a parent-POV Q via
     //   Q_eff_parent_pov = parent_Q - fpu_reduction * sqrt(cumulative_P),
     // where cumulative_P sums priors of preceding P-sorted children (expanded
-    // or not). Mirrors coroutine_search.hpp::compute_allocations exactly.
+    // or not).
     float fpu_reduction = 0.330f;
 
     // Clamp loop: cap per-iteration depth growth and break-out tolerance.
@@ -206,14 +207,9 @@ struct SearchParams {
     float break_eps       = 0.1f;
     int   clamp_max_iters = 1024;
 
-    // Rollup pruning. Children whose log-allocation is more than
-    // `rollup_log_gap` below the maximum Expanded alloc are excluded
-    // from the e^alloc-weighted Q average. e^-3.3 ~= 0.037, so the
-    // default trims any child contributing less than ~3% of the
-    // leader's weight — keeps a single dominant move from being
-    // diluted by long-tail children whose alloc is order-of-magnitude
-    // smaller. Set very large (e.g. +inf) to disable.
-    float rollup_log_gap  = 3.3f;
+    // Iter-0 clamp loop: force-expand every Unexpanded child (not just the
+    // top hdr->force_expand priors) when depth > depth_floor + log(this).
+    float force_all_unexpanded_log_arg = 40.0f;
 };
 
 }  // namespace detail
@@ -258,11 +254,10 @@ namespace detail {
 // LksSearchConfig — so the config can embed it by value.)
 
 /**
- * Paired legal move + its softmax priors (normal and optimistic).
- * Emitted by `softmax_legal_sorted` in decreasing-P order (sort key
- * is the normal policy P) so downstream MoveInfo fill is a single
- * sequential pass and the arena ends up P-sorted without an in-place
- * shuffle.
+ * Paired legal move + its softmax prior. Emitted by
+ * `softmax_legal_sorted` in decreasing-P order so downstream MoveInfo
+ * fill is a single sequential pass and the arena ends up P-sorted
+ * without an in-place shuffle.
  *
  * Stored as the raw `uint16_t` rather than a `chess::Move` because the
  * latter carries an unused 16-bit score field that would bloat this
@@ -271,74 +266,68 @@ namespace detail {
 struct MoveWithPriors {
     uint16_t move;   // 2: chess::Move underlying u16
     uint16_t _pad;   // 2
-    float    P;      // 4: normal-policy prior (sort key)
-    float    P_opt;  // 4: optimistic-policy prior
+    float    P;      // 4: policy prior (sort key)
 };
-static_assert(sizeof(MoveWithPriors) == 12, "MoveWithPriors must be 12 bytes");
+static_assert(sizeof(MoveWithPriors) == 8, "MoveWithPriors must be 8 bytes");
 
 /**
- * Tempered softmax over legal-move policy logits — runs two parallel
- * softmaxes (normal `out.policy` and `out.optimistic_policy`) at the
- * same `policy_temp`, then sorts by decreasing normal `P`. Output
- * order is what downstream descent expects (highest-prior first),
- * and is also the order we want in the arena's MoveInfo[].
+ * Tempered softmax over legal-move policy logits — runs one softmax over
+ * the GPU-gathered `out.legal_policy[0..num_moves)` at `policy_temp`, then
+ * sorts by decreasing `P`. Output order is what downstream descent expects
+ * (highest-prior first), and is also the order we want in the arena's
+ * MoveInfo[].
  *
- * `policy_temp` divides logits before the max-subtract / exp; T > 1
- * flattens, T < 1 sharpens. T == 1.0 reproduces the plain softmax that
- * mirrors `coroutine_search.hpp::evaluate_node`. The division is folded
- * into `inv_temp` and applied in the first pass so the existing
+ * The flat (4672) policy tensor never reaches the C++ side anymore: the
+ * exporter does a Gather inside TRT against the caller-supplied legal_indices,
+ * and `out.legal_policy[i]` is already the logit for `legal[i]`. Padding
+ * entries past `legal.size()` are dont-care.
+ *
+ * `policy_temp` divides logits before the max-subtract / exp; T > 1 flattens,
+ * T < 1 sharpens. T == 1.0 reproduces the plain softmax. The division is
+ * folded into `inv_temp` and applied in the first pass so the existing
  * max-subtract / exp / normalize loop is unchanged.
  */
 inline void softmax_legal_sorted(const RawNNOutput& out,
-                                 const chess::Board& board,
                                  const chess::Movelist& legal,
                                  float policy_temp,
                                  std::vector<MoveWithPriors>& moves)
 {
-    const bool flip = board.sideToMove() == chess::Color::BLACK;
     const int n = legal.size();
     moves.resize(static_cast<size_t>(n));
 
     const float inv_temp = 1.0f / policy_temp;
 
-    // Pre-pass: gather per-move policy-table indices, write moves[i].move,
-    // and compute scaled logits for both heads. Track per-head max for
-    // the LSE max-subtract.
-    float max_logit     = -std::numeric_limits<float>::infinity();
-    float max_logit_opt = -std::numeric_limits<float>::infinity();
+    // Pre-pass: copy legal moves and scaled logits. Track the max for the
+    // LSE max-subtract.
+    float max_logit = -std::numeric_limits<float>::infinity();
     for (int i = 0; i < n; ++i) {
-        const auto [from_idx, to_idx] = encode_move_to_policy_index(legal[i], flip);
-        const int flat = policy_flat_index(from_idx, to_idx);
-        const float scaled     = out.policy[flat]            * inv_temp;
-        const float scaled_opt = out.optimistic_policy[flat] * inv_temp;
+        const float scaled = out.legal_policy[i] * inv_temp;
         moves[i].move  = static_cast<uint16_t>(legal[i].move());
         moves[i]._pad  = 0;
         moves[i].P     = scaled;
-        moves[i].P_opt = scaled_opt;
-        max_logit     = std::max(max_logit,     scaled);
-        max_logit_opt = std::max(max_logit_opt, scaled_opt);
+        max_logit      = std::max(max_logit, scaled);
     }
 
-    // exp(scaled - max) for both heads, accumulating per-head sums.
-    float sum_exp     = 0.0f;
-    float sum_exp_opt = 0.0f;
+    // exp(scaled - max), accumulating the sum.
+    float sum_exp = 0.0f;
     for (int i = 0; i < n; ++i) {
-        moves[i].P     = std::exp(moves[i].P     - max_logit);
-        moves[i].P_opt = std::exp(moves[i].P_opt - max_logit_opt);
-        sum_exp     += moves[i].P;
-        sum_exp_opt += moves[i].P_opt;
+        moves[i].P = std::exp(moves[i].P - max_logit);
+        sum_exp   += moves[i].P;
     }
 
-    // Normalize each head independently.
-    const float inv_sum     = sum_exp     > 0.0f ? 1.0f / sum_exp     : 0.0f;
-    const float inv_sum_opt = sum_exp_opt > 0.0f ? 1.0f / sum_exp_opt : 0.0f;
-    for (int i = 0; i < n; ++i) {
-        moves[i].P     *= inv_sum;
-        moves[i].P_opt *= inv_sum_opt;
+    // Normalize. If TRT produced non-finite logits we'd otherwise get NaN
+    // priors and poison every subsequent allocator call; fall back to uniform
+    // priors over legal moves so a misbehaving NN can't brick search.
+    const float inv_sum =
+        (std::isfinite(sum_exp) && sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+    if (inv_sum == 0.0f) {
+        const float uniform = (n > 0) ? (1.0f / static_cast<float>(n)) : 0.0f;
+        for (int i = 0; i < n; ++i) moves[i].P = uniform;
+    } else {
+        for (int i = 0; i < n; ++i) moves[i].P *= inv_sum;
     }
 
-    // Sort by descending normal P (the optimistic prior is paired by
-    // index and rides along with the move).
+    // Sort by descending P.
     std::sort(moves.begin(), moves.end(),
         [](const MoveWithPriors& a, const MoveWithPriors& b) {
             return a.P > b.P;
@@ -346,8 +335,32 @@ inline void softmax_legal_sorted(const RawNNOutput& out,
 }
 
 /**
+ * Build the (padded) flat-policy-index array consumed by the GPU's
+ * end-of-policy-head gather. Mirrors `softmax_legal_sorted`'s legal-move
+ * iteration order — `legal[i]` ↔ `out.legal_policy[i]` ↔ `indices[i]`.
+ *
+ * Padding slots beyond `legal.size()` are filled with 0; the GPU still
+ * gathers them but the C++ softmax only reads the first `legal.size()`
+ * entries. Any in-range index works as padding.
+ */
+inline void build_legal_indices(
+    const chess::Movelist& legal,
+    bool flip_for_black,
+    std::array<std::int32_t, MAX_LEGAL_MOVES>& indices) noexcept
+{
+    const int n = legal.size();
+    for (int i = 0; i < n; ++i) {
+        const auto [from_idx, to_idx] =
+            encode_move_to_policy_index(legal[i], flip_for_black);
+        indices[i] = static_cast<std::int32_t>(
+            policy_flat_index(from_idx, to_idx));
+    }
+    for (int i = n; i < MAX_LEGAL_MOVES; ++i) indices[i] = 0;
+}
+
+/**
  * Variance of the NN value distribution, measured in the same
- * [-1, 1] scale as `Q = 2*out.value - 1`. The HL-Gauss head's 81
+ * [-1, 1] scale as Q from WDL logits. The HL-Gauss head's 81
  * bins are taken as equal-width over [-1, 1] with the i-th center
  * at `-1 + (i + 0.5) * (2 / VALUE_NUM_BINS)`.
  *
@@ -374,42 +387,106 @@ inline float compute_value_variance(
 }
 
 /**
- * Number of top children required to cover `coverage_threshold` of the
- * policy mass. Mirrors `FractionalNode::get_limit` in
- * `engine/fractional_mcts/node.hpp`, but takes advantage of the fact
- * that `softmax_legal_sorted` already emits `sorted_moves` in descending
- * P order, so no internal sort is needed.
+ * Per-position iter-0 force-expand count, computed once at first
+ * evaluation from the GPU's legal-move policy logits.
  *
- * If the top prior alone covers the threshold but is below
- * `single_node_threshold`, `limit` is forced to 2 (matches the prototype
- * search's behavior of refusing to commit fully to a non-overwhelming
- * top move).
+ * Intuition: rather than a fixed `force_expand_count` knob, we let
+ * each position's policy decide how many top-prior children deserve
+ * an unconditional iter-0 expansion. Sharp tactical positions (one
+ * dominant move) get a small count; quiet, diffuse positions (many
+ * plausible replies) get more.
+ *
+ * Algorithm:
+ *   1. Temp-1.0 softmax over `out.legal_policy[0..n)` -> p[i].
+ *   2. Subtract a noise floor of 1/300 from every entry, capped at 0:
+ *        q_i = max(0, p_i - 1/300)
+ *      Renormalize q to sum to 1 (when the sum is > 0).
+ *   3. Entropy H = -sum(q * log q) of the renormalized q.
+ *   4. Sort q descending; pick the smallest k whose top-k partial
+ *      sum of -q*log(q) is >= 0.95 * H.
+ *   5. Clamp to [1, 8] when n > 0; return 0 when n == 0.
+ *
+ * The 1/300 floor strips out long-tail near-zero priors so they
+ * don't pad the entropy, and the 95% cover keeps the count
+ * concentrated on moves that meaningfully share the policy mass.
  */
-inline int compute_limit(const std::vector<MoveWithPriors>& sorted_moves,
-                         float coverage_threshold,
-                         float single_node_threshold) noexcept
-{
-    if (sorted_moves.empty()) return 0;
+inline uint16_t compute_force_expand(const RawNNOutput& out, int num_moves) noexcept {
+    constexpr uint16_t kMinForce  = 1;
+    // Not generally load-bearing: clamping here typically moves nodes evaluated
+    // by only ~3%. A generous max is for pathological subtrees only.
+    constexpr uint16_t kMaxForce  = 8;
+    constexpr float    kNoiseFloor = 1.0f / 300.0f;
+    constexpr float    kCover      = 0.95f;
 
-    float cumsum = 0.0f;
-    int limit = static_cast<int>(sorted_moves.size());
-    for (size_t i = 0; i < sorted_moves.size(); ++i) {
-        cumsum += sorted_moves[i].P;
-        if (cumsum >= coverage_threshold) {
-            limit = static_cast<int>(i + 1);
-            break;
-        }
+    if (num_moves <= 0) return 0;
+
+    // Temp-1.0 softmax (LSE max-subtract for numerical stability).
+    std::array<float, MAX_LEGAL_MOVES> q{};
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < num_moves; ++i) {
+        max_logit = std::max(max_logit, out.legal_policy[i]);
     }
-    if (limit == 1 && sorted_moves[0].P < single_node_threshold) {
-        return 2;
+    float sum_exp = 0.0f;
+    for (int i = 0; i < num_moves; ++i) {
+        const float e = std::exp(out.legal_policy[i] - max_logit);
+        q[i] = e;
+        sum_exp += e;
     }
-    return limit;
+    if (!std::isfinite(sum_exp) || sum_exp <= 0.0f) {
+        // Degenerate logits (NaN / -inf max). Match softmax_legal_sorted's
+        // uniform fallback so the floor kicks in.
+        const float uniform = 1.0f / static_cast<float>(num_moves);
+        for (int i = 0; i < num_moves; ++i) q[i] = uniform;
+    } else {
+        const float inv_sum = 1.0f / sum_exp;
+        for (int i = 0; i < num_moves; ++i) q[i] *= inv_sum;
+    }
+
+    // Noise-floor subtract + renormalize.
+    float s = 0.0f;
+    for (int i = 0; i < num_moves; ++i) {
+        const float v = q[i] - kNoiseFloor;
+        q[i] = (v > 0.0f) ? v : 0.0f;
+        s += q[i];
+    }
+    if (s <= 0.0f) {
+        return std::min<uint16_t>(kMinForce, static_cast<uint16_t>(num_moves));
+    }
+    const float inv_s = 1.0f / s;
+    for (int i = 0; i < num_moves; ++i) q[i] *= inv_s;
+
+    // Sort descending (only the first `num_moves` entries are valid).
+    std::sort(q.begin(), q.begin() + num_moves, std::greater<float>());
+
+    // Entropy of the renormalized q.
+    float H = 0.0f;
+    for (int i = 0; i < num_moves; ++i) {
+        if (q[i] > 0.0f) H -= q[i] * std::log(q[i]);
+    }
+    if (H <= 0.0f) {
+        return std::min<uint16_t>(kMinForce, static_cast<uint16_t>(num_moves));
+    }
+
+    // Smallest k with top-k entropy mass >= 0.95 * H.
+    const float target = kCover * H;
+    float partial = 0.0f;
+    int k = 0;
+    for (int i = 0; i < num_moves; ++i) {
+        if (q[i] > 0.0f) partial -= q[i] * std::log(q[i]);
+        ++k;
+        if (partial >= target) break;
+    }
+
+    const int clamped = std::clamp(k, static_cast<int>(kMinForce),
+                                      static_cast<int>(kMaxForce));
+    return static_cast<uint16_t>(std::min(clamped, num_moves));
 }
 
 /**
  * Position-only terminal classification for a child move at expansion
  * time. Path-dependent terminal conditions are NOT considered here:
- *   - repetitions: handled at descent time via `isRepetition(1)`.
+ *   - repetitions: handled at descent time via `isRepetition(1)`
+ *     (2-fold draw policy; not cached in terminal_kind).
  *   - 50-move rule: handled at descent time via `isHalfMoveDraw()`.
  * Both depend on data (path history / half-move clock) that is not
  * part of the Zobrist key, so two transpositions to the same key can
@@ -546,12 +623,15 @@ struct RecurseContext {
  * untouched — the parent's own `should_abort()` check fires in the
  * same iteration and skips its rollup before the stale row is read.
  */
+inline constexpr uint32_t kRecursiveDepthLimit = 196;
+
 inline constexpr auto recursive_search =
     [](auto recursive_search,
        RecurseContext* ctx,
        lfsync::Permit permit,
        chess::Board board,
        float depth,
+       uint32_t rec_depth,
        Plan* out) -> lf::task<void>
 {
     if (ctx->w->should_abort()) co_return;
@@ -568,22 +648,33 @@ inline constexpr auto recursive_search =
         // where a peer could publish without us noticing. The CAS in
         // find_or_claim is the sole source of truth for ownership;
         // the eval-await window's race is handled there.
-        auto tokens = catgpt::tokenize<BatchEvaluator::SEQ_LENGTH>(
-            board, NO_HALFMOVE_CONFIG);
-        RawNNOutput out = co_await EvalAwaitable(*ctx->evaluator, tokens);
-        ctx->w->evals.fetch_add(1, std::memory_order_relaxed);
-
+        //
+        // Legal-move generation moves to BEFORE the eval submit so the
+        // GPU can gather only the legal-move logits (cuts policy D2H from
+        // POLICY_SIZE=4672 to MAX_LEGAL_MOVES=218 floats per request).
+        // The encoded flat indices ride along on the EvalRequest; the
+        // gathered logits arrive in `out.legal_policy[0..num_moves)`,
+        // already aligned with `legal[]`.
         chess::Movelist legal;
         chess::movegen::legalmoves(legal, board);
         const uint16_t num_moves = static_cast<uint16_t>(legal.size());
+
+        std::array<std::int32_t, MAX_LEGAL_MOVES> legal_indices;
+        const bool flip = board.sideToMove() == chess::Color::BLACK;
+        build_legal_indices(legal, flip, legal_indices);
+
+        auto tokens = catgpt::tokenize<BatchEvaluator::SEQ_LENGTH>(
+            board, NO_HALFMOVE_CONFIG);
+        RawNNOutput out = co_await EvalAwaitable(
+            *ctx->evaluator, tokens, legal_indices);
+        ctx->w->evals.fetch_add(1, std::memory_order_relaxed);
 
         // Sort moves by decreasing P up front (on compact 8-byte
         // pairs) so the arena fill below is a single pass that
         // writes each MoveInfo exactly once in the order descent
         // will consume them.
         std::vector<MoveWithPriors> sorted_moves;
-        softmax_legal_sorted(out, board, legal,
-                             ctx->params->policy_temp, sorted_moves);
+        softmax_legal_sorted(out, legal, ctx->params->policy_temp, sorted_moves);
 
         // alloc + fill BEFORE attempting to claim — these bytes
         // are privately owned until the CAS, and orphaned if the
@@ -602,39 +693,31 @@ inline constexpr auto recursive_search =
 
             mi[i] = v2::MoveInfo::pack(sorted_moves[i].move,
                                        sorted_moves[i].P,
-                                       sorted_moves[i].P_opt,
                                        tk);
         }
 
-        // Per-node variance + cached `limit` for this fresh TT entry.
-        // alloc_node_info pre-fills variance=0 and limit=0; overwrite
-        // both with the real values before publish so any reader
-        // observing this node sees them.
+        // Per-node variance for this fresh TT entry. alloc_node_info
+        // pre-fills variance=0; overwrite with the real value before
+        // publish so any reader observing this node sees it.
         const float variance = compute_value_variance(out.value_probs);
-        const int limit = compute_limit(
-            sorted_moves,
-            ctx->params->policy_coverage_threshold,
-            ctx->params->single_node_coverage_threshold);
         v2::NodeInfoHeader* hdr_w = ctx->arena->info_at(off);
         hdr_w->variance = variance;
-        hdr_w->limit = static_cast<uint16_t>(limit);
+        hdr_w->force_expand = compute_force_expand(out, static_cast<int>(num_moves));
 
-        const float Q = 2.0f * out.value - 1.0f;
+        const float Q = catgpt::wdl_logits_to_q(out.wdl_logits);
 
         // Heuristic initial max_depth for this fresh TT entry:
-        //   default_max_depth = -log(variance * C / limit)
+        //   default_max_depth = -log(variance * C)
         // Low-variance nodes get a HIGH max_depth so early ID iterations
         // skip re-descending them via the re-deepen check below; trust
         // the NN value. High-variance nodes get a LOW (possibly negative)
         // max_depth so the very first descent proceeds and the rollup
-        // refines Q. Edge cases (variance == 0, limit == 0) produce
-        // -inf/+inf/NaN, all of which are safe:
-        //   * the re-deepen check uses `<=` (NaN -> false, descent runs)
-        //   * `update_qd` is monotonic and will overwrite -inf on the
-        //     first rollup that completes a descent.
+        // refines Q. Edge case `variance == 0` produces -inf/+inf, which
+        // is safe: the re-deepen check uses `<=` and `update_qd` is
+        // monotonic and will overwrite -inf on the first rollup that
+        // completes a descent.
         const float default_max_depth = -std::log(
-            variance * ctx->params->default_depth_constant
-            / static_cast<float>(limit));
+            variance * ctx->params->default_depth_constant);
 
         // Single 128-bit CAS installs (key, qd_packed(Q, default_max_depth))
         // atomically, so any reader observing key == K necessarily
@@ -666,10 +749,11 @@ inline constexpr auto recursive_search =
         // is never torn here.
         auto [cur_q, cur_max_d] = v2::unpack_qd(
             v2::SearchArena::load_qd(entry).qd_packed);
-        if (depth <= cur_max_d) {
+        if (rec_depth >= kRecursiveDepthLimit || depth <= cur_max_d) {
             // Hand the already-unpacked TT (Q, max_depth) back to the
             // caller — same value the deleted post-join re-read would
-            // have produced.
+            // have produced. At the recursion cap, skip Pass 1+ as if
+            // re-deepened.
             if (out) { out->Q = cur_q; out->depth = cur_max_d; }
             co_return;
         }
@@ -705,16 +789,13 @@ inline constexpr auto recursive_search =
         return q;
     }();
 
-    // Variance-scaled depth floor: used as the per-child `depth` stamped
-    // on Unexpanded plans (the "current effort" for a never-visited
-    // child). It is no longer a hard descent cutoff — the gate is
-    // `alloc > depth` from the Halley allocation. Low-variance (high-
-    // confidence) parents raise the floor so unexpanded children need
-    // a larger allocation before we'll expand them; high-variance
-    // parents lower it (possibly below 0) so expansion happens easily
-    // and the rollup refines Q.
+    // Variance-scaled depth floor: threshold for iter-0 force-all
+    // Unexpanded expansion (`depth > depth_floor +
+    // log(force_all_unexpanded_log_arg)`). Same
+    // formula as default_max_depth on fresh TT entries.
     const float depth_floor = -std::log(
         hdr->variance * ctx->params->default_depth_constant);
+    constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 
     // ── Pass 1: classify children, populate Plan rows (no co_await) ──
     std::vector<Plan> plans;
@@ -727,21 +808,20 @@ inline constexpr auto recursive_search =
     for (uint16_t i = 0; i < num_moves; ++i) {
         const auto& m = moves[i];
         const v2::TerminalKind m_tk = m.terminal_kind();
-        const float m_P     = m.P();
-        const float m_P_opt = m.P_opt();
+        const float m_P = m.P();
 
         // Position-only terminals: Expanded with fixed Q and depth=+inf
         // (so the "alloc > depth" gate never triggers a re-recurse).
         // Q is stored in child-STM convention (same as TT): a child-loss
         // is Q=-1 ⇒ parent's rollup -Q = +1 ⇒ we win.
         if (m_tk == v2::kTerminalDraw) {
-            plans.push_back({Mode::Expanded, m_P, m_P_opt, /*Q=*/0.0f, kPosInf,
+            plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
                              /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
         }
         if (m_tk == v2::kTerminalLossForChild) {
-            plans.push_back({Mode::Expanded, m_P, m_P_opt, /*Q=*/-1.0f, kPosInf,
+            plans.push_back({Mode::Expanded, m_P, /*Q=*/-1.0f, kPosInf,
                              /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
@@ -749,7 +829,7 @@ inline constexpr auto recursive_search =
         if (m_tk == v2::kTerminalWinForChild) {
             // Reachable only via Syzygy: child-STM is in a TB-won position,
             // so child_Q=+1 ⇒ parent rollup -Q = -1 ⇒ this move loses for us.
-            plans.push_back({Mode::Expanded, m_P, m_P_opt, /*Q=*/+1.0f, kPosInf,
+            plans.push_back({Mode::Expanded, m_P, /*Q=*/+1.0f, kPosInf,
                              /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
@@ -758,12 +838,13 @@ inline constexpr auto recursive_search =
         chess::Board cb = board;
         cb.makeMove<true>(chess::Move{m.move});
 
-        // Path-dependent: 3-fold along this path or 50-move expiration is
-        // NOT in terminal_kind (different paths hashing to the same key
-        // may disagree on repetition / half-move clock). Treat as a draw
+        // Path-dependent: 2-fold repetition as a draw along this path
+        // (`isRepetition(1)`) or 50-move expiration is NOT in
+        // terminal_kind (different paths hashing to the same key may
+        // disagree on repetition / half-move clock). Treat as a draw
         // at this caller; Expanded with depth=+inf like terminals.
         if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
-            plans.push_back({Mode::Expanded, m_P, m_P_opt, /*Q=*/0.0f, kPosInf,
+            plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
                              /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
@@ -777,24 +858,20 @@ inline constexpr auto recursive_search =
             // qd is consistent (Cell A is atomic with the key match).
             auto [q, child_max_d] = v2::unpack_qd(
                 v2::SearchArena::load_qd(ce).qd_packed);
-            plans.push_back({Mode::Expanded, m_P, m_P_opt, q, child_max_d,
+            plans.push_back({Mode::Expanded, m_P, q, child_max_d,
                              /*alloc=*/0.0f});
             cumulative_P += m_P;
             continue;
         }
 
-        // TT miss: Unexpanded. FPU (Leela-style, matching
-        // coroutine_search.hpp::compute_allocations):
+        // TT miss: Unexpanded. FPU (Leela-style):
         //   Q_eff_parent_pov = parent_Q - fpu_reduction * sqrt(cumulative_P)
         // Stored in child-STM convention as -Q_eff_parent_pov so the
         // rollup's -Q yields back Q_eff_parent_pov.
-        // FPU's `cumulative_P` is summed over the NORMAL policy (matches
-        // coroutine_search.hpp), not over P_opt — it's about how much
-        // actual mass we've already conditioned on.
         const float Q_eff_parent_pov =
             parent_Q - fpu_reduction * std::sqrt(cumulative_P);
-        plans.push_back({Mode::Unexpanded, m_P, m_P_opt, /*Q=*/-Q_eff_parent_pov,
-                         /*depth=*/depth_floor, /*alloc=*/0.0f});
+        plans.push_back({Mode::Unexpanded, m_P, /*Q=*/-Q_eff_parent_pov,
+                         /*depth=*/kNegInf, /*alloc=*/0.0f});
         cumulative_P += m_P;
     }
 
@@ -804,19 +881,17 @@ inline constexpr auto recursive_search =
     // on first contact, we iterate:
     //
     //   1. compute_log_allocations on the current (Q, depth) state.
-    //   2. If iter > 0 and every plan satisfies alloc - depth <=
-    //      break_eps (i.e. the allocator is at a fixed point), break.
-    //   3. Fork every plan with alloc > p.depth, clamping the child's
-    //      recursion depth to min(alloc, p.depth + clamp_step) — an
-    //      incremental staircase. Children write their refreshed
-    //      (Q, depth) back through `&p`, so the next iter's allocator
-    //      sees the updated values and re-balances.
-    //      Carveout: on iter 0, if any of the first `hdr->limit`
-    //      children is still Unexpanded, recurse on it regardless of
-    //      the alloc/depth gate so the top-`limit` priors (the
-    //      cumulative-policy-coverage cohort cached on the node at
-    //      expansion time) always get at least one real descent before
-    //      any later iteration's break check can fire.
+    //   2. If iter > 0 and every Expanded plan satisfies
+    //      alloc - depth <= break_eps, break.
+    //   3. Expanded plans fork when alloc > p.depth at
+    //      min(alloc, p.depth + clamp_step). Unexpanded plans never
+    //      use the alloc gate; on iter 0 only, force-expand the first
+    //      `hdr->force_expand` Unexpanded priors (per-position dynamic
+    //      count, computed at first-eval from a temp-1.0 policy), or
+    //      all Unexpanded when `depth > depth_floor +
+    //      log(force_all_unexpanded_log_arg)`, at
+    //      recursion depth p.alloc. Children write (Q, depth) back
+    //      through `&p`.
     //
     // Permits: only iter 0's FIRST fork inherits this coroutine's
     // entry permit (so K bounds permit-holding frames, not alive
@@ -832,22 +907,22 @@ inline constexpr auto recursive_search =
     // paths leave the row stale but the post-iter should_abort()
     // check below skips later rollup before any stale row is observed.
     {
-        const float clamp_step = ctx->params->clamp_step;
-        const float break_eps  = ctx->params->break_eps;
-        const int   max_iters  = ctx->params->clamp_max_iters;
+        const float clamp_step  = ctx->params->clamp_step;
+        const float break_eps   = ctx->params->break_eps;
+        const float force_all_log_arg =
+            ctx->params->force_all_unexpanded_log_arg;
+        const int   max_iters   = ctx->params->clamp_max_iters;
+        const int   force_count = static_cast<int>(hdr->force_expand);
 
         for (int iter = 0; iter < max_iters; ++iter) {
-            // Drive descent allocation with the optimistic policy: same
-            // role as `compute_allocations(..., use_optimistic=true)` in
-            // coroutine_search.hpp's clamp loop.
             compute_log_allocations(plans.data(),
                                     static_cast<int>(plans.size()),
-                                    depth, ctx->params->c_puct,
-                                    /*use_optimistic=*/true);
+                                    depth, ctx->params->c_puct);
 
             if (iter > 0) {
                 bool any_unsaturated = false;
                 for (const Plan& p : plans) {
+                    if (p.mode != Mode::Expanded) continue;
                     if (p.alloc - p.depth > break_eps) {
                         any_unsaturated = true;
                         break;
@@ -856,34 +931,29 @@ inline constexpr auto recursive_search =
                 if (!any_unsaturated) break;
             }
 
+            const bool force_all_unexpanded =
+                (iter == 0)
+                && (depth > depth_floor + std::log(force_all_log_arg));
+
             bool first_fork = (iter == 0);
             bool any_fork   = false;
             for (uint16_t i = 0; i < num_moves; ++i) {
                 Plan& p = plans[i];
 
-                // Iter-0 force-expansion of the top-`limit` priors:
-                // if any of plans[0..limit) is still Unexpanded going
-                // into iter 0, recurse on it regardless of whether the
-                // Halley alloc cleared its depth_floor. Guarantees the
-                // top-`limit` highest-prior moves (the cumulative-
-                // coverage cohort cached on the node at expansion time)
-                // always get at least one real descent before the
-                // clamp loop's break check can fire.
-                const bool force_expand =
-                    (iter == 0) && (i < hdr->limit) && (p.mode == Mode::Unexpanded);
-                if (!force_expand && !(p.alloc > p.depth)) continue;
-
-                // Iter > 0: never expand a still-Unexpanded child. The
-                // first-touch budget for new children is spent entirely
-                // on iter 0 (force-expand cohort + any plan whose initial
-                // alloc cleared depth_floor). Any plan still Unexpanded
-                // at iter 1+ has been re-allocated against fresh sibling
-                // Q's and its expansion is no longer worth the GPU eval —
-                // skip it and let rollup drop it as Unexpanded.
-                if (iter > 0 && p.mode == Mode::Unexpanded) continue;
+                if (p.mode == Mode::Unexpanded) {
+                    if (iter != 0) continue;
+                    const bool force_expand =
+                        (static_cast<int>(i) < force_count)
+                        || force_all_unexpanded;
+                    if (!force_expand) continue;
+                } else if (!(p.alloc > p.depth)) {
+                    continue;
+                }
 
                 const float target_depth =
-                    std::min(p.alloc, p.depth + clamp_step);
+                    (p.mode == Mode::Unexpanded)
+                        ? p.alloc
+                        : std::min(p.alloc, p.depth + clamp_step);
 
                 chess::Board cb = board;
                 cb.makeMove<true>(chess::Move{moves[i].move});
@@ -891,13 +961,16 @@ inline constexpr auto recursive_search =
                 lfsync::Permit child_permit = first_fork
                     ? std::move(permit)
                     : co_await ctx->sem->acquire();
+                if (ctx->w->should_abort()) {
+                    break;
+                }
                 first_fork = false;
                 any_fork   = true;
 
                 p.mode = Mode::Expanded;
                 co_await lf::fork[recursive_search](
                     ctx, std::move(child_permit), std::move(cb),
-                    target_depth, &p);
+                    target_depth, rec_depth + 1, &p);
             }
 
             if (any_fork) {
@@ -917,44 +990,22 @@ inline constexpr auto recursive_search =
         }
     }
 
-    // ── Re-allocate with NORMAL policy for the rollup weights ──────────
-    // The clamp loop above used P_opt to drive exploration; for the
-    // weighted-Q rollup we want weights that reflect the actual policy
-    // distribution rather than the exploration-warmed one. Mirrors the
-    // `second_allocations = compute_allocations(node, N)` (default
-    // use_optimistic=false) call in coroutine_search.hpp::recursive_search.
-    compute_log_allocations(plans.data(), static_cast<int>(plans.size()),
-                            depth, ctx->params->c_puct,
-                            /*use_optimistic=*/false);
-
-    // ── Rollup: e^alloc-weighted average of -Q over Expanded plans ──
-    // Max-subtract LSE-style for numerical stability (alloc can reach
-    // depth + bias ≈ 20–40 at large N). Unexpanded children that never
-    // cleared the gate are dropped entirely.
-    //
-    // Long-tail pruning: also drop any Expanded child whose log-alloc
-    // is more than `rollup_log_gap` below the leader, i.e. whose
-    // softmax weight would be < e^-rollup_log_gap of the max. This
-    // keeps a dominant move from being diluted by far-behind siblings
-    // that contribute trivial weight but non-trivial Q variation.
-    float m_alloc = -std::numeric_limits<float>::infinity();
-    for (const Plan& p : plans) {
-        if (p.mode == Mode::Expanded && p.alloc > m_alloc) m_alloc = p.alloc;
-    }
-    if (!std::isfinite(m_alloc)) co_return;
-
-    const float rollup_log_gap = ctx->params->rollup_log_gap;
-    double num = 0.0;
-    double den = 0.0;
+    // ── Rollup: negamax over Expanded plans ─────────────────────────
+    // Parent's Q is the best move's value in parent-POV:
+    //   Q_new = max over Expanded plans of (-p.Q)
+    // (children store Q in child-STM convention; negation flips to
+    // parent POV.) Unexpanded children that never cleared the gate
+    // are dropped entirely.
+    float best = -std::numeric_limits<float>::infinity();
+    bool any_expanded = false;
     for (const Plan& p : plans) {
         if (p.mode != Mode::Expanded) continue;
-        if (m_alloc - p.alloc > rollup_log_gap) continue;
-        const double w = std::exp(static_cast<double>(p.alloc - m_alloc));
-        num += w * static_cast<double>(-p.Q);
-        den += w;
+        any_expanded = true;
+        const float v = -p.Q;
+        if (v > best) best = v;
     }
-    if (den > 0.0) {
-        const float Q_new = static_cast<float>(num / den);
+    if (any_expanded) {
+        const float Q_new = best;
         v2::SearchArena::update_qd(entry, Q_new, depth);
         // Hand the rolled-up (Q, depth) back to the parent's plan row.
         // If update_qd above lost the CAS to a peer with a deeper
@@ -967,7 +1018,7 @@ inline constexpr auto recursive_search =
         // and gated out of fan-out). Fall back to whatever TT holds
         // for `entry` — typically the NN-Q from our own
         // find_or_claim publish — so the parent's rollup doesn't
-        // average in the FPU stand-in we pre-marked above.
+        // inherit the FPU stand-in we pre-marked above.
         auto [q_tt, d_tt] = v2::unpack_qd(
             v2::SearchArena::load_qd(entry).qd_packed);
         out->Q     = q_tt;
@@ -988,7 +1039,8 @@ inline constexpr auto root_search =
 {
     lfsync::Permit p = co_await ctx->sem->acquire();
     co_await lf::call[recursive_search](
-        ctx, std::move(p), std::move(board), depth, /*out=*/nullptr);
+        ctx, std::move(p), std::move(board), depth,
+        /*rec_depth=*/0u, /*out=*/nullptr);
     co_await lf::join;
 };
 
@@ -1318,7 +1370,7 @@ public:
      *     whose Q happens to be the only real value seen at this node.
      * The line additionally ends — AFTER emitting the latest move —
      * when the resulting position satisfies any of:
-     *   - 3-fold repetition along this PV (`isRepetition(1)`),
+     *   - 2-fold (twofold) repetition along this PV (`isRepetition(1)`),
      *   - 50-move expiration (`isHalfMoveDraw()`),
      *   - insufficient material,
      *   - `max_len` plies have been emitted (defensive cap).
@@ -1360,8 +1412,9 @@ private:
      * for the child, in any of these ways:
      *   - position-only terminal cached on the MoveInfo
      *     (mate / stalemate / insufficient material / Syzygy WDL),
-     *   - path-dependent draw at this caller (3-fold along this PV
-     *     or 50-move expiration after `parent + mi.move`),
+     *   - path-dependent draw at this caller (2-fold along this PV
+     *     via `isRepetition(1)`, or 50-move expiration after
+     *     `parent + mi.move`),
      *   - the child's resulting position has a TT entry.
      * Returns false only for a "TT miss with no terminal shortcut" —
      * the same Unexpanded category `recursive_search` Pass 1 produces.
@@ -1649,8 +1702,9 @@ private:
             });
         }
 
-        // Aggregator + UCI info loop. Emit `info depth ...` only when the
-        // integer centi-depth derived from the minimum worker depth changes.
+        // Aggregator + UCI info loop. Emit `info depth ...` when centi-depth
+        // advances during the loop, and once more after runners join (see
+        // below) so budget-grace exits still report final PV/score.
         //
         // Termination conditions (any one ends the loop):
         //   1. `stop_token` requested (UCI `stop`, `quit()`, etc.) —
@@ -1674,6 +1728,54 @@ private:
         bool  budget_exhausted    = false;
         float min_depth_at_budget =
             -std::numeric_limits<float>::infinity();
+
+        auto emit_progress = [&](float min_d,
+                                 uint64_t evals_sum,
+                                 uint64_t claims_sum) {
+            const long depth_centi = std::isfinite(min_d)
+                ? std::lround(min_d * 100.0f)
+                : 0L;
+            const auto now = Clock::now();
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - t0).count();
+            const long long mss = static_cast<long long>(ms);
+
+            std::string pv_field;
+            const std::vector<chess::Move> pv_moves = principal_variation();
+            if (!pv_moves.empty()) {
+                pv_field = " pv";
+                for (const chess::Move& m : pv_moves) {
+                    pv_field += ' ';
+                    pv_field += chess::uci::moveToUci(m);
+                }
+            }
+
+            char score_field[32];
+            if (const v2::TTEntry* root =
+                    arena_->find(root_key_, v2::secondary_hash(board_));
+                root != nullptr) {
+                auto [root_q, _] = v2::unpack_qd(
+                    v2::SearchArena::load_qd(root).qd_packed);
+                std::snprintf(score_field, sizeof(score_field),
+                              " score cp %d", q_to_cp(root_q));
+            } else {
+                score_field[0] = '\0';
+            }
+
+            char buf[1024];
+            std::snprintf(buf, sizeof(buf),
+                "info depth %ld%s nodes %llu tt_claims %llu time %lld nps %lld%s",
+                depth_centi,
+                score_field,
+                static_cast<unsigned long long>(evals_sum),
+                static_cast<unsigned long long>(claims_sum),
+                mss,
+                mss > 0 ? static_cast<long long>(evals_sum) * 1000 / mss : 0,
+                pv_field.c_str());
+            emit(buf);
+            last_depth_centi = depth_centi;
+        };
+
         while (true) {
             if (st.stop_requested()) break;
 
@@ -1714,62 +1816,9 @@ private:
             const long depth_centi = std::isfinite(min_d)
                 ? std::lround(min_d * 100.0f)
                 : 0L;
-            if (depth_centi == last_depth_centi) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                continue;
+            if (depth_centi != last_depth_centi) {
+                emit_progress(min_d, evals_sum, claims_sum);
             }
-
-            const auto now = Clock::now();
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - t0).count();
-            const long long mss = static_cast<long long>(ms);
-
-            // Full PV walked from the current TT. Cost is bounded by
-            // `principal_variation`'s max_len cap; emissions fire only
-            // on depth-step transitions so this is well-amortized.
-            // `principal_variation()` shares bestmove()'s acquire-loaded
-            // TT reads and is documented safe mid-search.
-            std::string pv_field;
-            const std::vector<chess::Move> pv_moves = principal_variation();
-            if (!pv_moves.empty()) {
-                pv_field = " pv";
-                for (const chess::Move& m : pv_moves) {
-                    pv_field += ' ';
-                    pv_field += chess::uci::moveToUci(m);
-                }
-            }
-
-            // Root-position score from the TT: report the root's own Q
-            // (side-to-move at the root), not the chosen child's Q. The
-            // acquire-load semantics of `find` / `load_qd` make this safe
-            // mid-search; see invariants in tt_arena.hpp.
-            char score_field[32];
-            if (const v2::TTEntry* root =
-                    arena_->find(root_key_, v2::secondary_hash(board_));
-                root != nullptr) {
-                auto [root_q, _] = v2::unpack_qd(
-                    v2::SearchArena::load_qd(root).qd_packed);
-                std::snprintf(score_field, sizeof(score_field),
-                              " score cp %d", q_to_cp(root_q));
-            } else {
-                score_field[0] = '\0';
-            }
-
-            // Buffer sized for the fixed prefix + scores + a full PV. PV
-            // is capped to `principal_variation`'s max_len (100) plies of
-            // up to 6 chars each ("e7e8q "), so 1KiB is comfortable.
-            char buf[1024];
-            std::snprintf(buf, sizeof(buf),
-                "info depth %ld%s nodes %llu tt_claims %llu time %lld nps %lld%s",
-                depth_centi,
-                score_field,
-                static_cast<unsigned long long>(evals_sum),
-                static_cast<unsigned long long>(claims_sum),
-                mss,
-                mss > 0 ? static_cast<long long>(evals_sum) * 1000 / mss : 0,
-                pv_field.c_str());
-            emit(buf);
-            last_depth_centi = depth_centi;
 
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
@@ -1791,7 +1840,24 @@ private:
             claims_sum += w->tt_claims.load(std::memory_order_relaxed);
         }
         total_evals_.store(evals_sum, std::memory_order_relaxed);
-        (void)claims_sum;
+
+        // Final `info depth` after runners join: stable TT for PV/score and
+        // covers budget grace (we break on min_depth advance before the loop
+        // body can emit that step) and other early exits at an unchanged
+        // centi-depth tick.
+        {
+            float min_d = std::numeric_limits<float>::infinity();
+            for (const auto& w : workers_) {
+                min_d = std::min(min_d,
+                    w->depth.load(std::memory_order_relaxed));
+            }
+            const long depth_centi = std::isfinite(min_d)
+                ? std::lround(min_d * 100.0f)
+                : 0L;
+            if (depth_centi != last_depth_centi || budget_exhausted) {
+                emit_progress(min_d, evals_sum, claims_sum);
+            }
+        }
 
         // Pick the best move from the TT now that all runners have joined.
         const chess::Move best = bestmove();

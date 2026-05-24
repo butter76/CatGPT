@@ -51,7 +51,7 @@ engine:
                                 # per-move reset() is milliseconds, not seconds.
 
   # UCI timeout in seconds
-  timeout: 120.0
+  timeout: 30.0
 
   # Parallel workers (each loads own engine instance)
   num_workers: 1  # Use >1 for parallel evaluation

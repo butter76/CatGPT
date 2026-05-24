@@ -132,7 +132,7 @@ void run_p1_correctness(uint64_t per_thread_keys, int num_threads) {
                 uint64_t off = arena.alloc_node_info(nm);
                 MoveInfo* moves = arena.moves_at(off);
                 for (uint16_t j = 0; j < nm; ++j) {
-                    moves[j] = MoveInfo::pack(j, 1.0f / nm, /*P_opt=*/1.0f / nm,
+                    moves[j] = MoveInfo::pack(j, 1.0f / nm,
                                               catgpt::v2::kTerminalNone);
                 }
 
@@ -204,7 +204,6 @@ void run_p2_hot_race(int num_threads, uint64_t k_hot, uint64_t iters_per_thread)
                     MoveInfo* moves = arena.moves_at(off);
                     for (uint16_t j = 0; j < 30; ++j) {
                         moves[j] = MoveInfo::pack(j, 1.0f / 30.0f,
-                                                  /*P_opt=*/1.0f / 30.0f,
                                                   catgpt::v2::kTerminalNone);
                     }
                     SearchArena::publish_info(e, /*origQ=*/0.0f, sec, off);
@@ -277,7 +276,7 @@ void run_p3_reader_writer(int num_readers, uint64_t inserts, int writer_pause_us
             uint64_t off = arena.alloc_node_info(nm);
             MoveInfo* moves = arena.moves_at(off);
             for (uint16_t j = 0; j < nm; ++j) {
-                moves[j] = MoveInfo::pack(j, 1.0f / nm, /*P_opt=*/1.0f / nm,
+                moves[j] = MoveInfo::pack(j, 1.0f / nm,
                                           catgpt::v2::kTerminalNone);
             }
             // Encode num_moves into max_depth for round-trip checking.
@@ -391,11 +390,10 @@ ThroughputResult run_p4_one(int num_threads, uint64_t per_thread_inserts) {
                     auto* hdr = arena.info_at(off);
                     hdr->variance = 0.05f;
                     hdr->num_moves = kMovesPerNode;
-                    hdr->limit = 0;
+                    hdr->force_expand = 0;
                     MoveInfo* moves = arena.moves_at(off);
                     for (uint16_t m = 0; m < kMovesPerNode; ++m) {
                         moves[m] = MoveInfo::pack(m, 1.0f / kMovesPerNode,
-                                                  /*P_opt=*/1.0f / kMovesPerNode,
                                                   catgpt::v2::kTerminalNone);
                     }
                 }

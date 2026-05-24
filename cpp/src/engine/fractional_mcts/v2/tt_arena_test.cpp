@@ -108,13 +108,13 @@ constexpr const char* kind_name(TerminalKind k) {
 void test_static_layout() {
     std::printf("[1] static layout (sizeof, alignof, trivially copyable)\n");
 
-    static_assert(sizeof(MoveInfo) == 8, "MoveInfo size regression");
+    static_assert(sizeof(MoveInfo) == 4, "MoveInfo size regression");
     static_assert(alignof(MoveInfo) == 2, "MoveInfo alignment regression");
     static_assert(std::is_trivially_copyable_v<MoveInfo>,
                   "MoveInfo must stay trivially copyable");
     static_assert(sizeof(_Float16) == 2, "_Float16 must be IEEE 754 binary16");
 
-    EXPECT(sizeof(MoveInfo) == 8);
+    EXPECT(sizeof(MoveInfo) == 4);
     EXPECT(alignof(MoveInfo) == 2);
 }
 
@@ -142,7 +142,7 @@ void test_non_terminal_round_trip() {
 
     for (float p : p_values) {
         const uint16_t move = static_cast<uint16_t>(0xABCDu ^ std::bit_cast<uint32_t>(p));
-        MoveInfo mi = MoveInfo::pack(move, p, /*P_opt=*/p, kTerminalNone);
+        MoveInfo mi = MoveInfo::pack(move, p, kTerminalNone);
 
         EXPECT(mi.move == move);
         EXPECT(mi.terminal_kind() == kTerminalNone);
@@ -174,7 +174,7 @@ void test_terminal_round_trip() {
             const uint16_t move = static_cast<uint16_t>(
                 0x1234u ^ static_cast<uint16_t>(tk) ^
                 std::bit_cast<uint32_t>(p));
-            MoveInfo mi = MoveInfo::pack(move, p, /*P_opt=*/p, tk);
+            MoveInfo mi = MoveInfo::pack(move, p, tk);
 
             EXPECT(mi.move == move);
             if (mi.terminal_kind() != tk) {
@@ -212,7 +212,7 @@ void test_move_field_independence() {
         const uint16_t move = static_cast<uint16_t>(m);
         for (float p : p_samples) {
             for (TerminalKind tk : tk_samples) {
-                MoveInfo mi = MoveInfo::pack(move, p, /*P_opt=*/p, tk);
+                MoveInfo mi = MoveInfo::pack(move, p, tk);
                 if (mi.move != move) {
                     std::fprintf(stderr,
                         "  move bit-flip: packed move=0x%04x decoded=0x%04x\n",
@@ -231,19 +231,19 @@ void test_edge_bit_patterns() {
 
     // P = 0, every kind. Must decode to P=0 and the right kind.
     {
-        MoveInfo mi0 = MoveInfo::pack(0, 0.0f, /*P_opt=*/0.0f, kTerminalNone);
+        MoveInfo mi0 = MoveInfo::pack(0, 0.0f, kTerminalNone);
         EXPECT(mi0.terminal_kind() == kTerminalNone);
         EXPECT_EQ_F(mi0.P(), 0.0f);
 
-        MoveInfo mid = MoveInfo::pack(0, 0.0f, /*P_opt=*/0.0f, kTerminalDraw);
+        MoveInfo mid = MoveInfo::pack(0, 0.0f, kTerminalDraw);
         EXPECT(mid.terminal_kind() == kTerminalDraw);
         EXPECT_EQ_F(mid.P(), 0.0f);
 
-        MoveInfo mil = MoveInfo::pack(0, 0.0f, /*P_opt=*/0.0f, kTerminalLossForChild);
+        MoveInfo mil = MoveInfo::pack(0, 0.0f, kTerminalLossForChild);
         EXPECT(mil.terminal_kind() == kTerminalLossForChild);
         EXPECT_EQ_F(mil.P(), 0.0f);
 
-        MoveInfo miw = MoveInfo::pack(0, 0.0f, /*P_opt=*/0.0f, kTerminalWinForChild);
+        MoveInfo miw = MoveInfo::pack(0, 0.0f, kTerminalWinForChild);
         EXPECT(miw.terminal_kind() == kTerminalWinForChild);
         EXPECT_EQ_F(miw.P(), 0.0f);
     }
@@ -252,19 +252,19 @@ void test_edge_bit_patterns() {
     // the two mantissa LSBs but 1.0's mantissa is all-zero so it's
     // lossless here too.
     {
-        MoveInfo mi0 = MoveInfo::pack(0, 1.0f, /*P_opt=*/1.0f, kTerminalNone);
+        MoveInfo mi0 = MoveInfo::pack(0, 1.0f, kTerminalNone);
         EXPECT(mi0.terminal_kind() == kTerminalNone);
         EXPECT_EQ_F(mi0.P(), 1.0f);
 
-        MoveInfo mid = MoveInfo::pack(0, 1.0f, /*P_opt=*/1.0f, kTerminalDraw);
+        MoveInfo mid = MoveInfo::pack(0, 1.0f, kTerminalDraw);
         EXPECT(mid.terminal_kind() == kTerminalDraw);
         EXPECT_EQ_F(mid.P(), 1.0f);
 
-        MoveInfo mil = MoveInfo::pack(0, 1.0f, /*P_opt=*/1.0f, kTerminalLossForChild);
+        MoveInfo mil = MoveInfo::pack(0, 1.0f, kTerminalLossForChild);
         EXPECT(mil.terminal_kind() == kTerminalLossForChild);
         EXPECT_EQ_F(mil.P(), 1.0f);
 
-        MoveInfo miw = MoveInfo::pack(0, 1.0f, /*P_opt=*/1.0f, kTerminalWinForChild);
+        MoveInfo miw = MoveInfo::pack(0, 1.0f, kTerminalWinForChild);
         EXPECT(miw.terminal_kind() == kTerminalWinForChild);
         EXPECT_EQ_F(miw.P(), 1.0f);
     }
@@ -274,20 +274,20 @@ void test_edge_bit_patterns() {
     // 1.0 exactly, while non-terminal retains the extra ULP.
     {
         const float boundary = 1.0f + std::ldexp(1.0f, -10);
-        MoveInfo mi0 = MoveInfo::pack(0, boundary, /*P_opt=*/boundary, kTerminalNone);
+        MoveInfo mi0 = MoveInfo::pack(0, boundary, kTerminalNone);
         EXPECT(mi0.terminal_kind() == kTerminalNone);
         EXPECT_EQ_F(mi0.P(), fp16_round_trip(boundary));
         EXPECT(mi0.P() > 1.0f);  // the extra ULP survives non-terminal
 
-        MoveInfo mid = MoveInfo::pack(0, boundary, /*P_opt=*/boundary, kTerminalDraw);
+        MoveInfo mid = MoveInfo::pack(0, boundary, kTerminalDraw);
         EXPECT(mid.terminal_kind() == kTerminalDraw);
         EXPECT_EQ_F(mid.P(), 1.0f);  // ULP stolen for kind flag
 
-        MoveInfo mil = MoveInfo::pack(0, boundary, /*P_opt=*/boundary, kTerminalLossForChild);
+        MoveInfo mil = MoveInfo::pack(0, boundary, kTerminalLossForChild);
         EXPECT(mil.terminal_kind() == kTerminalLossForChild);
         EXPECT_EQ_F(mil.P(), 1.0f);
 
-        MoveInfo miw = MoveInfo::pack(0, boundary, /*P_opt=*/boundary, kTerminalWinForChild);
+        MoveInfo miw = MoveInfo::pack(0, boundary, kTerminalWinForChild);
         EXPECT(miw.terminal_kind() == kTerminalWinForChild);
         EXPECT_EQ_F(miw.P(), 1.0f);
     }
@@ -297,15 +297,15 @@ void test_edge_bit_patterns() {
     // decodes back to exactly 1.0.
     {
         const float boundary = 1.0f + 2.0f * std::ldexp(1.0f, -10);
-        MoveInfo mi0 = MoveInfo::pack(0, boundary, /*P_opt=*/boundary, kTerminalNone);
+        MoveInfo mi0 = MoveInfo::pack(0, boundary, kTerminalNone);
         EXPECT(mi0.terminal_kind() == kTerminalNone);
         EXPECT(mi0.P() > 1.0f);
 
-        MoveInfo mid = MoveInfo::pack(0, boundary, /*P_opt=*/boundary, kTerminalDraw);
+        MoveInfo mid = MoveInfo::pack(0, boundary, kTerminalDraw);
         EXPECT(mid.terminal_kind() == kTerminalDraw);
         EXPECT_EQ_F(mid.P(), 1.0f);
 
-        MoveInfo miw = MoveInfo::pack(0, boundary, /*P_opt=*/boundary, kTerminalWinForChild);
+        MoveInfo miw = MoveInfo::pack(0, boundary, kTerminalWinForChild);
         EXPECT(miw.terminal_kind() == kTerminalWinForChild);
         EXPECT_EQ_F(miw.P(), 1.0f);
     }
@@ -326,7 +326,7 @@ void test_monotonicity() {
 
     float last_decoded = -1.0f;
     for (float p : ps) {
-        MoveInfo mi = MoveInfo::pack(0, p, /*P_opt=*/p, kTerminalNone);
+        MoveInfo mi = MoveInfo::pack(0, p, kTerminalNone);
         float decoded = mi.P();
         EXPECT(decoded >= last_decoded - 1e-9f);
         last_decoded = decoded;
@@ -367,7 +367,7 @@ void test_randomized_round_trip() {
         ++kind_hits[k];
 
         const uint16_t move = static_cast<uint16_t>(uni_move(rng));
-        MoveInfo mi = MoveInfo::pack(move, p, /*P_opt=*/p, tk);
+        MoveInfo mi = MoveInfo::pack(move, p, tk);
 
         EXPECT(mi.move == move);
         EXPECT(mi.terminal_kind() == tk);
@@ -407,14 +407,12 @@ void test_exhaustive_packed_patterns_never_crash() {
     uint64_t nan_count = 0;
 
     for (uint32_t packed = 0; packed < 0x10000u; ++packed) {
-        // Bit-pack into MoveInfo's 8-byte layout: [move u16][_packed u16]
-        // [_packed_opt u16][_reserved u16]. Probe every 16-bit pattern in
-        // _packed; leave the rest (including _packed_opt) at fixed values
-        // to keep the scan one-dimensional.
-        const uint64_t word =
-              (static_cast<uint64_t>(packed) << 16)         // _packed
-            |  static_cast<uint64_t>(0x5678u);              // move
-        // _packed_opt and _reserved both zero (high half).
+        // Bit-pack into MoveInfo's 4-byte layout: [move u16][_packed u16].
+        // Probe every 16-bit pattern in _packed; keep `move` fixed to
+        // make the scan one-dimensional.
+        const uint32_t word =
+              (static_cast<uint32_t>(packed) << 16)         // _packed
+            |  static_cast<uint32_t>(0x5678u);              // move
         MoveInfo mi = std::bit_cast<MoveInfo>(word);
         EXPECT(mi.move == 0x5678u);
 
@@ -486,7 +484,6 @@ void test_claim_load_publish_round_trip() {
         moves[i] = catgpt::v2::MoveInfo::pack(
             static_cast<uint16_t>(i + 1),
             1.0f / static_cast<float>(kNumMoves),
-            /*P_opt=*/1.0f / static_cast<float>(kNumMoves),
             catgpt::v2::kTerminalNone);
     }
 

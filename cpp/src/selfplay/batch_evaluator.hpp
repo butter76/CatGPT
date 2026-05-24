@@ -167,15 +167,15 @@ public:
         // Free CUDA resources
         if (stream_) cudaStreamDestroy(stream_);
         if (d_input_) cudaFree(d_input_);
-        if (d_value_) cudaFree(d_value_);
+        if (d_legal_indices_) cudaFree(d_legal_indices_);
+        if (d_wdl_) cudaFree(d_wdl_);
         if (d_value_probs_) cudaFree(d_value_probs_);
-        if (d_policy_) cudaFree(d_policy_);
-        if (d_optimistic_policy_) cudaFree(d_optimistic_policy_);
+        if (d_legal_policy_) cudaFree(d_legal_policy_);
         if (h_input_) cudaFreeHost(h_input_);
-        if (h_value_) cudaFreeHost(h_value_);
+        if (h_legal_indices_) cudaFreeHost(h_legal_indices_);
+        if (h_wdl_) cudaFreeHost(h_wdl_);
         if (h_value_probs_) cudaFreeHost(h_value_probs_);
-        if (h_policy_) cudaFreeHost(h_policy_);
-        if (h_optimistic_policy_) cudaFreeHost(h_optimistic_policy_);
+        if (h_legal_policy_) cudaFreeHost(h_legal_policy_);
     }
 
     // Non-copyable, non-movable
@@ -273,12 +273,16 @@ private:
         // batch_size is always a bucket size (drain logic guarantees this),
         // so a captured cudaGraphExec is always present for it.
 
-        // Pack tokens into the pinned input buffer (the graph's H2D copy
-        // reads exactly this region; tail slots are never touched).
+        // Pack tokens + legal-move indices into the pinned input buffers
+        // (the graph's H2D copies read exactly these regions; tail slots
+        // are never touched).
         for (int b = 0; b < batch_size; ++b) {
             std::memcpy(h_input_ + b * SEQ_LENGTH,
                         batch[b]->tokens.data(),
                         SEQ_LENGTH * sizeof(std::int32_t));
+            std::memcpy(h_legal_indices_ + b * MAX_LEGAL_MOVES,
+                        batch[b]->legal_indices.data(),
+                        MAX_LEGAL_MOVES * sizeof(std::int32_t));
         }
 
         // Launch the captured graph: H2D + enqueueV3 + D2H, all sized for
@@ -289,16 +293,15 @@ private:
         // Distribute results and resume coroutines
         for (int b = 0; b < batch_size; ++b) {
             auto* req = batch[b];
-            req->result.value = h_value_[b];
+            std::memcpy(req->result.wdl_logits.data(),
+                        h_wdl_ + b * static_cast<int>(WDL_NUM_CLASSES),
+                        WDL_NUM_CLASSES * sizeof(float));
             std::memcpy(req->result.value_probs.data(),
                         h_value_probs_ + b * VALUE_NUM_BINS,
                         VALUE_NUM_BINS * sizeof(float));
-            std::memcpy(req->result.policy.data(),
-                        h_policy_ + b * POLICY_SIZE,
-                        POLICY_SIZE * sizeof(float));
-            std::memcpy(req->result.optimistic_policy.data(),
-                        h_optimistic_policy_ + b * POLICY_SIZE,
-                        POLICY_SIZE * sizeof(float));
+            std::memcpy(req->result.legal_policy.data(),
+                        h_legal_policy_ + b * MAX_LEGAL_MOVES,
+                        MAX_LEGAL_MOVES * sizeof(float));
 
             // Hand the submit_handle back to the libfork pool. The pool's
             // notifier wakes a sleeping worker, which calls lf::resume(h)
@@ -373,50 +376,74 @@ private:
             std::string name_str(name);
 
             if (mode == nvinfer1::TensorIOMode::kINPUT) {
-                input_name_ = name;
+                // Two inputs: tokens (batch, SEQ_LENGTH) and legal_indices
+                // (batch, MAX_LEGAL_MOVES). jax2onnx names them positionally
+                // (e.g. "in_0", "in_1") so we disambiguate by trailing dim.
+                if (dims.nbDims == 2 && dims.d[1] == SEQ_LENGTH) {
+                    input_name_ = name;
+                } else if (dims.nbDims == 2 && dims.d[1] == MAX_LEGAL_MOVES) {
+                    legal_indices_input_name_ = name;
+                } else {
+                    throw std::runtime_error(std::format(
+                        "Unexpected input tensor '{}' with shape "
+                        "(nbDims={}, d[1]={}); expected (batch, {}) tokens "
+                        "or (batch, {}) legal_indices.",
+                        name_str, dims.nbDims,
+                        dims.nbDims >= 2 ? static_cast<int>(dims.d[1]) : -1,
+                        SEQ_LENGTH, MAX_LEGAL_MOVES));
+                }
                 continue;
             }
 
-            // Match by name first (specific names before generic). The
-            // optimistic policy match must come BEFORE the plain "policy"
-            // match because "optimistic_policy_logit" contains "policy".
-            if (name_str.find("optimistic_policy") != std::string::npos) {
-                optimistic_policy_output_name_ = name;
-            } else if (name_str.find("policy") != std::string::npos ||
-                       name_str.find("Policy") != std::string::npos) {
+            // Match outputs by name first (specific names before generic).
+            // The gathered policy is named `optimistic_policy_legal_logit` so
+            // either substring "policy" or "legal" catches it; we prefer
+            // "policy" for robustness to future renames.
+            if (name_str.find("policy") != std::string::npos ||
+                name_str.find("Policy") != std::string::npos) {
                 policy_output_name_ = name;
             } else if (name_str.find("value_probs") != std::string::npos ||
                        name_str.find("bestq_probs") != std::string::npos) {
                 value_probs_output_name_ = name;
-            } else if (name_str.find("value") != std::string::npos ||
-                       name_str.find("Value") != std::string::npos) {
-                if (value_output_name_.empty()) {
-                    value_output_name_ = name;
-                }
+            } else if (name_str.find("wdl_logit") != std::string::npos ||
+                       name_str.find("wdl") != std::string::npos) {
+                wdl_output_name_ = name;
             } else {
-                // Fallback by shape
-                if (dims.nbDims == 1 || (dims.nbDims == 2 && dims.d[1] == 1)) {
-                    if (value_output_name_.empty()) value_output_name_ = name;
+                // Fallback by shape (wdl is name-detected only when ambiguous)
+                if (dims.nbDims == 2 && dims.d[1] == static_cast<int64_t>(WDL_NUM_CLASSES)) {
+                    if (wdl_output_name_.empty()) wdl_output_name_ = name;
                 } else if (dims.nbDims == 2 && dims.d[1] == VALUE_NUM_BINS) {
                     if (value_probs_output_name_.empty()) value_probs_output_name_ = name;
-                } else if (dims.nbDims == 2 && dims.d[1] == POLICY_SIZE) {
+                } else if (dims.nbDims == 2 && dims.d[1] == MAX_LEGAL_MOVES) {
                     if (policy_output_name_.empty()) policy_output_name_ = name_str;
                 }
             }
         }
 
-        if (input_name_.empty()) throw std::runtime_error("Could not find input tensor");
-        if (value_output_name_.empty()) throw std::runtime_error("Could not find value output tensor");
-        if (policy_output_name_.empty()) throw std::runtime_error("Could not find policy output tensor");
-        if (optimistic_policy_output_name_.empty()) {
-            throw std::runtime_error("Could not find optimistic_policy output tensor");
+        if (input_name_.empty()) {
+            throw std::runtime_error(
+                "Could not find tokens input tensor (batch, 64) int32");
+        }
+        if (legal_indices_input_name_.empty()) {
+            throw std::runtime_error(std::format(
+                "Could not find legal_indices input tensor (batch, {}) int32. "
+                "Re-export ONNX with the gather-aware export-onnx.sh.",
+                MAX_LEGAL_MOVES));
+        }
+        if (wdl_output_name_.empty()) {
+            throw std::runtime_error("Could not find WDL output tensor (wdl_logit)");
+        }
+        if (policy_output_name_.empty()) {
+            throw std::runtime_error(
+                "Could not find policy output tensor (optimistic_policy_legal_logit)");
         }
 
         std::println(stderr,
-                     "[BatchEvaluator] IO: input='{}', value='{}', bestq_probs='{}', "
-                     "policy='{}', optimistic_policy='{}'",
-                     input_name_, value_output_name_, value_probs_output_name_,
-                     policy_output_name_, optimistic_policy_output_name_);
+                     "[BatchEvaluator] IO: tokens='{}', legal_indices='{}', "
+                     "wdl='{}', bestq_probs='{}', policy='{}'",
+                     input_name_, legal_indices_input_name_,
+                     wdl_output_name_, value_probs_output_name_,
+                     policy_output_name_);
     }
 
     void allocate_buffers() {
@@ -427,17 +454,17 @@ private:
 
         // Device buffers (sized for largest effective bucket; shared across contexts)
         CATGPT_CUDA_CHECK(cudaMalloc(&d_input_, B * SEQ_LENGTH * sizeof(std::int32_t)));
-        CATGPT_CUDA_CHECK(cudaMalloc(&d_value_, B * sizeof(float)));
+        CATGPT_CUDA_CHECK(cudaMalloc(&d_legal_indices_, B * MAX_LEGAL_MOVES * sizeof(std::int32_t)));
+        CATGPT_CUDA_CHECK(cudaMalloc(&d_wdl_, B * WDL_NUM_CLASSES * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMalloc(&d_value_probs_, B * VALUE_NUM_BINS * sizeof(float)));
-        CATGPT_CUDA_CHECK(cudaMalloc(&d_policy_, B * POLICY_SIZE * sizeof(float)));
-        CATGPT_CUDA_CHECK(cudaMalloc(&d_optimistic_policy_, B * POLICY_SIZE * sizeof(float)));
+        CATGPT_CUDA_CHECK(cudaMalloc(&d_legal_policy_, B * MAX_LEGAL_MOVES * sizeof(float)));
 
         // Pinned host buffers
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_input_, B * SEQ_LENGTH * sizeof(std::int32_t)));
-        CATGPT_CUDA_CHECK(cudaMallocHost(&h_value_, B * sizeof(float)));
+        CATGPT_CUDA_CHECK(cudaMallocHost(&h_legal_indices_, B * MAX_LEGAL_MOVES * sizeof(std::int32_t)));
+        CATGPT_CUDA_CHECK(cudaMallocHost(&h_wdl_, B * WDL_NUM_CLASSES * sizeof(float)));
         CATGPT_CUDA_CHECK(cudaMallocHost(&h_value_probs_, B * VALUE_NUM_BINS * sizeof(float)));
-        CATGPT_CUDA_CHECK(cudaMallocHost(&h_policy_, B * POLICY_SIZE * sizeof(float)));
-        CATGPT_CUDA_CHECK(cudaMallocHost(&h_optimistic_policy_, B * POLICY_SIZE * sizeof(float)));
+        CATGPT_CUDA_CHECK(cudaMallocHost(&h_legal_policy_, B * MAX_LEGAL_MOVES * sizeof(float)));
 
         std::println(stderr,
                      "[BatchEvaluator dev={}] Allocated buffers for max effective bucket={}",
@@ -500,12 +527,17 @@ private:
                     "Sub-engine for bucket {} has {} optimization profile(s); "
                     "expected exactly 1 (rebuild with scripts/trt.sh).", b, n));
             }
-            auto opt = engine.getProfileShape(
-                input_name_.c_str(), 0, nvinfer1::OptProfileSelector::kOPT);
-            if (opt.nbDims < 1 || opt.d[0] != b) {
-                throw std::runtime_error(std::format(
-                    "Sub-engine for bucket {} has profile opt batch {}, expected {}.",
-                    b, opt.nbDims < 1 ? -1 : opt.d[0], b));
+            for (const char* in_name : {input_name_.c_str(),
+                                        legal_indices_input_name_.c_str()}) {
+                auto opt = engine.getProfileShape(
+                    in_name, 0, nvinfer1::OptProfileSelector::kOPT);
+                if (opt.nbDims < 1 || opt.d[0] != b) {
+                    throw std::runtime_error(std::format(
+                        "Sub-engine for bucket {} input '{}' has profile opt "
+                        "batch {}, expected {}.",
+                        b, in_name,
+                        opt.nbDims < 1 ? -1 : opt.d[0], b));
+                }
             }
         }
         std::println(stderr,
@@ -541,22 +573,27 @@ private:
             }
             CATGPT_CUDA_CHECK(cudaStreamSynchronize(stream_));
 
-            // min == opt == max for this profile, so this is one-time.
-            nvinfer1::Dims input_dims;
-            input_dims.nbDims = 2;
-            input_dims.d[0] = b;
-            input_dims.d[1] = SEQ_LENGTH;
-            ctx->setInputShape(input_name_.c_str(), input_dims);
+            // min == opt == max for this profile, so these are one-time.
+            nvinfer1::Dims tokens_dims;
+            tokens_dims.nbDims = 2;
+            tokens_dims.d[0] = b;
+            tokens_dims.d[1] = SEQ_LENGTH;
+            ctx->setInputShape(input_name_.c_str(), tokens_dims);
+
+            nvinfer1::Dims legal_dims;
+            legal_dims.nbDims = 2;
+            legal_dims.d[0] = b;
+            legal_dims.d[1] = MAX_LEGAL_MOVES;
+            ctx->setInputShape(legal_indices_input_name_.c_str(), legal_dims);
 
             // Bind addresses to the shared device buffers.
             ctx->setTensorAddress(input_name_.c_str(), d_input_);
-            ctx->setTensorAddress(value_output_name_.c_str(), d_value_);
+            ctx->setTensorAddress(legal_indices_input_name_.c_str(), d_legal_indices_);
+            ctx->setTensorAddress(wdl_output_name_.c_str(), d_wdl_);
             if (!value_probs_output_name_.empty()) {
                 ctx->setTensorAddress(value_probs_output_name_.c_str(), d_value_probs_);
             }
-            ctx->setTensorAddress(policy_output_name_.c_str(), d_policy_);
-            ctx->setTensorAddress(optimistic_policy_output_name_.c_str(),
-                                  d_optimistic_policy_);
+            ctx->setTensorAddress(policy_output_name_.c_str(), d_legal_policy_);
 
             contexts_.emplace(b, std::move(ctx));
         }
@@ -570,8 +607,9 @@ private:
     /**
      * Capture one cudaGraphExec per effective bucket. The graph wraps:
      *   - H2D: bucket * SEQ_LENGTH int32 tokens
-     *   - enqueueV3 on the bucket's IExecutionContext
-     *   - D2H: value, value_probs, policy, optimistic_policy
+     *   - H2D: bucket * MAX_LEGAL_MOVES int32 legal_indices
+     *   - enqueueV3 on the bucket's IExecutionContext (gathers policy on GPU)
+     *   - D2H: wdl_logits, value_probs, gathered legal_policy
      *
      * After this, process_batch only does host memcpys + cudaGraphLaunch
      * + cudaStreamSynchronize. No per-launch TRT setup, no per-launch
@@ -625,10 +663,10 @@ private:
         CATGPT_CUDA_CHECK(cudaStreamSynchronize(stream_));
 
         const std::size_t input_bytes  = bucket * SEQ_LENGTH * sizeof(std::int32_t);
-        const std::size_t value_bytes  = bucket * sizeof(float);
+        const std::size_t legal_in_bytes = bucket * MAX_LEGAL_MOVES * sizeof(std::int32_t);
+        const std::size_t wdl_bytes    = bucket * WDL_NUM_CLASSES * sizeof(float);
         const std::size_t vprobs_bytes = bucket * VALUE_NUM_BINS * sizeof(float);
-        const std::size_t policy_bytes = bucket * POLICY_SIZE * sizeof(float);
-        const std::size_t opt_policy_bytes = bucket * POLICY_SIZE * sizeof(float);
+        const std::size_t legal_out_bytes = bucket * MAX_LEGAL_MOVES * sizeof(float);
 
         // ThreadLocal (not Global) so concurrent BatchEvaluator init on
         // the same GPU doesn't trip cudaErrorStreamCaptureUnsupported.
@@ -639,8 +677,11 @@ private:
         // thread only.
         CATGPT_CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
 
-        // H2D
+        // H2D: tokens and legal-move indices
         CATGPT_CUDA_CHECK(cudaMemcpyAsync(d_input_, h_input_, input_bytes,
+                                          cudaMemcpyHostToDevice, stream_));
+        CATGPT_CUDA_CHECK(cudaMemcpyAsync(d_legal_indices_, h_legal_indices_,
+                                          legal_in_bytes,
                                           cudaMemcpyHostToDevice, stream_));
 
         // Inference
@@ -653,14 +694,12 @@ private:
         }
 
         // D2H
-        CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_value_, d_value_, value_bytes,
+        CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_wdl_, d_wdl_, wdl_bytes,
                                           cudaMemcpyDeviceToHost, stream_));
         CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_value_probs_, d_value_probs_, vprobs_bytes,
                                           cudaMemcpyDeviceToHost, stream_));
-        CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_policy_, d_policy_, policy_bytes,
-                                          cudaMemcpyDeviceToHost, stream_));
-        CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_optimistic_policy_, d_optimistic_policy_,
-                                          opt_policy_bytes,
+        CATGPT_CUDA_CHECK(cudaMemcpyAsync(h_legal_policy_, d_legal_policy_,
+                                          legal_out_bytes,
                                           cudaMemcpyDeviceToHost, stream_));
 
         cudaGraph_t graph = nullptr;
@@ -733,27 +772,30 @@ private:
     // contexts_ and CUDA buffers).
     std::unordered_map<int, cudaGraphExec_t> graph_execs_;
 
+    // Input tensor names (auto-detected by shape in setup_io). The model has
+    // two inputs: tokens (batch, SEQ_LENGTH) and legal_indices (batch,
+    // MAX_LEGAL_MOVES) — see scripts/export_onnx.py.
     std::string input_name_;
-    std::string value_output_name_;
+    std::string legal_indices_input_name_;
+    std::string wdl_output_name_;
     std::string value_probs_output_name_;
     std::string policy_output_name_;
-    std::string optimistic_policy_output_name_;
 
     cudaStream_t stream_ = nullptr;
 
     // Device buffers
     std::int32_t* d_input_ = nullptr;
-    float* d_value_ = nullptr;
+    std::int32_t* d_legal_indices_ = nullptr;
+    float* d_wdl_ = nullptr;
     float* d_value_probs_ = nullptr;
-    float* d_policy_ = nullptr;
-    float* d_optimistic_policy_ = nullptr;
+    float* d_legal_policy_ = nullptr;
 
     // Pinned host buffers
     std::int32_t* h_input_ = nullptr;
-    float* h_value_ = nullptr;
+    std::int32_t* h_legal_indices_ = nullptr;
+    float* h_wdl_ = nullptr;
     float* h_value_probs_ = nullptr;
-    float* h_policy_ = nullptr;
-    float* h_optimistic_policy_ = nullptr;
+    float* h_legal_policy_ = nullptr;
 };
 
 // ─── EvalAwaitable::await_suspend (needs BatchEvaluator to be complete) ────

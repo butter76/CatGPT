@@ -12,11 +12,18 @@
 #     cpp/src/selfplay/batch_evaluator.hpp; the loader validates and throws if
 #     any expected bucket is missing from the .network file.
 #
+# ONNX inputs (auto-detected by TRT):
+#   in_0  (tokens)         — int32 (batch, 64)  chess position tokens
+#   in_1  (legal_indices)  — int32 (batch, 218) flat policy indices of legal
+#                            moves (padded with 0); MUST stay in sync with
+#                            MAX_LEGAL_MOVES in cpp/src/engine/nn_constants.hpp
+#                            and MAX_LEGAL_MOVES in scripts/export_onnx.py.
+#
 # ONNX outputs (auto-detected by TRT):
-#   wdl_value               — WDL-derived Q value, scalar (batch,)
-#   bestq_probs             — BestQ HL-Gauss distribution (batch, 81)
-#   policy_logit            — Move distribution logits (batch, 4672)
-#   optimistic_policy_logit — Optimistic policy logits (batch, 4672)
+#   wdl_logit                     — raw WDL logits [W, D, L] (batch, 3)
+#   bestq_probs                   — BestQ HL-Gauss distribution (batch, 81)
+#   optimistic_policy_legal_logit — Optimistic policy logits gathered at
+#                                   legal_indices (batch, 218)
 
 set -euo pipefail
 
@@ -29,6 +36,9 @@ NETWORK_OUT=${NETWORK_OUT:-main.network}
 
 BUCKETS=(1 2 3 4 6 8 12 18 26 36 56 112)
 
+# Must match MAX_LEGAL_MOVES in cpp/src/engine/nn_constants.hpp.
+MAX_LEGAL=218
+
 TRT_FILES=()
 for b in "${BUCKETS[@]}"; do
   out="main.b${b}.trt"
@@ -38,9 +48,9 @@ for b in "${BUCKETS[@]}"; do
     --onnx="${ONNX}" \
     --saveEngine="${out}" \
     --fp16 \
-    --minShapes=in_0:${b}x64 \
-    --optShapes=in_0:${b}x64 \
-    --maxShapes=in_0:${b}x64
+    --minShapes=in_0:${b}x64,in_1:${b}x${MAX_LEGAL} \
+    --optShapes=in_0:${b}x64,in_1:${b}x${MAX_LEGAL} \
+    --maxShapes=in_0:${b}x64,in_1:${b}x${MAX_LEGAL}
   TRT_FILES+=("${out}")
 done
 

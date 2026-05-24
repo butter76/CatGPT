@@ -25,6 +25,12 @@ jax.config.update("jax_default_matmul_precision", "highest")
 # (hidden_size, ff_dim, num_heads, seq_length, vocab_size, etc.)
 MAGIC_BATCH_SIZE = 477
 
+# Upper bound on legal moves in any chess position; matches MAX_LEGAL_MOVES in
+# cpp/src/engine/nn_constants.hpp. The exported model takes a second input of
+# shape (batch, MAX_LEGAL_MOVES) carrying flat policy indices for the gather
+# at the end of the optimistic-policy head.
+MAX_LEGAL_MOVES = 218
+
 
 def dump_onnx_ir(onnx_path: str | Path, output_path: str | Path | None = None) -> str:
     """Dump ONNX model IR to a human-readable text file.
@@ -475,8 +481,16 @@ def main() -> None:
     # Define the forward function returning multiple outputs
     output_keys = args.output_keys
 
-    def forward(x: jax.Array) -> tuple[jax.Array, ...]:
-        outputs = model.apply(params, x, train=False, compute_dtype=jnp.float32)
+    def forward(
+        x: jax.Array, legal_indices: jax.Array
+    ) -> tuple[jax.Array, ...]:
+        outputs = model.apply(
+            params,
+            x,
+            legal_indices=legal_indices,
+            train=False,
+            compute_dtype=jnp.float32,
+        )
         result = []
         for key in output_keys:
             if key not in outputs:
@@ -493,9 +507,13 @@ def main() -> None:
         export_batch_size = args.batch_size
         print(f"\n[Export] Using fixed batch size {export_batch_size}")
 
-    # Input spec
+    # Input specs: (1) tokens (batch, seq_length) int32, (2) legal-move flat
+    # policy indices (batch, MAX_LEGAL_MOVES) int32 for the C++-runtime gather.
     seq_length = model_config.seq_length
-    input_specs = [jax.ShapeDtypeStruct((export_batch_size, seq_length), jnp.int32)]
+    input_specs = [
+        jax.ShapeDtypeStruct((export_batch_size, seq_length), jnp.int32),
+        jax.ShapeDtypeStruct((export_batch_size, MAX_LEGAL_MOVES), jnp.int32),
+    ]
 
     # Export to ONNX
     print(f"[Export] Converting to ONNX (opset {args.opset})...")
@@ -530,9 +548,16 @@ def main() -> None:
         import onnxruntime as ort
 
         sess = ort.InferenceSession(str(output_path))
-        input_name = sess.get_inputs()[0].name
+        ort_input_names = [i.name for i in sess.get_inputs()]
         ort_output_names = [o.name for o in sess.get_outputs()]
 
+        if len(ort_input_names) != 2:
+            raise RuntimeError(
+                f"Expected 2 ONNX inputs (tokens, legal_indices); got "
+                f"{len(ort_input_names)}: {ort_input_names}"
+            )
+
+        print(f"  ONNX inputs:  {ort_input_names}")
         print(f"  ONNX outputs: {ort_output_names}")
 
         # Test multiple batch sizes if dynamic
@@ -545,13 +570,26 @@ def main() -> None:
             test_input = np.random.randint(
                 0, model_config.vocab_size, size=(batch_size, seq_length), dtype=np.int32
             )
+            # Random in-range legal indices: mimics what the C++ runtime sends
+            # (real flat policy indices, padded with 0). Validation is purely
+            # JAX-vs-ORT, so any in-range int32 works.
+            test_legal_indices = np.random.randint(
+                0, 64 * 73, size=(batch_size, MAX_LEGAL_MOVES), dtype=np.int32
+            )
             jax_input = jnp.array(test_input)
+            jax_legal = jnp.array(test_legal_indices)
 
             # JAX reference outputs
-            jax_outputs = forward(jax_input)
+            jax_outputs = forward(jax_input, jax_legal)
 
             # ONNX Runtime outputs
-            ort_outputs = sess.run(None, {input_name: test_input})
+            ort_outputs = sess.run(
+                None,
+                {
+                    ort_input_names[0]: test_input,
+                    ort_input_names[1]: test_legal_indices,
+                },
+            )
 
             # Compare each output
             all_close = True

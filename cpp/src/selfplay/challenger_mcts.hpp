@@ -314,7 +314,7 @@ private:
         }
 
         // Convert value from [0, 1] to [-1, 1]
-        float value = 2.0f * raw.value - 1.0f;
+        float value = wdl_logits_to_q(raw.wdl_logits);
 
         // Extract policy priors for legal moves via softmax
         bool flip = pos.sideToMove() == chess::Color::BLACK;

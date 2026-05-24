@@ -26,6 +26,12 @@ DTYPE_MAP = {
     "bfloat16": jnp.bfloat16,
 }
 
+def wdl_value_from_logits(wdl_logits: jax.Array) -> jax.Array:
+    """WDL-derived scalar P(W) + 0.5*P(D) in [0, 1], from raw logits."""
+    wdl_probs = jax.nn.softmax(wdl_logits, axis=-1)
+    return wdl_probs[:, 0] + 0.5 * wdl_probs[:, 1]
+
+
 if TYPE_CHECKING:
     from catgpt.jax.configs import (
         JaxCheckpointConfig,
@@ -463,8 +469,8 @@ class Trainer:
             metrics["bestq_mse"] = bestq_mse
 
         # WDL metrics
-        if "wdl_value" in outputs:
-            wdl_value = outputs["wdl_value"].astype(jnp.float32)
+        if "wdl_logit" in outputs:
+            wdl_value = wdl_value_from_logits(outputs["wdl_logit"]).astype(jnp.float32)
             metrics["wdl_value"] = jnp.mean(wdl_value)
 
             # MSE of WDL value vs bestQ target
@@ -795,8 +801,8 @@ class Trainer:
             metrics["bestq_mse"] = bestq_mse
 
         # WDL metrics
-        if "wdl_value" in outputs:
-            wdl_value = outputs["wdl_value"].astype(jnp.float32)
+        if "wdl_logit" in outputs:
+            wdl_value = wdl_value_from_logits(outputs["wdl_logit"]).astype(jnp.float32)
             metrics["wdl_value"] = jnp.mean(wdl_value)
 
             if "best_q_target" in batch:

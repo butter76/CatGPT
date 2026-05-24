@@ -19,8 +19,8 @@
  * Tuning env vars (UCI defaults tuned for headline GPU saturation;
  * may differ from LksSearch ctor defaults):
  *   LKS_WORKERS_PER_GPU     (default 2; total workers = this * #CUDA devices)
- *   LKS_COROS_PER_WORKER    (default 112)
- *   LKS_MAX_BATCH_SIZE      (default 56)
+ *   LKS_COROS_PER_WORKER    (default 256)
+ *   LKS_MAX_BATCH_SIZE      (default 112)
  *   LKS_LIFETIME_MAX_EVALS  (default 1<<27)
  *   LKS_DELTA_DEPTH         (default 0.2; per-iteration log-scale ID step
  *                            piped into LksSearchConfig::delta_depth on
@@ -356,7 +356,7 @@ int main(int argc, char* argv[]) {
     } else if (const char* env = std::getenv("CATGPT_TRT_ENGINE")) {
         engine_path = env;
     } else {
-        engine_path = "/home/shadeform/CatGPT/main.trt";
+        engine_path = "/home/shadeform/CatGPT/main.network";
     }
 
     if (!fs::exists(engine_path)) {
@@ -367,8 +367,8 @@ int main(int argc, char* argv[]) {
     }
 
     const int workers_per_gpu  = catgpt::env_int("LKS_WORKERS_PER_GPU", 2);
-    const int coros_per_worker = catgpt::env_int("LKS_COROS_PER_WORKER", 112);
-    const int max_batch_size   = catgpt::env_int("LKS_MAX_BATCH_SIZE", 56);
+    const int coros_per_worker = catgpt::env_int("LKS_COROS_PER_WORKER", 256);
+    const int max_batch_size   = catgpt::env_int("LKS_MAX_BATCH_SIZE", 112);
     const uint64_t lifetime_max_evals =
         catgpt::env_u64("LKS_LIFETIME_MAX_EVALS", 1ULL << 27);
     const float delta_depth = catgpt::env_float("LKS_DELTA_DEPTH", 0.2f);

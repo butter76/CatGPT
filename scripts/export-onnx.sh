@@ -5,11 +5,16 @@
 # real tensor dimensions, then post-process the ONNX graph to replace all
 # occurrences with dynamic dimension (-1).
 #
+# Inputs (in order):
+#   tokens                          — int32 (batch, 64) chess position tokens
+#   legal_indices                   — int32 (batch, 218) flat policy indices
+#                                     of legal moves (padded with 0)
+#
 # Outputs (in order):
-#   wdl_value               — WDL-derived Q value, scalar (batch,)
-#   bestq_probs             — BestQ HL-Gauss distribution (batch, 81)
-#   policy_logit            — Move distribution logits (batch, 4672)
-#   optimistic_policy_logit — Optimistic policy logits (batch, 4672)
+#   wdl_logit                       — raw WDL logits [W, D, L] (batch, 3)
+#   bestq_probs                     — BestQ HL-Gauss distribution (batch, 81)
+#   optimistic_policy_legal_logit   — Optimistic policy logits gathered at
+#                                     legal_indices (batch, 218)
 #
 # Usage: ./export-onnx.sh [checkpoint_path]
 
@@ -18,7 +23,7 @@ set -e
 uv run python scripts/export_onnx.py \
     --checkpoint ./checkpoints_jax/S2/shard_12 \
     --output-path main.onnx \
-    --output-keys wdl_value bestq_probs policy_logit optimistic_policy_logit \
+    --output-keys wdl_logit bestq_probs optimistic_policy_legal_logit \
     --dynamic-batch \
     --opset 20 \
     --validate
