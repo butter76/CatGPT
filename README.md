@@ -160,4 +160,8 @@ See [`pyproject.toml`](pyproject.toml) for exact pins.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+CatGPT is released under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) — see [`LICENSE`](LICENSE).
+
+Free for noncommercial use: personal projects, research, experimentation, education, and use by charitable, educational, public-research, public-safety, environmental, and governmental organizations. **Commercial use is not permitted under this license.** For a commercial license, please open an issue or contact the maintainers.
+
+Third-party components under `cpp/external/` (`libfork`, `fathom`, `chess-library`, …) remain under their original upstream licenses; see the `LICENSE` file inside each dependency directory.
