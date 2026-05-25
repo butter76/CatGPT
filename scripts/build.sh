@@ -318,6 +318,7 @@ fi
 
 phase "Phase 6: cmake configure + build"
 
+rm -rf "$BUILD_DIR/CMakeCache.txt" "$BUILD_DIR/CMakeFiles"
 mkdir -p "$BUILD_DIR"
 cmake \
     -S "$REPO_DIR/cpp" \

@@ -141,6 +141,7 @@ Makefile
 *.cmake
 !CMakeLists.txt
 !CMakePresets.json
+!cpp/cmake/GenVersion.cmake
 
 # clangd
 .cache/

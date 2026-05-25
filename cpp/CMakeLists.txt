@@ -1,8 +1,14 @@
 cmake_minimum_required(VERSION 3.22)
 
-# Set compilers to GCC 14 (must be before project())
-set(CMAKE_C_COMPILER gcc-14)
-set(CMAKE_CXX_COMPILER g++-14)
+# Default to GCC 14 for local dev; callers (e.g. scripts/build.sh) may set
+# CMAKE_C_COMPILER / CMAKE_CXX_COMPILER on the cmake command line (must be
+# before project()).
+if(NOT CMAKE_C_COMPILER)
+    set(CMAKE_C_COMPILER gcc-14)
+endif()
+if(NOT CMAKE_CXX_COMPILER)
+    set(CMAKE_CXX_COMPILER g++-14)
+endif()
 
 project(ChessEngine VERSION 0.1.0 LANGUAGES C CXX)
 
