@@ -4,13 +4,12 @@ version = "0.1.0"
 description = "ML research project for chess and beyond using JAX"
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT" }
+license = { text = "PolyForm Noncommercial 1.0.0" }
 authors = [{ name = "CatGPT Team" }]
 keywords = ["ml", "research", "chess", "deep-learning", "jax"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
