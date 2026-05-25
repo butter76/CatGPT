@@ -21,7 +21,7 @@
 set -e
 
 uv run python scripts/export_onnx.py \
-    --checkpoint ./checkpoints_jax/S2/shard_12 \
+    --checkpoint ./checkpoints_jax/S2/shard_15 \
     --output-path main.onnx \
     --output-keys wdl_logit bestq_probs optimistic_policy_legal_logit \
     --dynamic-batch \
