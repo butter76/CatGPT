@@ -1,133 +1,163 @@
-# CatGPT 🐱
+# CatGPT
 
-ML research project for chess and beyond built with **JAX** and **Flax**.
+A chess GPT trained in **JAX/Flax**, served on the GPU through a custom C++/TensorRT engine, driven by a new search algorithm called **Likelihood Search (LKS)** that targets the failure modes of vanilla MCTS at high node counts.
 
-Behind CatGPT is a chess transformer incorporating modern innovations from LLMs into chess. Runs on top of a new type of search called Likelihood Search (LKS), aimed to fix many of the shortcomings of MCTS, especially at very high node counts.
+The point of CatGPT is to break several widely-held assumptions about network design and search stemming from AlphaZero.
 
-> **Looking for the C++ engine?** See [`cpp/README.md`](cpp/README.md) for build and usage instructions for the native CatGPT engine.
+The repo holds three first-class pieces:
 
-## Quick Start
+- **Training stack** (`src/catgpt/`, `scripts/`, `configs/`) — JAX/Flax models, optimizers, Hydra configs, data pipeline, ONNX export.
+- **Inference engine** (`cpp/`) — C++23 / GCC 14 / TensorRT 10 UCI engine. See [`cpp/README.md`](cpp/README.md) for build and run instructions.
+- **Web viewer** (`web/`) — Next.js UI that streams live search stats from the engine over SSE.
 
-### Prerequisites
+## Repo layout
 
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/) package manager
+```
+CatGPT/
+├── src/catgpt/        # Python package
+│   ├── core/          # Framework-agnostic: chess, configs, data, evaluation
+│   ├── jax/           # JAX/Flax models, optimizers, training, evaluation
+│   ├── cpp/           # Python adapter that drives the UCI engine
+│   └── tournament/    # SPRT harness + opening books
+├── cpp/               # Native C++ engine (lks_uci, trt_benchmark, ...)
+├── web/               # Next.js viewer for live search
+├── scripts/           # Train / eval / convert / pack / tournament drivers
+├── configs/           # Hydra configs (jax_base, jax_eval, cpp_eval, ...)
+├── tests/             # Python test suite
+├── checkpoints_jax/   # Local checkpoint dir (gitignored)
+├── update.sh          # one-file sudo-less bootstrap (calls scripts/build.sh)
+└── pyproject.toml
+```
 
-### Installation
+## Quick start
+
+### A. Run the engine on a fresh GPU box (sudo-less bootstrap)
+
+You need only an NVIDIA driver and a CUDA 12.x toolkit installed by an admin; everything else (GCC 14, TensorRT 10.13, submodules) is built/fetched into a working directory of your choice.
 
 ```bash
-# Install uv (if not already installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# Put update.sh in an empty dir on the target host, then:
+chmod +x update.sh
+./update.sh
+```
 
-# Clone and install
-git clone https://github.com/your-org/catgpt.git
-cd catgpt
+[`update.sh`](update.sh) clones the repo, initializes the `libfork` / `fathom` / `chess-library` submodules, and hands off to [`scripts/build.sh`](scripts/build.sh), which runs an idempotent 8-phase build:
 
-# Install with JAX (CPU)
+1. Machine scan (logs gcc / cmake / nvidia / cuda state).
+2. Locate a CUDA 12.x toolkit (or fail fast).
+3. Build GCC 14 from source into `gcc-14/` (skipped if already present).
+4. Download and unpack TensorRT 10.13.3.9 into `TensorRT-10.13.3.9/`.
+5. Verify `main.onnx` is present (either staged manually or fetched via `MAIN_ONNX_URL`).
+6. Configure cmake and build `lks_uci` + `trt_benchmark`.
+7. Pack per-bucket TRT engines into `main.network` via [`scripts/trt.sh`](scripts/trt.sh) + [`scripts/pack_network.py`](scripts/pack_network.py).
+8. Run `trt_benchmark` against the packed network.
+
+Output artifacts land alongside `update.sh`:
+
+```
+./catgpt          # UCI engine binary (copy of cpp/build/bin/lks_uci)
+./main.network    # Packed multi-bucket TRT engine
+./trt_benchmark.txt  # Benchmark log
+./build.log       # Full build log
+```
+
+`./catgpt` speaks UCI; point Cute Chess / Banksia / lichess-bot at it the same way you would Stockfish. See [`cpp/README.md`](cpp/README.md) for tuning env vars (`LKS_*`) and `CATGPT_TRT_ENGINE`.
+
+### B. Hack on Python (training, eval, data)
+
+Prerequisites: Python 3.12+ and [uv](https://docs.astral.sh/uv/).
+
+```bash
+git clone https://github.com/butter76/CatGPT.git
+cd CatGPT
+
+# CPU-only JAX:
 uv sync --extra jax
 
-# Or install with JAX (CUDA)
+# Or GPU JAX (CUDA 12):
 uv sync --extra jax-cuda
 
-# Install with dev dependencies
-uv sync --extra jax --extra dev
+# Add dev tooling:
+uv sync --extra jax-cuda --extra dev
 ```
 
-## Framework Support
+The Python tree is configured via Hydra; the canonical config is [`configs/jax_base.yaml`](configs/jax_base.yaml).
 
-CatGPT is built on JAX/Flax for high-performance machine learning:
+## Training and evaluation
 
-```python
-# JAX/Flax
-from catgpt.jax.models import BaseModel
-from catgpt.jax.training import Trainer
+All scripts accept Hydra-style key=value overrides.
 
-# Shared utilities (framework-agnostic)
-from catgpt.core import setup_logging, load_config
-from catgpt.core.chess import ChessEngine
+```bash
+# Train the JAX model
+uv run python scripts/train_jax.py
+uv run python scripts/train_jax.py model.hidden_size=512 training.batch_size=128
+uv run python scripts/train_jax.py +resume_from=checkpoints_jax/epoch_10
+
+# Evaluate a JAX checkpoint
+uv run python scripts/evaluate_jax.py
+
+# Export a trained model to ONNX (used by trt.sh + pack_network.py)
+uv run python scripts/export_onnx.py
+
+# Run an SPRT match between two C++ engine configurations
+uv run python scripts/sprt_tournament.py \
+    engine_a.type=mcts engine_a.mcts.num_simulations=400 \
+    engine_b.type=mcts engine_b.mcts.num_simulations=800
+
+# Self-play data generation
+uv run python scripts/selfplay.py
 ```
 
-## Project Structure
+Other scripts of note live under [`scripts/`](scripts/): `pipeline_bagz_to_training.py` and `batch_convert_*.py` for the Leela bag → training-bag data pipeline, `download_syzygy_*.py` for tablebases, `find_unsolved_puzzles.py` / `evaluate_cpp.py` for puzzle evaluation.
 
+## Web viewer
+
+[`web/`](web/) is a Next.js app that spawns the `catgpt_search` binary as a subprocess and streams its JSON-per-line search stats to the browser over Server-Sent Events. It is independent of the training stack.
+
+```bash
+cd web
+npm install
+npm run dev
+# open http://localhost:3000
 ```
-catgpt/
-├── src/catgpt/
-│   ├── core/                # Shared, framework-agnostic code
-│   │   ├── chess/           # Chess engine (no ML deps)
-│   │   ├── configs/         # Configuration management
-│   │   ├── data/            # Common data types
-│   │   ├── evaluation/      # Shared evaluation logic
-│   │   └── utils/           # Logging, etc.
-│   └── jax/                 # JAX/Flax implementations
-│       ├── models/          # Flax models
-│       ├── optimizers/      # Optax extensions
-│       ├── training/        # JAX training loops
-│       ├── evaluation/      # JAX metrics
-│       └── data/            # JAX data loading
-├── scripts/                 # Training & evaluation scripts
-├── configs/                 # Hydra configurations
-├── tests/                   # Test suite
-└── ...
-```
+
+The viewer expects the `catgpt_search` binary and a `.network` engine on the host — build them via `update.sh` first.
+
+## C++ engine
+
+The native engine is built around `LksSearch` (Lazy-SMP, log-scale iterative deepening, GPU-batched via TensorRT) plus a bespoke UCI loop. Full details, env vars, model I/O, and the list of secondary binaries (`catgpt_analyze`, legacy MCTS engines, microbenches) live in [`cpp/README.md`](cpp/README.md).
 
 ## Development
 
 ```bash
-# Run linting
+# Lint
 uv run ruff check src tests scripts
 
-# Run type checking
+# Type check
 uv run pyright src
 
-# Run tests
+# Tests
 uv run pytest tests -v
 
-# Run tests with coverage
+# Tests with coverage
 uv run pytest tests -v --cov=src/catgpt
 ```
 
-## CLI Usage
+Bugbot will automatically review PRs for issues.
 
-```bash
-# Show version
-uv run catgpt version
-
-# Train a model (JAX)
-uv run python scripts/train_jax.py
-
-# Evaluate a checkpoint
-uv run python scripts/evaluate_jax.py --checkpoint checkpoints/model
-```
-
-## Configuration
-
-Configurations are managed with [Hydra](https://hydra.cc/). Base config is in `configs/jax_base.yaml`.
-
-Override any value from CLI:
-```bash
-uv run python scripts/train_jax.py training.learning_rate=0.001 model.num_layers=12
-```
-
-## Optional Dependencies
+## Optional dependencies
 
 | Extra | Packages | Install |
 |-------|----------|---------|
-| `jax` | JAX, Flax, Optax (CPU) | `uv sync --extra jax` |
-| `jax-cuda` | JAX, Flax, Optax (CUDA) | `uv sync --extra jax-cuda` |
-| `dev` | pytest, ruff, pyright | `uv sync --extra dev` |
-| `notebook` | Jupyter, matplotlib | `uv sync --extra notebook` |
-| `export` | ONNX, TensorFlow (for model export) | `uv sync --extra export` |
-| `all` | Everything | `uv sync --extra all` |
+| `jax` | JAX, Flax, Optax, Orbax (CPU) | `uv sync --extra jax` |
+| `jax-cuda` | JAX, Flax, Optax, Orbax (CUDA 12) | `uv sync --extra jax-cuda` |
+| `dev` | pytest, ruff, pyright, pre-commit, ipython | `uv sync --extra dev` |
+| `notebook` | Jupyter, matplotlib, seaborn, plotly | `uv sync --extra notebook` |
+| `export` | ONNX, onnxruntime, jax2onnx, TensorFlow, tf2onnx | `uv sync --extra export` |
+| `all` | Everything above | `uv sync --extra all` |
 
-## Contributing
-
-1. Install dev dependencies: `uv sync --extra jax --extra dev`
-2. Make your changes
-3. Run checks: `uv run ruff check src tests scripts && uv run pyright src && uv run pytest tests`
-4. Submit a PR
-
-Bugbot will automatically review your PR for issues.
+See [`pyproject.toml`](pyproject.toml) for exact pins.
 
 ## License
 
-MIT
+MIT — see [`LICENSE`](LICENSE).
