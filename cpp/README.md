@@ -7,7 +7,7 @@ The native side of CatGPT: a C++23 / GCC 14 / TensorRT 10 chess engine built aro
 - **CMake** 3.22+
 - **GCC 14** (system gcc is _not_ sufficient — C++23 `std::print`, coroutines, etc.). The bootstrap builds it from source into `gcc-14/` automatically; otherwise install it yourself and point `-DCMAKE_CXX_COMPILER=g++-14`.
 - **CUDA** 12.x toolkit (driver + `libcudart`).
-- **TensorRT** 10.13.x (10.13.3.9 is what `scripts/build.sh` pins).
+- **TensorRT** 10.16.x (10.16.1.11 is what `scripts/build.sh` pins).
 - **Linux x86_64.**
 - **Git submodules** under `external/`:
   - [`libfork`](https://github.com/ConorWilliams/libfork) — continuation-stealing fork-join coroutine runtime (used by `lks_uci` and friends).
@@ -30,7 +30,7 @@ For a fresh GPU box, use the top-level [`scripts/build.sh`](../scripts/build.sh)
 1. Machine scan (logs uname, glibc, gcc, nvidia-smi, nvcc, candidate CUDA dirs).
 2. Locate a CUDA 12.x toolkit (honors `CUDA_ROOT_OVERRIDE` / `CUDA_HOME`).
 3. Build **GCC 14** from source into `$WORK_DIR/gcc-14/` (~30–60 min on first run).
-4. Download and unpack **TensorRT 10.13.3.9** into `$WORK_DIR/TensorRT-10.13.3.9/`.
+4. Download and unpack **TensorRT 10.16.1.11** into `$WORK_DIR/TensorRT-10.16.1.11/`.
 5. Verify `$WORK_DIR/main.onnx` exists (or fetch via `MAIN_ONNX_URL`).
 6. `cmake` configure and build `lks_uci` + `trt_benchmark` into `cpp/build/bin/`.
 7. Build per-bucket TensorRT engines and pack them into `$WORK_DIR/main.network` (via [`scripts/trt.sh`](../scripts/trt.sh) + [`scripts/pack_network.py`](../scripts/pack_network.py)).
@@ -49,7 +49,7 @@ cmake -S . -B build \
     -DCMAKE_C_COMPILER=/path/to/gcc-14 \
     -DCMAKE_CXX_COMPILER=/path/to/g++-14 \
     -DCUDA_ROOT=/usr/local/cuda-12.8 \
-    -DTENSORRT_ROOT=/path/to/TensorRT-10.13.3.9 \
+    -DTENSORRT_ROOT=/path/to/TensorRT-10.16.1.11 \
     -DGCC14_LIB_DIR=/path/to/gcc-14/lib64
 
 cmake --build build -j$(nproc) --target lks_uci trt_benchmark
@@ -145,7 +145,7 @@ The current export is gather-aware: the GPU collapses the full `(64, 73) = 4672`
 `lks_uci` and `trt_benchmark` accept either a raw single-engine `.trt` file or a packed `.network` produced by [`scripts/pack_network.py`](../scripts/pack_network.py). A `.network` contains multiple TensorRT engines built for different batch-size buckets, plus metadata; the loader picks the right bucket per inference. Produce one with [`scripts/trt.sh`](../scripts/trt.sh):
 
 ```bash
-TRT_ROOT=/path/to/TensorRT-10.13.3.9 \
+TRT_ROOT=/path/to/TensorRT-10.16.1.11 \
 ONNX=/path/to/main.onnx \
 NETWORK_OUT=/path/to/main.network \
 bash scripts/trt.sh
@@ -231,6 +231,6 @@ cpp/
 |---|---|---|
 | `CMAKE_C_COMPILER` / `CMAKE_CXX_COMPILER` | `gcc-14` / `g++-14` | Toolchain (must be on PATH or absolute) |
 | `CUDA_ROOT` | `/usr/local/cuda-12.8` | CUDA toolkit root (must contain `include/cuda.h` and `lib64/libcudart.so`) |
-| `TENSORRT_ROOT` | `/home/shadeform/TensorRT-10.13.3.9` | TensorRT root (`include/NvInfer.h`, `lib/libnvinfer.so`) |
+| `TENSORRT_ROOT` | `/home/shadeform/TensorRT-10.16.1.11` | TensorRT root (`include/NvInfer.h`, `lib/libnvinfer.so`) |
 | `GCC14_LIB_DIR` | `/usr/local/lib64` | Dir containing `libstdc++.so.6` for GCC 14; baked into BUILD_RPATH/INSTALL_RPATH |
 | `VCPKG_ROOT` | `$HOME/vcpkg` | Used to find optional libcoro; legacy targets are silently skipped if missing |

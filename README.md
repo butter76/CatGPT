@@ -33,7 +33,7 @@ CatGPT/
 
 ### A. Run the engine on a fresh GPU box (sudo-less bootstrap)
 
-You need only an NVIDIA driver and a CUDA 12.x toolkit installed by an admin; everything else (GCC 14, TensorRT 10.13, submodules) is built/fetched into a working directory of your choice.
+You need only an NVIDIA driver and a CUDA 12.x toolkit installed by an admin; everything else (GCC 14, TensorRT 10.16, submodules) is built/fetched into a working directory of your choice.
 
 ```bash
 # Put update.sh in an empty dir on the target host, then:
@@ -46,7 +46,7 @@ chmod +x update.sh
 1. Machine scan (logs gcc / cmake / nvidia / cuda state).
 2. Locate a CUDA 12.x toolkit (or fail fast).
 3. Build GCC 14 from source into `gcc-14/` (skipped if already present).
-4. Download and unpack TensorRT 10.13.3.9 into `TensorRT-10.13.3.9/`.
+4. Download and unpack TensorRT 10.16.1.11 into `TensorRT-10.16.1.11/`.
 5. Verify `main.onnx` is present (either staged manually or fetched via `MAIN_ONNX_URL`).
 6. Configure cmake and build `lks_uci` + `trt_benchmark`.
 7. Pack per-bucket TRT engines into `main.network` via [`scripts/trt.sh`](scripts/trt.sh) + [`scripts/pack_network.py`](scripts/pack_network.py).

@@ -120,6 +120,7 @@ openings/
 *.onnx
 *.data
 *.trt
+*.network
 
 # C++ Build Artifacts
 cpp/build/

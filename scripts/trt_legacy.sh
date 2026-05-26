@@ -15,8 +15,8 @@
 #   policy_logit            — Move distribution logits (batch, 4672)
 #   optimistic_policy_logit — Optimistic policy logits (batch, 4672)
 
-LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/shadeform/TensorRT-10.13.3.9/lib \
-/home/shadeform/TensorRT-10.13.3.9/bin/trtexec \
+LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/shadeform/TensorRT-10.16.1.11/lib \
+/home/shadeform/TensorRT-10.16.1.11/bin/trtexec \
   --onnx=main.onnx \
   --saveEngine=main.trt \
   --fp16 \

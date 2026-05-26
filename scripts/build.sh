@@ -3,7 +3,7 @@
 #
 # Invoked by ../update.sh, which sets WORK_DIR to the directory that
 # contains both the cloned CatGPT/ tree and the durable install
-# artifacts (gcc-14/, TensorRT-10.13.3.9/, main.onnx, main.network).
+# artifacts (gcc-14/, TensorRT-10.16.1.11/, main.onnx, main.network).
 #
 # Idempotent: every phase has a sentinel check so re-runs only do work
 # that's actually outstanding.
@@ -31,7 +31,7 @@ WORK_DIR="${WORK_DIR:-$(cd "$REPO_DIR/.." && pwd -P)}"
 mkdir -p "$WORK_DIR/.cache"
 
 GCC_PREFIX="$WORK_DIR/gcc-14"
-TRT_DIR="$WORK_DIR/TensorRT-10.13.3.9"
+TRT_DIR="$WORK_DIR/TensorRT-10.16.1.11"
 ONNX_PATH="$WORK_DIR/main.onnx"
 NETWORK_PATH="$WORK_DIR/main.network"
 BUILD_DIR="$REPO_DIR/cpp/build"
@@ -39,7 +39,7 @@ BUILD_DIR="$REPO_DIR/cpp/build"
 GCC_VERSION="${GCC_VERSION:-14.2.0}"
 GCC_TARBALL_URL="https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz"
 
-TRT_URL="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.13.3/tars/TensorRT-10.13.3.9.Linux.x86_64-gnu.cuda-12.9.tar.gz"
+TRT_URL="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.16.1/tars/TensorRT-10.16.1.11.Linux.x86_64-gnu.cuda-12.9.tar.gz"
 
 # TODO: replace with the real hosted ONNX URL once we have one.
 MAIN_ONNX_URL="${MAIN_ONNX_URL:-}"
@@ -274,16 +274,16 @@ log "GCC_LIB_DIR = $GCC_LIB_DIR"
 "$CXX" --version | head -1
 
 # ---------------------------------------------------------------------------
-# Phase 4: TensorRT 10.13.3.9 (sentinel: lib/libnvinfer.so present)
+# Phase 4: TensorRT 10.16.1.11 (sentinel: lib/libnvinfer.so present)
 # ---------------------------------------------------------------------------
 
-phase "Phase 4: TensorRT 10.13.3.9"
+phase "Phase 4: TensorRT 10.16.1.11"
 
 if [[ -f "$TRT_DIR/lib/libnvinfer.so" && -f "$TRT_DIR/include/NvInfer.h" ]]; then
     log "found TensorRT at $TRT_DIR (skipping download)"
 else
-    log "downloading TensorRT 10.13.3.9 tarball"
-    TRT_TAR="$WORK_DIR/.cache/TensorRT-10.13.3.9.tar.gz"
+    log "downloading TensorRT 10.16.1.11 tarball"
+    TRT_TAR="$WORK_DIR/.cache/TensorRT-10.16.1.11.tar.gz"
     if [[ ! -s "$TRT_TAR" ]]; then
         wget -O "$TRT_TAR.part" "$TRT_URL"
         mv "$TRT_TAR.part" "$TRT_TAR"

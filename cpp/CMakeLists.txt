@@ -100,7 +100,7 @@ message(STATUS "CUDA include: ${CUDA_INCLUDE_DIR}")
 message(STATUS "CUDA runtime: ${CUDART_LIB}")
 
 # === TensorRT ===
-set(TENSORRT_ROOT "/home/shadeform/TensorRT-10.13.3.9" CACHE PATH "TensorRT installation root")
+set(TENSORRT_ROOT "/home/shadeform/TensorRT-10.16.1.11" CACHE PATH "TensorRT installation root")
 set(TENSORRT_INCLUDE_DIR "${TENSORRT_ROOT}/include")
 set(TENSORRT_LIB_DIR "${TENSORRT_ROOT}/lib")
 
