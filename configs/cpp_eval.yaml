@@ -18,7 +18,7 @@
 #   uv run python scripts/evaluate_cpp.py benchmark.max_puzzles=100
 
 # TensorRT engine path
-trt_engine: "main.network"
+trt_engine: "S2.network"
 
 # C++ binary paths (relative to cpp/build/bin/)
 cpp_build_dir: "cpp/build/bin"

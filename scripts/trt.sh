@@ -33,8 +33,9 @@ TRT_ROOT="${TRT_ROOT:-/home/shadeform/TensorRT-10.16.1.11}"
 TRTEXEC=${TRT_ROOT}/bin/trtexec
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:${TRT_ROOT}/lib
 
-ONNX=${ONNX:-main.onnx}
-NETWORK_OUT=${NETWORK_OUT:-main.network}
+MODEL=${MODEL:-S2}
+ONNX=${ONNX:-${MODEL}.onnx}
+NETWORK_OUT=${NETWORK_OUT:-${MODEL}.network}
 
 BUCKETS=(1 2 3 4 6 8 12 18 26 36 56 112)
 
@@ -43,7 +44,7 @@ MAX_LEGAL=218
 
 TRT_FILES=()
 for b in "${BUCKETS[@]}"; do
-  out="main.b${b}.trt"
+  out="${MODEL}.b${b}.trt"
   echo
   echo "=== Building bucket ${b} -> ${out} ==="
   "${TRTEXEC}" \

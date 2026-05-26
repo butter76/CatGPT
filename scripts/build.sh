@@ -3,7 +3,9 @@
 #
 # Invoked by ../update.sh, which sets WORK_DIR to the directory that
 # contains both the cloned CatGPT/ tree and the durable install
-# artifacts (gcc-14/, TensorRT-10.16.1.11/, main.onnx, main.network).
+# artifacts (gcc-14/, TensorRT-10.16.1.11/, ${MODEL}.onnx,
+# ${MODEL}.network). MODEL defaults to S2; set MODEL=S4 (etc.) to point
+# at a different model stem.
 #
 # Idempotent: every phase has a sentinel check so re-runs only do work
 # that's actually outstanding.
@@ -30,10 +32,12 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 WORK_DIR="${WORK_DIR:-$(cd "$REPO_DIR/.." && pwd -P)}"
 mkdir -p "$WORK_DIR/.cache"
 
+MODEL="${MODEL:-S2}"
+
 GCC_PREFIX="$WORK_DIR/gcc-14"
 TRT_DIR="$WORK_DIR/TensorRT-10.16.1.11"
-ONNX_PATH="$WORK_DIR/main.onnx"
-NETWORK_PATH="$WORK_DIR/main.network"
+ONNX_PATH="$WORK_DIR/${MODEL}.onnx"
+NETWORK_PATH="$WORK_DIR/${MODEL}.network"
 BUILD_DIR="$REPO_DIR/cpp/build"
 
 GCC_VERSION="${GCC_VERSION:-14.2.0}"
@@ -42,7 +46,7 @@ GCC_TARBALL_URL="https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSIO
 TRT_URL="https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.16.1/tars/TensorRT-10.16.1.11.Linux.x86_64-gnu.cuda-12.9.tar.gz"
 
 # TODO: replace with the real hosted ONNX URL once we have one.
-MAIN_ONNX_URL="${MAIN_ONNX_URL:-}"
+ONNX_URL="${ONNX_URL:-}"
 
 JOBS="${JOBS:-$(nproc)}"
 
@@ -66,6 +70,7 @@ exec > >(tee -a "$WORK_DIR/build.log") 2>&1
 log "build.sh starting at $(date -Is)"
 log "WORK_DIR=$WORK_DIR"
 log "REPO_DIR=$REPO_DIR"
+log "MODEL=$MODEL"
 
 # ---------------------------------------------------------------------------
 # Phase 1: Debug scan (always runs, never fails)
@@ -297,19 +302,19 @@ fi
 log "trtexec     = $TRT_DIR/bin/trtexec"
 
 # ---------------------------------------------------------------------------
-# Phase 5: main.onnx
+# Phase 5: ${MODEL}.onnx
 # ---------------------------------------------------------------------------
 
-phase "Phase 5: main.onnx"
+phase "Phase 5: ${MODEL}.onnx"
 
 if [[ -s "$ONNX_PATH" ]]; then
     log "found ONNX at $ONNX_PATH ($(stat -c %s "$ONNX_PATH") bytes)"
-elif [[ -n "$MAIN_ONNX_URL" ]]; then
-    log "downloading ONNX from $MAIN_ONNX_URL"
-    wget -O "$ONNX_PATH.part" "$MAIN_ONNX_URL"
+elif [[ -n "$ONNX_URL" ]]; then
+    log "downloading ONNX from $ONNX_URL"
+    wget -O "$ONNX_PATH.part" "$ONNX_URL"
     mv "$ONNX_PATH.part" "$ONNX_PATH"
 else
-    die "no ONNX at $ONNX_PATH and MAIN_ONNX_URL is unset. Either stage main.onnx in WORK_DIR or set MAIN_ONNX_URL and re-run."
+    die "no ONNX at $ONNX_PATH and ONNX_URL is unset. Either stage ${MODEL}.onnx in WORK_DIR or set ONNX_URL and re-run."
 fi
 
 # ---------------------------------------------------------------------------
@@ -342,7 +347,7 @@ TRT_BENCH_BIN="$BUILD_DIR/bin/trt_benchmark"
 # Phase 7: build .network bundle (sentinel: network newer than onnx)
 # ---------------------------------------------------------------------------
 
-phase "Phase 7: build main.network"
+phase "Phase 7: build ${MODEL}.network"
 
 if [[ -s "$NETWORK_PATH" && "$NETWORK_PATH" -nt "$ONNX_PATH" ]]; then
     log "found up-to-date $NETWORK_PATH (newer than $ONNX_PATH) — skipping rebuild"
@@ -354,6 +359,7 @@ else
     (
         cd "$WORK_DIR"
         TRT_ROOT="$TRT_DIR" \
+        MODEL="$MODEL" \
         ONNX="$ONNX_PATH" \
         NETWORK_OUT="$NETWORK_PATH" \
         PYTHON="${PYTHON:-python3}" \
@@ -394,7 +400,7 @@ phase "Done"
 log "catgpt        = $CATGPT_BIN"
 log "lks_uci       = $LKS_UCI_BIN"
 log "trt_benchmark = $TRT_BENCH_BIN"
-log "main.network  = $NETWORK_PATH"
+log "${MODEL}.network  = $NETWORK_PATH"
 log "bench log     = $TRT_BENCH_LOG"
 echo
 echo "OK: $CATGPT_BIN $NETWORK_PATH"

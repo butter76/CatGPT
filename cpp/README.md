@@ -31,12 +31,12 @@ For a fresh GPU box, use the top-level [`scripts/build.sh`](../scripts/build.sh)
 2. Locate a CUDA 12.x toolkit (honors `CUDA_ROOT_OVERRIDE` / `CUDA_HOME`).
 3. Build **GCC 14** from source into `$WORK_DIR/gcc-14/` (~30–60 min on first run).
 4. Download and unpack **TensorRT 10.16.1.11** into `$WORK_DIR/TensorRT-10.16.1.11/`.
-5. Verify `$WORK_DIR/main.onnx` exists (or fetch via `MAIN_ONNX_URL`).
+5. Verify `$WORK_DIR/${MODEL}.onnx` exists (or fetch via `ONNX_URL`). `MODEL` defaults to `S2`; set `MODEL=S4` (etc.) to point at `S4.onnx`.
 6. `cmake` configure and build `lks_uci` + `trt_benchmark` into `cpp/build/bin/`.
-7. Build per-bucket TensorRT engines and pack them into `$WORK_DIR/main.network` (via [`scripts/trt.sh`](../scripts/trt.sh) + [`scripts/pack_network.py`](../scripts/pack_network.py)).
+7. Build per-bucket TensorRT engines and pack them into `$WORK_DIR/${MODEL}.network` (via [`scripts/trt.sh`](../scripts/trt.sh) + [`scripts/pack_network.py`](../scripts/pack_network.py)).
 8. Run `trt_benchmark` against the packed network.
 
-The result is a self-contained `$WORK_DIR/catgpt` UCI binary plus `$WORK_DIR/main.network`.
+The result is a self-contained `$WORK_DIR/catgpt` UCI binary plus `$WORK_DIR/${MODEL}.network` (defaults to `S2.network`).
 
 ### Manual cmake
 
@@ -66,11 +66,11 @@ The tiny [`build.sh`](build.sh) in this directory is just a one-shot `cmake .. &
 Bespoke UCI loop on top of `LksSearch`. The worker thread emits `info` / `bestmove` lines as it searches; the driver streams them straight to stdout. Tree state is reused across `position` commands when the new line is a strict prefix-extension of the previous one, preserving the shared transposition table.
 
 ```bash
-# Default engine path: $CATGPT_TRT_ENGINE, else ./main.network
+# Default engine path: $CATGPT_TRT_ENGINE, else ./S2.network
 ./build/bin/lks_uci
 
 # Or pass it explicitly
-./build/bin/lks_uci /path/to/main.network
+./build/bin/lks_uci /path/to/S2.network
 ```
 
 Supported UCI commands: `uci`, `isready`, `ucinewgame`, `position`, `go`, `stop`, `quit`.
@@ -79,7 +79,7 @@ Supported UCI commands: `uci`, `isready`, `ucinewgame`, `position`, `go`, `stop`
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CATGPT_TRT_ENGINE` | `./main.network` | Engine path if not passed on the CLI |
+| `CATGPT_TRT_ENGINE` | `./S2.network` | Engine path if not passed on the CLI |
 | `LKS_WORKERS_PER_GPU` | `2` | Total workers = this × `#CUDA devices` |
 | `LKS_COROS_PER_WORKER` | `256` | Concurrent coroutines per worker |
 | `LKS_MAX_BATCH_SIZE` | `112` | Max GPU batch per inference |
@@ -94,8 +94,8 @@ Supported UCI commands: `uci`, `isready`, `ucinewgame`, `position`, `go`, `stop`
 Loads a `.network` (or raw `.trt`) and sweeps a series of batch sizes, reporting average / min / max latency and throughput.
 
 ```bash
-./build/bin/trt_benchmark                       # uses $CATGPT_TRT_ENGINE or ./main.network
-./build/bin/trt_benchmark /path/to/main.network # or pass the path
+./build/bin/trt_benchmark                       # uses $CATGPT_TRT_ENGINE or ./S2.network
+./build/bin/trt_benchmark /path/to/S2.network   # or pass the path
 ```
 
 Example output:
@@ -146,8 +146,8 @@ The current export is gather-aware: the GPU collapses the full `(64, 73) = 4672`
 
 ```bash
 TRT_ROOT=/path/to/TensorRT-10.16.1.11 \
-ONNX=/path/to/main.onnx \
-NETWORK_OUT=/path/to/main.network \
+ONNX=/path/to/S2.onnx \
+NETWORK_OUT=/path/to/S2.network \
 bash scripts/trt.sh
 ```
 

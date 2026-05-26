@@ -47,16 +47,16 @@ chmod +x update.sh
 2. Locate a CUDA 12.x toolkit (or fail fast).
 3. Build GCC 14 from source into `gcc-14/` (skipped if already present).
 4. Download and unpack TensorRT 10.16.1.11 into `TensorRT-10.16.1.11/`.
-5. Verify `main.onnx` is present (either staged manually or fetched via `MAIN_ONNX_URL`).
+5. Verify `${MODEL}.onnx` is present (either staged manually or fetched via `ONNX_URL`). `MODEL` defaults to `S2`; set `MODEL=S4` to point the same pipeline at `S4.onnx`.
 6. Configure cmake and build `lks_uci` + `trt_benchmark`.
-7. Pack per-bucket TRT engines into `main.network` via [`scripts/trt.sh`](scripts/trt.sh) + [`scripts/pack_network.py`](scripts/pack_network.py).
+7. Pack per-bucket TRT engines into `${MODEL}.network` via [`scripts/trt.sh`](scripts/trt.sh) + [`scripts/pack_network.py`](scripts/pack_network.py).
 8. Run `trt_benchmark` against the packed network.
 
 Output artifacts land alongside `update.sh`:
 
 ```
 ./catgpt          # UCI engine binary (copy of cpp/build/bin/lks_uci)
-./main.network    # Packed multi-bucket TRT engine
+./S2.network      # Packed multi-bucket TRT engine (or ${MODEL}.network)
 ./trt_benchmark.txt  # Benchmark log
 ./build.log       # Full build log
 ```

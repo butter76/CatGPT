@@ -14,7 +14,7 @@
  *
  * Usage: lks_uci [engine_path]
  *   engine_path: Path to TensorRT engine file
- *                (default: $CATGPT_TRT_ENGINE or ./main.network)
+ *                (default: $CATGPT_TRT_ENGINE or ./S2.network)
  *
  * Tuning env vars (UCI defaults tuned for headline GPU saturation;
  * may differ from LksSearch ctor defaults):
@@ -366,7 +366,7 @@ int main(int argc, char* argv[]) {
     } else if (const char* env = std::getenv("CATGPT_TRT_ENGINE")) {
         engine_path = env;
     } else {
-        engine_path = "./main.network";
+        engine_path = "./S2.network";
     }
 
     if (!fs::exists(engine_path)) {

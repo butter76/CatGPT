@@ -14,7 +14,7 @@
  *   catgpt_analyze [network_path] [FEN]
  *   catgpt_analyze [network_path] < fen.txt
  *
- * Default network: $CATGPT_NETWORK or /home/shadeform/CatGPT/main.network
+ * Default network: $CATGPT_NETWORK or /home/shadeform/CatGPT/S2.network
  */
 
 #include <NvInfer.h>
@@ -580,7 +580,7 @@ int main(int argc, char* argv[]) {
     if (const char* env = std::getenv("CATGPT_NETWORK")) {
         network_path = env;
     } else {
-        network_path = "/home/shadeform/CatGPT/main.network";
+        network_path = "/home/shadeform/CatGPT/S2.network";
     }
     std::string fen;
 
