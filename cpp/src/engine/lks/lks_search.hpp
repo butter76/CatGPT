@@ -130,6 +130,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -195,7 +196,12 @@ struct SearchParams {
     float fpu_reduction = 0.330f;
 
     // Clamp loop: cap per-iteration depth growth and break-out tolerance.
-    //   - each forked child is dispatched at min(p.alloc, p.depth + clamp_step);
+    //   - each forked child is dispatched at
+    //     min(p.alloc, p.depth + clamp_step * jitter), where `jitter` is
+    //     drawn uniformly from [0.5, 1.5] per fork from a per-worker-thread
+    //     RNG (see clamp_step_jitter()); this perturbs the per-fork depth
+    //     step to give Lazy-SMP workers naturally divergent descent shapes
+    //     without changing the long-run allocator fixed point;
     //   - loop breaks (after iter 0) once every plan has
     //     p.alloc - p.depth <= break_eps (i.e. the Halley allocator is at
     //     a fixed point and no child wants meaningfully more depth);
@@ -625,6 +631,19 @@ struct RecurseContext {
  */
 inline constexpr uint32_t kRecursiveDepthLimit = 196;
 
+// Per-fork multiplier in [0.5, 1.5] applied to `clamp_step` when computing
+// a forked child's target depth. The RNG is `thread_local`, and each
+// `WorkerSearch` owns a 1-thread `lazy_pool`, so every worker draws from
+// an independent stream — giving Lazy-SMP workers naturally divergent
+// per-iteration depth steps. The interval is symmetric around 1, so the
+// expected step is unchanged from the deterministic clamp_step; only the
+// per-fork shape is perturbed.
+inline float clamp_step_jitter() noexcept {
+    thread_local std::mt19937 rng{std::random_device{}()};
+    thread_local std::uniform_real_distribution<float> dist(0.5f, 1.5f);
+    return dist(rng);
+}
+
 inline constexpr auto recursive_search =
     [](auto recursive_search,
        RecurseContext* ctx,
@@ -884,7 +903,9 @@ inline constexpr auto recursive_search =
     //   2. If iter > 0 and every Expanded plan satisfies
     //      alloc - depth <= break_eps, break.
     //   3. Expanded plans fork when alloc > p.depth at
-    //      min(alloc, p.depth + clamp_step). Unexpanded plans never
+    //      min(alloc, p.depth + clamp_step * jitter), where jitter is
+    //      drawn uniformly from [0.5, 1.5] per fork via
+    //      clamp_step_jitter() (Lazy-SMP variation). Unexpanded plans never
     //      use the alloc gate; on iter 0 only, force-expand the first
     //      `hdr->force_expand` Unexpanded priors (per-position dynamic
     //      count, computed at first-eval from a temp-1.0 policy), or
@@ -953,7 +974,8 @@ inline constexpr auto recursive_search =
                 const float target_depth =
                     (p.mode == Mode::Unexpanded)
                         ? p.alloc
-                        : std::min(p.alloc, p.depth + clamp_step);
+                        : std::min(p.alloc,
+                                   p.depth + clamp_step * clamp_step_jitter());
 
                 chess::Board cb = board;
                 cb.makeMove<true>(chess::Move{moves[i].move});
