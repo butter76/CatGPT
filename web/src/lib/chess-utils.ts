@@ -172,6 +172,41 @@ export function tryMove(
 }
 
 /**
+ * Build a move line from a list of UCI moves, applying them one-by-one
+ * starting from the given FEN. Returns the resolved entries (SAN, UCI, and
+ * FEN after each move) along with the index of the first illegal move, if any.
+ */
+export function buildLineFromUCI(
+  fen: string,
+  ucis: UCIMove[]
+): {
+  entries: { san: string; uci: UCIMove; fenAfter: string }[];
+  invalidAt: number | null;
+} {
+  const entries: { san: string; uci: UCIMove; fenAfter: string }[] = [];
+  try {
+    const chess = new Chess(fen);
+    for (let i = 0; i < ucis.length; i++) {
+      const { from, to, promotion } = parseUCIMove(ucis[i]);
+      const move = chess.move({
+        from: from as ChessSquare,
+        to: to as ChessSquare,
+        promotion: promotion as "q" | "r" | "b" | "n" | undefined,
+      });
+      if (!move) return { entries, invalidAt: i };
+      entries.push({
+        san: move.san,
+        uci: move.from + move.to + (move.promotion ?? ""),
+        fenAfter: chess.fen(),
+      });
+    }
+  } catch {
+    return { entries, invalidAt: entries.length };
+  }
+  return { entries, invalidAt: null };
+}
+
+/**
  * Check if a move from→to would be a pawn promotion.
  */
 export function isPromotion(fen: string, from: string, to: string): boolean {

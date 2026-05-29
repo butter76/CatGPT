@@ -21,6 +21,7 @@ import {
 import { Chessboard } from "react-chessboard";
 import { AddPositionDialog } from "@/components/chess/add-position-dialog";
 import { EngineAnalysisPanel } from "@/components/chess/engine-analysis-panel";
+import { Textarea } from "@/components/ui/textarea";
 import {
   isValidFEN,
   sideToMove,
@@ -28,6 +29,7 @@ import {
   tryMove,
   isPromotion,
   parseUCIMove,
+  buildLineFromUCI,
 } from "@/lib/chess-utils";
 import {
   FlaskConical,
@@ -72,6 +74,8 @@ function AnalyzePageContent() {
   const [orientation, setOrientation] = useState<"white" | "black">("white");
   const [moves, setMoves] = useState<MoveEntry[]>([]);
   const [currentPly, setCurrentPly] = useState(0);
+  const [movesInput, setMovesInput] = useState("");
+  const [movesError, setMovesError] = useState<string | null>(null);
 
   // Promotion state
   const [pendingPromotion, setPendingPromotion] = useState<{
@@ -95,8 +99,34 @@ function AnalyzePageContent() {
       setStartingFen(val);
       setMoves([]);
       setCurrentPly(0);
+      setMovesInput("");
+      setMovesError(null);
     }
   }, []);
+
+  const handleMovesChange = useCallback(
+    (val: string) => {
+      setMovesInput(val);
+      const tokens = val.trim().split(/\s+/).filter(Boolean);
+      if (tokens.length === 0) {
+        setMoves([]);
+        setCurrentPly(0);
+        setMovesError(null);
+        return;
+      }
+      const { entries, invalidAt } = buildLineFromUCI(startingFen, tokens);
+      if (invalidAt !== null) {
+        setMovesError(
+          `Invalid move "${tokens[invalidAt]}" at position ${invalidAt + 1}`
+        );
+      } else {
+        setMovesError(null);
+      }
+      setMoves(entries);
+      setCurrentPly(0);
+    },
+    [startingFen]
+  );
 
   const executeMove = useCallback(
     (from: string, to: string, promotion?: string) => {
@@ -240,6 +270,27 @@ function AnalyzePageContent() {
             {fenInput && !fenValid && (
               <p className="text-xs text-red-500 flex items-center gap-1">
                 <AlertCircle className="w-3 h-3" /> Invalid FEN string
+              </p>
+            )}
+          </div>
+          <div className="grid gap-2">
+            <Label htmlFor="moves-input">Moves (UCI)</Label>
+            <Textarea
+              id="moves-input"
+              value={movesInput}
+              onChange={(e) => handleMovesChange(e.target.value)}
+              placeholder="e.g. c8d7 e5b8 c2h7 b8d6 h7g8"
+              rows={2}
+              className={`font-mono text-sm ${movesError ? "border-red-500" : ""}`}
+            />
+            {movesError ? (
+              <p className="text-xs text-red-500 flex items-center gap-1">
+                <AlertCircle className="w-3 h-3" /> {movesError}
+              </p>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                Space- or newline-separated UCI moves to pre-populate the move
+                list.
               </p>
             )}
           </div>
