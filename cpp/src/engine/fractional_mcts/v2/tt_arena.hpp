@@ -323,8 +323,23 @@ struct NodeInfoHeader {
     float    variance;      // 4: computed once from NN value distribution
     uint16_t num_moves;     // 2: <= 218 in chess
     uint16_t force_expand;  // 2: dynamic iter-0 force-expand count, [0, 8]
+    // Mutable, set to 1 by the first recursive_search invocation that gets
+    // past the re-deepen check on this entry. Read by PV-mode descents to
+    // decide whether to waive the depth-monotonic re-deepen short-circuit
+    // (PV mode is not allowed to re-deepen-skip on a node that has never
+    // had a real rollup, i.e. only a fresh-NN snapshot in TT).
+    //
+    // Multi-writer access uses `std::atomic_ref<uint8_t>` at the use site
+    // for relaxed-ordered loads/stores. The field itself is a plain byte
+    // so the existing reinterpret_cast-into-arena init pattern in
+    // `alloc_node_info` keeps working without placement-new gymnastics;
+    // basic thread safety is enough here (writes are idempotent — every
+    // writer stores the same value 1 — and a missed write only delays
+    // the waiver by one iteration, no correctness issue).
+    mutable uint8_t expanded;  // 1
+    uint8_t  _pad[3];          // 3: pad to 12 bytes (4-byte alignment)
 };
-static_assert(sizeof(NodeInfoHeader) == 8, "NodeInfoHeader must be 8 bytes");
+static_assert(sizeof(NodeInfoHeader) == 12, "NodeInfoHeader must be 12 bytes");
 
 /**
  * Bytes reserved at the start of `arena_` so that `alloc_raw` never
@@ -773,6 +788,33 @@ public:
         }
     }
 
+    /**
+     * Variant of `update_qd` that ignores the depth-monotonic gate: the
+     * (new_q, new_max_depth) pair always replaces whatever Cell A's qd
+     * half holds, with the key half preserved by the CAS. Used by the
+     * PV-mode rollup, which intentionally re-evaluates already-deeper
+     * entries (the re-deepen waiver lets PV descend past the gate, so
+     * the rollup needs to land regardless of the entry's current depth).
+     *
+     * Same CAS-loop shape as `update_qd`; the difference is that the
+     * loop never returns "skipped". The retry only re-runs when a
+     * concurrent writer (PV or non-PV) raced us on Cell A.
+     */
+    static void store_qd_force(TTEntry* entry, float new_q, float new_max_depth) noexcept {
+        KeyQd expected = entry->key_qd.load(std::memory_order_relaxed);
+        while (true) {
+            const KeyQd desired{expected.key, pack_qd(new_q, new_max_depth)};
+            if (entry->key_qd.compare_exchange_weak(
+                    expected, desired,
+                    std::memory_order_acq_rel,
+                    std::memory_order_relaxed))
+            {
+                return;
+            }
+            // expected was reloaded by compare_exchange_weak; loop.
+        }
+    }
+
     // ── Arena ops ────────────────────────────────────────────────────────
 
     /**
@@ -798,6 +840,7 @@ public:
         header->variance = 0.0f;
         header->num_moves = num_moves;
         header->force_expand = 0;
+        header->expanded = 0;
         return offset;
     }
 

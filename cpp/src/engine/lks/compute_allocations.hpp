@@ -87,6 +87,22 @@ struct Plan {
     float Q;
     float depth;
     float alloc;
+    // Per-iteration scratch for PV-mode descent. Placed last so existing
+    // {Mode, P, Q, depth, alloc} aggregate initializers in the descent's
+    // pass 1 keep working — the missing `isPV` falls through to its
+    // default-member-initialized `false`.
+    //
+    // Written by the parent at fork dispatch time: `p.isPV =
+    // pv_mode_child`, where `pv_mode_child` is true exactly for the
+    // iter > 0 PV-force-fork of the current best Expanded child and
+    // false for every other fork. So a plan that's re-forked under a
+    // normal alloc-gate fork has its prior PV claim eagerly
+    // invalidated, and a plan that's not re-forked at all this iter
+    // keeps its previous isPV value. Read by the parent's break gate
+    // (the pv_mode loop only exits when some isPV=true plan's score
+    // is within kPvQEps of the best Expanded child's score). Never
+    // written to TT; never read by `compute_log_allocations`.
+    bool  isPV = false;
 };
 
 /**

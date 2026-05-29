@@ -632,6 +632,7 @@ inline constexpr auto recursive_search =
        chess::Board board,
        float depth,
        uint32_t rec_depth,
+       bool pv_mode,
        Plan* out) -> lf::task<void>
 {
     if (ctx->w->should_abort()) co_return;
@@ -742,24 +743,7 @@ inline constexpr auto recursive_search =
         entry = ce;
     }
 
-    // ── re-deepen check (works for both fresh-claim and TT-shared) ──
-    {
-        // Cell A is atomic with the key match (find / find_or_claim
-        // both ensure we observe a key from a successful CAS), so qd
-        // is never torn here.
-        auto [cur_q, cur_max_d] = v2::unpack_qd(
-            v2::SearchArena::load_qd(entry).qd_packed);
-        if (rec_depth >= kRecursiveDepthLimit || depth <= cur_max_d) {
-            // Hand the already-unpacked TT (Q, max_depth) back to the
-            // caller — same value the deleted post-join re-read would
-            // have produced. At the recursion cap, skip Pass 1+ as if
-            // re-deepened.
-            if (out) { out->Q = cur_q; out->depth = cur_max_d; }
-            co_return;
-        }
-    }
-
-    // ── load node info (move list + variance) for the upcoming passes ──
+    // ── load node info (move list + variance + expanded flag) ──────
     // Cell B is provably published by the time we reach this point:
     //   * `find(key, sec)` only returns non-null after validating
     //     the secondary, which requires Cell B to be published
@@ -771,6 +755,13 @@ inline constexpr auto recursive_search =
     //     which only returns true after acquire-observing the
     //     winning peer's Cell B publish — same HB chain as `find`.
     // So a plain `load_info` is sufficient — no spin needed.
+    //
+    // This used to live AFTER the re-deepen check; it moved up so the
+    // PV-mode waiver can read `hdr->expanded` to decide whether to
+    // skip the depth-monotonic short-circuit. The cost is one extra
+    // cache line touched on the re-deepen-skip path; in exchange the
+    // PV-mode descent never replays a stale TT (Q, max_depth) snapshot
+    // for a node that was never actually rolled up here.
     const v2::InfoCell info_cell = v2::SearchArena::load_info(entry);
     assert(info_cell.info_offset != v2::kNoInfoOffset
            && "Cell B unpublished after find/find_or_claim returned a "
@@ -778,6 +769,51 @@ inline constexpr auto recursive_search =
     const v2::NodeInfoHeader* hdr = ctx->arena->info_at(info_cell.info_offset);
     const uint16_t num_moves = hdr->num_moves;
     const v2::MoveInfo* moves = ctx->arena->moves_at(info_cell.info_offset);
+
+    // ── re-deepen check (works for both fresh-claim and TT-shared) ──
+    // PV-mode waiver: when this descent runs under pv_mode and the
+    // entry has at least one prior real rollup (`hdr->expanded == 1`),
+    // we ignore the depth-monotonic gate and descend anyway. This is
+    // what lets the PV walk a real chain of recurse-driven moves at
+    // every ply instead of replaying TT (Q, max_depth) snapshots that
+    // can come from a different path (and may secretly hide a
+    // repetition along *this* PV).
+    //
+    // The recursive-depth cap is NEVER waived — runaway descent depth
+    // is a real risk even on the PV.
+    {
+        const bool waive_depth_check =
+            pv_mode &&
+            std::atomic_ref<uint8_t>(hdr->expanded)
+                .load(std::memory_order_relaxed) != 0;
+        // Cell A is atomic with the key match (find / find_or_claim
+        // both ensure we observe a key from a successful CAS), so qd
+        // is never torn here.
+        auto [cur_q, cur_max_d] = v2::unpack_qd(
+            v2::SearchArena::load_qd(entry).qd_packed);
+        if (rec_depth >= kRecursiveDepthLimit ||
+            (!waive_depth_check && depth <= cur_max_d)) {
+            // Hand the already-unpacked TT (Q, max_depth) back to the
+            // caller — same value the deleted post-join re-read would
+            // have produced. At the recursion cap, skip Pass 1+ as if
+            // re-deepened. The parent's `out->isPV` flag is left
+            // alone here: no fresh descent happened, so any prior PV
+            // claim on this row remains the freshest data the parent
+            // has.
+            if (out) { out->Q = cur_q; out->depth = cur_max_d; }
+            co_return;
+        }
+    }
+
+    // We're committed to descending past the re-deepen check. Mark this
+    // node as "has had at least one real rollup (or is about to)" so
+    // future PV-mode visitors may waive the depth-monotonic gate. Plain
+    // byte storage with `std::atomic_ref` for relaxed atomicity — every
+    // writer stores the same value (1), so concurrent races are
+    // idempotent and a missed write only delays the waiver by one
+    // iteration.
+    std::atomic_ref<uint8_t>(hdr->expanded)
+        .store(1, std::memory_order_relaxed);
 
     // Parent Q (from the same TT entry we just validated) feeds the FPU
     // estimate for unexpanded children. For a freshly-claimed entry this
@@ -814,15 +850,24 @@ inline constexpr auto recursive_search =
         // (so the "alloc > depth" gate never triggers a re-recurse).
         // Q is stored in child-STM convention (same as TT): a child-loss
         // is Q=-1 ⇒ parent's rollup -Q = +1 ⇒ we win.
+        //
+        // isPV=true on all depth=+inf rows: terminal Q is exact (no
+        // refinement possible) AND we must NEVER let the iter > 0 PV
+        // force-fork dispatch a recursive_search on a terminal child
+        // (caller-skip contract requires the parent to filter out
+        // terminals before recursing). Pre-marking isPV=true makes
+        // the break gate satisfiable when the best move is terminal,
+        // and combined with the `std::isfinite(p.depth)` guard on
+        // is_pv_force below, no terminal child is ever forked.
         if (m_tk == v2::kTerminalDraw) {
             plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
-                             /*alloc=*/0.0f});
+                             /*alloc=*/0.0f, /*isPV=*/true});
             cumulative_P += m_P;
             continue;
         }
         if (m_tk == v2::kTerminalLossForChild) {
             plans.push_back({Mode::Expanded, m_P, /*Q=*/-1.0f, kPosInf,
-                             /*alloc=*/0.0f});
+                             /*alloc=*/0.0f, /*isPV=*/true});
             cumulative_P += m_P;
             continue;
         }
@@ -830,7 +875,7 @@ inline constexpr auto recursive_search =
             // Reachable only via Syzygy: child-STM is in a TB-won position,
             // so child_Q=+1 ⇒ parent rollup -Q = -1 ⇒ this move loses for us.
             plans.push_back({Mode::Expanded, m_P, /*Q=*/+1.0f, kPosInf,
-                             /*alloc=*/0.0f});
+                             /*alloc=*/0.0f, /*isPV=*/true});
             cumulative_P += m_P;
             continue;
         }
@@ -843,9 +888,11 @@ inline constexpr auto recursive_search =
         // terminal_kind (different paths hashing to the same key may
         // disagree on repetition / half-move clock). Treat as a draw
         // at this caller; Expanded with depth=+inf like terminals.
+        // Pre-marked isPV=true for the same reason as terminal_kind
+        // rows (see comment above).
         if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
             plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
-                             /*alloc=*/0.0f});
+                             /*alloc=*/0.0f, /*isPV=*/true});
             cumulative_P += m_P;
             continue;
         }
@@ -882,7 +929,8 @@ inline constexpr auto recursive_search =
     //
     //   1. compute_log_allocations on the current (Q, depth) state.
     //   2. If iter > 0 and every Expanded plan satisfies
-    //      alloc - depth <= break_eps, break.
+    //      alloc - depth <= break_eps, break (in pv_mode the break is
+    //      additionally gated on PV convergence — see below).
     //   3. Expanded plans fork when alloc > p.depth at
     //      min(alloc, p.depth + clamp_step). Unexpanded plans never
     //      use the alloc gate; on iter 0 only, force-expand the first
@@ -892,6 +940,26 @@ inline constexpr auto recursive_search =
     //      log(force_all_unexpanded_log_arg)`, at
     //      recursion depth p.alloc. Children write (Q, depth) back
     //      through `&p`.
+    //
+    // PV-mode overlay (only when this coroutine runs with pv_mode=true):
+    //   - On every iter > 0, identify pv_idx = argmax_i(-plans[i].Q)
+    //     over Expanded plans (the parent-POV best child) and
+    //     unconditionally force-fork that child under
+    //     pv_mode_child=true, even if its alloc gate (`alloc >
+    //     p.depth`) doesn't fire. The re-deepen waiver in the child's
+    //     recursive_search lets the recursion proceed even when
+    //     target_depth doesn't strictly grow depth.
+    //   - All non-PV-forced forks use pv_mode_child=false. Children
+    //     of non-PV parents always run with pv_mode=false.
+    //   - At each fork dispatch the parent eagerly assigns
+    //     `p.isPV = pv_mode_child`, so the row's PV claim tracks the
+    //     mode of the most recent rollup that overwrote it. Plans
+    //     not re-forked this iter retain their previous isPV value.
+    //   - The break-after-break_eps gate is augmented: we additionally
+    //     require some Expanded isPV=true plan to be within kPvQEps
+    //     (parent-POV) of the current best score. This prevents an
+    //     early break before the PV move has been refined under
+    //     pv_mode_child=true at all.
     //
     // Permits: only iter 0's FIRST fork inherits this coroutine's
     // entry permit (so K bounds permit-holding frames, not alive
@@ -913,11 +981,35 @@ inline constexpr auto recursive_search =
             ctx->params->force_all_unexpanded_log_arg;
         const int   max_iters   = ctx->params->clamp_max_iters;
         const int   force_count = static_cast<int>(hdr->force_expand);
+        // PV convergence tolerance: loop in pv_mode only breaks once
+        // some isPV=true plan's parent-POV score is within this margin
+        // of the best Expanded child's score. Magnitude matches a
+        // typical Q-noise floor; tight enough that the break_eps gate
+        // remains the primary terminator on most positions.
+        constexpr float kPvQEps = 0.04f;
 
         for (int iter = 0; iter < max_iters; ++iter) {
             compute_log_allocations(plans.data(),
                                     static_cast<int>(plans.size()),
                                     depth, ctx->params->c_puct);
+
+            // PV pick (computed once per iter, used by both the break
+            // gate and the per-plan force-fork). Only meaningful at
+            // iter > 0 in pv_mode; otherwise stays -1.
+            int pv_idx = -1;
+            if (pv_mode && iter > 0) {
+                float best_neg_q =
+                    -std::numeric_limits<float>::infinity();
+                for (int i = 0; i < static_cast<int>(num_moves); ++i) {
+                    const Plan& p = plans[i];
+                    if (p.mode != Mode::Expanded) continue;
+                    const float neg_q = -p.Q;
+                    if (neg_q > best_neg_q) {
+                        best_neg_q = neg_q;
+                        pv_idx = i;
+                    }
+                }
+            }
 
             if (iter > 0) {
                 bool any_unsaturated = false;
@@ -928,7 +1020,25 @@ inline constexpr auto recursive_search =
                         break;
                     }
                 }
-                if (!any_unsaturated) break;
+                bool pv_break_ok = !pv_mode;
+                if (pv_mode) {
+                    if (pv_idx < 0) {
+                        // No Expanded plans at all; PV concept is
+                        // vacuous, let the regular gate proceed.
+                        pv_break_ok = true;
+                    } else {
+                        const float best_neg_q = -plans[pv_idx].Q;
+                        for (const Plan& p : plans) {
+                            if (p.mode != Mode::Expanded || !p.isPV)
+                                continue;
+                            if (std::abs(-p.Q - best_neg_q) <= kPvQEps) {
+                                pv_break_ok = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!any_unsaturated && pv_break_ok) break;
             }
 
             const bool force_all_unexpanded =
@@ -940,15 +1050,38 @@ inline constexpr auto recursive_search =
             for (uint16_t i = 0; i < num_moves; ++i) {
                 Plan& p = plans[i];
 
+                bool is_pv_force = false;
                 if (p.mode == Mode::Unexpanded) {
                     if (iter != 0) continue;
                     const bool force_expand =
                         (static_cast<int>(i) < force_count)
                         || force_all_unexpanded;
                     if (!force_expand) continue;
-                } else if (!(p.alloc > p.depth)) {
-                    continue;
+                } else {
+                    // Expanded: normal alloc gate, with a PV-mode
+                    // override on the current best child. The override
+                    // fires every iter > 0 in pv_mode (no `!p.isPV`
+                    // gate) so we keep refining the PV move every
+                    // iteration; idempotent because target_depth and
+                    // depth_floor stabilize and the rollup writeback
+                    // is monotonic in (Q, depth) on the PV chain.
+                    //
+                    // The `std::isfinite(p.depth)` guard excludes
+                    // terminal / path-dep-draw plans (depth=+inf):
+                    // recursive_search's caller-skip contract forbids
+                    // descending into a terminal child, and there's
+                    // nothing to refine anyway (Q is exact). Such
+                    // rows were pre-marked isPV=true at Pass 1, so
+                    // the break gate is still satisfiable when the
+                    // best move is terminal.
+                    is_pv_force =
+                        pv_mode && iter > 0
+                        && static_cast<int>(i) == pv_idx
+                        && std::isfinite(p.depth);
+                    if (!(p.alloc > p.depth) && !is_pv_force) continue;
                 }
+
+                const bool pv_mode_child = is_pv_force;
 
                 const float target_depth =
                     (p.mode == Mode::Unexpanded)
@@ -968,18 +1101,26 @@ inline constexpr auto recursive_search =
                 any_fork   = true;
 
                 p.mode = Mode::Expanded;
+                // Eagerly mark this plan's PV state from the child's
+                // dispatch mode: PV-forced child ⇒ isPV=true, normal
+                // re-fork ⇒ isPV=false. This naturally invalidates
+                // any prior PV claim on a plan that's now being
+                // re-evaluated under a non-PV descent, with no
+                // back-propagation needed from the child.
+                p.isPV = pv_mode_child;
                 co_await lf::fork[recursive_search](
                     ctx, std::move(child_permit), std::move(cb),
-                    target_depth, rec_depth + 1, &p);
+                    target_depth, rec_depth + 1, pv_mode_child, &p);
             }
 
             if (any_fork) {
                 co_await lf::join;
-            } else {
+            } else if (iter > 0) {
                 // Nothing past its depth gate this iter — either
                 // iter 0 with no fan-out at all (matches the original
                 // single-shot's "no any_fork" path) or iter 1+ where
-                // every plan that could grow is within break_eps.
+                // every plan that could grow is within break_eps and
+                // (in pv_mode) PV convergence is already satisfied.
                 // Either way, no later iter would change anything,
                 // so fall through to rollup. Without this guard the
                 // loop would spin doing no work.
@@ -1006,13 +1147,27 @@ inline constexpr auto recursive_search =
     }
     if (any_expanded) {
         const float Q_new = best;
-        v2::SearchArena::update_qd(entry, Q_new, depth);
-        // Hand the rolled-up (Q, depth) back to the parent's plan row.
-        // If update_qd above lost the CAS to a peer with a deeper
-        // entry, the parent still gets our local rollup — a fresh,
-        // self-consistent estimate from the same children we just
-        // descended into.
-        if (out) { out->Q = Q_new; out->depth = depth; }
+        if (pv_mode) {
+            // PV-mode rollup: the re-deepen waiver lets us descend on
+            // an entry that already has a deeper TT (Q, max_depth)
+            // snapshot, so the depth-monotonic gate in `update_qd`
+            // would silently drop our rollup. Use the unconditional
+            // writer instead, and floor the written depth at
+            // `depth_floor` so a PV-mode visit at very low depth
+            // doesn't ratchet TT depth below the NN's
+            // confidence-derived floor.
+            const float d_write = std::max(depth, depth_floor);
+            v2::SearchArena::store_qd_force(entry, Q_new, d_write);
+            if (out) { out->Q = Q_new; out->depth = d_write; }
+        } else {
+            v2::SearchArena::update_qd(entry, Q_new, depth);
+            // Hand the rolled-up (Q, depth) back to the parent's plan
+            // row. If update_qd above lost the CAS to a peer with a
+            // deeper entry, the parent still gets our local rollup —
+            // a fresh, self-consistent estimate from the same
+            // children we just descended into.
+            if (out) { out->Q = Q_new; out->depth = depth; }
+        }
     } else if (out) {
         // No Expanded child contributed (everything was Unexpanded
         // and gated out of fan-out). Fall back to whatever TT holds
@@ -1040,7 +1195,7 @@ inline constexpr auto root_search =
     lfsync::Permit p = co_await ctx->sem->acquire();
     co_await lf::call[recursive_search](
         ctx, std::move(p), std::move(board), depth,
-        /*rec_depth=*/0u, /*out=*/nullptr);
+        /*rec_depth=*/0u, /*pv_mode=*/true, /*out=*/nullptr);
     co_await lf::join;
 };
 
