@@ -446,6 +446,24 @@ struct MoveInfo {
         return MoveInfo{move, bits};
     }
 
+    // Promote this (non-terminal) slot to kTerminalDraw in place. Used by
+    // the Pass-1 path-dependent draw detection to make a repetition /
+    // 50-move draw visible to all other descenders of the parent node.
+    //
+    // Weak thread-safety model: relaxed atomic store on the 2-byte _packed
+    // sub-word only (the `move` field is untouched). The write is idempotent
+    // — the draw bits are a pure function of the slot's current magnitude —
+    // so concurrent writers all store the same value, and concurrent plain
+    // readers observe either the old non-terminal value or the new draw, both
+    // valid. 16-bit aligned stores are not torn on the target ISA.
+    void mark_terminal_draw() noexcept {
+        const uint16_t cur =
+            std::atomic_ref<uint16_t>(_packed).load(std::memory_order_relaxed);
+        const uint16_t draw_bits =
+            static_cast<uint16_t>((cur & kMagnitudeMask & ~kKindMask) | kSignBit);
+        std::atomic_ref<uint16_t>(_packed).store(draw_bits, std::memory_order_relaxed);
+    }
+
 private:
     static constexpr uint16_t kSignBit       = 0x8000u;
     static constexpr uint16_t kKindMask      = 0x0003u;

@@ -891,6 +891,13 @@ inline constexpr auto recursive_search =
         // Pre-marked isPV=true for the same reason as terminal_kind
         // rows (see comment above).
         if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
+            // Promote this path-dependent draw to a permanent kTerminalDraw on
+            // the shared MoveInfo slot so every other descender of this node
+            // (any thread, any path) treats the move as a draw — even paths
+            // where it would not itself repeat. Intentional path-dependent to
+            // path-independent promotion for fortress detection. Weak/idempotent
+            // write; see MoveInfo::mark_terminal_draw.
+            ctx->arena->moves_at(info_cell.info_offset)[i].mark_terminal_draw();
             plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
                              /*alloc=*/0.0f, /*isPV=*/true});
             cumulative_P += m_P;
@@ -1116,9 +1123,7 @@ inline constexpr auto recursive_search =
             if (any_fork) {
                 co_await lf::join;
             } else if (iter > 0) {
-                // Nothing past its depth gate this iter — either
-                // iter 0 with no fan-out at all (matches the original
-                // single-shot's "no any_fork" path) or iter 1+ where
+                // Nothing past its depth gate this iter — iter 1+ where
                 // every plan that could grow is within break_eps and
                 // (in pv_mode) PV convergence is already satisfied.
                 // Either way, no later iter would change anything,
