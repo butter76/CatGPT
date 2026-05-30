@@ -44,6 +44,7 @@
 #ifndef CATGPT_ENGINE_LKS_COMPUTE_ALLOCATIONS_HPP
 #define CATGPT_ENGINE_LKS_COMPUTE_ALLOCATIONS_HPP
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -143,6 +144,15 @@ inline void compute_log_allocations(Plan* plans, int M,
                                     float depth, float c_puct) noexcept
 {
     if (M <= 0) return;
+
+    // Floor depth well above the IEEE underflow cliff. N = exp(depth) goes
+    // subnormal at depth ~= -708 and flushes to exactly 0 at ~= -744, at
+    // which point cbrt_N = 0 ⇒ hi = +inf ⇒ every alloc collapses to -inf
+    // (silently — the debug post-check passes vacuously with N = 0). -200
+    // is far below any depth the descent legitimately reaches yet leaves
+    // ~500 units of headroom, so a runaway descent clamps here instead of
+    // emitting all-(-inf) allocations.
+    depth = std::max(depth, -200.0f);
 
     // q_max in parent-loss POV is -min(Q_i).
     double qmax_neg_q = -std::numeric_limits<double>::infinity();
