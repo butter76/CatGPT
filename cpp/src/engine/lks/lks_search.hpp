@@ -831,6 +831,8 @@ inline constexpr auto recursive_search =
     // formula as default_max_depth on fresh TT entries.
     const float depth_floor = -std::log(
         hdr->variance * ctx->params->default_depth_constant);
+    assert(std::isfinite(depth_floor) &&
+           "depth_floor non-finite: hdr->variance * default_depth_constant must be > 0");
     constexpr float kNegInf = -std::numeric_limits<float>::infinity();
 
     // ── Pass 1: classify children, populate Plan rows (no co_await) ──
@@ -988,6 +990,9 @@ inline constexpr auto recursive_search =
             ctx->params->force_all_unexpanded_log_arg;
         const int   max_iters   = ctx->params->clamp_max_iters;
         const int   force_count = static_cast<int>(hdr->force_expand);
+        assert(force_count >= 1 &&
+               "force_expand should be >= 1 at first-eval; a count < 1 leaves iter-0 "
+               "force-expand dependent solely on the force_all_unexpanded path");
         // PV convergence tolerance: loop in pv_mode only breaks once
         // some isPV=true plan's parent-POV score is within this margin
         // of the best Expanded child's score. Magnitude matches a
@@ -995,7 +1000,8 @@ inline constexpr auto recursive_search =
         // remains the primary terminator on most positions.
         constexpr float kPvQEps = 0.04f;
 
-        for (int iter = 0; iter < max_iters; ++iter) {
+        int iter = 0;
+        for (; iter < max_iters; ++iter) {
             compute_log_allocations(plans.data(),
                                     static_cast<int>(plans.size()),
                                     depth, ctx->params->c_puct);
@@ -1134,6 +1140,9 @@ inline constexpr auto recursive_search =
 
             if (ctx->w->should_abort()) co_return;
         }
+        assert(iter < max_iters &&
+               "clamp loop hit clamp_max_iters without converging; "
+               "falling through to rollup on an unconverged allocation state");
     }
 
     // ── Rollup: negamax over Expanded plans ─────────────────────────
@@ -1150,6 +1159,8 @@ inline constexpr auto recursive_search =
         const float v = -p.Q;
         if (v > best) best = v;
     }
+    assert(any_expanded &&
+           "rollup found no Expanded plan; falling back to TT (Q, depth) for parent");
     if (any_expanded) {
         const float Q_new = best;
         if (pv_mode) {
