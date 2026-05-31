@@ -1077,7 +1077,7 @@ inline constexpr auto recursive_search =
 
             const bool force_all_unexpanded =
                 (iter == 0)
-                && ((depth > depth_floor + std::log(force_all_log_arg)) || (depth > depth_floor && pv_mode));
+                && ((depth > depth_floor + std::log(force_all_log_arg)) || (pv_mode));
 
             bool first_fork = (iter == 0);
             bool any_fork   = false;
