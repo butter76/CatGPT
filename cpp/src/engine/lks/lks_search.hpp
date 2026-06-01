@@ -987,8 +987,10 @@ inline constexpr auto recursive_search =
         if (cb.isHalfMoveDraw()) {
             draw_here = true;
         } else if (cb.isRepetition(1)) {
-            moves[i].record_repetition_depth(
-                repeating_ancestor_depth(&frame, cb.hash()));
+            if (pv_mode) {
+                moves[i].record_repetition_depth(
+                    repeating_ancestor_depth(&frame, cb.hash()));
+            }
             draw_here = true;
         } else if (depth < moves[i].load_repetition_depth()) {
             // No repetition on our own path, but a prior descender recorded
