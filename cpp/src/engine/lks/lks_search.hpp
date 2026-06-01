@@ -1237,17 +1237,25 @@ inline constexpr auto recursive_search =
     // parent POV.) Unexpanded children that never cleared the gate
     // are dropped entirely.
     float best = -std::numeric_limits<float>::infinity();
+    int  best_idx = -1;
     bool any_expanded = false;
-    for (const Plan& p : plans) {
+    for (int i = 0; i < static_cast<int>(plans.size()); ++i) {
+        const Plan& p = plans[i];
         if (p.mode != Mode::Expanded) continue;
         any_expanded = true;
         const float v = -p.Q;
-        if (v > best) best = v;
+        if (v > best) { best = v; best_idx = i; }
     }
     assert(any_expanded &&
            "rollup found no Expanded plan; falling back to TT (Q, depth) for parent");
     if (any_expanded) {
         const float Q_new = best;
+        // Persist the best child index for the PV / bestmove display walk.
+        // plans[i] is built 1:1 with moves[i] in Pass 1, so best_idx is a
+        // valid MoveInfo index. Relaxed last-writer-wins store (display
+        // only); mirrors the `expanded` flag's weak-consistency model.
+        std::atomic_ref<uint16_t>(hdr->pv_child)
+            .store(static_cast<uint16_t>(best_idx), std::memory_order_relaxed);
         if (pv_mode) {
             // PV-mode rollup: the re-deepen waiver lets us descend on
             // an entry that already has a deeper TT (Q, max_depth)
@@ -1585,73 +1593,57 @@ public:
     }
 
     /**
-     * Pick the root move with the best score, where score = -child_Q from
-     * our perspective. Mirrors the plan classification used in
-     * `recursive_search`: terminal_kind drives fixed Q for terminal
-     * children; `isRepetition(1)` and `isHalfMoveDraw()` are checked
-     * path-dependently (drawn at this caller); non-terminal children's
-     * Q is read from their TT entry.
+     * Best root move = the root node's persisted `pv_child` (the negamax
+     * argmax of -child_Q recorded by the most recent rollup). This is the
+     * search's own best-line decision, the same value the PV walk follows,
+     * so `bestmove()` and `principal_variation()[0]` are always consistent.
      *
-     * Tiebreak (lex): score, then child max_depth, then prior P.
+     * Falls back to `legal[0]` (UCI requires a move) when the root has no
+     * recorded best child — TT miss, unpublished info, or no rollup landed
+     * yet — and to `chess::Move::NO_MOVE` only when there are no legal moves.
      *
-     * Falls back to:
-     *   - `chess::Move::NO_MOVE` if there are no legal moves,
-     *   - `legal[0]` if the root has not yet been expanded (TT miss or
-     *     `info_offset == kNoInfoOffset`).
-     *
-     * Children that were never expanded during search (e.g. budget
-     * exhausted before they were reached) are scored as "we lose" so
-     * any move with TT-evaluated children outranks them; if NO child
-     * has a TT entry, the highest-P move wins via the P tiebreak.
-     *
-     * Safe to call concurrently with a search in flight (uses acquire
-     * loads on `qd_packed` / `info_offset`); intended to be called
-     * after `quit()`/runners join, when the result is stable.
+     * Safe to call concurrently with a search in flight (relaxed/acquire
+     * TT reads); intended to be called after `quit()`/runners join.
      */
     [[nodiscard]] chess::Move bestmove() const {
-        return select_best_move(board_, /*fallback_to_first_legal=*/true);
+        const chess::Move m = pv_move_at(board_);
+        if (m != chess::Move::NO_MOVE) return m;
+        chess::Movelist legal;
+        chess::movegen::legalmoves(legal, board_);
+        return legal.empty() ? chess::Move::NO_MOVE : legal[0];
     }
 
     /**
-     * Walk the TT from the root, picking the best move at each ply, to
-     * produce the principal variation. The line ends — without emitting
-     * a move from the current position — at the first node satisfying
-     * any of:
-     *   - no legal moves (checkmate / stalemate),
-     *   - the position has no TT entry (search hadn't visited it),
-     *   - the position's TT entry has no children (`num_moves == 0`),
-     *   - the position's HIGHEST-POLICY child (`moves[0]`, by
-     *     construction — MoveInfo is P-sorted) is unexpanded (TT miss
-     *     with no terminal shortcut and no path-dependent draw at this
-     *     caller). This avoids the PV being driven by a low-P sibling
-     *     whose Q happens to be the only real value seen at this node.
-     * The line additionally ends — AFTER emitting the latest move —
-     * when the resulting position satisfies any of:
-     *   - 2-fold (twofold) repetition along this PV (`isRepetition(1)`),
-     *   - 50-move expiration (`isHalfMoveDraw()`),
-     *   - insufficient material,
-     *   - `max_len` plies have been emitted (defensive cap).
+     * Walk the persisted `pv_child` chain from the root to produce the
+     * principal variation. At each ply we play the node's recorded best
+     * child (`pv_move_at`) and descend into the resulting position.
      *
-     * The terminal/path-dependent checks are run on the board after
-     * `makeMove<true>(m)`, so the path history kept by `chess::Board`
-     * accurately disambiguates repetitions that depend on the sequence
-     * of moves actually played.
+     * The line ends — without emitting a move from the current position —
+     * when `pv_move_at` returns `NO_MOVE`, i.e. the position has no TT
+     * entry, no children, or no rollup recorded a best child (`pv_child ==
+     * kNoPvChild`). Because `pv_child` is only set by a real rollup, this
+     * naturally stops at the deepest node the search actually evaluated —
+     * no separate "is the top child expanded?" heuristic needed.
      *
-     * Safe to call concurrently with a search in flight (uses the same
-     * acquire-loaded TT reads as `bestmove()`); intended to be called
-     * after `quit()`/runners join, when the result is stable.
+     * The line additionally ends — AFTER emitting the latest move — when
+     * the resulting position is a 2-fold repetition (`isRepetition(1)`),
+     * 50-move draw (`isHalfMoveDraw()`), insufficient material, or after
+     * `max_len` plies (defensive cap). These run on the board after
+     * `makeMove<true>(m)`, so the board's own path history disambiguates
+     * sequence-dependent repetitions correctly.
+     *
+     * Safe to call concurrently with a search in flight; intended for use
+     * after `quit()`/runners join, when the TT is stable.
      */
     [[nodiscard]] std::vector<chess::Move>
-    principal_variation(int max_len = 100) const {
+    principal_variation(int max_len = 256) const {
         std::vector<chess::Move> pv;
         if (max_len <= 0) return pv;
         pv.reserve(static_cast<size_t>(max_len));
 
         chess::Board b = board_;
         for (int i = 0; i < max_len; ++i) {
-            const chess::Move m =
-                select_best_move(b, /*fallback_to_first_legal=*/false,
-                                    /*require_top_child_expanded=*/true);
+            const chess::Move m = pv_move_at(b);
             if (m == chess::Move::NO_MOVE) break;
             pv.push_back(m);
             b.makeMove<true>(m);
@@ -1665,152 +1657,36 @@ public:
 
 private:
     /**
-     * "Is this child expanded?" — true when we have a definitive value
-     * for the child, in any of these ways:
-     *   - position-only terminal cached on the MoveInfo
-     *     (mate / stalemate / insufficient material / Syzygy WDL),
-     *   - path-dependent draw at this caller (2-fold along this PV
-     *     via `isRepetition(1)`, or 50-move expiration after
-     *     `parent + mi.move`),
-     *   - the child's resulting position has a TT entry.
-     * Returns false only for a "TT miss with no terminal shortcut" —
-     * the same Unexpanded category `recursive_search` Pass 1 produces.
+     * Return the move recorded as `b`'s best child by the search's rollup
+     * (`NodeInfoHeader::pv_child`), or `chess::Move::NO_MOVE` when there is
+     * nothing recorded to follow: no TT entry for `b`, unpublished info, no
+     * children, or `pv_child == kNoPvChild` (no rollup yet). The index is a
+     * direct offset into the node's P-sorted MoveInfo array.
      *
-     * Used by PV walking to refuse to descend through nodes whose
-     * highest-policy child has never been searched.
+     * Relaxed load of `pv_child` — display-only; a value from a slightly
+     * older rollup is fine. A non-null `find` already guarantees Cell B is
+     * published with a matching secondary, so a plain `load_info` suffices.
      */
-    [[nodiscard]] bool is_child_expanded(const chess::Board& parent,
-                                         const v2::MoveInfo& mi) const {
-        if (mi.terminal_kind() != v2::kTerminalNone) return true;
-        chess::Board cb = parent;
-        cb.makeMove<true>(chess::Move{mi.move});
-        if (cb.isRepetition(1) || cb.isHalfMoveDraw()) return true;
-        return arena_->find(cb.hash(), v2::secondary_hash(cb)) != nullptr;
-    }
-
-    /**
-     * Core of `bestmove()` / `principal_variation()`: pick the highest-
-     * scoring move at `b`, where score = -child_Q with tiebreaks (child
-     * max_depth, then prior P). See `bestmove()` for the full scoring /
-     * tiebreak / fallback contract.
-     *
-     * `fallback_to_first_legal` controls the TT-miss behavior:
-     *   - true  (bestmove): return `legal[0]` when the root has no TT
-     *     entry, or its entry has zero MoveInfo rows. UCI requires a
-     *     bestmove even if we never got to expand the root.
-     *   - false (PV walking): return `NO_MOVE` in the same cases so the
-     *     PV terminates cleanly at the first unsearched position
-     *     instead of trailing off into a random legal-list-order move.
-     *
-     * `require_top_child_expanded` (PV walking): when true, return
-     * `NO_MOVE` if `moves[0]` (the highest-P child, by construction —
-     * `softmax_legal_sorted` writes MoveInfo in decreasing-P order)
-     * is unexpanded. Prevents the PV from being driven by a low-P
-     * sibling whose Q happens to be the only real value at this node.
-     */
-    [[nodiscard]] chess::Move
-    select_best_move(const chess::Board& b,
-                     bool fallback_to_first_legal,
-                     bool require_top_child_expanded = false) const {
-        chess::Movelist legal;
-        chess::movegen::legalmoves(legal, b);
-        if (legal.empty()) return chess::Move::NO_MOVE;
-
-        const v2::TTEntry* root =
+    [[nodiscard]] chess::Move pv_move_at(const chess::Board& b) const {
+        const v2::TTEntry* e =
             arena_->find(b.hash(), v2::secondary_hash(b));
-        if (root == nullptr) {
-            return fallback_to_first_legal ? legal[0] : chess::Move::NO_MOVE;
-        }
+        if (e == nullptr) return chess::Move::NO_MOVE;
 
-        // A non-null `find` already guarantees Cell B is published with
-        // a matching key_secondary (the secondary check is gated on
-        // observing the release-store), so a plain `load_info` is
-        // sufficient — no spin, no kNoInfoOffset to handle here.
-        const v2::InfoCell info = v2::SearchArena::load_info(root);
+        const v2::InfoCell info = v2::SearchArena::load_info(e);
         assert(info.info_offset != v2::kNoInfoOffset
                && "find returned a non-null entry whose Cell B is "
                   "unpublished; SearchArena invariant broken");
 
         const v2::NodeInfoHeader* hdr = arena_->info_at(info.info_offset);
         const uint16_t num_moves = hdr->num_moves;
-        const v2::MoveInfo* moves = arena_->moves_at(info.info_offset);
-        if (num_moves == 0) {
-            return fallback_to_first_legal ? legal[0] : chess::Move::NO_MOVE;
-        }
-
-        // PV-walking guard: if the highest-policy child hasn't been
-        // expanded yet, we don't trust any move from this node.
-        if (require_top_child_expanded
-            && !is_child_expanded(b, moves[0])) {
+        const uint16_t pc =
+            std::atomic_ref<uint16_t>(hdr->pv_child)
+                .load(std::memory_order_relaxed);
+        if (pc == v2::kNoPvChild || pc >= num_moves) {
             return chess::Move::NO_MOVE;
         }
-
-        chess::Move best       = chess::Move{moves[0].move};
-        float       best_score = -std::numeric_limits<float>::infinity();
-        float       best_depth = -std::numeric_limits<float>::infinity();
-        float       best_P     = -1.0f;
-
-        for (uint16_t i = 0; i < num_moves; ++i) {
-            const v2::MoveInfo& mi = moves[i];
-            const chess::Move m{mi.move};
-            const v2::TerminalKind tk = mi.terminal_kind();
-            const float mi_P = mi.P();
-
-            float child_Q;
-            float child_depth = std::numeric_limits<float>::infinity();
-
-            if (tk == v2::kTerminalDraw) {
-                child_Q = 0.0f;
-            } else if (tk == v2::kTerminalLossForChild) {
-                child_Q = -1.0f;  // child loses ⇒ we win
-            } else if (tk == v2::kTerminalWinForChild) {
-                // Syzygy: child position is a TB win for STM-at-child ⇒
-                // this move loses for us. Score reflects that directly.
-                child_Q = +1.0f;
-            } else {
-                chess::Board cb = b;
-                cb.makeMove<true>(m);
-                if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
-                    child_Q = 0.0f;
-                } else {
-                    const uint64_t child_key = cb.hash();
-                    const uint32_t child_sec = v2::secondary_hash(cb);
-                    const v2::TTEntry* ce = arena_->find(child_key, child_sec);
-                    if (ce == nullptr) {
-                        // Unreached during search (or genuine 64-bit
-                        // collision masking the entry): score as "we
-                        // lose" so any TT-evaluated sibling outranks
-                        // it. P tiebreak still picks the highest-prior
-                        // unreached move when no children have TT
-                        // entries.
-                        child_Q     = +1.0f;
-                        child_depth = -std::numeric_limits<float>::infinity();
-                    } else {
-                        // Cell A's qd is atomic with the (key, secondary)
-                        // match — no need to wait on Cell B again
-                        // (we don't need moveInfo, and find already
-                        // verified the secondary).
-                        auto [q, d] = v2::unpack_qd(
-                            v2::SearchArena::load_qd(ce).qd_packed);
-                        child_Q     = q;
-                        child_depth = d;
-                    }
-                }
-            }
-
-            const float score = -child_Q;
-            const bool better =
-                   score > best_score
-                || (score == best_score && child_depth > best_depth)
-                || (score == best_score && child_depth == best_depth && mi_P > best_P);
-            if (better) {
-                best_score = score;
-                best_depth = child_depth;
-                best_P     = mi_P;
-                best       = m;
-            }
-        }
-        return best;
+        const v2::MoveInfo* moves = arena_->moves_at(info.info_offset);
+        return chess::Move{moves[pc].move};
     }
 
     /**
@@ -2019,17 +1895,21 @@ private:
                 score_field[0] = '\0';
             }
 
-            char buf[1024];
-            std::snprintf(buf, sizeof(buf),
-                "info depth %ld%s nodes %llu tt_claims %llu time %lld nps %lld%s",
+            // Fixed-prefix fields go through a small fixed buffer; the PV
+            // (up to 256 plies ≈ 1.5 KB) is appended via std::string so a
+            // long line is never truncated by a fixed buffer.
+            char prefix[256];
+            std::snprintf(prefix, sizeof(prefix),
+                "info depth %ld%s nodes %llu tt_claims %llu time %lld nps %lld",
                 depth_centi,
                 score_field,
                 static_cast<unsigned long long>(evals_sum),
                 static_cast<unsigned long long>(claims_sum),
                 mss,
-                mss > 0 ? static_cast<long long>(evals_sum) * 1000 / mss : 0,
-                pv_field.c_str());
-            emit(buf);
+                mss > 0 ? static_cast<long long>(evals_sum) * 1000 / mss : 0);
+            std::string line = prefix;
+            line += pv_field;
+            emit(line);
             last_depth_centi = depth_centi;
         };
 

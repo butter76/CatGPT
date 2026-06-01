@@ -275,7 +275,7 @@ bool snapshot_root(const LksSearch& s,
     }
 
     out.best_move = s.bestmove();
-    out.pv = s.principal_variation(/*max_len=*/100);
+    out.pv = s.principal_variation(/*max_len=*/256);
     return true;
 }
 

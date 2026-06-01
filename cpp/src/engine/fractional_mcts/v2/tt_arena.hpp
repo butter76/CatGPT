@@ -337,9 +337,25 @@ struct NodeInfoHeader {
     // writer stores the same value 1 — and a missed write only delays
     // the waiver by one iteration, no correctness issue).
     mutable uint8_t expanded;  // 1
-    uint8_t  _pad[3];          // 3: pad to 12 bytes (4-byte alignment)
+    uint8_t  _pad0;            // 1: align pv_child to its natural 2-byte slot
+    // Best child move index from this node's most recent rollup (the
+    // negamax argmax of -child_Q). Persisted purely so the PV / bestmove
+    // display can walk the search's own best-line decision straight down
+    // the tree, instead of greedily re-deriving "best child" from shared
+    // TT Q values at every ply (which drifts across paths and truncates).
+    // Sentinel `kNoPvChild` == "no rollup has recorded a best child yet".
+    // Relaxed last-writer-wins via `std::atomic_ref<uint16_t>` at the use
+    // site — display-only, so a stale/missed write merely shows a slightly
+    // older best line. `mutable` for the same const-arena-view reason as
+    // `expanded`. Lands at offset 10 (2-byte aligned); keeps the struct at
+    // 12 bytes, so no arena resize.
+    mutable uint16_t pv_child;  // 2
 };
 static_assert(sizeof(NodeInfoHeader) == 12, "NodeInfoHeader must be 12 bytes");
+
+// Sentinel for NodeInfoHeader::pv_child: no rollup has recorded a best
+// child for this node yet (display walkers stop here).
+inline constexpr uint16_t kNoPvChild = 0xFFFFu;
 
 /**
  * Bytes reserved at the start of `arena_` so that `alloc_raw` never
@@ -879,6 +895,7 @@ public:
         header->num_moves = num_moves;
         header->force_expand = 0;
         header->expanded = 0;
+        header->pv_child = kNoPvChild;
         return offset;
     }
 
