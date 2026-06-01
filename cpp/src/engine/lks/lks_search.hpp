@@ -598,6 +598,53 @@ struct RecurseContext {
 };
 
 /**
+ * Intrusive, stack-allocated frame for the current descent path.
+ *
+ * Each `recursive_search` invocation owns one `PathFrame` (a local in its
+ * coroutine frame) recording its position `hash` and search `depth`, and
+ * links to its caller's frame via `parent`. Children receive `&frame` and
+ * read the chain to locate a repeating ancestor's depth (see
+ * `repeating_ancestor_depth`).
+ *
+ * Lifetime: a parent is suspended at `lf::join` while its children run, so
+ * its coroutine frame (and thus its `PathFrame`) outlives every descendant
+ * that holds a pointer to it. The frame is immutable after construction, so
+ * concurrent reads by sibling subtrees are race-free without any atomics.
+ *
+ * The chain spans only POST-root search nodes: the root's frame has
+ * `parent == nullptr`. Pre-root game-history positions (baked into the
+ * board's repetition history) are therefore NOT in the chain — a repetition
+ * against one of them is reported as `+inf` depth by the walk below, which
+ * is exactly the "infinite depth if the repeat happened before the root"
+ * semantics the repetition gate wants.
+ */
+struct PathFrame {
+    uint64_t         hash;
+    float            depth;
+    const PathFrame* parent;
+};
+
+/**
+ * Walk the path chain from `start` (the current node's own frame) toward the
+ * root, returning the search `depth` of the nearest ancestor whose position
+ * hash equals `rep_hash`. Returns +inf when no on-path ancestor matches,
+ * i.e. the repetition is with a pre-root position.
+ *
+ * The nearest (closest-to-leaf) match is the most recent occurrence and is
+ * guaranteed to lie within the half-move window whenever `isRepetition`
+ * fired, so this is the correct repeating position to attribute the draw to.
+ * Opposite-side-to-move ancestors never match (side-to-move is folded into
+ * the Zobrist key), so a plain hash compare over the whole chain is safe.
+ */
+[[nodiscard]] inline float repeating_ancestor_depth(
+    const PathFrame* start, uint64_t rep_hash) noexcept {
+    for (const PathFrame* p = start; p != nullptr; p = p->parent) {
+        if (p->hash == rep_hash) return p->depth;
+    }
+    return std::numeric_limits<float>::infinity();
+}
+
+/**
  * Recursive descent (libfork lambda).
  *
  * INVARIANT: every entry owns exactly one `Permit` on entry. The permit
@@ -633,11 +680,17 @@ inline constexpr auto recursive_search =
        float depth,
        uint32_t rec_depth,
        bool pv_mode,
+       const PathFrame* parent_frame,
        Plan* out) -> lf::task<void>
 {
     if (ctx->w->should_abort()) co_return;
 
     const uint64_t key = board.hash();
+
+    // This node's path frame, linking to the caller's. Lives for the whole
+    // descent (the coroutine stays alive across every co_await/join below),
+    // so children may safely hold `&frame`. Immutable after construction.
+    const PathFrame frame{key, depth, parent_frame};
     const uint32_t sec = v2::secondary_hash(board);
     v2::TTEntry* entry = ctx->arena->find(key, sec);
 
@@ -843,6 +896,14 @@ inline constexpr auto recursive_search =
     float cumulative_P = 0.0f;
     constexpr float kPosInf = std::numeric_limits<float>::infinity();
 
+    // Set true if any of the first `hdr->force_expand` (highest-prior)
+    // moves is a path-dependent draw — a direct 2-fold repetition / 50-move
+    // draw on this path, or a draw adopted via the recorded
+    // `repetition_depth`. When a top move only draws, iter-0 force-expands
+    // ALL unexpanded children (see Pass 2's force_all_unexpanded) so the
+    // descent looks past the draw for a non-drawing alternative.
+    bool top_move_pathdraw = false;
+
     for (uint16_t i = 0; i < num_moves; ++i) {
         const auto& m = moves[i];
         const v2::TerminalKind m_tk = m.terminal_kind();
@@ -885,21 +946,42 @@ inline constexpr auto recursive_search =
         chess::Board cb = board;
         cb.makeMove<true>(chess::Move{m.move});
 
-        // Path-dependent: 2-fold repetition as a draw along this path
-        // (`isRepetition(1)`) or 50-move expiration is NOT in
-        // terminal_kind (different paths hashing to the same key may
-        // disagree on repetition / half-move clock). Treat as a draw
-        // at this caller; Expanded with depth=+inf like terminals.
-        // Pre-marked isPV=true for the same reason as terminal_kind
-        // rows (see comment above).
-        if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
-            // Promote this path-dependent draw to a permanent kTerminalDraw on
-            // the shared MoveInfo slot so every other descender of this node
-            // (any thread, any path) treats the move as a draw — even paths
-            // where it would not itself repeat. Intentional path-dependent to
-            // path-independent promotion for fortress detection. Weak/idempotent
-            // write; see MoveInfo::mark_terminal_draw.
-            ctx->arena->moves_at(info_cell.info_offset)[i].mark_terminal_draw();
+        // Path-dependent draw handling. None of this is in terminal_kind:
+        // different paths reaching the same parent key may disagree on
+        // repetition / half-move clock, so the draw can't be promoted to a
+        // path-independent terminal. All draw rows are Expanded with
+        // depth=+inf (never re-recurse) and pre-marked isPV=true for the
+        // same reason as terminal_kind rows (see comment above).
+        //
+        //   50-move rule: a plain path-local draw — drawn for THIS caller
+        //   only, with no shared MoveInfo mutation.
+        //
+        //   2-fold repetition: a path-local draw for the discoverer, AND we
+        //   record the repeating ancestor's search `depth` into the shared
+        //   MoveInfo (+inf if the repeat is pre-root). Other descenders of
+        //   this parent that do NOT themselves repeat consult that recorded
+        //   `repetition_depth` and treat the move as a draw iff their node's
+        //   `depth` is strictly below it (a low-budget visit is more likely
+        //   to be inside the same cyclic line). The recorded value is a
+        //   non-monotonic last-writer-wins relaxed store, so it may decrease.
+        bool draw_here = false;
+        if (cb.isHalfMoveDraw()) {
+            draw_here = true;
+        } else if (cb.isRepetition(1)) {
+            moves[i].record_repetition_depth(
+                repeating_ancestor_depth(&frame, cb.hash()));
+            draw_here = true;
+        } else if (depth < moves[i].load_repetition_depth()) {
+            // No repetition on our own path, but a prior descender recorded
+            // one at a higher depth than ours — adopt the draw. Sentinel
+            // -inf (never recorded) makes this comparison false.
+            draw_here = true;
+        }
+        if (draw_here) {
+            // A path-dependent draw among the top-prior moves triggers the
+            // wider iter-0 force-expand (see Pass 2). `hdr->force_expand`
+            // is the same count Pass 2 gates per-index force-expansion on.
+            if (i < hdr->force_expand) top_move_pathdraw = true;
             plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
                              /*alloc=*/0.0f, /*isPV=*/true});
             cumulative_P += m_P;
@@ -946,9 +1028,10 @@ inline constexpr auto recursive_search =
     //      `hdr->force_expand` Unexpanded priors (per-position dynamic
     //      count, computed at first-eval from a temp-1.0 policy), or
     //      all Unexpanded when `depth > depth_floor +
-    //      log(force_all_unexpanded_log_arg)`, at
-    //      recursion depth p.alloc. Children write (Q, depth) back
-    //      through `&p`.
+    //      log(force_all_unexpanded_log_arg)`, when in pv_mode, or when
+    //      any of the first `hdr->force_expand` moves is a path-dependent
+    //      draw (`top_move_pathdraw`), at recursion depth p.alloc.
+    //      Children write (Q, depth) back through `&p`.
     //
     // PV-mode overlay (only when this coroutine runs with pv_mode=true):
     //   - On every iter > 0, identify pv_idx = argmax_i(-plans[i].Q)
@@ -1056,7 +1139,9 @@ inline constexpr auto recursive_search =
 
             const bool force_all_unexpanded =
                 (iter == 0)
-                && ((depth > depth_floor + std::log(force_all_log_arg)) || (pv_mode));
+                && ((depth > depth_floor + std::log(force_all_log_arg))
+                    || pv_mode
+                    || top_move_pathdraw);
 
             bool first_fork = (iter == 0);
             bool any_fork   = false;
@@ -1123,7 +1208,7 @@ inline constexpr auto recursive_search =
                 p.isPV = pv_mode_child;
                 co_await lf::fork[recursive_search](
                     ctx, std::move(child_permit), std::move(cb),
-                    target_depth, rec_depth + 1, pv_mode_child, &p);
+                    target_depth, rec_depth + 1, pv_mode_child, &frame, &p);
             }
 
             if (any_fork) {
@@ -1211,7 +1296,8 @@ inline constexpr auto root_search =
     lfsync::Permit p = co_await ctx->sem->acquire();
     co_await lf::call[recursive_search](
         ctx, std::move(p), std::move(board), depth,
-        /*rec_depth=*/0u, /*pv_mode=*/true, /*out=*/nullptr);
+        /*rec_depth=*/0u, /*pv_mode=*/true,
+        /*parent_frame=*/nullptr, /*out=*/nullptr);
     co_await lf::join;
 };
 
