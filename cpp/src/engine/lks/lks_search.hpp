@@ -1593,24 +1593,109 @@ public:
     }
 
     /**
-     * Best root move = the root node's persisted `pv_child` (the negamax
-     * argmax of -child_Q recorded by the most recent rollup). This is the
-     * search's own best-line decision, the same value the PV walk follows,
-     * so `bestmove()` and `principal_variation()[0]` are always consistent.
+     * Best root move, computed on the fly as the negamax argmax over the
+     * root's direct (depth-1) children: score = -child_Q from our POV, with
+     * tiebreaks (child max_depth, then prior P). Each child's Q mirrors the
+     * Pass-1 classification — terminal_kind drives a fixed Q; `isRepetition(1)`
+     * / `isHalfMoveDraw()` are checked path-dependently on `board_`'s own
+     * history and scored as draws; everything else reads the child's TT Q.
      *
-     * Falls back to `legal[0]` (UCI requires a move) when the root has no
-     * recorded best child — TT miss, unpublished info, or no rollup landed
-     * yet — and to `chess::Move::NO_MOVE` only when there are no legal moves.
+     * This deliberately does NOT use the persisted `pv_child`: an abort can
+     * leave the root's `pv_child` stale or unset (e.g. a rollup that lost the
+     * race, or no rollup at all), whereas recomputing the one-ply negamax
+     * here always reflects the latest child TT state at decision time. The PV
+     * *display* (`principal_variation`) still walks `pv_child`.
      *
-     * Safe to call concurrently with a search in flight (relaxed/acquire
-     * TT reads); intended to be called after `quit()`/runners join.
+     * Children never reached during search are scored as "we lose" so any
+     * TT-evaluated sibling outranks them; if NO child has a TT entry, the
+     * highest-P move wins via the P tiebreak. Falls back to `legal[0]` when
+     * the root itself was never expanded (UCI still needs a move), and to
+     * `chess::Move::NO_MOVE` only when there are no legal moves.
+     *
+     * Safe to call concurrently with a search in flight (acquire TT reads);
+     * intended to be called after `quit()`/runners join.
      */
     [[nodiscard]] chess::Move bestmove() const {
-        const chess::Move m = pv_move_at(board_);
-        if (m != chess::Move::NO_MOVE) return m;
         chess::Movelist legal;
         chess::movegen::legalmoves(legal, board_);
-        return legal.empty() ? chess::Move::NO_MOVE : legal[0];
+        if (legal.empty()) return chess::Move::NO_MOVE;
+
+        const v2::TTEntry* root =
+            arena_->find(board_.hash(), v2::secondary_hash(board_));
+        if (root == nullptr) return legal[0];
+
+        // A non-null `find` guarantees Cell B is published with a matching
+        // secondary, so a plain `load_info` is sufficient (no spin).
+        const v2::InfoCell info = v2::SearchArena::load_info(root);
+        assert(info.info_offset != v2::kNoInfoOffset
+               && "find returned a non-null entry whose Cell B is "
+                  "unpublished; SearchArena invariant broken");
+
+        const v2::NodeInfoHeader* hdr = arena_->info_at(info.info_offset);
+        const uint16_t num_moves = hdr->num_moves;
+        const v2::MoveInfo* moves = arena_->moves_at(info.info_offset);
+        if (num_moves == 0) return legal[0];
+
+        chess::Move best       = chess::Move{moves[0].move};
+        float       best_score = -std::numeric_limits<float>::infinity();
+        float       best_depth = -std::numeric_limits<float>::infinity();
+        float       best_P     = -1.0f;
+
+        for (uint16_t i = 0; i < num_moves; ++i) {
+            const v2::MoveInfo& mi = moves[i];
+            const chess::Move m{mi.move};
+            const v2::TerminalKind tk = mi.terminal_kind();
+            const float mi_P = mi.P();
+
+            float child_Q;
+            float child_depth = std::numeric_limits<float>::infinity();
+
+            if (tk == v2::kTerminalDraw) {
+                child_Q = 0.0f;
+            } else if (tk == v2::kTerminalLossForChild) {
+                child_Q = -1.0f;  // child loses ⇒ we win
+            } else if (tk == v2::kTerminalWinForChild) {
+                // Syzygy: child is a TB win for STM-at-child ⇒ we lose.
+                child_Q = +1.0f;
+            } else {
+                chess::Board cb = board_;
+                cb.makeMove<true>(m);
+                if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
+                    child_Q = 0.0f;
+                } else {
+                    const v2::TTEntry* ce =
+                        arena_->find(cb.hash(), v2::secondary_hash(cb));
+                    if (ce == nullptr) {
+                        // Never reached during search (or a 64-bit collision
+                        // masking the entry): score as "we lose" so any
+                        // TT-evaluated sibling outranks it. The P tiebreak
+                        // still picks the highest-prior move when no child
+                        // has a TT entry.
+                        child_Q     = +1.0f;
+                        child_depth = -std::numeric_limits<float>::infinity();
+                    } else {
+                        auto [q, d] = v2::unpack_qd(
+                            v2::SearchArena::load_qd(ce).qd_packed);
+                        child_Q     = q;
+                        child_depth = d;
+                    }
+                }
+            }
+
+            const float score = -child_Q;
+            const bool better =
+                   score > best_score
+                || (score == best_score && child_depth > best_depth)
+                || (score == best_score && child_depth == best_depth
+                    && mi_P > best_P);
+            if (better) {
+                best_score = score;
+                best_depth = child_depth;
+                best_P     = mi_P;
+                best       = m;
+            }
+        }
+        return best;
     }
 
     /**
