@@ -337,9 +337,25 @@ struct NodeInfoHeader {
     // writer stores the same value 1 — and a missed write only delays
     // the waiver by one iteration, no correctness issue).
     mutable uint8_t expanded;  // 1
-    uint8_t  _pad[3];          // 3: pad to 12 bytes (4-byte alignment)
+    uint8_t  _pad0;            // 1: align pv_child to its natural 2-byte slot
+    // Best child move index from this node's most recent rollup (the
+    // negamax argmax of -child_Q). Persisted purely so the PV / bestmove
+    // display can walk the search's own best-line decision straight down
+    // the tree, instead of greedily re-deriving "best child" from shared
+    // TT Q values at every ply (which drifts across paths and truncates).
+    // Sentinel `kNoPvChild` == "no rollup has recorded a best child yet".
+    // Relaxed last-writer-wins via `std::atomic_ref<uint16_t>` at the use
+    // site — display-only, so a stale/missed write merely shows a slightly
+    // older best line. `mutable` for the same const-arena-view reason as
+    // `expanded`. Lands at offset 10 (2-byte aligned); keeps the struct at
+    // 12 bytes, so no arena resize.
+    mutable uint16_t pv_child;  // 2
 };
 static_assert(sizeof(NodeInfoHeader) == 12, "NodeInfoHeader must be 12 bytes");
+
+// Sentinel for NodeInfoHeader::pv_child: no rollup has recorded a best
+// child for this node yet (display walkers stop here).
+inline constexpr uint16_t kNoPvChild = 0xFFFFu;
 
 /**
  * Bytes reserved at the start of `arena_` so that `alloc_raw` never
@@ -361,7 +377,8 @@ enum TerminalKind : uint8_t {
 };
 
 /**
- * Per-move slot — 4 bytes total. Layout-invisible to callers; go through
+ * Per-move slot — 8 bytes total (4-byte `move`+`_packed` half, plus a
+ * 4-byte `repetition_depth`). Layout-invisible to callers; go through
  * the `P()` / `terminal_kind()` accessors (and `pack()` to construct).
  *
  * Encoding of `_packed` (viewed as IEEE 754 binary16):
@@ -386,12 +403,27 @@ enum TerminalKind : uint8_t {
  *     (once per expansion, done pre-CAS while bytes are privately owned);
  *     unpacking is in the hot descent pre-pass but still cheap.
  *
- * One MoveInfo per 4-byte word, sixteen per 64B cacheline: the
+ * One MoveInfo per 8-byte word, eight per 64B cacheline: the
  * move-iteration hot loop in search reads these densely.
  */
 struct MoveInfo {
     uint16_t move;         // 2: chess::Move underlying u16
     uint16_t _packed;      // 2: opaque — holds P + terminal_kind, see above
+    // Path-dependent repetition gate (see lks_search Pass 1). A descender
+    // that detects a 2-fold repetition on *its* path stores the search
+    // `depth` of the repeating ancestor here (+inf if the repeat is with a
+    // pre-root game position). Other descenders of this same parent node —
+    // who do NOT themselves repeat — treat the move as a draw iff their
+    // node's `depth` is strictly below this value. Sentinel -inf == "no
+    // repetition ever recorded" (reader test `depth < -inf` is always
+    // false → never a draw). Unlike TT max_depth this is NOT monotonic:
+    // it is a plain relaxed last-writer-wins store (see
+    // record_repetition_depth), so it may decrease over time.
+    //
+    // `mutable` so a const MoveInfo* (the descent's read-only `moves`
+    // view) can still run the relaxed load/store through std::atomic_ref,
+    // same pattern as NodeInfoHeader::expanded.
+    mutable float repetition_depth;  // 4
 
     [[nodiscard]] TerminalKind terminal_kind() const noexcept {
         if ((_packed & kSignBit) == 0) return kTerminalNone;
@@ -443,25 +475,29 @@ struct MoveInfo {
                 break;
         }
 
-        return MoveInfo{move, bits};
+        // Fresh slots start with no repetition recorded (sentinel -inf).
+        return MoveInfo{move, bits,
+                        -std::numeric_limits<float>::infinity()};
     }
 
-    // Promote this (non-terminal) slot to kTerminalDraw in place. Used by
-    // the Pass-1 path-dependent draw detection to make a repetition /
-    // 50-move draw visible to all other descenders of the parent node.
+    // Record the search depth of a repeating ancestor for this move.
+    // `d` is the ancestor's `depth` (or +inf for a pre-root repeat).
     //
-    // Weak thread-safety model: relaxed atomic store on the 2-byte _packed
-    // sub-word only (the `move` field is untouched). The write is idempotent
-    // — the draw bits are a pure function of the slot's current magnitude —
-    // so concurrent writers all store the same value, and concurrent plain
-    // readers observe either the old non-terminal value or the new draw, both
-    // valid. 16-bit aligned stores are not torn on the target ISA.
-    void mark_terminal_draw() noexcept {
-        const uint16_t cur =
-            std::atomic_ref<uint16_t>(_packed).load(std::memory_order_relaxed);
-        const uint16_t draw_bits =
-            static_cast<uint16_t>((cur & kMagnitudeMask & ~kKindMask) | kSignBit);
-        std::atomic_ref<uint16_t>(_packed).store(draw_bits, std::memory_order_relaxed);
+    // Weak thread-safety model: relaxed atomic store on the 4-byte
+    // `repetition_depth` sub-word only (`move` / `_packed` untouched).
+    // Intentionally last-writer-wins and NON-monotonic — unlike the TT's
+    // max_depth this value is allowed to decrease, so there is no CAS gate.
+    // A reader that races a write observes either the old or the new value,
+    // both valid; a missed write only delays the draw waiver by one visit.
+    void record_repetition_depth(float d) const noexcept {
+        std::atomic_ref<float>(repetition_depth)
+            .store(d, std::memory_order_relaxed);
+    }
+
+    // Relaxed load of the recorded repetition depth (-inf if none).
+    [[nodiscard]] float load_repetition_depth() const noexcept {
+        return std::atomic_ref<float>(repetition_depth)
+            .load(std::memory_order_relaxed);
     }
 
 private:
@@ -469,8 +505,8 @@ private:
     static constexpr uint16_t kKindMask      = 0x0003u;
     static constexpr uint16_t kMagnitudeMask = 0x7FFFu;
 };
-static_assert(sizeof(MoveInfo) == 4, "MoveInfo must be 4 bytes");
-static_assert(alignof(MoveInfo) == 2, "MoveInfo must be 2-byte aligned");
+static_assert(sizeof(MoveInfo) == 8, "MoveInfo must be 8 bytes");
+static_assert(alignof(MoveInfo) == 4, "MoveInfo must be 4-byte aligned");
 static_assert(std::is_trivially_copyable_v<MoveInfo>,
               "MoveInfo is held in arena bytes; must be trivially copyable");
 static_assert(sizeof(_Float16) == 2, "_Float16 must be IEEE 754 binary16");
@@ -859,6 +895,7 @@ public:
         header->num_moves = num_moves;
         header->force_expand = 0;
         header->expanded = 0;
+        header->pv_child = kNoPvChild;
         return offset;
     }
 
