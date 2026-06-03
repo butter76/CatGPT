@@ -1263,23 +1263,37 @@ inline constexpr auto recursive_search =
     float best = -std::numeric_limits<float>::infinity();
     int  best_idx = -1;
     bool any_expanded = false;
+    // Track the best child that was actually descended under pv_mode_child
+    // (isPV=true) separately from the global best. These usually coincide,
+    // but the PV-convergence gate only guarantees an isPV plan within
+    // kPvQEps of the best — so the global argmax can be a sibling that was
+    // never refined on the PV. We return Q from the global best but persist
+    // pv_child from the best *isPV* plan, so the display PV walk only ever
+    // follows children that were genuinely explored as PV.
+    float best_pv = -std::numeric_limits<float>::infinity();
+    int   best_pv_idx = -1;
     for (int i = 0; i < static_cast<int>(plans.size()); ++i) {
         const Plan& p = plans[i];
         if (p.mode != Mode::Expanded) continue;
         any_expanded = true;
         const float v = -p.Q;
         if (v > best) { best = v; best_idx = i; }
+        if (p.isPV && v > best_pv) { best_pv = v; best_pv_idx = i; }
     }
     assert(any_expanded &&
            "rollup found no Expanded plan; falling back to TT (Q, depth) for parent");
     if (any_expanded) {
         const float Q_new = best;
-        // Persist the best child index for the PV / bestmove display walk.
-        // plans[i] is built 1:1 with moves[i] in Pass 1, so best_idx is a
-        // valid MoveInfo index. Relaxed last-writer-wins store (display
-        // only); mirrors the `expanded` flag's weak-consistency model.
+        // Persist the child index for the PV / bestmove display walk.
+        // Prefer the best isPV plan (the move actually descended on the PV);
+        // fall back to the global best_idx when no isPV plan exists (e.g. a
+        // non-pv_mode rollup). plans[i] is built 1:1 with moves[i] in Pass 1,
+        // so the index is a valid MoveInfo index. Relaxed last-writer-wins
+        // store (display only); mirrors the `expanded` flag's
+        // weak-consistency model.
+        const int pv_store_idx = (best_pv_idx >= 0) ? best_pv_idx : best_idx;
         std::atomic_ref<uint16_t>(hdr->pv_child)
-            .store(static_cast<uint16_t>(best_idx), std::memory_order_relaxed);
+            .store(static_cast<uint16_t>(pv_store_idx), std::memory_order_relaxed);
         if (pv_mode) {
             // PV-mode rollup: the re-deepen waiver lets us descend on
             // an entry that already has a deeper TT (Q, max_depth)
