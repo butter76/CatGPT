@@ -505,23 +505,40 @@ void test_claim_load_publish_round_trip() {
     catgpt::v2::InfoCell pre = catgpt::v2::SearchArena::load_info(e);
     EXPECT(pre.info_offset == catgpt::v2::kNoInfoOffset);
 
-    // Publish: origQ kept distinct from the rolled-up Q so we can verify
-    // the round-trip preserves the input value.
-    constexpr float kOrigQ = -0.625f;        // exact in fp32
-    catgpt::v2::SearchArena::publish_info(e, /*origQ=*/kOrigQ,
+    // Publish: pv_depth seeded with a distinct value so we can verify the
+    // round-trip preserves the input.
+    constexpr float kSeedPvDepth = -0.625f;  // exact in fp32
+    catgpt::v2::SearchArena::publish_info(e, /*pv_depth=*/kSeedPvDepth,
                                           /*key_secondary=*/kSec, off);
 
     catgpt::v2::InfoCell post = catgpt::v2::SearchArena::load_info(e);
     EXPECT(post.info_offset == off);
-    EXPECT_EQ_F(post.origQ, kOrigQ);
+    EXPECT_EQ_F(post.pv_depth, kSeedPvDepth);
+    EXPECT_EQ_F(catgpt::v2::SearchArena::load_pv_depth(e), kSeedPvDepth);
     EXPECT(post.key_secondary == kSec);
 
     auto info_opt = catgpt::v2::SearchArena::wait_published(e);
     EXPECT(info_opt.has_value());
     if (info_opt) {
         EXPECT(info_opt->info_offset == off);
-        EXPECT_EQ_F(info_opt->origQ, kOrigQ);
+        EXPECT_EQ_F(info_opt->pv_depth, kSeedPvDepth);
     }
+
+    // store_pv_depth mutates only the pv_depth sub-word; key_secondary and
+    // info_offset round-trip unchanged. Non-monotonic (last-writer-wins),
+    // so a lower value also lands.
+    constexpr float kPvDepth2 = 7.5f;        // exact in fp32
+    catgpt::v2::SearchArena::store_pv_depth(e, kPvDepth2);
+    EXPECT_EQ_F(catgpt::v2::SearchArena::load_pv_depth(e), kPvDepth2);
+    {
+        catgpt::v2::InfoCell pv = catgpt::v2::SearchArena::load_info(e);
+        EXPECT_EQ_F(pv.pv_depth, kPvDepth2);
+        EXPECT(pv.key_secondary == kSec);
+        EXPECT(pv.info_offset == off);
+    }
+    constexpr float kPvDepth3 = -3.0f;       // lower than kPvDepth2
+    catgpt::v2::SearchArena::store_pv_depth(e, kPvDepth3);
+    EXPECT_EQ_F(catgpt::v2::SearchArena::load_pv_depth(e), kPvDepth3);
 
     // update_qd raises max_depth.
     bool ok = catgpt::v2::SearchArena::update_qd(e, /*new_q=*/0.5f, /*new_max_depth=*/8.0f);
@@ -539,9 +556,9 @@ void test_claim_load_publish_round_trip() {
     EXPECT_EQ_F(q3, 0.5f);
     EXPECT_EQ_F(md3, 8.0f);
 
-    // origQ remains untouched by update_qd.
+    // Cell B remains untouched by update_qd (Cell A mutator).
     catgpt::v2::InfoCell after_update = catgpt::v2::SearchArena::load_info(e);
-    EXPECT_EQ_F(after_update.origQ, kOrigQ);
+    EXPECT_EQ_F(after_update.pv_depth, kPvDepth3);
     EXPECT(after_update.info_offset == off);
 
     // Re-finding the same (key, sec) returns the same entry; second
@@ -586,7 +603,7 @@ void test_forced_zobrist_collision() {
     EXPECT(claimed1);
     EXPECT(e1 != nullptr);
     const uint64_t off1 = arena.alloc_node_info(/*num_moves=*/3);
-    catgpt::v2::SearchArena::publish_info(e1, /*origQ=*/kQ1, kSec1, off1);
+    catgpt::v2::SearchArena::publish_info(e1, /*pv_depth=*/kQ1, kSec1, off1);
 
     // Second claim with the same primary but a different secondary.
     // The probe should walk past e1 and claim a fresh slot.
@@ -595,7 +612,7 @@ void test_forced_zobrist_collision() {
     EXPECT(e2 != nullptr);
     EXPECT(e2 != e1);  // distinct slots
     const uint64_t off2 = arena.alloc_node_info(/*num_moves=*/5);
-    catgpt::v2::SearchArena::publish_info(e2, /*origQ=*/kQ2, kSec2, off2);
+    catgpt::v2::SearchArena::publish_info(e2, /*pv_depth=*/kQ2, kSec2, off2);
 
     // find_or_claim with each secondary returns the matching slot
     // (claimed_by_us = false on both).
@@ -623,8 +640,8 @@ void test_forced_zobrist_collision() {
     EXPECT(ic2.key_secondary == kSec2);
     EXPECT(ic1.info_offset == off1);
     EXPECT(ic2.info_offset == off2);
-    EXPECT_EQ_F(ic1.origQ, kQ1);
-    EXPECT_EQ_F(ic2.origQ, kQ2);
+    EXPECT_EQ_F(ic1.pv_depth, kQ1);
+    EXPECT_EQ_F(ic2.pv_depth, kQ2);
 
     // Cell A's qd round-trip is unaffected by the colocation: each
     // entry still reports its own (Q, max_depth) committed at claim.

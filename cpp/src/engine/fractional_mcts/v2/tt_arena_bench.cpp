@@ -185,7 +185,7 @@ void run_one(uint64_t K, PhaseTimings& out) {
                                                 /*Q=*/0.123f, /*max_depth=*/0.0f);
         (void)claimed;
         // Distinct keys -> we always claim.
-        SearchArena::publish_info(e, /*origQ=*/0.123f, sec, off);
+        SearchArena::publish_info(e, /*pv_depth=*/0.123f, sec, off);
     }
     auto t1 = Clock::now();
     out.fill = std::chrono::duration_cast<ns>(t1 - t0);
@@ -282,7 +282,7 @@ void run_one(uint64_t K, PhaseTimings& out) {
             auto [e, claimed] = ap->find_or_claim(keys[i], sec,
                                                   /*Q=*/0.0f, /*max_depth=*/0.0f);
             (void)claimed;
-            SearchArena::publish_info(e, /*origQ=*/0.0f, sec, off);
+            SearchArena::publish_info(e, /*pv_depth=*/0.0f, sec, off);
         }
 
         g_no_alloc.store(true, std::memory_order_relaxed);

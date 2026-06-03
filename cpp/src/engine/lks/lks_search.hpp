@@ -604,53 +604,6 @@ struct RecurseContext {
 };
 
 /**
- * Intrusive, stack-allocated frame for the current descent path.
- *
- * Each `recursive_search` invocation owns one `PathFrame` (a local in its
- * coroutine frame) recording its position `hash` and search `depth`, and
- * links to its caller's frame via `parent`. Children receive `&frame` and
- * read the chain to locate a repeating ancestor's depth (see
- * `repeating_ancestor_depth`).
- *
- * Lifetime: a parent is suspended at `lf::join` while its children run, so
- * its coroutine frame (and thus its `PathFrame`) outlives every descendant
- * that holds a pointer to it. The frame is immutable after construction, so
- * concurrent reads by sibling subtrees are race-free without any atomics.
- *
- * The chain spans only POST-root search nodes: the root's frame has
- * `parent == nullptr`. Pre-root game-history positions (baked into the
- * board's repetition history) are therefore NOT in the chain — a repetition
- * against one of them is reported as `+inf` depth by the walk below, which
- * is exactly the "infinite depth if the repeat happened before the root"
- * semantics the repetition gate wants.
- */
-struct PathFrame {
-    uint64_t         hash;
-    float            depth;
-    const PathFrame* parent;
-};
-
-/**
- * Walk the path chain from `start` (the current node's own frame) toward the
- * root, returning the search `depth` of the nearest ancestor whose position
- * hash equals `rep_hash`. Returns +inf when no on-path ancestor matches,
- * i.e. the repetition is with a pre-root position.
- *
- * The nearest (closest-to-leaf) match is the most recent occurrence and is
- * guaranteed to lie within the half-move window whenever `isRepetition`
- * fired, so this is the correct repeating position to attribute the draw to.
- * Opposite-side-to-move ancestors never match (side-to-move is folded into
- * the Zobrist key), so a plain hash compare over the whole chain is safe.
- */
-[[nodiscard]] inline float repeating_ancestor_depth(
-    const PathFrame* start, uint64_t rep_hash) noexcept {
-    for (const PathFrame* p = start; p != nullptr; p = p->parent) {
-        if (p->hash == rep_hash) return p->depth;
-    }
-    return std::numeric_limits<float>::infinity();
-}
-
-/**
  * Recursive descent (libfork lambda).
  *
  * INVARIANT: every entry owns exactly one `Permit` on entry. The permit
@@ -699,17 +652,11 @@ inline constexpr auto recursive_search =
        float depth,
        uint32_t rec_depth,
        bool pv_mode,
-       const PathFrame* parent_frame,
        Plan* out) -> lf::task<void>
 {
     if (ctx->w->should_abort()) co_return;
 
     const uint64_t key = board.hash();
-
-    // This node's path frame, linking to the caller's. Lives for the whole
-    // descent (the coroutine stays alive across every co_await/join below),
-    // so children may safely hold `&frame`. Immutable after construction.
-    const PathFrame frame{key, depth, parent_frame};
     const uint32_t sec = v2::secondary_hash(board);
     v2::TTEntry* entry = ctx->arena->find(key, sec);
 
@@ -795,12 +742,12 @@ inline constexpr auto recursive_search =
         // Single 128-bit CAS installs (key, qd_packed(Q, default_max_depth))
         // atomically, so any reader observing key == K necessarily
         // sees the matching qd. Then a single 128-bit release-store
-        // of Cell B publishes (origQ, key_secondary, info_offset).
+        // of Cell B publishes (pv_depth, key_secondary, info_offset).
         auto [ce, claimed] = ctx->arena->find_or_claim(
             key, sec, Q, /*max_depth=*/default_max_depth);
         if (claimed) {
             v2::SearchArena::publish_info(
-                ce, /*origQ=*/Q, /*key_secondary=*/sec, off);
+                ce, /*pv_depth=*/default_max_depth, /*key_secondary=*/sec, off);
             ctx->w->tt_claims.fetch_add(1, std::memory_order_relaxed);
         } else {
             // A peer published this key while we were awaiting the
@@ -976,23 +923,30 @@ inline constexpr auto recursive_search =
         //   only, with no shared MoveInfo mutation.
         //
         //   2-fold repetition: a path-local draw for the discoverer, AND we
-        //   record the repeating ancestor's search `depth` into the shared
-        //   MoveInfo (+inf if the repeat is pre-root). Other descenders of
-        //   this parent that do NOT themselves repeat consult that recorded
-        //   `repetition_depth` and treat the move as a draw iff their node's
-        //   `depth` is strictly below it (a low-budget visit is more likely
-        //   to be inside the same cyclic line). The recorded value is a
-        //   non-monotonic last-writer-wins relaxed store, so it may decrease.
+        //   record the repeating position's last-rollup `pv_depth` (read from
+        //   its TT entry, +inf when it has none yet) into the shared MoveInfo.
+        //   Other descenders of this parent that do NOT themselves repeat
+        //   consult that recorded `repetition_depth` and treat the move as a
+        //   draw iff their node's `depth` is strictly below it (a low-budget
+        //   visit is more likely to be inside the same cyclic line). The
+        //   recorded value is a non-monotonic last-writer-wins relaxed store,
+        //   so it may decrease.
         bool draw_here = false;
         if (cb.isHalfMoveDraw()) {
             draw_here = true;
         } else if (cb.isRepetition(1)) {
             if (pv_mode) {
+                // Record the repeating position's last-rollup `pv_depth` from
+                // its TT entry (+inf when no entry exists yet). Other
+                // descenders of this parent that don't themselves repeat
+                // adopt the draw iff their own `depth` is strictly below it.
+                v2::TTEntry* rep_ce =
+                    ctx->arena->find(cb.hash(), v2::secondary_hash(cb));
                 moves[i].record_repetition_depth(
-                    repeating_ancestor_depth(&frame, cb.hash()));
+                    rep_ce ? v2::SearchArena::load_pv_depth(rep_ce) : kPosInf);
             }
             draw_here = true;
-        } else if (depth < moves[i].load_repetition_depth()) {
+        } else if (pv_mode && depth < moves[i].load_repetition_depth()) {
             // No repetition on our own path, but a prior descender recorded
             // one at a higher depth than ours — adopt the draw. Sentinel
             // -inf (never recorded) makes this comparison false.
@@ -1232,7 +1186,7 @@ inline constexpr auto recursive_search =
                 p.isPV = pv_mode_child;
                 co_await lf::fork[recursive_search](
                     ctx, std::move(child_permit), std::move(cb),
-                    target_depth, rec_depth + 1, pv_mode_child, &frame, &p);
+                    target_depth, rec_depth + 1, pv_mode_child, &p);
             }
 
             if (any_fork) {
@@ -1262,6 +1216,12 @@ inline constexpr auto recursive_search =
     // are dropped entirely.
     float best = -std::numeric_limits<float>::infinity();
     int  best_idx = -1;
+    // Best Expanded plan that was actually descended under a PV-mode child
+    // (isPV=true). Tracked separately from the overall best so the recorded
+    // pv_child reflects a move refined on the PV chain, even when its Q is
+    // marginally below the overall best.
+    float best_pv = -std::numeric_limits<float>::infinity();
+    int  best_pv_idx = -1;
     bool any_expanded = false;
     for (int i = 0; i < static_cast<int>(plans.size()); ++i) {
         const Plan& p = plans[i];
@@ -1269,17 +1229,30 @@ inline constexpr auto recursive_search =
         any_expanded = true;
         const float v = -p.Q;
         if (v > best) { best = v; best_idx = i; }
+        if (p.isPV && v > best_pv) { best_pv = v; best_pv_idx = i; }
     }
     assert(any_expanded &&
            "rollup found no Expanded plan; falling back to TT (Q, depth) for parent");
     if (any_expanded) {
         const float Q_new = best;
         // Persist the best child index for the PV / bestmove display walk.
-        // plans[i] is built 1:1 with moves[i] in Pass 1, so best_idx is a
-        // valid MoveInfo index. Relaxed last-writer-wins store (display
-        // only); mirrors the `expanded` flag's weak-consistency model.
+        // Prefer the best Expanded *isPV* plan so the recorded chain follows
+        // a move actually refined under PV-mode descent (its Q may be
+        // slightly below `Q_new`). Fall back to the overall best child when
+        // no isPV plan exists (non-PV rollups, or the first PV iteration
+        // before any child is marked). plans[i] is built 1:1 with moves[i]
+        // in Pass 1, so the index is a valid MoveInfo index. Relaxed
+        // last-writer-wins store (display only); mirrors the `expanded`
+        // flag's weak-consistency model.
+        const int pv_child_idx = (best_pv_idx >= 0) ? best_pv_idx : best_idx;
         std::atomic_ref<uint16_t>(hdr->pv_child)
-            .store(static_cast<uint16_t>(best_idx), std::memory_order_relaxed);
+            .store(static_cast<uint16_t>(pv_child_idx), std::memory_order_relaxed);
+        // Record the depth this node was just rolled up to, alongside the
+        // Cell A (Q, max_depth) write. Weakly-concurrent, last-writer-wins
+        // (non-monotonic), floored at `depth_floor` so a low-depth visit
+        // can't report below the NN's confidence-derived floor.
+        const float d_write = std::max(depth, depth_floor);
+        v2::SearchArena::store_pv_depth(entry, d_write);
         if (pv_mode) {
             // PV-mode rollup: the re-deepen waiver lets us descend on
             // an entry that already has a deeper TT (Q, max_depth)
@@ -1289,7 +1262,6 @@ inline constexpr auto recursive_search =
             // `depth_floor` so a PV-mode visit at very low depth
             // doesn't ratchet TT depth below the NN's
             // confidence-derived floor.
-            const float d_write = std::max(depth, depth_floor);
             v2::SearchArena::store_qd_force(entry, Q_new, d_write);
             if (out) { out->Q = Q_new; out->depth = d_write; }
         } else {
@@ -1328,8 +1300,7 @@ inline constexpr auto root_search =
     lfsync::Permit p = co_await ctx->sem->acquire();
     co_await lf::call[recursive_search](
         ctx, std::move(p), std::move(board), depth,
-        /*rec_depth=*/0u, /*pv_mode=*/true,
-        /*parent_frame=*/nullptr, /*out=*/nullptr);
+        /*rec_depth=*/0u, /*pv_mode=*/true, /*out=*/nullptr);
     co_await lf::join;
 };
 

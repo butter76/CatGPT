@@ -14,15 +14,21 @@
  *                       Claimed via a single 128-bit CAS so any reader
  *                       observing key == K necessarily observes the
  *                       matching qd_packed from the same atomic.
- *                  * `info`    (Cell B, immutable post-publish):
- *                       low  4 B = origQ (NN value at expansion time),
+ *                  * `info`    (Cell B; key_secondary + info_offset are
+ *                       immutable post-publish, pv_depth is mutable):
+ *                       low  4 B = pv_depth (last search depth this node
+ *                       was rolled up to; weakly-concurrent,
+ *                       last-writer-wins),
  *                       next 4 B = key_secondary (independent 32-bit
  *                       hash of the position; meaningful iff
  *                       info_offset != kNoInfoOffset),
  *                       high 8 B = info_offset (kNoInfoOffset until
- *                       published). Set exactly once with a 128-bit
- *                       release-store after the writer has filled the
- *                       arena bytes for this node.
+ *                       published). key_secondary + info_offset are set
+ *                       exactly once with a 128-bit release-store after
+ *                       the writer has filled the arena bytes for this
+ *                       node; pv_depth is subsequently mutated in place
+ *                       (relaxed 128-bit load-modify-store) without
+ *                       touching the other two halves.
  *                Capacity = `next_pow2(ceil(K / load_factor))`.
  *
  *                A "match" for find/find_or_claim is the (key, key_secondary)
@@ -58,7 +64,7 @@
  *     3.  For each position: probe linearly, 128-bit CAS Cell A from
  *         (kEmptyKey, 0) to (key, pack_qd(Q, max_depth)) (acq_rel). On
  *         success, 128-bit release-store Cell B with
- *         (origQ, key_secondary, info_offset). On CAS failure with key
+ *         (pv_depth, key_secondary, info_offset). On CAS failure with key
  *         half == K and matching key_secondary on the published Cell B,
  *         another writer beat us with the same position; we skip (the
  *         bytes we wrote are wasted but harmless). On CAS failure with a
@@ -84,8 +90,9 @@
  *         release-acquire HB with the publisher's release-store.
  *     2.  Plain `load_info` is sufficient — it is guaranteed to see
  *         `info_offset != kNoInfoOffset` and the matching `key_secondary`.
- *         The arena bytes (NodeInfoHeader + MoveInfo[]) and origQ are
- *         visible by the same HB chain.
+ *         The arena bytes (NodeInfoHeader + MoveInfo[]) are visible by the
+ *         same HB chain. `pv_depth` is weakly-concurrent heuristic data;
+ *         read it relaxed via `load_pv_depth`, not from this snapshot.
  *     3.  `wait_published` exists for the diagnostic / test path that
  *         enters via `find_primary_only_unsafe` (which deliberately
  *         skips the secondary check); production readers do not need it.
@@ -268,14 +275,22 @@ static_assert(alignof(KeyQd) == 8);
 static_assert(std::is_trivially_copyable_v<KeyQd>);
 
 /**
- * Cell B of a TTEntry. Immutable post-publish: set exactly once with a
- * 128-bit release-store after the writer has filled the arena bytes.
- * Readers that need moveInfo acquire-load this cell and (optionally)
- * spin until `info_offset != kNoInfoOffset`.
+ * Cell B of a TTEntry. `key_secondary` and `info_offset` are immutable
+ * post-publish: set exactly once with a 128-bit release-store after the
+ * writer has filled the arena bytes. Readers that need moveInfo
+ * acquire-load this cell and (optionally) spin until
+ * `info_offset != kNoInfoOffset`.
  *
- * `origQ` is the NN-evaluated Q for this position at expansion time. It
- * is preserved here so it remains accessible after `update_qd` overwrites
- * the rolled-up Q in Cell A.
+ * `pv_depth` is the last search depth this node was rolled up to,
+ * recorded around the same time as the Cell A (Q, max_depth) write with
+ * `d_write = max(depth, depth_floor)`. Unlike the immutable halves it is
+ * mutated in place after publish under a weak (last-writer-wins)
+ * consistency model: `store_pv_depth` does a relaxed 128-bit
+ * load-modify-store that only changes the `pv_depth` sub-word. Because
+ * `key_secondary` and `info_offset` are frozen by the time any rollup
+ * can reach this entry, racing `store_pv_depth` calls can never corrupt
+ * those halves — the worst case is a stale `pv_depth`. Initialized to
+ * `kFreshMaxDepth` at publish ("not yet rolled up here").
  *
  * `key_secondary` is a 32-bit hash of the position computed via a path
  * independent of the primary `key` (e.g. derived from the board's piece
@@ -286,7 +301,7 @@ static_assert(std::is_trivially_copyable_v<KeyQd>);
  * same 128-bit release-store.
  */
 struct InfoCell {
-    float    origQ;          // 4: NN value at expansion (immutable)
+    float    pv_depth;       // 4: last rollup depth; weakly-concurrent
     uint32_t key_secondary;  // 4: independent 32-bit hash; valid iff
                              //    info_offset != kNoInfoOffset
     uint64_t info_offset;    // 8: kNoInfoOffset until published
@@ -548,7 +563,7 @@ public:
                                 + kArenaReservedBytes)
     {
         // Value-init zeros each TTEntry: Cell A = (kEmptyKey, 0) and Cell
-        // B = (origQ=0, _reserved=0, info_offset=kNoInfoOffset). With
+        // B = (pv_depth=0, key_secondary=0, info_offset=kNoInfoOffset). With
         // both sentinels fixed at 0, every slot starts in the correct
         // "empty + unpublished" state without an extra init pass.
         table_ = new TTEntry[capacity_]();
@@ -579,7 +594,7 @@ public:
      * `claimed_by_us` is true, the caller has just won the 128-bit CAS
      * for this key (and the (q, max_depth) pair was committed atomically
      * with the key in Cell A) — caller is on the hook to call
-     * `publish_info(entry, origQ, key_secondary, info_offset)` after
+     * `publish_info(entry, pv_depth, key_secondary, info_offset)` after
      * writing the arena bytes for the node. The same `key_secondary`
      * passed here MUST be passed to `publish_info`. If `claimed_by_us`
      * is false, another thread has already claimed AND published the
@@ -796,22 +811,58 @@ public:
      * fully written. This must be called exactly once per `find_or_claim`
      * that returned `claimed_by_us == true`; do not call twice.
      *
-     * `origQ` is the NN-evaluated Q at expansion time. It becomes
-     * immutable once this store retires.
+     * `pv_depth` seeds the (mutable, weakly-concurrent) last-rollup-depth
+     * field. Fresh claims pass `kFreshMaxDepth` ("not yet rolled up
+     * here"); it is later overwritten by `store_pv_depth`.
      *
      * `key_secondary` MUST be the same value the caller passed to
      * `find_or_claim` for this position. The 128-bit release-store
-     * publishes (origQ, key_secondary, info_offset) atomically, so any
+     * publishes (pv_depth, key_secondary, info_offset) atomically, so any
      * acquire-loader observing `info_offset != kNoInfoOffset` also
      * observes the matching `key_secondary`.
      */
     static void publish_info(TTEntry* entry,
-                             float origQ,
+                             float pv_depth,
                              uint32_t key_secondary,
                              uint64_t info_offset) noexcept {
         assert(info_offset != kNoInfoOffset);
-        const InfoCell c{origQ, key_secondary, info_offset};
+        const InfoCell c{pv_depth, key_secondary, info_offset};
         entry->info.store(c, std::memory_order_release);
+    }
+
+    /**
+     * Weakly-concurrent (last-writer-wins) update of Cell B's `pv_depth`
+     * sub-word, leaving `key_secondary` and `info_offset` untouched.
+     *
+     * Implemented as a relaxed 128-bit load-modify-store rather than a
+     * sub-word atomic, so it never mixes access sizes on the cell. This
+     * is race-safe by construction: by the time any rollup can reach a
+     * given entry, `key_secondary` and `info_offset` are frozen (set once
+     * at publish and never changed again), so concurrent `store_pv_depth`
+     * calls only ever differ in the `pv_depth` they write back — the
+     * other two halves round-trip unchanged regardless of interleaving.
+     * The result is a valid InfoCell carrying some racing writer's
+     * `pv_depth`. No CAS / monotonic gate: callers want the *last* depth
+     * searched, which is allowed to decrease.
+     *
+     * Must only be called on a published entry.
+     */
+    static void store_pv_depth(TTEntry* entry, float pv_depth) noexcept {
+        InfoCell c = entry->info.load(std::memory_order_relaxed);
+        assert(c.info_offset != kNoInfoOffset
+               && "store_pv_depth on an unpublished entry");
+        c.pv_depth = pv_depth;
+        entry->info.store(c, std::memory_order_relaxed);
+    }
+
+    /**
+     * Relaxed read of Cell B's weakly-concurrent `pv_depth`. Returns
+     * `kFreshMaxDepth` for an entry that has only been published (never
+     * rolled up). Relaxed because `pv_depth` is heuristic data, like
+     * NodeInfoHeader::pv_child.
+     */
+    [[nodiscard]] static float load_pv_depth(const TTEntry* entry) noexcept {
+        return entry->info.load(std::memory_order_relaxed).pv_depth;
     }
 
     /**

@@ -141,7 +141,7 @@ void run_p1_correctness(uint64_t per_thread_keys, int num_threads) {
                                                         /*Q=*/0.0f,
                                                         /*max_depth=*/max_ds[i]);
                 EXPECT(claimed); // disjoint keys -> always our claim
-                SearchArena::publish_info(e, /*origQ=*/0.0f, sec, off);
+                SearchArena::publish_info(e, /*pv_depth=*/0.0f, sec, off);
             }
         });
     }
@@ -206,7 +206,7 @@ void run_p2_hot_race(int num_threads, uint64_t k_hot, uint64_t iters_per_thread)
                         moves[j] = MoveInfo::pack(j, 1.0f / 30.0f,
                                                   catgpt::v2::kTerminalNone);
                     }
-                    SearchArena::publish_info(e, /*origQ=*/0.0f, sec, off);
+                    SearchArena::publish_info(e, /*pv_depth=*/0.0f, sec, off);
                 }
 
                 // Independent: every thread CAS-bumps max_depth to a thread-and-iter
@@ -285,7 +285,7 @@ void run_p3_reader_writer(int num_readers, uint64_t inserts, int writer_pause_us
                                                     /*Q=*/0.0f,
                                                     /*max_depth=*/static_cast<float>(nm));
             (void)claimed;
-            SearchArena::publish_info(e, /*origQ=*/0.0f, sec, off);
+            SearchArena::publish_info(e, /*pv_depth=*/0.0f, sec, off);
             if (writer_pause_us > 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(writer_pause_us));
             }
@@ -406,7 +406,7 @@ ThroughputResult run_p4_one(int num_threads, uint64_t per_thread_inserts) {
                                                             /*Q=*/0.0f,
                                                             /*max_depth=*/1.0f);
                     (void)claimed;
-                    SearchArena::publish_info(e, /*origQ=*/0.0f, sec, off);
+                    SearchArena::publish_info(e, /*pv_depth=*/0.0f, sec, off);
                 }
 
                 // 4. a small lookup burst per batch (search reads are mostly hits)
