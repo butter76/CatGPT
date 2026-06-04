@@ -857,7 +857,7 @@ inline constexpr auto recursive_search =
         const bool waive_depth_check =
             pv_mode &&
             std::atomic_ref<uint8_t>(hdr->expanded)
-                .load(std::memory_order_relaxed) != 0;
+                .load(std::memory_order_relaxed) != 0 && depth > -15.0f;
         // Cell A is atomic with the key match (find / find_or_claim
         // both ensure we observe a key from a successful CAS), so qd
         // is never torn here.
