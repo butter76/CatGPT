@@ -22,7 +22,7 @@ const CATGPT_BINARY =
 
 const CATGPT_ENGINE =
   process.env.CATGPT_ENGINE_PATH ||
-  `${process.env.HOME}/CatGPT/S2.network`;
+  `${process.env.HOME}/CatGPT/S4.network`;
 
 /** Check if catgpt_search binary is available */
 export function isCatGPTAvailable(): boolean {

@@ -1145,7 +1145,7 @@ void print_usage(const char* prog) {
     std::println("");
     std::println("Arguments:");
     std::println("  NETWORK_PATH        Path to a packed .network file (multi-engine bundle).");
-    std::println("                      (default: /home/shadeform/CatGPT/S2.network)");
+    std::println("                      (default: /home/shadeform/CatGPT/S4.network)");
     std::println("");
     std::println("Options:");
     std::println("  -b, --batch N       Benchmark only batch size N (single + pipelined).");
@@ -1158,7 +1158,7 @@ int main(int argc, char* argv[]) {
     print_header();
     print_cuda_info();
 
-    fs::path engine_path = "/home/shadeform/CatGPT/S2.network";
+    fs::path engine_path = "/home/shadeform/CatGPT/S4.network";
     int32_t target_batch_size = 0;  // 0 = default sweep
 
     // Simple positional + flag parsing

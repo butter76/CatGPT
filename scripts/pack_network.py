@@ -25,7 +25,7 @@ Bucket sizes are inferred from input filenames matching ``*.b{N}.trt``; pass
 when packing a single file).
 
 Usage:
-    uv run scripts/pack_network.py -o S2.network S2.b1.trt S2.b2.trt ...
+    uv run scripts/pack_network.py -o S4.network S4.b1.trt S4.b2.trt ...
 """
 
 from __future__ import annotations

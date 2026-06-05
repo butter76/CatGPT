@@ -17,8 +17,8 @@
 
 LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/shadeform/TensorRT-10.16.1.11/lib \
 /home/shadeform/TensorRT-10.16.1.11/bin/trtexec \
-  --onnx=S2.onnx \
-  --saveEngine=S2.trt \
+  --onnx=S4.onnx \
+  --saveEngine=S4.trt \
   --fp16 \
   --profile=0  --minShapes=in_0:1x64   --optShapes=in_0:1x64   --maxShapes=in_0:1x64 \
   --profile=1  --minShapes=in_0:2x64   --optShapes=in_0:2x64   --maxShapes=in_0:2x64 \

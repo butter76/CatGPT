@@ -33,7 +33,7 @@ TRT_ROOT="${TRT_ROOT:-/home/shadeform/TensorRT-10.16.1.11}"
 TRTEXEC=${TRT_ROOT}/bin/trtexec
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:${TRT_ROOT}/lib
 
-MODEL=${MODEL:-S2}
+MODEL=${MODEL:-S4}
 ONNX=${ONNX:-${MODEL}.onnx}
 NETWORK_OUT=${NETWORK_OUT:-${MODEL}.network}
 

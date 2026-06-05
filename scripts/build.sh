@@ -4,7 +4,7 @@
 # Invoked by ../update.sh, which sets WORK_DIR to the directory that
 # contains both the cloned CatGPT/ tree and the durable install
 # artifacts (gcc-14/, TensorRT-10.16.1.11/, ${MODEL}.onnx,
-# ${MODEL}.network). MODEL defaults to S2; set MODEL=S4 (etc.) to point
+# ${MODEL}.network). MODEL defaults to S4; set MODEL=S2 (etc.) to point
 # at a different model stem.
 #
 # Idempotent: every phase has a sentinel check so re-runs only do work
@@ -32,7 +32,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 WORK_DIR="${WORK_DIR:-$(cd "$REPO_DIR/.." && pwd -P)}"
 mkdir -p "$WORK_DIR/.cache"
 
-MODEL="${MODEL:-S2}"
+MODEL="${MODEL:-S4}"
 
 GCC_PREFIX="$WORK_DIR/gcc-14"
 TRT_DIR="$WORK_DIR/TensorRT-10.16.1.11"
