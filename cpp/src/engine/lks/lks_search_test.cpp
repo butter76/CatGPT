@@ -893,6 +893,91 @@ void test_syzygy_disabled_in_search() {
     }
 }
 
+// ── Time-management tests ───────────────────────────────────────────────────
+
+// Run one timed search from the current board, returning wall-clock ms.
+// Resets the board to startpos first so the arena/TT does not carry over
+// between calls. `tc` supplies the wall-clock budget (cfg.time).
+long run_timed_search(LksSearch& search, const catgpt::lks::TimeControl& tc) {
+    search.setBoard(chess::Board{});  // startpos; drops arena after a search
+    Recorder rec;
+    LksSearchConfig cfg;
+    cfg.max_evals   = 1'000'000'000ULL;  // effectively unbounded → time-stopped
+    cfg.on_uci_line = rec.callback();
+    cfg.time        = tc;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    search.search(std::move(cfg));
+    wait_until_done(search);
+    search.quit();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    auto lines = rec.snapshot();
+    EXPECT(!lines.empty());
+    EXPECT(starts_with(lines.back(), "bestmove "));
+    EXPECT(search.total_evals() < 1'000'000'000ULL);  // stopped by time
+    return static_cast<long>(elapsed);
+}
+
+void test_movetime_budget() {
+    std::printf("[20] movetime bounds search near the deadline\n");
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*workers_per_gpu=*/1);
+
+    catgpt::lks::TimeControl tc;
+    tc.movetime_ms = 400;
+    const long elapsed = run_timed_search(search, tc);
+
+    EXPECT(elapsed >= 300);   // did not bail well before the deadline
+    EXPECT(elapsed < 3000);   // stopped near it (generous cold-GPU slack)
+}
+
+void test_wtime_budget() {
+    std::printf("[21] wtime/btime derive a bounded soft/hard budget\n");
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*workers_per_gpu=*/1);
+
+    catgpt::lks::TimeControl tc;
+    tc.wtime_ms = 4000;       // startpos: white to move → uses wtime
+    tc.btime_ms = 4000;       // bank≈3900, soft≈39ms, hard≈1950ms
+    const long elapsed = run_timed_search(search, tc);
+
+    EXPECT(elapsed < 3000);   // far under the 4s clock and the hard cap
+}
+
+void test_time_boosts_raise_soft() {
+    std::printf("[22] first-move / surprise boosts lengthen the search\n");
+    LksSearch search(engine_path(), /*lifetime_max_evals=*/(1ULL << 18),
+                     /*workers_per_gpu=*/1);
+
+    // Wide clock so the soft fractions dominate the per-iteration cost, and
+    // zero the dynamic-extension bonuses so only the first-move/surprise
+    // soft floors differ between runs.
+    catgpt::lks::TimeControl base;
+    base.wtime_ms          = 16000;  // bank≈15900
+    base.btime_ms          = 16000;
+    base.change_bonus_pct  = 0.0f;
+    base.worsen_bonus_pct  = 0.0f;
+    base.first_move_pct    = 0.10f;  // soft floor ≈1590ms
+    base.surprise_pct      = 0.05f;  // soft floor ≈795ms
+    // soft_pct stays 0.01 → baseline soft ≈159ms
+
+    const long elapsed_base = run_timed_search(search, base);
+
+    catgpt::lks::TimeControl surprise = base;
+    surprise.surprise = true;
+    const long elapsed_surprise = run_timed_search(search, surprise);
+
+    catgpt::lks::TimeControl first = base;
+    first.first_move = true;
+    const long elapsed_first = run_timed_search(search, first);
+
+    EXPECT(elapsed_surprise > elapsed_base);
+    EXPECT(elapsed_first > elapsed_base);
+    EXPECT(elapsed_first > elapsed_surprise);
+}
+
 }  // namespace
 
 int main() {
@@ -917,6 +1002,9 @@ int main() {
     test_syzygy_in_search_marks_children();
     test_syzygy_in_search_skips_gpu_eval();
     test_syzygy_disabled_in_search();
+    test_movetime_budget();
+    test_wtime_budget();
+    test_time_boosts_raise_soft();
 
     if (g_failed == 0) {
         std::printf("\nAll tests passed.\n");

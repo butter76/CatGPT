@@ -221,6 +221,59 @@ struct SearchParams {
 }  // namespace detail
 
 /**
+ * Game-clock time management for a single `go`.
+ *
+ * Two ways to bound a search by wall-clock time:
+ *   - `movetime_ms > 0`: spend exactly that long (soft == hard).
+ *   - `wtime_ms`/`btime_ms` (+ optional inc): derive a soft/hard budget
+ *     from the side-to-move's remaining clock. `worker_main` reads the
+ *     side to move off `board_` and picks the matching clock/inc.
+ *
+ * The budget model (mirrors the legacy chessbench engine):
+ *   reserve_ms is always held back; bank = max(0, time_left - reserve_ms).
+ *   soft = soft_pct*bank + inc   (target: stop after the iteration that
+ *                                 crosses it)
+ *   hard = min(hard_pct*bank + inc, bank)  (force-stop ceiling)
+ * Soft is boosted by first_move_pct (game's first move) and surprise_pct
+ * (opponent played an unpredicted reply), and extended mid-search by
+ * change_bonus_pct (best move changed) / worsen_bonus_pct (root score
+ * dropped by more than worsen_threshold_cp), each applied at most once
+ * and always clamped to hard.
+ *
+ * Every `*_pct`/`*_ms`/`*_cp` field is an exposed tunable so the search
+ * can be retuned without recompiling (see the LKS_TIME_* env vars in
+ * lks_uci_main.cpp). A budget is "active" iff movetime_ms > 0 OR
+ * wtime_ms > 0 OR btime_ms > 0; otherwise the search is time-unbounded.
+ */
+struct TimeControl {
+    // ── Per-go clock inputs (from the `go` command); <=0 means unset ──
+    int64_t wtime_ms    = -1;
+    int64_t btime_ms    = -1;
+    int64_t winc_ms     = 0;
+    int64_t binc_ms     = 0;
+    int64_t movetime_ms = -1;
+
+    // ── Cross-move flags (set by the UCI driver) ──
+    bool first_move = false;  // first search of the game
+    bool surprise   = false;  // opponent's reply differed from our prediction
+
+    // ── Tunable constants (defaults mirror the legacy engine) ──
+    int64_t reserve_ms          = 100;     // never spend below this much clock
+    float   soft_pct            = 0.01f;   // soft target as fraction of bank
+    float   hard_pct            = 0.50f;   // hard ceiling as fraction of bank
+    float   first_move_pct      = 0.10f;   // soft floor on the first move
+    float   surprise_pct        = 0.05f;   // soft floor on a surprise
+    float   change_bonus_pct    = 0.02f;   // soft extension when best move changes
+    float   worsen_bonus_pct    = 0.04f;   // soft extension when score drops
+    int     worsen_threshold_cp = 10;      // cp drop that counts as "worsened"
+
+    // Active iff some clock or an explicit movetime was supplied.
+    [[nodiscard]] bool active() const noexcept {
+        return movetime_ms > 0 || wtime_ms > 0 || btime_ms > 0;
+    }
+};
+
+/**
  * Per-search configuration.
  *
  * `on_uci_line` is invoked from `worker_main`, one call per UCI line.
@@ -250,6 +303,8 @@ struct LksSearchConfig {
     float target_min_depth = std::numeric_limits<float>::infinity();
 
     detail::SearchParams params{};  // descent-time tunables (see SearchParams)
+
+    TimeControl time{};  // wall-clock budget (see TimeControl)
 
     std::function<void(std::string_view)> on_uci_line;
 };
@@ -1935,6 +1990,55 @@ private:
         using Clock = std::chrono::steady_clock;
         const auto t0 = Clock::now();
 
+        // ── Wall-clock budget (see TimeControl) ──────────────────────────
+        // soft_deadline: stop after the ID iteration that crosses it (the
+        //   target spend; can be extended mid-search on instability).
+        // hard_deadline: force-stop ceiling, enforced unconditionally every
+        //   tick. Both stay at time_point::max() when neither a clock nor an
+        //   explicit movetime was supplied, leaving the search time-unbounded.
+        const TimeControl& tc = cfg.time;
+        Clock::time_point soft_deadline = Clock::time_point::max();
+        Clock::time_point hard_deadline = Clock::time_point::max();
+        int64_t time_bank_ms        = 0;      // effective bank, for extensions
+        bool    applied_change_bonus = false;
+        bool    applied_worsen_bonus = false;
+        if (tc.active()) {
+            int64_t soft_ms;
+            int64_t hard_ms;
+            if (tc.movetime_ms > 0) {
+                soft_ms = tc.movetime_ms;
+                hard_ms = tc.movetime_ms;
+            } else {
+                const bool    white     = board_.sideToMove() == chess::Color::WHITE;
+                const int64_t time_left = white ? tc.wtime_ms : tc.btime_ms;
+                const int64_t inc       = white ? tc.winc_ms  : tc.binc_ms;
+                const int64_t bank      =
+                    std::max<int64_t>(0, time_left - tc.reserve_ms);
+                time_bank_ms = bank;
+                auto pct = [bank](float p) -> int64_t {
+                    const float v = p * static_cast<float>(bank);
+                    return v > 0.0f ? static_cast<int64_t>(v) : 0;
+                };
+                soft_ms = pct(tc.soft_pct) + inc;
+                hard_ms = std::min<int64_t>(pct(tc.hard_pct) + inc, bank);
+                // Soft floors for a surprise reply / the game's first move.
+                // Mark the matching one-shot bonus consumed so the in-loop
+                // extension does not stack on top of the floor.
+                if (tc.surprise) {
+                    soft_ms = std::max<int64_t>(soft_ms, pct(tc.surprise_pct) + inc);
+                    applied_change_bonus = true;
+                }
+                if (tc.first_move) {
+                    soft_ms = std::max<int64_t>(soft_ms, pct(tc.first_move_pct));
+                    applied_change_bonus = true;
+                    applied_worsen_bonus = true;
+                }
+                if (soft_ms > hard_ms) soft_ms = hard_ms;
+            }
+            soft_deadline = t0 + std::chrono::milliseconds(soft_ms);
+            hard_deadline = t0 + std::chrono::milliseconds(hard_ms);
+        }
+
         // Reset per-search counters. Stagger each worker's starting depth.
         // No per-worker eval slice is set: `cfg.max_evals` is enforced as
         // a single aggregate budget by the loop below.
@@ -1980,10 +2084,29 @@ private:
         //      finished one more iteration. This evens out termination
         //      depth across Lazy-SMP workers; expect a per-search eval
         //      overshoot of one slow-worker iteration.
+        //   5. Wall-clock deadlines (see TimeControl): `hard_deadline`
+        //      force-stops every tick; `soft_deadline` stops after the
+        //      first completed iteration and may be extended mid-search.
         long  last_depth_centi    = std::numeric_limits<long>::min();
         bool  budget_exhausted    = false;
         float min_depth_at_budget =
             -std::numeric_limits<float>::infinity();
+
+        // Mid-search instability tracking (for soft-deadline extension).
+        bool      completed_iter  = false;  // at least one ID iteration done
+        chess::Move prev_best_move = chess::Move::NO_MOVE;
+        int       prev_best_cp    = std::numeric_limits<int>::min();
+
+        // Current root score (centipawns, side-to-move POV), or nullopt when
+        // the root has no published TT entry yet.
+        auto current_root_cp = [&]() -> std::optional<int> {
+            const v2::TTEntry* root =
+                arena_->find(root_key_, v2::secondary_hash(board_));
+            if (root == nullptr) return std::nullopt;
+            auto [root_q, _] = v2::unpack_qd(
+                v2::SearchArena::load_qd(root).qd_packed);
+            return q_to_cp(root_q);
+        };
 
         auto emit_progress = [&](float min_d,
                                  uint64_t evals_sum,
@@ -2039,6 +2162,9 @@ private:
         while (true) {
             if (st.stop_requested()) break;
 
+            const auto now = Clock::now();
+            if (now >= hard_deadline) break;
+
             uint64_t evals_sum = 0;
             uint64_t claims_sum = 0;
             float    min_d = std::numeric_limits<float>::infinity();
@@ -2076,9 +2202,58 @@ private:
             const long depth_centi = std::isfinite(min_d)
                 ? std::lround(min_d * 100.0f)
                 : 0L;
-            if (depth_centi != last_depth_centi) {
+            const bool new_iter = (depth_centi != last_depth_centi);
+            if (new_iter) {
                 emit_progress(min_d, evals_sum, claims_sum);
+                completed_iter = true;
             }
+
+            // Mid-search soft-deadline extension on instability (port of the
+            // legacy engine): on a fresh ID iteration, and only off the game's
+            // first move, grant a one-time extension if the best move changed
+            // or the root score dropped by more than worsen_threshold_cp.
+            if (new_iter && tc.active() && tc.movetime_ms <= 0
+                && !tc.first_move
+                && soft_deadline != Clock::time_point::max()) {
+                const std::vector<chess::Move> pv = principal_variation();
+                const chess::Move cur_best =
+                    pv.empty() ? chess::Move::NO_MOVE : pv.front();
+                const std::optional<int> cur_cp = current_root_cp();
+
+                const bool changed =
+                    prev_best_move != chess::Move::NO_MOVE
+                    && cur_best != chess::Move::NO_MOVE
+                    && cur_best != prev_best_move;
+                const bool worsened =
+                    prev_best_cp != std::numeric_limits<int>::min()
+                    && cur_cp.has_value()
+                    && (prev_best_cp - *cur_cp) > tc.worsen_threshold_cp;
+
+                int64_t extra_ms = 0;
+                if (changed && !applied_change_bonus) {
+                    extra_ms += static_cast<int64_t>(
+                        tc.change_bonus_pct * static_cast<float>(time_bank_ms));
+                    applied_change_bonus = true;
+                }
+                if (worsened && !applied_worsen_bonus) {
+                    extra_ms += static_cast<int64_t>(
+                        tc.worsen_bonus_pct * static_cast<float>(time_bank_ms));
+                    applied_worsen_bonus = true;
+                }
+                if (extra_ms > 0) {
+                    auto new_soft =
+                        soft_deadline + std::chrono::milliseconds(extra_ms);
+                    if (new_soft > hard_deadline) new_soft = hard_deadline;
+                    soft_deadline = new_soft;
+                }
+
+                if (cur_best != chess::Move::NO_MOVE) prev_best_move = cur_best;
+                if (cur_cp.has_value()) prev_best_cp = *cur_cp;
+            }
+
+            // Soft deadline: never cuts before one full ID iteration has
+            // completed, then stops the search (hard is the absolute cap).
+            if (completed_iter && now >= soft_deadline) break;
 
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }

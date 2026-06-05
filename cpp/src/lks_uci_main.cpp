@@ -30,6 +30,21 @@
  *                            `go`)
  *   LKS_MAX_DEPTH           (default 32; log-scale ID ceiling on every
  *                            `go` → LksSearchConfig::max_depth)
+ *
+ *   Game-clock time management (see LksSearchConfig::TimeControl). All
+ *   piped into cfg.time on every `go`; `go wtime/btime[/winc/binc]`
+ *   derive a soft/hard budget from the side-to-move's clock, while
+ *   `go movetime X` spends exactly X ms. Defaults mirror the legacy
+ *   chessbench engine:
+ *   LKS_TIME_RESERVE_MS       (default 100;  clock always held back)
+ *   LKS_TIME_SOFT_PCT         (default 0.01; soft target = pct*bank + inc)
+ *   LKS_TIME_HARD_PCT         (default 0.50; hard cap    = pct*bank + inc)
+ *   LKS_TIME_FIRST_MOVE_PCT   (default 0.10; soft floor on first move)
+ *   LKS_TIME_SURPRISE_PCT     (default 0.05; soft floor on a surprise)
+ *   LKS_TIME_CHANGE_BONUS_PCT (default 0.02; soft +=pct*bank if best changes)
+ *   LKS_TIME_WORSEN_BONUS_PCT (default 0.04; soft +=pct*bank if score drops)
+ *   LKS_TIME_WORSEN_CP        (default 10;   cp drop that counts as worsened)
+ *
  *   LKS_SYZYGY_PATH         (default $SYZYGY_HOME, else "" = disabled)
  *                           Directory of .rtbw/.rtbz Syzygy endgame
  *                           tablebase files. When set, eligible root
@@ -38,9 +53,11 @@
  */
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -112,13 +129,15 @@ public:
                  fs::path syzygy_path,
                  float delta_depth,
                  float c_puct,
-                 float max_depth)
+                 float max_depth,
+                 catgpt::lks::TimeControl time_tunables)
         : search_(std::move(engine_path), lifetime_max_evals,
                   workers_per_gpu, coros_per_worker, max_batch_size,
                   std::move(syzygy_path))
         , delta_depth_(delta_depth)
         , c_puct_(c_puct)
         , max_depth_(max_depth)
+        , time_tunables_(time_tunables)
     {}
 
     void run() {
@@ -141,18 +160,12 @@ public:
             } else if (cmd == "stop") {
                 handle_stop();
             } else if (cmd == "quit") {
-                // Cancel watchdog before quitting to avoid a stray quit()
-                // call after we've returned. Member dtor order (watchdog
-                // first, then search_) makes this safe regardless, but
-                // explicit is cheap.
-                movetime_watchdog_ = std::jthread{};
                 search_.quit();
                 return;
             }
             // Unknown commands are silently ignored per UCI spec.
         }
         // EOF: ensure clean shutdown.
-        movetime_watchdog_ = std::jthread{};
         search_.quit();
     }
 
@@ -175,23 +188,40 @@ private:
     void handle_isready() {
         // Drain any in-flight search so we can honestly report ready.
         // quit() is idempotent and a fast no-op when nothing is running.
-        movetime_watchdog_ = std::jthread{};
         search_.quit();
         std::println("readyok");
         std::fflush(stdout);
     }
 
     void handle_ucinewgame() {
-        movetime_watchdog_ = std::jthread{};
         search_.quit();
         search_.reset();
         prev_fen_.clear();
         prev_moves_.clear();
+        // Fresh game: next search is the first move; no prediction yet.
+        first_move_ = true;
+        have_searched_ = false;
+        pending_surprise_ = false;
+        predicted_reply_uci_.clear();
+        reply_ply_ = kNoReplyPly;
     }
 
     void handle_position(const std::vector<std::string>& tokens) {
-        movetime_watchdog_ = std::jthread{};
         search_.quit();
+
+        // Capture our prediction of the opponent's reply from the just-
+        // finished search BEFORE the board is mutated below. The previous
+        // search ran on `prev_moves_`, so our best move lands at ply
+        // prev_moves_.size() and the predicted reply at the next ply. The
+        // PV walks from the still-loaded previous board: pv[0] is our best,
+        // pv[1] the predicted reply.
+        if (have_searched_) {
+            const std::vector<chess::Move> pv = search_.principal_variation(2);
+            predicted_reply_uci_ =
+                pv.size() > 1 ? chess::uci::moveToUci(pv[1]) : std::string{};
+            reply_ply_ = prev_moves_.size() + 1;
+        }
+
         if (tokens.size() < 2) return;
 
         // Parse out (fen, moves) from the tokens, canonicalizing
@@ -231,6 +261,18 @@ private:
             && std::equal(prev_moves_.begin(), prev_moves_.end(),
                           moves.begin());
 
+        // Surprise detection: when the game continues along the same line
+        // and the opponent's actual reply (the move at reply_ply_) differs
+        // from what we predicted, flag the next search for a soft-time
+        // boost. Only meaningful on a prefix extension so the ply indices
+        // line up.
+        if (prefix_match && !predicted_reply_uci_.empty()
+            && reply_ply_ != kNoReplyPly && moves.size() > reply_ply_) {
+            if (moves[reply_ply_] != predicted_reply_uci_) {
+                pending_surprise_ = true;
+            }
+        }
+
         if (prefix_match) {
             for (std::size_t k = prev_moves_.size(); k < moves.size(); ++k) {
                 chess::Move m =
@@ -264,23 +306,27 @@ private:
     }
 
     void handle_go(const std::vector<std::string>& tokens) {
-        // Drain any prior search and cancel any prior movetime watchdog.
-        movetime_watchdog_ = std::jthread{};
+        // Drain any prior search.
         search_.quit();
 
         // Defaults: effectively-infinite eval budget. Overridden by
-        // `nodes X`. `infinite` is the same as the default. `movetime X`
-        // leaves the eval budget huge and asks the watchdog to call
-        // quit() after X ms. `depth N` is interpreted as centi-depth
-        // (N=800 -> stop when min_depth() >= 8.00), matching the
-        // encoding used by `info depth ...` in worker_main.
+        // `nodes X`. `infinite` is the same as the default. `depth N` is
+        // interpreted as centi-depth (N=800 -> stop when min_depth() >=
+        // 8.00), matching the encoding used by `info depth ...` in
+        // worker_main. Wall-clock control (`movetime`, `wtime`/`btime`
+        // [+inc]) is handled entirely inside worker_main via cfg.time
+        // (see LksSearchConfig::TimeControl); the tunable constants come
+        // from the LKS_TIME_* env vars captured in time_tunables_.
         catgpt::lks::LksSearchConfig cfg;
         cfg.max_evals = 1'000'000'000ULL;
         cfg.delta_depth = delta_depth_;
         cfg.max_depth = max_depth_;
         cfg.params.c_puct = c_puct_;
         cfg.on_uci_line = [](std::string_view s) { emit_line(s); };
-        std::int64_t movetime_ms = -1;
+
+        cfg.time = time_tunables_;
+        cfg.time.first_move = first_move_;
+        cfg.time.surprise   = pending_surprise_;
 
         for (std::size_t i = 1; i < tokens.size(); ++i) {
             const auto& t = tokens[i];
@@ -292,7 +338,23 @@ private:
                 } catch (...) {}
             } else if (t == "movetime" && i + 1 < tokens.size()) {
                 try {
-                    movetime_ms = std::stoll(tokens[++i]);
+                    cfg.time.movetime_ms = std::stoll(tokens[++i]);
+                } catch (...) {}
+            } else if (t == "wtime" && i + 1 < tokens.size()) {
+                try {
+                    cfg.time.wtime_ms = std::stoll(tokens[++i]);
+                } catch (...) {}
+            } else if (t == "btime" && i + 1 < tokens.size()) {
+                try {
+                    cfg.time.btime_ms = std::stoll(tokens[++i]);
+                } catch (...) {}
+            } else if (t == "winc" && i + 1 < tokens.size()) {
+                try {
+                    cfg.time.winc_ms = std::stoll(tokens[++i]);
+                } catch (...) {}
+            } else if (t == "binc" && i + 1 < tokens.size()) {
+                try {
+                    cfg.time.binc_ms = std::stoll(tokens[++i]);
                 } catch (...) {}
             } else if (t == "depth" && i + 1 < tokens.size()) {
                 try {
@@ -303,49 +365,43 @@ private:
                     }
                 } catch (...) {}
             }
-            // Other tokens (wtime/btime/winc/binc/movestogo/etc.) are
-            // silently ignored.
+            // movestogo and other tokens are intentionally ignored.
         }
+
+        // The surprise boost is one-shot; consume it. After this search
+        // launches the game is no longer on its first move.
+        pending_surprise_ = false;
+        first_move_ = false;
+        have_searched_ = true;
 
         // search() returns immediately; worker_main runs on its own
         // jthread and emits info+bestmove via on_uci_line.
         search_.search(std::move(cfg));
-
-        if (movetime_ms > 0) {
-            movetime_watchdog_ = std::jthread(
-                [this, ms = movetime_ms](std::stop_token st) {
-                    // Sleep in small slices so cancellation is prompt.
-                    auto deadline =
-                        std::chrono::steady_clock::now()
-                        + std::chrono::milliseconds(ms);
-                    while (!st.stop_requested()
-                           && std::chrono::steady_clock::now() < deadline) {
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(10));
-                    }
-                    if (!st.stop_requested()) {
-                        search_.quit();
-                    }
-                });
-        }
     }
 
     void handle_stop() {
-        movetime_watchdog_ = std::jthread{};
         search_.quit();
     }
 
     // Declaration order matters for destruction order: members are
-    // destructed in reverse, so movetime_watchdog_ is joined first
-    // (canceling any pending quit() callback), then search_ tears down
-    // its workers/evaluators/CUDA buffers.
+    // destructed in reverse, so search_ (which joins its worker thread in
+    // its destructor) tears down last.
     catgpt::lks::LksSearch search_;
     float delta_depth_;
     float c_puct_;
     float max_depth_;
+    catgpt::lks::TimeControl time_tunables_;
     std::string prev_fen_;
     std::vector<std::string> prev_moves_;
-    std::jthread movetime_watchdog_;
+
+    // ── Cross-move time-management state ──
+    static constexpr std::size_t kNoReplyPly =
+        std::numeric_limits<std::size_t>::max();
+    bool        first_move_       = true;   // next search is the game's first
+    bool        have_searched_    = false;  // a search has produced a PV
+    bool        pending_surprise_ = false;  // opponent's reply was unpredicted
+    std::string predicted_reply_uci_;       // our predicted opponent reply
+    std::size_t reply_ply_        = kNoReplyPly;  // ply index of that reply
 };
 
 }  // namespace catgpt
@@ -385,6 +441,28 @@ int main(int argc, char* argv[]) {
     const float c_puct      = catgpt::env_float("LKS_C_PUCT", 1.75f);
     const float max_depth   = catgpt::env_float("LKS_MAX_DEPTH", 32.0f);
 
+    // Game-clock time-management tunables (see LksSearchConfig::TimeControl).
+    // Only the constant knobs are loaded here; per-go clock inputs and the
+    // first-move/surprise flags are filled in by the driver at search time.
+    catgpt::lks::TimeControl time_tunables;
+    time_tunables.reserve_ms =
+        catgpt::env_int("LKS_TIME_RESERVE_MS",
+                        static_cast<int>(time_tunables.reserve_ms));
+    time_tunables.soft_pct =
+        catgpt::env_float("LKS_TIME_SOFT_PCT", time_tunables.soft_pct);
+    time_tunables.hard_pct =
+        catgpt::env_float("LKS_TIME_HARD_PCT", time_tunables.hard_pct);
+    time_tunables.first_move_pct =
+        catgpt::env_float("LKS_TIME_FIRST_MOVE_PCT", time_tunables.first_move_pct);
+    time_tunables.surprise_pct =
+        catgpt::env_float("LKS_TIME_SURPRISE_PCT", time_tunables.surprise_pct);
+    time_tunables.change_bonus_pct =
+        catgpt::env_float("LKS_TIME_CHANGE_BONUS_PCT", time_tunables.change_bonus_pct);
+    time_tunables.worsen_bonus_pct =
+        catgpt::env_float("LKS_TIME_WORSEN_BONUS_PCT", time_tunables.worsen_bonus_pct);
+    time_tunables.worsen_threshold_cp =
+        catgpt::env_int("LKS_TIME_WORSEN_CP", time_tunables.worsen_threshold_cp);
+
     // Syzygy path resolution: LKS_SYZYGY_PATH overrides; otherwise fall
     // back to $SYZYGY_HOME (the conventional name); empty = disabled.
     fs::path syzygy_path;
@@ -403,11 +481,19 @@ int main(int argc, char* argv[]) {
             workers_per_gpu, coros_per_worker, max_batch_size, lifetime_max_evals,
             delta_depth, max_depth, c_puct,
             syzygy_path.empty() ? std::string{"<disabled>"} : syzygy_path.string());
+        std::println(
+            stderr,
+            "Time: reserve_ms={} soft_pct={} hard_pct={} first_move_pct={} surprise_pct={} change_bonus_pct={} worsen_bonus_pct={} worsen_cp={}",
+            time_tunables.reserve_ms, time_tunables.soft_pct, time_tunables.hard_pct,
+            time_tunables.first_move_pct, time_tunables.surprise_pct,
+            time_tunables.change_bonus_pct, time_tunables.worsen_bonus_pct,
+            time_tunables.worsen_threshold_cp);
 
         catgpt::LksUciDriver driver(engine_path, lifetime_max_evals,
                                     workers_per_gpu, coros_per_worker,
                                     max_batch_size, std::move(syzygy_path),
-                                    delta_depth, c_puct, max_depth);
+                                    delta_depth, c_puct, max_depth,
+                                    time_tunables);
         std::println(stderr, "Engine loaded; entering UCI loop");
         driver.run();
     } catch (const std::exception& e) {
