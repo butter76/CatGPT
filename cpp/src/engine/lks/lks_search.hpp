@@ -2085,15 +2085,22 @@ private:
         //      depth across Lazy-SMP workers; expect a per-search eval
         //      overshoot of one slow-worker iteration.
         //   5. Wall-clock deadlines (see TimeControl): `hard_deadline`
-        //      force-stops every tick; `soft_deadline` stops after the
-        //      first completed iteration and may be extended mid-search.
+        //      force-stops every tick; `soft_deadline` uses the same grace
+        //      as the eval budget — it latches `min_depth()` once the
+        //      (possibly extended) soft deadline passes and stops on the
+        //      next tick where `min_depth()` strictly advances, i.e. the
+        //      slowest worker has finished its in-flight ID iteration.
         long  last_depth_centi    = std::numeric_limits<long>::min();
         bool  budget_exhausted    = false;
         float min_depth_at_budget =
             -std::numeric_limits<float>::infinity();
 
+        // Soft-deadline grace state (mirrors the eval-budget grace above).
+        bool  soft_expired        = false;
+        float min_depth_at_soft   =
+            -std::numeric_limits<float>::infinity();
+
         // Mid-search instability tracking (for soft-deadline extension).
-        bool      completed_iter  = false;  // at least one ID iteration done
         chess::Move prev_best_move = chess::Move::NO_MOVE;
         int       prev_best_cp    = std::numeric_limits<int>::min();
 
@@ -2205,14 +2212,13 @@ private:
             const bool new_iter = (depth_centi != last_depth_centi);
             if (new_iter) {
                 emit_progress(min_d, evals_sum, claims_sum);
-                completed_iter = true;
             }
 
             // Mid-search soft-deadline extension on instability (port of the
             // legacy engine): on a fresh ID iteration, and only off the game's
             // first move, grant a one-time extension if the best move changed
             // or the root score dropped by more than worsen_threshold_cp.
-            if (new_iter && tc.active() && tc.movetime_ms <= 0
+            if (new_iter && !soft_expired && tc.active() && tc.movetime_ms <= 0
                 && !tc.first_move
                 && soft_deadline != Clock::time_point::max()) {
                 const std::vector<chess::Move> pv = principal_variation();
@@ -2251,9 +2257,22 @@ private:
                 if (cur_cp.has_value()) prev_best_cp = *cur_cp;
             }
 
-            // Soft deadline: never cuts before one full ID iteration has
-            // completed, then stops the search (hard is the absolute cap).
-            if (completed_iter && now >= soft_deadline) break;
+            // Soft deadline: mirror the eval-budget grace above. Latch min_d
+            // the first time the (possibly extended) soft deadline passes,
+            // then stop once the slowest worker has finished one more ID
+            // iteration (min_d strictly advanced) — letting the in-flight
+            // iteration complete instead of force-aborting at soft. `hard`
+            // remains the absolute cap if min_d never advances.
+            if (!soft_expired && now >= soft_deadline) {
+                soft_expired      = true;
+                min_depth_at_soft = std::isfinite(min_d)
+                    ? min_d
+                    : -std::numeric_limits<float>::infinity();
+            }
+            if (soft_expired && std::isfinite(min_d)
+                && min_d > min_depth_at_soft) {
+                break;
+            }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
