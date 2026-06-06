@@ -12,11 +12,12 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { NotationFormat } from "@/lib/types";
-import { Database, FlaskConical, Cat, Gauge } from "lucide-react";
+import { Database, FlaskConical, Cat, Gauge, Swords } from "lucide-react";
 
 const NAV_ITEMS = [
   { href: "/positions", label: "Position Database", icon: Database },
   { href: "/longbench", label: "LongBench", icon: Gauge },
+  { href: "/tournaments", label: "Tournaments", icon: Swords },
   { href: "/analyze", label: "Quick Analysis", icon: FlaskConical },
 ];
 

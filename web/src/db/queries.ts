@@ -1,4 +1,4 @@
-import { eq, desc, inArray, and } from "drizzle-orm";
+import { eq, desc, asc, inArray, and } from "drizzle-orm";
 import { db } from "./index";
 import {
   positions,
@@ -8,6 +8,10 @@ import {
   engineAnalyses,
   benchmarkRuns,
   benchmarkPositionResults,
+  tournaments,
+  tournamentGames,
+  gameMoves,
+  gameUciLogs,
 } from "./schema";
 import type {
   Position,
@@ -22,6 +26,15 @@ import type {
   BenchmarkRunDetail,
   BenchmarkRunStatus,
   BenchmarkStatsSample,
+  Tournament,
+  TournamentDetail,
+  TournamentGameSummary,
+  TournamentGameDetail,
+  EngineConfig,
+  GameMove,
+  GameResult,
+  GameSide,
+  GameUciLog,
 } from "@/lib/types";
 
 // ─── Helpers to assemble full Position objects ────────────────────
@@ -665,4 +678,319 @@ export async function markStaleRunsFailed(): Promise<void> {
       finishedAt: new Date(),
     })
     .where(and(eq(benchmarkRuns.status, "running")));
+}
+
+// ─── Tournaments ──────────────────────────────────────────────────
+
+function toTournament(row: typeof tournaments.$inferSelect): Tournament {
+  return {
+    id: row.id,
+    name: row.name,
+    whiteLabel: row.whiteLabel,
+    blackLabel: row.blackLabel,
+    whiteConfig: row.whiteConfig as EngineConfig,
+    blackConfig: row.blackConfig as EngineConfig,
+    timeControl: row.timeControl,
+    totalGames: row.totalGames,
+    concurrency: row.concurrency,
+    openingBook: row.openingBook,
+    drawMoveNumber: row.drawMoveNumber,
+    drawMoveCount: row.drawMoveCount,
+    drawScoreCp: row.drawScoreCp,
+    tbPath: row.tbPath,
+    status: row.status,
+    scoreWhite: row.scoreWhite,
+    scoreBlack: row.scoreBlack,
+    scoreDraw: row.scoreDraw,
+    errorMessage: row.errorMessage,
+    createdAt: row.createdAt.toISOString(),
+    startedAt: row.startedAt?.toISOString() ?? null,
+    finishedAt: row.finishedAt?.toISOString() ?? null,
+  };
+}
+
+function toGameSummary(
+  row: typeof tournamentGames.$inferSelect
+): TournamentGameSummary {
+  return {
+    id: row.id,
+    tournamentId: row.tournamentId,
+    gameNumber: row.gameNumber,
+    whiteEngine: row.whiteEngine,
+    blackEngine: row.blackEngine,
+    status: row.status,
+    result: row.result,
+    termination: row.termination,
+    plyCount: row.plyCount,
+    createdAt: row.createdAt.toISOString(),
+    finishedAt: row.finishedAt?.toISOString() ?? null,
+  };
+}
+
+export interface CreateTournamentInput {
+  name: string;
+  whiteLabel: string;
+  blackLabel: string;
+  whiteConfig: EngineConfig;
+  blackConfig: EngineConfig;
+  timeControl: string;
+  totalGames: number;
+  concurrency: number;
+  openingBook: string | null;
+  drawMoveNumber: number;
+  drawMoveCount: number;
+  drawScoreCp: number;
+  tbPath: string | null;
+}
+
+export async function createTournament(
+  input: CreateTournamentInput
+): Promise<Tournament> {
+  const [row] = await db
+    .insert(tournaments)
+    .values({
+      name: input.name,
+      whiteLabel: input.whiteLabel,
+      blackLabel: input.blackLabel,
+      whiteConfig: input.whiteConfig,
+      blackConfig: input.blackConfig,
+      timeControl: input.timeControl,
+      totalGames: input.totalGames,
+      concurrency: input.concurrency,
+      openingBook: input.openingBook,
+      drawMoveNumber: input.drawMoveNumber,
+      drawMoveCount: input.drawMoveCount,
+      drawScoreCp: input.drawScoreCp,
+      tbPath: input.tbPath,
+      status: "pending",
+    })
+    .returning();
+  return toTournament(row);
+}
+
+export async function listTournaments(): Promise<Tournament[]> {
+  const rows = await db
+    .select()
+    .from(tournaments)
+    .orderBy(desc(tournaments.createdAt));
+  return rows.map(toTournament);
+}
+
+export async function getTournamentRow(id: number): Promise<Tournament | null> {
+  const [row] = await db.select().from(tournaments).where(eq(tournaments.id, id));
+  return row ? toTournament(row) : null;
+}
+
+export async function getTournamentDetail(
+  id: number
+): Promise<TournamentDetail | null> {
+  const tournament = await getTournamentRow(id);
+  if (!tournament) return null;
+  const gameRows = await db
+    .select()
+    .from(tournamentGames)
+    .where(eq(tournamentGames.tournamentId, id))
+    .orderBy(asc(tournamentGames.gameNumber));
+  return { ...tournament, games: gameRows.map(toGameSummary) };
+}
+
+export async function markTournamentRunning(id: number): Promise<void> {
+  await db
+    .update(tournaments)
+    .set({ status: "running", startedAt: new Date() })
+    .where(eq(tournaments.id, id));
+}
+
+export async function updateTournamentScores(
+  id: number,
+  scores: { white: number; black: number; draw: number }
+): Promise<void> {
+  await db
+    .update(tournaments)
+    .set({
+      scoreWhite: scores.white,
+      scoreBlack: scores.black,
+      scoreDraw: scores.draw,
+    })
+    .where(eq(tournaments.id, id));
+}
+
+export async function completeTournament(
+  id: number,
+  scores: { white: number; black: number; draw: number }
+): Promise<void> {
+  await db
+    .update(tournaments)
+    .set({
+      status: "completed",
+      scoreWhite: scores.white,
+      scoreBlack: scores.black,
+      scoreDraw: scores.draw,
+      finishedAt: new Date(),
+    })
+    .where(eq(tournaments.id, id));
+}
+
+export async function failTournament(
+  id: number,
+  errorMessage: string
+): Promise<void> {
+  await db
+    .update(tournaments)
+    .set({ status: "failed", errorMessage, finishedAt: new Date() })
+    .where(eq(tournaments.id, id));
+}
+
+export async function markStaleTournamentsFailed(): Promise<void> {
+  await db
+    .update(tournaments)
+    .set({
+      status: "failed",
+      errorMessage: "Interrupted (server restart)",
+      finishedAt: new Date(),
+    })
+    .where(eq(tournaments.status, "running"));
+  await db
+    .update(tournamentGames)
+    .set({ status: "completed" })
+    .where(eq(tournamentGames.status, "in_progress"));
+}
+
+/** Create (or fetch) the game row for a given game number. */
+export async function startTournamentGame(input: {
+  tournamentId: number;
+  gameNumber: number;
+  whiteEngine: string;
+  blackEngine: string;
+  openingFen: string | null;
+}): Promise<number> {
+  const [row] = await db
+    .insert(tournamentGames)
+    .values({
+      tournamentId: input.tournamentId,
+      gameNumber: input.gameNumber,
+      whiteEngine: input.whiteEngine,
+      blackEngine: input.blackEngine,
+      openingFen: input.openingFen,
+      status: "in_progress",
+    })
+    .onConflictDoUpdate({
+      target: [tournamentGames.tournamentId, tournamentGames.gameNumber],
+      set: {
+        whiteEngine: input.whiteEngine,
+        blackEngine: input.blackEngine,
+        openingFen: input.openingFen,
+        status: "in_progress",
+      },
+    })
+    .returning({ id: tournamentGames.id });
+  return row.id;
+}
+
+export async function finalizeTournamentGame(input: {
+  gameId: number;
+  result: GameResult | null;
+  termination: string | null;
+  pgn: string | null;
+  finalFen: string | null;
+  plyCount: number;
+  moves: Omit<GameMove, never>[];
+  uciLogs: GameUciLog[];
+}): Promise<void> {
+  await db
+    .update(tournamentGames)
+    .set({
+      status: "completed",
+      result: input.result,
+      termination: input.termination,
+      pgn: input.pgn,
+      finalFen: input.finalFen,
+      plyCount: input.plyCount,
+      finishedAt: new Date(),
+    })
+    .where(eq(tournamentGames.id, input.gameId));
+
+  // Replace any partial move/log rows for idempotency on re-runs.
+  await db.delete(gameMoves).where(eq(gameMoves.gameId, input.gameId));
+  if (input.moves.length > 0) {
+    await db.insert(gameMoves).values(
+      input.moves.map((m) => ({
+        gameId: input.gameId,
+        ply: m.ply,
+        mover: m.mover,
+        san: m.san,
+        uci: m.uci,
+        fenAfter: m.fenAfter,
+        evalCp: m.evalCp,
+        depth: m.depth,
+        timeMs: m.timeMs,
+        whiteClockMs: m.whiteClockMs,
+        blackClockMs: m.blackClockMs,
+      }))
+    );
+  }
+
+  await db.delete(gameUciLogs).where(eq(gameUciLogs.gameId, input.gameId));
+  if (input.uciLogs.length > 0) {
+    await db.insert(gameUciLogs).values(
+      input.uciLogs.map((l) => ({
+        gameId: input.gameId,
+        engine: l.engine,
+        content: l.content,
+      }))
+    );
+  }
+}
+
+export async function getTournamentGameDetail(
+  tournamentId: number,
+  gameId: number
+): Promise<TournamentGameDetail | null> {
+  const [row] = await db
+    .select()
+    .from(tournamentGames)
+    .where(
+      and(
+        eq(tournamentGames.id, gameId),
+        eq(tournamentGames.tournamentId, tournamentId)
+      )
+    );
+  if (!row) return null;
+
+  const [moveRows, logRows, tournamentRow] = await Promise.all([
+    db
+      .select()
+      .from(gameMoves)
+      .where(eq(gameMoves.gameId, gameId))
+      .orderBy(asc(gameMoves.ply)),
+    db.select().from(gameUciLogs).where(eq(gameUciLogs.gameId, gameId)),
+    db
+      .select({ timeControl: tournaments.timeControl })
+      .from(tournaments)
+      .where(eq(tournaments.id, tournamentId)),
+  ]);
+
+  return {
+    ...toGameSummary(row),
+    pgn: row.pgn,
+    openingFen: row.openingFen,
+    finalFen: row.finalFen,
+    timeControl: tournamentRow[0]?.timeControl ?? "",
+    moves: moveRows.map((m) => ({
+      ply: m.ply,
+      mover: m.mover as GameSide,
+      san: m.san,
+      uci: m.uci,
+      fenAfter: m.fenAfter,
+      evalCp: m.evalCp,
+      depth: m.depth,
+      timeMs: m.timeMs,
+      whiteClockMs: m.whiteClockMs,
+      blackClockMs: m.blackClockMs,
+    })),
+    uciLogs: logRows.map((l) => ({
+      engine: l.engine as GameSide | "combined",
+      content: l.content,
+    })),
+  };
 }

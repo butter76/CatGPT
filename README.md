@@ -123,6 +123,18 @@ npm run dev
 
 The viewer expects the `catgpt_search` binary and a `.network` engine on the host — build them via `update.sh` first.
 
+### Tournament / Playtest environment
+
+The web app also hosts a cutechess-driven tournament environment (`/tournaments`) for running engine-vs-engine matches (e.g. CatGPT `lks_uci` vs Stockfish at 15m+5s). Games stream live, are replayable move-by-move with per-move evals, store full UCI debug logs for later debugging, and each ply deep-links into Quick Analysis.
+
+It requires `cutechess-cli` on the host:
+
+```bash
+./scripts/build-cutechess.sh        # builds cutechess-cli from source (Qt5)
+```
+
+Then configure the relevant env vars in `web/.env.local` (see [`web/.env.example`](web/.env.example)): `CUTECHESS_CLI_PATH`, `LKS_UCI_PATH`, `LKS_NETWORK_PATH`, `STOCKFISH_PATH`, and `SYZYGY_HOME` (used for tablebase adjudication). Apply the database schema with `npm run db:push` from `web/`.
+
 ## C++ engine
 
 The native engine is built around `LksSearch` (Lazy-SMP, log-scale iterative deepening, GPU-batched via TensorRT) plus a bespoke UCI loop. Full details, env vars, model I/O, and the list of secondary binaries (`catgpt_analyze`, legacy MCTS engines, microbenches) live in [`cpp/README.md`](cpp/README.md).

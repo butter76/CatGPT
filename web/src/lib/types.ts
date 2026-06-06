@@ -195,6 +195,105 @@ export interface BenchmarkRunDetail extends BenchmarkRun {
   })[];
 }
 
+// ─── Tournaments ──────────────────────────────────────────────────
+
+export type TournamentStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type GameStatus = "pending" | "in_progress" | "completed";
+
+export type GameResult = "white_win" | "black_win" | "draw";
+
+export type GameSide = "white" | "black";
+
+/** A single UCI engine configuration for a cutechess match. */
+export interface EngineConfig {
+  /** cutechess engine `name` (also used in engines.json). */
+  name: string;
+  /** Full launch command, e.g. "/path/lks_uci /path/S4.network". */
+  command: string;
+  /** UCI options set via `setoption`. */
+  options?: { name: string; value: string }[];
+  /** Extra UCI init strings sent before the game. */
+  initStrings?: string[];
+}
+
+export interface Tournament {
+  id: number;
+  name: string;
+  whiteLabel: string;
+  blackLabel: string;
+  whiteConfig: EngineConfig;
+  blackConfig: EngineConfig;
+  timeControl: string;
+  totalGames: number;
+  concurrency: number;
+  openingBook: string | null;
+  drawMoveNumber: number;
+  drawMoveCount: number;
+  drawScoreCp: number;
+  tbPath: string | null;
+  status: TournamentStatus;
+  scoreWhite: number;
+  scoreBlack: number;
+  scoreDraw: number;
+  errorMessage: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface TournamentGameSummary {
+  id: number;
+  tournamentId: number;
+  gameNumber: number;
+  whiteEngine: string;
+  blackEngine: string;
+  status: GameStatus;
+  result: GameResult | null;
+  termination: string | null;
+  plyCount: number;
+  createdAt: string;
+  finishedAt: string | null;
+}
+
+export interface TournamentDetail extends Tournament {
+  games: TournamentGameSummary[];
+}
+
+export interface GameMove {
+  ply: number;
+  mover: GameSide;
+  san: string;
+  uci: UCIMove;
+  fenAfter: string;
+  evalCp: number | null;
+  depth: number | null;
+  timeMs: number | null;
+  /** Clock remaining (ms) before this ply, from cutechess's `go` command. */
+  whiteClockMs: number | null;
+  blackClockMs: number | null;
+}
+
+export interface GameUciLog {
+  engine: GameSide | "combined";
+  content: string;
+}
+
+export interface TournamentGameDetail extends TournamentGameSummary {
+  pgn: string | null;
+  openingFen: string | null;
+  finalFen: string | null;
+  /** cutechess tc string of the parent tournament, e.g. "900+5". */
+  timeControl: string;
+  moves: GameMove[];
+  uciLogs: GameUciLog[];
+}
+
 // ─── Notation helpers ─────────────────────────────────────────────
 
 export type NotationFormat = "uci" | "algebraic";
