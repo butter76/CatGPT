@@ -240,6 +240,9 @@ struct SearchParams {
  * dropped by more than worsen_threshold_cp), each applied at most once
  * and always clamped to hard.
  *
+ * `early_return_margin` is a driver-only tunable (worker_main ignores it);
+ * see the early-return chain in lks_uci_main.cpp.
+ *
  * Every `*_pct`/`*_ms`/`*_cp` field is an exposed tunable so the search
  * can be retuned without recompiling (see the LKS_TIME_* env vars in
  * lks_uci_main.cpp). A budget is "active" iff movetime_ms > 0 OR
@@ -261,11 +264,18 @@ struct TimeControl {
     int64_t reserve_ms          = 100;     // never spend below this much clock
     float   soft_pct            = 0.01f;   // soft target as fraction of bank
     float   hard_pct            = 0.50f;   // hard ceiling as fraction of bank
-    float   first_move_pct      = 0.10f;   // soft floor on the first move
-    float   surprise_pct        = 0.05f;   // soft floor on a surprise
+    float   first_move_pct      = 0.08f;   // soft floor on the first move
+    float   surprise_pct        = 0.04f;   // soft floor on a surprise
     float   change_bonus_pct    = 0.02f;   // soft extension when best move changes
-    float   worsen_bonus_pct    = 0.04f;   // soft extension when score drops
+    float   worsen_bonus_pct    = 0.02f;   // soft extension when score drops
     int     worsen_threshold_cp = 10;      // cp drop that counts as "worsened"
+
+    // Early-return ("ponderhit-like") chain margin, in log-depth units.
+    // Driver-only field (worker_main never reads it): when the opponent
+    // plays our predicted reply and the new root's TT depth is within this
+    // margin of the anchored root depth, the UCI driver replies straight
+    // from the TT without launching a search. See lks_uci_main.cpp.
+    float   early_return_margin = 0.3f;
 
     // Active iff some clock or an explicit movetime was supplied.
     [[nodiscard]] bool active() const noexcept {
@@ -912,7 +922,7 @@ inline constexpr auto recursive_search =
         const bool waive_depth_check =
             pv_mode &&
             std::atomic_ref<uint8_t>(hdr->expanded)
-                .load(std::memory_order_relaxed) != 0 && depth > -15.0f;
+                .load(std::memory_order_relaxed) != 0 && depth > -5.0f;
         // Cell A is atomic with the key match (find / find_or_claim
         // both ensure we observe a key from a successful CAS), so qd
         // is never torn here.
@@ -1046,11 +1056,6 @@ inline constexpr auto recursive_search =
                 moves[i].record_repetition_depth(
                     repeating_ancestor_depth(&frame, cb.hash()));
             }
-            draw_here = true;
-        } else if (depth < moves[i].load_repetition_depth()) {
-            // No repetition on our own path, but a prior descender recorded
-            // one at a higher depth than ours — adopt the draw. Sentinel
-            // -inf (never recorded) makes this comparison false.
             draw_here = true;
         }
         if (draw_here) {
@@ -1616,6 +1621,52 @@ public:
     [[nodiscard]] const v2::SearchArena& arena() const noexcept { return *arena_; }
 
     /**
+     * How the most recent `worker_main` run terminated, for cross-move time
+     * management in the UCI driver:
+     *   - kSoftCompleted: the soft deadline expired and the slowest worker
+     *     then finished one more ID iteration (the "non-abort" path).
+     *   - kHardAborted:   a game-clock search force-stopped at the hard
+     *     deadline before the soft grace completed (the "abort" path).
+     *   - kOther:         any other exit (stop, max-depth, target depth,
+     *     eval budget, root shortcut, or a `movetime` search).
+     * Only meaningful after the search has finished (read post-quit()/join).
+     */
+    enum class Completion { kOther, kSoftCompleted, kHardAborted };
+    [[nodiscard]] Completion last_completion() const noexcept {
+        return last_completion_;
+    }
+
+    /**
+     * Root TT entry's max_depth (log-scale), or nullopt when the current
+     * root has no published TT entry. Used by the early-return chain to
+     * compare a reused subtree's depth against the anchored root depth.
+     */
+    [[nodiscard]] std::optional<float> root_depth() const {
+        const v2::TTEntry* root =
+            arena_->find(root_key_, v2::secondary_hash(board_));
+        if (root == nullptr) return std::nullopt;
+        auto [q, d] = v2::unpack_qd(
+            v2::SearchArena::load_qd(root).qd_packed);
+        (void)q;
+        return d;
+    }
+
+    /**
+     * Root TT entry's score in centipawns (side-to-move POV), or nullopt
+     * when the current root has no published TT entry. Mirrors the score
+     * field emitted by `worker_main`'s `info` lines.
+     */
+    [[nodiscard]] std::optional<int> root_cp() const {
+        const v2::TTEntry* root =
+            arena_->find(root_key_, v2::secondary_hash(board_));
+        if (root == nullptr) return std::nullopt;
+        auto [q, d] = v2::unpack_qd(
+            v2::SearchArena::load_qd(root).qd_packed);
+        (void)d;
+        return q_to_cp(q);
+    }
+
+    /**
      * Whether a SyzygyProber was constructed AND successfully loaded at
      * least one tablebase file. False when no path was provided, when
      * the path was empty of .rtbw/.rtbz files, or when tb_init failed.
@@ -1975,6 +2026,10 @@ private:
         auto& cb = cfg.on_uci_line;
         auto emit = [&](std::string_view s) { if (cb) cb(s); };
 
+        // Default termination reason; overwritten on the soft-grace / hard
+        // exits below. A root shortcut or any non-time exit leaves kOther.
+        last_completion_ = Completion::kOther;
+
         // ── Root fast-paths ────────────────────────────────────────────
         // Cheap deterministic answers (no legal moves, single legal move,
         // Syzygy-resolvable root) short-circuit before any per-worker
@@ -2170,7 +2225,16 @@ private:
             if (st.stop_requested()) break;
 
             const auto now = Clock::now();
-            if (now >= hard_deadline) break;
+            if (now >= hard_deadline) {
+                // Force-stop at the hard cap. For a genuine game-clock
+                // search (no explicit movetime) this is the "abort" path
+                // — the soft grace never completed. `movetime` searches
+                // have no soft phase, so they stay kOther.
+                if (tc.movetime_ms <= 0) {
+                    last_completion_ = Completion::kHardAborted;
+                }
+                break;
+            }
 
             uint64_t evals_sum = 0;
             uint64_t claims_sum = 0;
@@ -2271,6 +2335,8 @@ private:
             }
             if (soft_expired && std::isfinite(min_d)
                 && min_d > min_depth_at_soft) {
+                // The "non-abort": min_depth advanced past the soft latch.
+                last_completion_ = Completion::kSoftCompleted;
                 break;
             }
 
@@ -2391,6 +2457,10 @@ private:
     std::jthread                               worker_;
     std::atomic<bool>                          running_{false};
     std::atomic<uint64_t>                      total_evals_{0};
+
+    // How the most recent worker_main run ended (see last_completion()).
+    // Written only on the worker thread; read by the driver post-join.
+    Completion                                 last_completion_ = Completion::kOther;
 
     // Syzygy tablebase prober — owns Fathom's global tb_init/tb_free
     // lifecycle. Null when no Syzygy path was provided. Probed once at

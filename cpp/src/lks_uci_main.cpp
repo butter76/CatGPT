@@ -39,11 +39,14 @@
  *   LKS_TIME_RESERVE_MS       (default 100;  clock always held back)
  *   LKS_TIME_SOFT_PCT         (default 0.01; soft target = pct*bank + inc)
  *   LKS_TIME_HARD_PCT         (default 0.50; hard cap    = pct*bank + inc)
- *   LKS_TIME_FIRST_MOVE_PCT   (default 0.10; soft floor on first move)
- *   LKS_TIME_SURPRISE_PCT     (default 0.05; soft floor on a surprise)
+ *   LKS_TIME_FIRST_MOVE_PCT   (default 0.08; soft floor on first move)
+ *   LKS_TIME_SURPRISE_PCT     (default 0.04; soft floor on a surprise)
  *   LKS_TIME_CHANGE_BONUS_PCT (default 0.02; soft +=pct*bank if best changes)
- *   LKS_TIME_WORSEN_BONUS_PCT (default 0.04; soft +=pct*bank if score drops)
+ *   LKS_TIME_WORSEN_BONUS_PCT (default 0.02; soft +=pct*bank if score drops)
  *   LKS_TIME_WORSEN_CP        (default 10;   cp drop that counts as worsened)
+ *   LKS_TIME_EARLY_RETURN_MARGIN (default 0.3; log-depth margin for the
+ *                            TT early-return chain when the opponent plays
+ *                            the predicted reply)
  *
  *   LKS_SYZYGY_PATH         (default $SYZYGY_HOME, else "" = disabled)
  *                           Directory of .rtbw/.rtbz Syzygy endgame
@@ -53,6 +56,7 @@
  */
 
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -175,6 +179,39 @@ private:
         std::cout.flush();
     }
 
+    // Reply straight from the TT for an early-return move (no search ran).
+    // Emits an `info` line (depth/score/pv, mirroring worker_main's fields)
+    // and the chosen `bestmove`.
+    void emit_early_return() {
+        const chess::Move best = search_.bestmove();
+        const std::vector<chess::Move> pv = search_.principal_variation();
+
+        std::string info = "info";
+        if (const auto d = search_.root_depth()) {
+            info += " depth ";
+            info += std::to_string(std::lround(*d * 100.0f));
+        }
+        if (const auto cp = search_.root_cp()) {
+            info += " score cp ";
+            info += std::to_string(*cp);
+        }
+        if (!pv.empty()) {
+            info += " pv";
+            for (const chess::Move& m : pv) {
+                info += ' ';
+                info += chess::uci::moveToUci(m);
+            }
+        }
+        emit_line(info);
+        emit_line("info string early return");
+
+        std::string bm = "bestmove ";
+        bm += (best != chess::Move::NO_MOVE)
+            ? chess::uci::moveToUci(best)
+            : std::string{"0000"};
+        emit_line(bm);
+    }
+
     void handle_uci() {
         std::println("id name {} {}{}",
                      ENGINE_NAME,
@@ -204,6 +241,10 @@ private:
         pending_surprise_ = false;
         predicted_reply_uci_.clear();
         reply_ply_ = kNoReplyPly;
+        // Early-return chain state.
+        chain_armed_ = false;
+        anchor_root_depth_ = 0.0f;
+        last_was_real_search_ = false;
     }
 
     void handle_position(const std::vector<std::string>& tokens) {
@@ -220,6 +261,33 @@ private:
             predicted_reply_uci_ =
                 pv.size() > 1 ? chess::uci::moveToUci(pv[1]) : std::string{};
             reply_ply_ = prev_moves_.size() + 1;
+        }
+
+        // Consume the just-finished search's outcome for the early-return
+        // chain. The board is still at the previous root here, so
+        // `root_depth()` reports that root's depth — the anchor. Only a real
+        // worker_main run updates this; a chained early return leaves the
+        // anchor (and `last_completion`) untouched so the chain stays bounded
+        // to the first root's depth.
+        if (have_searched_ && last_was_real_search_) {
+            switch (search_.last_completion()) {
+                case catgpt::lks::LksSearch::Completion::kSoftCompleted:
+                    if (const auto d = search_.root_depth()) {
+                        anchor_root_depth_ = *d;
+                        chain_armed_ = true;
+                    } else {
+                        chain_armed_ = false;
+                    }
+                    break;
+                case catgpt::lks::LksSearch::Completion::kHardAborted:
+                    // A hard abort counts as a surprise for the next move.
+                    pending_surprise_ = true;
+                    chain_armed_ = false;
+                    break;
+                case catgpt::lks::LksSearch::Completion::kOther:
+                    chain_armed_ = false;
+                    break;
+            }
         }
 
         if (tokens.size() < 2) return;
@@ -368,11 +436,40 @@ private:
             // movestogo and other tokens are intentionally ignored.
         }
 
+        // ── Early-return chain ("ponderhit-like") ────────────────────────
+        // When the previous (real) search soft-completed and the opponent
+        // then played our predicted reply, the reused TT subtree at the new
+        // root may already be searched almost as deeply as the anchored
+        // root. If so, answer straight from the TT without launching a
+        // search. Restricted to genuine game-clock searches (a soft phase
+        // must exist); the anchor stays fixed so the chain stays bounded to
+        // the first root's depth.
+        const bool game_clock_go =
+            cfg.time.active() && cfg.time.movetime_ms <= 0;
+        if (chain_armed_ && !first_move_ && !pending_surprise_
+            && game_clock_go) {
+            if (const auto d = search_.root_depth();
+                d && *d >= anchor_root_depth_ - cfg.time.early_return_margin) {
+                emit_early_return();
+                // Anchor + chain_armed_ left unchanged so chaining continues;
+                // only the predicted reply (recomputed by the next
+                // handle_position) advances.
+                pending_surprise_ = false;
+                first_move_ = false;
+                have_searched_ = true;
+                last_was_real_search_ = false;
+                return;
+            }
+            // New root too shallow: fall through to a full search.
+            chain_armed_ = false;
+        }
+
         // The surprise boost is one-shot; consume it. After this search
         // launches the game is no longer on its first move.
         pending_surprise_ = false;
         first_move_ = false;
         have_searched_ = true;
+        last_was_real_search_ = true;
 
         // search() returns immediately; worker_main runs on its own
         // jthread and emits info+bestmove via on_uci_line.
@@ -402,6 +499,17 @@ private:
     bool        pending_surprise_ = false;  // opponent's reply was unpredicted
     std::string predicted_reply_uci_;       // our predicted opponent reply
     std::size_t reply_ply_        = kNoReplyPly;  // ply index of that reply
+
+    // ── Early-return ("ponderhit-like") chain state ──
+    // After a soft-completed real search we anchor the root's TT depth and
+    // arm the chain. On subsequent moves, when the opponent plays our
+    // predicted reply and the reused subtree's depth is within
+    // `early_return_margin` of the anchor, we answer straight from the TT
+    // without searching. The anchor is held fixed across chained replies so
+    // the chain self-terminates once the depth drifts too far below it.
+    bool  chain_armed_          = false;  // early return currently possible
+    float anchor_root_depth_    = 0.0f;   // anchored root TT depth (valid iff armed)
+    bool  last_was_real_search_ = false;  // last move ran worker_main (vs early return)
 };
 
 }  // namespace catgpt
@@ -432,7 +540,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const int workers_per_gpu  = catgpt::env_int("LKS_WORKERS_PER_GPU", 2);
+    const int workers_per_gpu  = catgpt::env_int("LKS_WORKERS_PER_GPU", 1);
     const int coros_per_worker = catgpt::env_int("LKS_COROS_PER_WORKER", 256);
     const int max_batch_size   = catgpt::env_int("LKS_MAX_BATCH_SIZE", 112);
     const uint64_t lifetime_max_evals =
@@ -462,6 +570,9 @@ int main(int argc, char* argv[]) {
         catgpt::env_float("LKS_TIME_WORSEN_BONUS_PCT", time_tunables.worsen_bonus_pct);
     time_tunables.worsen_threshold_cp =
         catgpt::env_int("LKS_TIME_WORSEN_CP", time_tunables.worsen_threshold_cp);
+    time_tunables.early_return_margin =
+        catgpt::env_float("LKS_TIME_EARLY_RETURN_MARGIN",
+                          time_tunables.early_return_margin);
 
     // Syzygy path resolution: LKS_SYZYGY_PATH overrides; otherwise fall
     // back to $SYZYGY_HOME (the conventional name); empty = disabled.
@@ -483,11 +594,11 @@ int main(int argc, char* argv[]) {
             syzygy_path.empty() ? std::string{"<disabled>"} : syzygy_path.string());
         std::println(
             stderr,
-            "Time: reserve_ms={} soft_pct={} hard_pct={} first_move_pct={} surprise_pct={} change_bonus_pct={} worsen_bonus_pct={} worsen_cp={}",
+            "Time: reserve_ms={} soft_pct={} hard_pct={} first_move_pct={} surprise_pct={} change_bonus_pct={} worsen_bonus_pct={} worsen_cp={} early_return_margin={}",
             time_tunables.reserve_ms, time_tunables.soft_pct, time_tunables.hard_pct,
             time_tunables.first_move_pct, time_tunables.surprise_pct,
             time_tunables.change_bonus_pct, time_tunables.worsen_bonus_pct,
-            time_tunables.worsen_threshold_cp);
+            time_tunables.worsen_threshold_cp, time_tunables.early_return_margin);
 
         catgpt::LksUciDriver driver(engine_path, lifetime_max_evals,
                                     workers_per_gpu, coros_per_worker,
