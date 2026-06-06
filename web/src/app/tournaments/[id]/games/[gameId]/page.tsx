@@ -77,6 +77,17 @@ function formatClock(ms: number | null): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+/** Compact "time used" for a single move, e.g. "0.4s", "12s", "1m03". */
+function formatThinkTime(ms: number | null): string {
+  if (ms == null) return "";
+  const sec = ms / 1000;
+  if (sec < 10) return `${sec.toFixed(1)}s`;
+  if (sec < 60) return `${Math.round(sec)}s`;
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return `${m}m${String(s).padStart(2, "0")}`;
+}
+
 /**
  * Remaining clock for each side at the position reached after `currentPly`
  * plies. Stored clocks are the snapshot *before* each ply, so the state after
@@ -465,6 +476,7 @@ function MoveCell({
   if (!move) return <td className="py-1 px-3" />;
   const isCurrent = currentPly === move.ply;
   const evalStr = formatEval(move.evalCp);
+  const timeStr = formatThinkTime(move.timeMs);
   return (
     <td className="py-1 px-3">
       <button
@@ -481,6 +493,11 @@ function MoveCell({
             }`}
           >
             {evalStr}
+          </span>
+        )}
+        {timeStr && (
+          <span className="text-[10px] font-mono text-muted-foreground">
+            {timeStr}
           </span>
         )}
       </button>
