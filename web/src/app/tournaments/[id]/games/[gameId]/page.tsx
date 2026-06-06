@@ -8,10 +8,13 @@ import { Button } from "@/components/ui/button";
 import { AnalysisBoard } from "@/components/chess/analysis-board";
 import {
   ArrowLeft,
+  Check,
   ChevronFirst,
   ChevronLast,
   ChevronLeft,
   ChevronRight,
+  Copy,
+  ExternalLink,
   FlaskConical,
   Loader2,
   Terminal,
@@ -23,6 +26,7 @@ import type {
   TournamentGameDetail,
 } from "@/lib/types";
 import { fetchTournamentGame } from "@/lib/store";
+import { lichessAnalysisUrl } from "@/lib/chess-utils";
 
 const STANDARD_START =
   "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -140,6 +144,7 @@ export default function GameReplayPage({
   const [currentPly, setCurrentPly] = useState(0);
   const [showLogs, setShowLogs] = useState(false);
   const [streaming, setStreaming] = useState(false);
+  const [copied, setCopied] = useState(false);
   const esRef = useRef<EventSource | null>(null);
   const followRef = useRef(true);
 
@@ -360,8 +365,41 @@ export default function GameReplayPage({
               ply {currentPly}/{moves.length}
             </span>
           </div>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              className="flex-1"
+              onClick={() => {
+                navigator.clipboard.writeText(currentFen);
+                setCopied(true);
+                setTimeout(() => setCopied(false), 2000);
+              }}
+            >
+              {copied ? (
+                <Check className="w-4 h-4 mr-1.5 text-green-500" />
+              ) : (
+                <Copy className="w-4 h-4 mr-1.5" />
+              )}
+              Copy FEN
+            </Button>
+            <Button variant="outline" size="sm" asChild className="flex-1">
+              <a
+                href={lichessAnalysisUrl(currentFen)}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <ExternalLink className="w-4 h-4 mr-1.5" />
+                Open in Lichess
+              </a>
+            </Button>
+          </div>
           <Button variant="secondary" size="sm" asChild className="w-full">
-            <Link href={`/analyze?fen=${encodeURIComponent(currentFen)}`}>
+            <Link
+              href={`/analyze?fen=${encodeURIComponent(currentFen)}`}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
               <FlaskConical className="w-4 h-4 mr-1.5" />
               Open position in Quick Analysis
             </Link>
