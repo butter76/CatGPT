@@ -1520,7 +1520,7 @@ public:
             w_gpu_cpu_.assign(num_workers_, -1);
             for (int i = 0; i < num_workers_; ++i) {
                 const int device_id = i / workers_per_gpu_;
-                const int os_node   = numa::gpu_numa_node(device_id, topo_);
+                const int os_node   = gpu_numa_node(device_id, topo_);
                 const int nidx      = topo_.index_of_node(os_node);
                 if (nidx < 0) continue;
                 w_node_[i] = os_node;
@@ -2504,6 +2504,23 @@ private:
      * expires, a `stop_token` fires, or any other terminator) or the
      * local ID depth reaches `cfg.max_depth`.
      */
+    // Map a CUDA device to its local NUMA node (OS node id) via its PCIe
+    // bus id and /sys, with a round-robin fallback when sysfs reports no
+    // affinity (numa_node == -1, common in VMs / single-node hosts). Lives
+    // here (not in numa_util.hpp) so the CUDA dependency stays out of the
+    // header shared with the CUDA-less tt_arena tests.
+    static int gpu_numa_node(int device_id, const numa::Topology& topo) {
+        char bus[32] = {0};
+        if (cudaDeviceGetPCIBusId(bus, sizeof(bus), device_id) != cudaSuccess) {
+            return numa::round_robin_node(device_id, topo);
+        }
+        const int n = numa::numa_node_for_pci_bus(bus);
+        if (n < 0 || topo.index_of_node(n) < 0) {
+            return numa::round_robin_node(device_id, topo);
+        }
+        return n;
+    }
+
     void run_worker_search(WorkerSearch& w, int worker_idx,
                            const LksSearchConfig& cfg)
     {

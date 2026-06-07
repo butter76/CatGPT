@@ -20,8 +20,11 @@
  *     physical cores. Anonymous mmap pages fault in zeroed, so callers
  *     that need zeroed memory (e.g. the all-zero TT sentinels) get it for
  *     free without an extra memset.
- *   - `gpu_numa_node` (only when <cuda_runtime.h> is in scope): maps a
- *     CUDA device to the NUMA node its PCIe root complex hangs off.
+ *   - `numa_node_for_pci_bus` + `round_robin_node`: map a PCI device (by
+ *     bus id) to the NUMA node its root complex hangs off, with a
+ *     round-robin fallback. This stays CUDA-free; the thin CUDA wrapper
+ *     that fetches a device's bus id lives in lks_search.hpp where
+ *     <cuda_runtime.h> is unconditionally in scope.
  *
  * NUMA placement rationale: the shared structures this allocator is built
  * for (the TT + arena) are accessed by hash, i.e. uniformly at random by
@@ -399,26 +402,15 @@ inline int numa_node_for_pci_bus(std::string pci_bus_id) {
     }
 }
 
-#if defined(CUDART_VERSION)
 /**
- * Map a CUDA device to its local NUMA node (OS node id). Falls back to a
- * round-robin assignment across the topology's nodes when sysfs reports
- * no affinity (numa_node == -1, common in VMs / single-node hosts).
+ * Round-robin a device index across the topology's NUMA nodes (OS node
+ * id). Used as the fallback when a device reports no NUMA affinity
+ * (numa_node == -1, common in VMs / single-node hosts).
  */
-inline int gpu_numa_node(int device_id, const Topology& topo) {
-    auto round_robin = [&]() -> int {
-        if (topo.num_nodes() <= 0) return 0;
-        return topo.node_ids[static_cast<std::size_t>(device_id) % topo.node_ids.size()];
-    };
-    char bus[32] = {0};
-    if (cudaDeviceGetPCIBusId(bus, sizeof(bus), device_id) != cudaSuccess) {
-        return round_robin();
-    }
-    const int n = numa_node_for_pci_bus(bus);
-    if (n < 0 || topo.index_of_node(n) < 0) return round_robin();
-    return n;
+inline int round_robin_node(int device_id, const Topology& topo) {
+    if (topo.num_nodes() <= 0) return 0;
+    return topo.node_ids[static_cast<std::size_t>(device_id) % topo.node_ids.size()];
 }
-#endif  // CUDART_VERSION
 
 }  // namespace catgpt::numa
 
