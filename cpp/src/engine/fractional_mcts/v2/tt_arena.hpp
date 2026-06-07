@@ -110,6 +110,8 @@
 #include <type_traits>
 #include <utility>
 
+#include "../../numa_util.hpp"
+
 #if defined(__x86_64__) || defined(_M_X64)
 #include <emmintrin.h>  // _mm_pause
 #define CATGPT_CPU_RELAX() _mm_pause()
@@ -542,22 +544,35 @@ public:
      */
     explicit SearchArena(uint64_t k_max_evals,
                          double load_factor = 0.5,
-                         uint64_t avg_moves_per_node = 40)
+                         uint64_t avg_moves_per_node = 40,
+                         const numa::Topology* topo = nullptr)
         : capacity_(compute_capacity(k_max_evals, load_factor))
         , arena_capacity_bytes_(compute_arena_bytes(k_max_evals, avg_moves_per_node)
                                 + kArenaReservedBytes)
     {
-        // Value-init zeros each TTEntry: Cell A = (kEmptyKey, 0) and Cell
-        // B = (origQ=0, _reserved=0, info_offset=kNoInfoOffset). With
-        // both sentinels fixed at 0, every slot starts in the correct
-        // "empty + unpublished" state without an extra init pass.
-        table_ = new TTEntry[capacity_]();
-        arena_ = new uint8_t[arena_capacity_bytes_];
+        const numa::Topology& t = topo ? *topo : numa::host_topology();
+
+        // Both buffers are mmap'd, THP-advised, MPOL_INTERLEAVE'd across all
+        // NUMA nodes, and prefaulted in parallel across every physical core
+        // (see numa_util.hpp). Anonymous pages fault in zeroed, so the TT's
+        // all-zero "empty + unpublished" sentinels (Cell A key == 0, Cell B
+        // info_offset == kNoInfoOffset == 0) hold without an init pass and
+        // the arena starts zeroed too. This replaces the old single-threaded
+        // `new TTEntry[capacity_]()` value-init, which both serialized the
+        // (200 GB+) commit and first-touched every page onto one NUMA node.
+        table_bytes_ = capacity_ * sizeof(TTEntry);
+        table_ = static_cast<TTEntry*>(numa::alloc_interleaved(table_bytes_, t));
+        arena_ = static_cast<uint8_t*>(numa::alloc_interleaved(arena_capacity_bytes_, t));
+        if (table_ == nullptr || arena_ == nullptr) {
+            numa::free_mapped(table_, table_bytes_);
+            numa::free_mapped(arena_, arena_capacity_bytes_);
+            throw std::bad_alloc();
+        }
     }
 
     ~SearchArena() {
-        delete[] table_;
-        delete[] arena_;
+        numa::free_mapped(table_, table_bytes_);
+        numa::free_mapped(arena_, arena_capacity_bytes_);
     }
 
     SearchArena(const SearchArena&) = delete;
@@ -988,6 +1003,7 @@ private:
 
     TTEntry*              table_      = nullptr;
     uint8_t*              arena_      = nullptr;
+    uint64_t              table_bytes_ = 0;           // mmap length of table_
     uint64_t              capacity_   = 0;            // pow2
     // Skip the reserved prefix so the first `alloc_raw` returns an offset
     // > 0 and offset 0 stays available as the `kNoInfoOffset` sentinel.
