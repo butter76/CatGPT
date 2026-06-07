@@ -29,6 +29,31 @@ export const LKS_NETWORK_PATH =
 export const STOCKFISH_PATH =
   process.env.STOCKFISH_PATH || `${HOME}/Stockfish/src/stockfish`;
 
+// Lc0 built with the ONNX→TensorRT backend (see build/onnxtrt). Distinct from
+// LC0_PATH (the plain CUDA build used for position analysis).
+export const LC0_TRT_PATH =
+  process.env.LC0_TRT_PATH || `${HOME}/lc0/build/onnxtrt/lc0`;
+
+export const LC0_WEIGHTS_PATH =
+  process.env.LC0_WEIGHTS_PATH || `${HOME}/lc0/build/release/BT4-1740.pb.gz`;
+
+// onnxruntime-gpu (TensorRT EP) + TensorRT + cuDNN + CUDA runtime libs. lc0
+// cannot pick these up via UCI, so they must be exported for the engine
+// process; we bake them into the launch command via `env`.
+//
+// /usr/local/lib64 is first because the onnx-trt binary was compiled with
+// gcc 14 and needs its newer libstdc++ (CXXABI_1.3.15) — the system default
+// (gcc 13) is too old and makes lc0 fail to start with a CXXABI error.
+export const LC0_LD_LIBRARY_PATH =
+  process.env.LC0_LD_LIBRARY_PATH ||
+  [
+    "/usr/local/lib64",
+    `${HOME}/onnxruntime-linux-x64-gpu-1.23.2/lib`,
+    `${HOME}/TensorRT-10.16.1.11/lib`,
+    `${HOME}/CatGPT/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib`,
+    "/usr/local/cuda/lib64",
+  ].join(":");
+
 export const SYZYGY_HOME =
   process.env.SYZYGY_HOME || process.env.LKS_SYZYGY_PATH || "";
 
@@ -56,10 +81,12 @@ export interface TournamentEnvAvailability {
   cutechess: boolean;
   catgpt: boolean;
   stockfish: boolean;
+  lc0: boolean;
   syzygy: boolean;
   defaults: {
     catgptCommand: string;
     stockfishCommand: string;
+    lc0Command: string;
     syzygyPath: string;
     cutechessPath: string;
   };
@@ -70,17 +97,19 @@ export function getTournamentEnvAvailability(): TournamentEnvAvailability {
     cutechess: isExecutable(CUTECHESS_CLI_PATH),
     catgpt: isExecutable(LKS_UCI_PATH),
     stockfish: isExecutable(STOCKFISH_PATH),
+    lc0: isExecutable(LC0_TRT_PATH),
     syzygy: dirExists(SYZYGY_HOME),
     defaults: {
       catgptCommand: `${LKS_UCI_PATH} ${LKS_NETWORK_PATH}`,
       stockfishCommand: STOCKFISH_PATH,
+      lc0Command: defaultLc0Config().command,
       syzygyPath: SYZYGY_HOME,
       cutechessPath: CUTECHESS_CLI_PATH,
     },
   };
 }
 
-// ─── Default engine configs (CatGPT lks_uci vs Stockfish) ─────────
+// ─── Default engine configs (CatGPT lks_uci, Stockfish, Lc0) ──────
 
 export function defaultCatgptConfig(): EngineConfig {
   return {
@@ -100,6 +129,36 @@ export function defaultStockfishConfig(): EngineConfig {
       { name: "Hash", value: "8192" },
     ],
     initStrings: [],
+  };
+}
+
+export function defaultLc0Config(): EngineConfig {
+  // Everything goes in the launch command as CLI flags rather than UCI
+  // options, for two reasons:
+  //   1. LD_LIBRARY_PATH can't be set over UCI, so we wrap lc0 in `env`.
+  //   2. `--backend-opts=gpu=0,fp16=true,batch=112` contains commas; the UI's
+  //      option parser splits on commas, which would mangle it into three
+  //      bogus options. Keeping it as a flag avoids that entirely.
+  return {
+    name: "Lc0",
+    command:
+      `env LD_LIBRARY_PATH=${LC0_LD_LIBRARY_PATH} ${LC0_TRT_PATH} ` +
+      `--backend=onnx-trt --weights=${LC0_WEIGHTS_PATH} ` +
+      `--minibatch-size=112 --backend-opts=gpu=0,fp16=true,batch=112`,
+    options: [],
+    initStrings: [],
+  };
+}
+
+export function defaultEngineConfigs(): {
+  catgpt: EngineConfig;
+  stockfish: EngineConfig;
+  lc0: EngineConfig;
+} {
+  return {
+    catgpt: defaultCatgptConfig(),
+    stockfish: defaultStockfishConfig(),
+    lc0: defaultLc0Config(),
   };
 }
 

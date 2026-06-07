@@ -1,0 +1,34 @@
+services:
+  postgres:
+    image: postgres:17
+    command: "-d 1"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    # Bind to loopback ONLY. Never expose the dev DB on 0.0.0.0 — an
+    # internet-facing Postgres gets brute-forced and cryptojacked within minutes.
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=9327eebc8575fc5efa2012b8f5701c90f920b11002bc3097
+      - POSTGRES_DB=main
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Lets the @neondatabase/serverless HTTP driver talk to local Postgres.
+  neon-proxy:
+    image: ghcr.io/timowilhelm/local-neon-http-proxy:main
+    environment:
+      - PG_CONNECTION_STRING=postgres://postgres:9327eebc8575fc5efa2012b8f5701c90f920b11002bc3097@postgres:5432/main
+    # Loopback only — reach the app via SSH/Cursor port forwarding, not the public internet.
+    ports:
+      - "127.0.0.1:4444:4444"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  db_data:

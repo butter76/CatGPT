@@ -111,16 +111,19 @@ export interface TournamentEnginesInfo {
   cutechess: boolean;
   catgpt: boolean;
   stockfish: boolean;
+  lc0: boolean;
   syzygy: boolean;
   defaults: {
     catgptCommand: string;
     stockfishCommand: string;
+    lc0Command: string;
     syzygyPath: string;
     cutechessPath: string;
   };
   defaultConfigs: {
     catgpt: EngineConfig;
     stockfish: EngineConfig;
+    lc0: EngineConfig;
   };
 }
 
