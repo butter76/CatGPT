@@ -220,6 +220,11 @@ export interface EngineConfig {
   options?: { name: string; value: string }[];
   /** Extra UCI init strings sent before the game. */
   initStrings?: string[];
+  /**
+   * Optional cutechess tc string for this engine (e.g. "60+0.6"). When set it
+   * overrides the tournament-level default time control for this side.
+   */
+  timeControl?: string;
 }
 
 export interface Tournament {

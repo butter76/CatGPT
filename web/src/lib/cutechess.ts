@@ -238,13 +238,18 @@ export function buildCutechessArgs(
   workDir: string,
   cfg: CutechessRunConfig
 ): string[] {
+  // Per-engine time control: cutechess applies `-each` after per-engine
+  // options, so the tc must live inside each `-engine` list (not `-each`) for
+  // per-side overrides to take effect.
+  const whiteTc = cfg.whiteConfig.timeControl?.trim() || cfg.timeControl;
+  const blackTc = cfg.blackConfig.timeControl?.trim() || cfg.timeControl;
   const args: string[] = [
     "-engine",
     `conf=${cfg.whiteConfig.name}`,
+    `tc=${whiteTc}`,
     "-engine",
     `conf=${cfg.blackConfig.name}`,
-    "-each",
-    `tc=${cfg.timeControl}`,
+    `tc=${blackTc}`,
     "-games",
     String(cfg.totalGames),
     "-rounds",

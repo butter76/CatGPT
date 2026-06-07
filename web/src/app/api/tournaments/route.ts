@@ -35,7 +35,11 @@ function sanitizeConfig(
   const initStrings = Array.isArray(r.initStrings)
     ? r.initStrings.filter((s): s is string => typeof s === "string")
     : fallback.initStrings;
-  return { name, command, options, initStrings };
+  const timeControl =
+    typeof r.timeControl === "string" && r.timeControl.trim()
+      ? r.timeControl.trim()
+      : fallback.timeControl;
+  return { name, command, options, initStrings, timeControl };
 }
 
 function posInt(v: unknown, fallback: number, min: number): number {

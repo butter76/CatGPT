@@ -287,10 +287,12 @@ function NewTournamentDialog({
   const [whiteName, setWhiteName] = useState("CatGPT");
   const [whiteCommand, setWhiteCommand] = useState("");
   const [whiteOptions, setWhiteOptions] = useState("");
+  const [whiteTc, setWhiteTc] = useState("");
   const [blackPreset, setBlackPreset] = useState<PresetKey>("stockfish");
   const [blackName, setBlackName] = useState("Stockfish");
   const [blackCommand, setBlackCommand] = useState("");
   const [blackOptions, setBlackOptions] = useState("Threads=8, Hash=8192");
+  const [blackTc, setBlackTc] = useState("");
   const [timeControl, setTimeControl] = useState("900+5");
   const [totalGames, setTotalGames] = useState("2");
   const [concurrency, setConcurrency] = useState("1");
@@ -327,11 +329,13 @@ function NewTournamentDialog({
         command: whiteCommand.trim(),
         options: parseOptions(whiteOptions),
       };
+      if (whiteTc.trim()) whiteConfig.timeControl = whiteTc.trim();
       const blackConfig: EngineConfig = {
         name: blackName.trim() || "Engine B",
         command: blackCommand.trim(),
         options: parseOptions(blackOptions),
       };
+      if (blackTc.trim()) blackConfig.timeControl = blackTc.trim();
       const tournament = await createTournamentAPI({
         name: name.trim() || undefined,
         whiteConfig,
@@ -442,6 +446,9 @@ function NewTournamentDialog({
                 setWhiteOptions(v);
                 setWhitePreset("custom");
               }}
+              timeControl={whiteTc}
+              setTimeControl={setWhiteTc}
+              tcPlaceholder={timeControl}
             />
             <EngineFields
               title="Engine B"
@@ -469,14 +476,17 @@ function NewTournamentDialog({
                 setBlackOptions(v);
                 setBlackPreset("custom");
               }}
+              timeControl={blackTc}
+              setTimeControl={setBlackTc}
+              tcPlaceholder={timeControl}
             />
           </div>
 
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
             <div className="space-y-1.5">
-              <Label htmlFor="t-tc">Time control</Label>
+              <Label htmlFor="t-tc">Time control (default)</Label>
               <Input id="t-tc" value={timeControl} onChange={(e) => setTimeControl(e.target.value)} />
-              <p className="text-[11px] text-muted-foreground">900+5 = 15m+5s</p>
+              <p className="text-[11px] text-muted-foreground">900+5 = 15m+5s. Per-engine override below.</p>
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="t-games">Games</Label>
@@ -555,6 +565,9 @@ function EngineFields({
   setCommand,
   options,
   setOptions,
+  timeControl,
+  setTimeControl,
+  tcPlaceholder,
 }: {
   title: string;
   presets: EnginePreset[];
@@ -566,6 +579,9 @@ function EngineFields({
   setCommand: (v: string) => void;
   options: string;
   setOptions: (v: string) => void;
+  timeControl: string;
+  setTimeControl: (v: string) => void;
+  tcPlaceholder: string;
 }) {
   const selected = presets.find((p) => p.key === preset);
   const presetMissing =
@@ -617,6 +633,18 @@ function EngineFields({
           className="h-8 text-xs font-mono"
           placeholder="Threads=8, Hash=8192"
         />
+      </div>
+      <div className="space-y-1.5">
+        <Label className="text-xs">Time control (override)</Label>
+        <Input
+          value={timeControl}
+          onChange={(e) => setTimeControl(e.target.value)}
+          className="h-8 text-xs font-mono"
+          placeholder={`default: ${tcPlaceholder || "900+5"}`}
+        />
+        <p className="text-[11px] text-muted-foreground">
+          Blank inherits the tournament default.
+        </p>
       </div>
     </div>
   );
