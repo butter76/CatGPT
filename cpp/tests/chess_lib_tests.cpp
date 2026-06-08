@@ -1180,3 +1180,48 @@ TEST_SUITE("Tokenizer Python Compatibility (test_tokenizer.py)") {
         REQUIRE(tokens_from_board == tokens_from_fen);
     }
 }
+
+// ============================================================================
+// Upcoming Repetition (cuckoo) Tests
+// ============================================================================
+// Verifies the forked chess-library's Board::upcomingRepetition is exposed and
+// behaves correctly through CatGPT's actual build (amalgamated include/chess.hpp,
+// C++23 flags). `ply` is the distance from the search root; a large value treats
+// the whole window as post-root so any reversible repeating move is reported.
+
+TEST_SUITE("Upcoming repetition (cuckoo)") {
+
+    TEST_CASE("Knight cycle is detected, short window is not") {
+        Board board;
+        board.makeMove<true>(uci::uciToMove(board, "g1f3"));
+        board.makeMove<true>(uci::uciToMove(board, "g8f6"));
+        CHECK_FALSE(board.upcomingRepetition(1000));  // only 2 plies back
+        board.makeMove<true>(uci::uciToMove(board, "f3g1"));
+        CHECK(board.upcomingRepetition(1000));  // Black can play Nf6-g8 back to start
+    }
+
+    TEST_CASE("Rook cycle with a clear path is detected") {
+        Board board("7k/8/8/8/8/8/8/R6K w - - 0 1");
+        board.makeMove<true>(uci::uciToMove(board, "a1a4"));
+        board.makeMove<true>(uci::uciToMove(board, "h8g8"));
+        board.makeMove<true>(uci::uciToMove(board, "a4a1"));
+        CHECK(board.upcomingRepetition(1000));
+    }
+
+    TEST_CASE("Start position and a tactical position have no cycle") {
+        Board start;
+        CHECK_FALSE(start.upcomingRepetition(1000));
+
+        Board tactical("r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4");
+        CHECK_FALSE(tactical.upcomingRepetition(1000));
+    }
+
+    TEST_CASE("Pre-root semantics: single occurrence below root is not reported") {
+        Board board;
+        board.makeMove<true>(uci::uciToMove(board, "g1f3"));
+        board.makeMove<true>(uci::uciToMove(board, "g8f6"));
+        board.makeMove<true>(uci::uciToMove(board, "f3g1"));
+        CHECK_FALSE(board.upcomingRepetition(3));  // ply == cycle length, occurred once
+        CHECK(board.upcomingRepetition(4));        // cycle lies entirely after root
+    }
+}
