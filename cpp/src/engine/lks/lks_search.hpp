@@ -716,6 +716,19 @@ struct PathFrame {
 }
 
 /**
+ * A TT Q is stored without repetition/50-move history (Zobrist excludes it),
+ * so a position scored as winning may actually be a forceable draw on THIS
+ * path. When the side to move at `b` can force an upcoming repetition, clamp a
+ * winning (Q>0) reading down to a draw. Path-dependent: applied to the consumed
+ * value only, never written back to the shared arena. The `q > 0` test
+ * short-circuits the cuckoo walk on the common (non-winning) case.
+ */
+[[nodiscard]] inline float clamp_q_upcoming_rep(
+    float q, const chess::Board& b, int ply) noexcept {
+    return (q > 0.0f && b.upcomingRepetition(ply)) ? 0.0f : q;
+}
+
+/**
  * Recursive descent (libfork lambda).
  *
  * INVARIANT: every entry owns exactly one `Permit` on entry. The permit
@@ -937,7 +950,11 @@ inline constexpr auto recursive_search =
             // alone here: no fresh descent happened, so any prior PV
             // claim on this row remains the freshest data the parent
             // has.
-            if (out) { out->Q = cur_q; out->depth = cur_max_d; }
+            if (out) {
+                out->Q = clamp_q_upcoming_rep(
+                    cur_q, board, static_cast<int>(rec_depth));
+                out->depth = cur_max_d;
+            }
             co_return;
         }
     }
@@ -1077,6 +1094,7 @@ inline constexpr auto recursive_search =
             // qd is consistent (Cell A is atomic with the key match).
             auto [q, child_max_d] = v2::unpack_qd(
                 v2::SearchArena::load_qd(ce).qd_packed);
+            q = clamp_q_upcoming_rep(q, cb, static_cast<int>(rec_depth) + 1);
             plans.push_back({Mode::Expanded, m_P, q, child_max_d,
                              /*alloc=*/0.0f});
             cumulative_P += m_P;
