@@ -727,15 +727,17 @@ struct PathFrame {
 
 /**
  * A TT Q is stored without repetition/50-move history (Zobrist excludes it),
- * so a position scored as winning may actually be a forceable draw on THIS
- * path. When the side to move at `b` can force an upcoming repetition, clamp a
- * winning (Q>0) reading down to a draw. Path-dependent: applied to the consumed
- * value only, never written back to the shared arena. The `q > 0` test
- * short-circuits the cuckoo walk on the common (non-winning) case.
+ * so a position scored as losing may actually be a forceable draw on THIS
+ * path. When the side to move at `b` can force an upcoming repetition, floor a
+ * losing (Q<0) reading up to a draw: that side can always take the repetition
+ * instead of walking into the losing line. A winning side would never opt into
+ * the draw, so winning readings are left untouched. Path-dependent: applied to
+ * the consumed value only, never written back to the shared arena. The `q < 0`
+ * test short-circuits the cuckoo walk on the common (non-losing) case.
  */
 [[nodiscard]] inline float clamp_q_upcoming_rep(
     float q, const chess::Board& b, int ply) noexcept {
-    return (q > 0.0f && b.upcomingRepetition(ply)) ? 0.0f : q;
+    return (q < 0.0f && b.upcomingRepetition(ply)) ? 0.0f : q;
 }
 
 /**
@@ -942,15 +944,19 @@ inline constexpr auto recursive_search =
     // The recursive-depth cap is NEVER waived — runaway descent depth
     // is a real risk even on the PV.
     {
-        const bool waive_depth_check =
-            pv_mode &&
-            std::atomic_ref<uint8_t>(hdr->expanded)
-                .load(std::memory_order_relaxed) != 0 && depth > -5.0f;
         // Cell A is atomic with the key match (find / find_or_claim
         // both ensure we observe a key from a successful CAS), so qd
         // is never torn here.
         auto [cur_q, cur_max_d] = v2::unpack_qd(
             v2::SearchArena::load_qd(entry).qd_packed);
+
+        // PV modes ignore the TT depth, bounded by -5.0f
+        // Also we should always descend if the current Q is positive
+        // to prevent blindness to repetitions.
+        const bool waive_depth_check =
+            pv_mode &&
+            std::atomic_ref<uint8_t>(hdr->expanded)
+                .load(std::memory_order_relaxed) != 0 && (depth > -5.0f || cur_q > 0.2f);
         if (rec_depth >= kRecursiveDepthLimit ||
             (!waive_depth_check && depth <= cur_max_d)) {
             // Hand the already-unpacked TT (Q, max_depth) back to the
