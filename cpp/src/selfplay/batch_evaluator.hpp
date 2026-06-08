@@ -53,6 +53,7 @@
 
 #include "../engine/network_file.hpp"
 #include "../engine/nn_constants.hpp"
+#include "../engine/numa_util.hpp"
 #include "../engine/policy.hpp"
 #include "../engine/trt_runtime.hpp"
 #include "eval_request.hpp"
@@ -96,14 +97,19 @@ public:
      * @param device_id     CUDA device to bind this evaluator to. The ctor,
      *                      the GPU thread, and the dtor all cudaSetDevice
      *                      to this id before touching CUDA APIs.
+     * @param pin_cpu       Logical CPU to pin the GPU thread to (a core on
+     *                      the NUMA node local to `device_id`). -1 disables
+     *                      pinning. Best-effort: a pin failure is ignored.
      */
     BatchEvaluator(const fs::path& network_path,
                    lf::lazy_pool* pool,
                    int max_batch_size,
-                   int device_id)
+                   int device_id,
+                   int pin_cpu = -1)
         : pool_(pool)
         , max_batch_size_(max_batch_size > 0 ? max_batch_size : 1)
         , device_id_(device_id)
+        , pin_cpu_(pin_cpu)
         , shutdown_(false)
         , total_evals_(0)
     {
@@ -230,6 +236,13 @@ private:
         // parent thread's current-device is NOT inherited. Pin to ours
         // before touching any CUDA API on this thread.
         CATGPT_CUDA_CHECK(cudaSetDevice(device_id_));
+
+        // Pin this GPU thread to the SMT sibling of its worker's descent
+        // core, on the NUMA node local to the GPU, so H2D/D2H copies of the
+        // pinned host buffers stay node-local. Best-effort.
+        if (pin_cpu_ >= 0) {
+            catgpt::numa::pin_this_thread_to_cpu(pin_cpu_);
+        }
 
         std::vector<EvalRequest*> batch;
         batch.reserve(largest_effective_bucket());
@@ -734,6 +747,7 @@ private:
     // Configuration
     int max_batch_size_;
     int device_id_;
+    int pin_cpu_ = -1;  // logical CPU for the GPU thread, -1 = no pin
 
     // Request queue
     std::deque<EvalRequest*> queue_;

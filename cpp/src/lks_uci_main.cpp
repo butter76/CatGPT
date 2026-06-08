@@ -55,6 +55,7 @@
  *                           instead of running the GPU search.
  */
 
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -121,6 +122,44 @@ static float env_float(const char* name, float fallback) {
     const char* s = std::getenv(name);
     if (!s || !*s) return fallback;
     try { return std::stof(s); } catch (...) { return fallback; }
+}
+
+// Estimate the resident footprint of the shared SearchArena (TT + node
+// arena) from LKS_LIFETIME_MAX_EVALS and warn if it approaches the TCEC
+// per-engine RAM ceiling. Mirrors SearchArena::compute_capacity /
+// compute_arena_bytes (load_factor 0.5, avg_moves_per_node 40) and the
+// fixed type sizes (sizeof(TTEntry)==32, NodeInfoHeader 12, MoveInfo 8).
+// The bit_ceil rounding of the TT can nearly double its size near a
+// power-of-two boundary, so it is reported explicitly. TRT weights and
+// pinned host buffers are excluded (a few GB total, per GPU).
+static void log_arena_footprint(uint64_t k_max_evals) {
+    constexpr uint64_t kTtEntryBytes   = 32;
+    constexpr uint64_t kPerNodeBytes   = 12 + 40 * 8;  // header + 40 MoveInfo
+    // load_factor 0.5 -> target capacity = 2 * K, then next pow2.
+    const double   target = static_cast<double>(k_max_evals) / 0.5;
+    const uint64_t want   = target < 16.0
+                              ? 16ULL
+                              : static_cast<uint64_t>(target) + 1ULL;
+    const uint64_t tt_cap = std::bit_ceil(want);
+    const uint64_t tt_bytes    = tt_cap * kTtEntryBytes;
+    const uint64_t arena_bytes = k_max_evals * kPerNodeBytes;
+    const uint64_t total       = tt_bytes + arena_bytes;
+
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+    // TCEC: max ~256 GiB/engine with multi-threaded init; keep headroom for
+    // TRT weights, pinned buffers, and the OS.
+    constexpr double kCeilGiB = 240.0;
+    const double total_gib = static_cast<double>(total) / kGiB;
+
+    std::println(stderr,
+                 "Arena footprint: TT {:.1f} GiB (capacity {} entries) + node arena {:.1f} GiB = {:.1f} GiB (TRT weights + pinned buffers excluded)",
+                 static_cast<double>(tt_bytes) / kGiB, tt_cap,
+                 static_cast<double>(arena_bytes) / kGiB, total_gib);
+    if (total_gib > kCeilGiB) {
+        std::println(stderr,
+                     "WARNING: estimated arena footprint {:.1f} GiB exceeds the ~{:.0f} GiB/engine budget; lower LKS_LIFETIME_MAX_EVALS (note: TT rounds up to a power of two, so a small reduction can halve it)",
+                     total_gib, kCeilGiB);
+    }
 }
 
 class LksUciDriver {
@@ -592,6 +631,7 @@ int main(int argc, char* argv[]) {
             workers_per_gpu, coros_per_worker, max_batch_size, lifetime_max_evals,
             delta_depth, max_depth, c_puct,
             syzygy_path.empty() ? std::string{"<disabled>"} : syzygy_path.string());
+        catgpt::log_arena_footprint(lifetime_max_evals);
         std::println(
             stderr,
             "Time: reserve_ms={} soft_pct={} hard_pct={} first_move_pct={} surprise_pct={} change_bonus_pct={} worsen_bonus_pct={} worsen_cp={} early_return_margin={}",

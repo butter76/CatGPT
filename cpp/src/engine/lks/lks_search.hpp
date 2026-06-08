@@ -150,6 +150,7 @@
 #include "../../lf/async_semaphore.hpp"
 #include "../../selfplay/batch_evaluator.hpp"
 #include "../../selfplay/eval_request.hpp"
+#include "../numa_util.hpp"
 #include "../../syzygy.hpp"
 #include "../../tokenizer.hpp"
 #include "../policy.hpp"
@@ -625,6 +626,15 @@ struct WorkerSearch {
     std::unique_ptr<lfsync::LfAsyncSemaphore> sem;        // permits = coros_per_worker
 
     int device_id = 0;  // CUDA device this worker's evaluator is bound to.
+
+    // NUMA placement, filled in by the LksSearch ctor before the per-worker
+    // init thread runs. `numa_node` is the OS node id local to this worker's
+    // GPU; `compute_cpu` is the physical core the lazy_pool descent thread is
+    // pinned to; `gpu_cpu` is the SMT sibling the BatchEvaluator GPU thread
+    // is pinned to. All -1 when pinning is unavailable (no /sys topology).
+    int numa_node   = 0;
+    int compute_cpu = -1;
+    int gpu_cpu     = -1;
 
     std::atomic<bool>     stop{false};
     std::atomic<uint64_t> evals{0};
@@ -1425,6 +1435,21 @@ inline constexpr auto root_search =
     co_await lf::join;
 };
 
+/**
+ * One-shot task whose only job is to pin the lazy_pool's (single) worker
+ * thread to a physical core. Each `WorkerSearch` owns an `lf::lazy_pool(1)`
+ * whose worker thread is created internally by libfork, so we cannot set
+ * its affinity from the outside; running this task via `lf::sync_wait`
+ * executes it *on* that worker thread, letting it pin itself. NUMA pinning
+ * is a best-effort performance hint (failures are swallowed in
+ * `pin_this_thread_to_cpu`), so this never affects correctness.
+ */
+inline constexpr auto pin_pool_worker =
+    [](auto /*self*/, int cpu) -> lf::task<void> {
+    catgpt::numa::pin_this_thread_to_cpu(cpu);
+    co_return;
+};
+
 }  // namespace detail
 
 class LksSearch {
@@ -1496,8 +1521,59 @@ public:
                      "[LksSearch] {} device(s) x {} workers_per_gpu = {} total workers",
                      num_gpus_, workers_per_gpu_, num_workers_);
 
-        arena_.emplace(lifetime_max_evals_, /*load_factor=*/0.5,
-                       /*avg_moves_per_node=*/40);
+        // ── NUMA topology + per-worker core assignment ──────────────────
+        // Discover the host's NUMA layout once and decide, per worker, which
+        // physical core runs its libfork descent (compute_cpu) and which SMT
+        // sibling runs its GPU thread (gpu_cpu), on the NUMA node local to
+        // the worker's GPU. A per-node round-robin hands out distinct cores;
+        // assignment degrades to -1 (no pinning) when /sys topology is
+        // unavailable (e.g. a local dev box). Computed serially here so the
+        // parallel init threads below just consume their slot.
+        topo_ = numa::host_topology();
+        {
+            std::vector<std::size_t> node_rr(
+                static_cast<std::size_t>(std::max(1, topo_.num_nodes())), 0);
+            w_node_.assign(num_workers_, topo_.num_nodes() > 0 ? topo_.node_ids[0] : 0);
+            w_compute_cpu_.assign(num_workers_, -1);
+            w_gpu_cpu_.assign(num_workers_, -1);
+            for (int i = 0; i < num_workers_; ++i) {
+                const int device_id = i / workers_per_gpu_;
+                const int os_node   = gpu_numa_node(device_id, topo_);
+                const int nidx      = topo_.index_of_node(os_node);
+                if (nidx < 0) continue;
+                w_node_[i] = os_node;
+                const auto& phys = topo_.node_phys_cpus[nidx];
+                if (phys.empty()) continue;
+                const int core = phys[node_rr[nidx] % phys.size()];
+                ++node_rr[nidx];
+                w_compute_cpu_[i] = core;
+                w_gpu_cpu_[i] =
+                    (core >= 0 && core < static_cast<int>(topo_.sibling_of.size()))
+                        ? topo_.sibling_of[core]
+                        : core;
+            }
+        }
+        std::println(stderr,
+                     "[LksSearch] NUMA: {} node(s){}",
+                     topo_.num_nodes(),
+                     topo_.num_nodes() <= 1 ? " (pinning disabled)" : "");
+        for (int i = 0; i < num_workers_; ++i) {
+            std::println(stderr,
+                         "[LksSearch] worker {} -> gpu {} numa {} compute_cpu {} gpu_cpu {}",
+                         i, i / workers_per_gpu_, w_node_[i],
+                         w_compute_cpu_[i], w_gpu_cpu_[i]);
+        }
+
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            arena_.emplace(lifetime_max_evals_, /*load_factor=*/0.5,
+                           /*avg_moves_per_node=*/40, &topo_);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - t0).count();
+            std::println(stderr,
+                         "[LksSearch] arena allocated (interleaved, parallel prefault): TT {} B + node arena {} B in {} ms",
+                         arena_->table_bytes(), arena_->arena_capacity_bytes(), ms);
+        }
         root_key_ = board_.hash();
 
         // Persistent workers: build pool + evaluator + sem per worker once.
@@ -1519,17 +1595,36 @@ public:
                     try {
                         const int device_id = i / workers_per_gpu_;
                         CATGPT_CUDA_CHECK(cudaSetDevice(device_id));
+                        // Pin this init thread to the GPU-local NUMA node
+                        // BEFORE constructing the BatchEvaluator: its ctor's
+                        // cudaMallocHost pinned transfer buffers first-touch
+                        // on the calling thread's node, so this keeps them on
+                        // the node closest to the GPU.
+                        if (w_compute_cpu_[i] >= 0) {
+                            numa::pin_this_thread_to_node(topo_, w_node_[i]);
+                        }
                         auto w = std::make_unique<WorkerSearch>();
-                        w->device_id = device_id;
+                        w->device_id   = device_id;
+                        w->numa_node   = w_node_[i];
+                        w->compute_cpu = w_compute_cpu_[i];
+                        w->gpu_cpu     = w_gpu_cpu_[i];
                         // 1 worker per pool: per-WorkerSearch isolation
                         // is the model. lazy_pool means the worker thread
                         // sleeps when no work is ready, woken on
                         // pool->schedule(handle) by the GPU thread or
                         // by a release()'d semaphore waiter.
                         w->pool = std::make_unique<lf::lazy_pool>(/*n=*/1);
+                        // Pin the pool's internal worker thread (the descent
+                        // thread) to its physical core. libfork creates that
+                        // thread internally, so we run a one-shot task on it
+                        // via sync_wait to let it set its own affinity.
+                        if (w->compute_cpu >= 0) {
+                            lf::sync_wait(*w->pool, detail::pin_pool_worker,
+                                          w->compute_cpu);
+                        }
                         w->evaluator = std::make_unique<BatchEvaluator>(
                             trt_engine_path_, w->pool.get(),
-                            max_batch_size_, device_id);
+                            max_batch_size_, device_id, w->gpu_cpu);
                         w->sem = std::make_unique<lfsync::LfAsyncSemaphore>(
                             eval_permits, *w->pool);
                         workers_[i] = std::move(w);
@@ -1568,10 +1663,16 @@ public:
 
     void reset() {
         assert(!is_searching() && "reset() called while a search is in flight");
-        // Rebuild arena in place: two delete[]s on the old buffers, two new[]s
-        // on fresh ones. Workers and evaluators are NOT rebuilt.
+        // Rebuild arena in place: munmap the old buffers, mmap + parallel
+        // NUMA-interleaved prefault on fresh ones (see SearchArena). Workers
+        // and evaluators are NOT rebuilt. The parallel init keeps the
+        // per-`ucinewgame` reallocation off the critical path for huge TTs.
+        const auto t0 = std::chrono::steady_clock::now();
         arena_.emplace(lifetime_max_evals_, /*load_factor=*/0.5,
-                       /*avg_moves_per_node=*/40);
+                       /*avg_moves_per_node=*/40, &topo_);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+        std::println(stderr, "[LksSearch] arena reallocated in {} ms", ms);
         searched_since_reset_ = false;
     }
 
@@ -2421,9 +2522,33 @@ private:
      * expires, a `stop_token` fires, or any other terminator) or the
      * local ID depth reaches `cfg.max_depth`.
      */
+    // Map a CUDA device to its local NUMA node (OS node id) via its PCIe
+    // bus id and /sys, with a round-robin fallback when sysfs reports no
+    // affinity (numa_node == -1, common in VMs / single-node hosts). Lives
+    // here (not in numa_util.hpp) so the CUDA dependency stays out of the
+    // header shared with the CUDA-less tt_arena tests.
+    static int gpu_numa_node(int device_id, const numa::Topology& topo) {
+        char bus[32] = {0};
+        if (cudaDeviceGetPCIBusId(bus, sizeof(bus), device_id) != cudaSuccess) {
+            return numa::round_robin_node(device_id, topo);
+        }
+        const int n = numa::numa_node_for_pci_bus(bus);
+        if (n < 0 || topo.index_of_node(n) < 0) {
+            return numa::round_robin_node(device_id, topo);
+        }
+        return n;
+    }
+
     void run_worker_search(WorkerSearch& w, int worker_idx,
                            const LksSearchConfig& cfg)
     {
+        // The runner mostly blocks in lf::sync_wait while the pool's pinned
+        // descent thread does the work, so a loose node-level pin (not a
+        // dedicated core) is enough to keep its bookkeeping NUMA-local
+        // without stealing a physical core from the hot threads.
+        if (w.compute_cpu >= 0) {
+            numa::pin_this_thread_to_node(topo_, w.numa_node);
+        }
         const float start = cfg.start_depth
                           + (static_cast<float>(worker_idx) / static_cast<float>(num_workers_))
                             * cfg.delta_depth;
@@ -2469,6 +2594,14 @@ private:
     chess::Board board_;
     uint64_t     root_key_ = 0;
     bool         searched_since_reset_ = false;
+
+    // NUMA topology (scanned once in the ctor) and the per-worker core
+    // assignment derived from it. Owned here so the arena's parallel
+    // allocation (ctor + reset) reuses it without re-scanning /sys.
+    numa::Topology   topo_;
+    std::vector<int> w_node_;         // OS node id per worker
+    std::vector<int> w_compute_cpu_;  // descent (lazy_pool) core per worker
+    std::vector<int> w_gpu_cpu_;      // GPU thread core per worker
 
     std::optional<v2::SearchArena>             arena_;
     std::vector<std::unique_ptr<WorkerSearch>> workers_;
