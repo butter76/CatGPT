@@ -557,9 +557,8 @@ inline uint16_t compute_force_expand(const RawNNOutput& out, int num_moves) noex
 /**
  * Position-only terminal classification for a child move at expansion
  * time. Path-dependent terminal conditions are NOT considered here:
- *   - repetitions: handled at descent time via `isRepetitionDraw(ply)`
- *     (Stockfish rule: 2-fold draws only when the repeat is post-root,
- *     else 3-fold; not cached in terminal_kind).
+ *   - repetitions: handled at descent time via `isRepetition(1)`
+ *     (plain 2-fold repetition draw; not cached in terminal_kind).
  *   - 50-move rule: handled at descent time via `isHalfMoveDraw()`.
  * Both depend on data (path history / half-move clock) that is not
  * part of the Zobrist key, so two transpositions to the same key can
@@ -713,7 +712,7 @@ struct PathFrame {
  * i.e. the repetition is with a pre-root position.
  *
  * The nearest (closest-to-leaf) match is the most recent occurrence and is
- * guaranteed to lie within the half-move window whenever `isRepetitionDraw`
+ * guaranteed to lie within the half-move window whenever `isRepetition(1)`
  * fired, so this is the correct repeating position to attribute the draw to.
  * Opposite-side-to-move ancestors never match (side-to-move is folded into
  * the Zobrist key), so a plain hash compare over the whole chain is safe.
@@ -735,10 +734,12 @@ struct PathFrame {
  * the draw, so winning readings are left untouched. Path-dependent: applied to
  * the consumed value only, never written back to the shared arena. The `q < 0`
  * test short-circuits the cuckoo walk on the common (non-losing) case.
+ * Uses the plain 2-fold variant (`upcomingRepetitionTwoFold`): any reachable
+ * repetition can be forced, independent of the search root.
  */
 [[nodiscard]] inline float clamp_q_upcoming_rep(
-    float q, const chess::Board& b, int ply) noexcept {
-    return (q < 0.0f && b.upcomingRepetition(ply)) ? 0.0f : q;
+    float q, const chess::Board& b) noexcept {
+    return (q < 0.0f && b.upcomingRepetitionTwoFold()) ? 0.0f : q;
 }
 
 /**
@@ -968,8 +969,7 @@ inline constexpr auto recursive_search =
             // claim on this row remains the freshest data the parent
             // has.
             if (out) {
-                out->Q = clamp_q_upcoming_rep(
-                    cur_q, board, static_cast<int>(rec_depth));
+                out->Q = clamp_q_upcoming_rep(cur_q, board);
                 out->depth = cur_max_d;
             }
             co_return;
@@ -1015,9 +1015,9 @@ inline constexpr auto recursive_search =
     constexpr float kPosInf = std::numeric_limits<float>::infinity();
 
     // Set true if any of the first `hdr->force_expand` (highest-prior)
-    // moves is a path-dependent draw — a repetition draw (`isRepetitionDraw`)
-    // / 50-move draw on this path, or a draw adopted via the recorded
-    // `repetition_depth`. When a top move only draws, iter-0 force-expands
+    // moves is a path-dependent draw — a 2-fold repetition draw
+    // (`isRepetition(1)`) / 50-move draw on this path, or a draw adopted via
+    // the recorded `repetition_depth`. When a top move only draws, iter-0 force-expands
     // ALL unexpanded children (see Pass 2's force_all_unexpanded) so the
     // descent looks past the draw for a non-drawing alternative.
     bool top_move_pathdraw = false;
@@ -1074,10 +1074,9 @@ inline constexpr auto recursive_search =
         //   50-move rule: a plain path-local draw — drawn for THIS caller
         //   only, with no shared MoveInfo mutation.
         //
-        //   repetition: a path-local draw for the discoverer under the
-        //   Stockfish rule (`isRepetitionDraw`): a 2-fold counts only when the
-        //   repeated position is post-root (on the way to this search root),
-        //   otherwise a 3-fold is required. We also record the repeating
+        //   repetition: a path-local draw for the discoverer under a plain
+        //   2-fold repetition check (`isRepetition(1)`): any position seen once
+        //   before within the half-move window draws. We also record the repeating
         //   ancestor's search `depth` into the shared MoveInfo (+inf if the
         //   repeat is pre-root). Other descenders of this parent that do NOT
         //   themselves repeat consult that recorded `repetition_depth` and
@@ -1088,7 +1087,7 @@ inline constexpr auto recursive_search =
         bool draw_here = false;
         if (cb.isHalfMoveDraw()) {
             draw_here = true;
-        } else if (cb.isRepetitionDraw(static_cast<int>(rec_depth) + 1)) {
+        } else if (cb.isRepetition(1)) {
             if (pv_mode) {
                 moves[i].record_repetition_depth(
                     repeating_ancestor_depth(&frame, cb.hash()));
@@ -1114,7 +1113,7 @@ inline constexpr auto recursive_search =
             // qd is consistent (Cell A is atomic with the key match).
             auto [q, child_max_d] = v2::unpack_qd(
                 v2::SearchArena::load_qd(ce).qd_packed);
-            q = clamp_q_upcoming_rep(q, cb, static_cast<int>(rec_depth) + 1);
+            q = clamp_q_upcoming_rep(q, cb);
             plans.push_back({Mode::Expanded, m_P, q, child_max_d,
                              /*alloc=*/0.0f});
             cumulative_P += m_P;
@@ -1870,7 +1869,7 @@ public:
      * root's direct (depth-1) children: score = -child_Q from our POV, with
      * tiebreaks (child max_depth, then prior P). Each child's Q mirrors the
      * Pass-1 classification — terminal_kind drives a fixed Q;
-     * `isRepetitionDraw(1)` / `isHalfMoveDraw()` are checked path-dependently on
+     * `isRepetition(1)` / `isHalfMoveDraw()` are checked path-dependently on
      * `board_`'s own history and scored as draws; everything else reads the
      * child's TT Q.
      *
@@ -1934,9 +1933,8 @@ public:
             } else {
                 chess::Board cb = board_;
                 cb.makeMove<true>(m);
-                // Root's direct child sits at ply 1: under the Stockfish rule a
-                // repetition against pre-root game history needs a full 3-fold.
-                if (cb.isRepetitionDraw(1) || cb.isHalfMoveDraw()) {
+                // Plain 2-fold repetition draw on `board_`'s own history.
+                if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
                     child_Q = 0.0f;
                 } else {
                     const v2::TTEntry* ce =
@@ -1987,8 +1985,8 @@ public:
      * no separate "is the top child expanded?" heuristic needed.
      *
      * The line additionally ends — AFTER emitting the latest move — when
-     * the resulting position draws by repetition under the Stockfish rule
-     * (`isRepetitionDraw(ply)`), 50-move draw (`isHalfMoveDraw()`),
+     * the resulting position draws by a plain 2-fold repetition
+     * (`isRepetition(1)`), 50-move draw (`isHalfMoveDraw()`),
      * insufficient material, or after
      * `max_len` plies (defensive cap). These run on the board after
      * `makeMove<true>(m)`, so the board's own path history disambiguates
@@ -2009,10 +2007,9 @@ public:
             if (m == chess::Move::NO_MOVE) break;
             pv.push_back(m);
             b.makeMove<true>(m);
-            // After pushing the i-th move `b` is at ply i+1 from the root, so
-            // the on-path 2-fold / pre-root 3-fold rule resolves correctly as
-            // the line is built up.
-            if (b.isRepetitionDraw(i + 1) || b.isHalfMoveDraw()
+            // A plain 2-fold repetition (or 50-move / insufficient material)
+            // ends the line. Runs on `b`'s own path history.
+            if (b.isRepetition(1) || b.isHalfMoveDraw()
                 || b.isInsufficientMaterial()) {
                 break;
             }

@@ -143,9 +143,8 @@ ChildClass classify_child(const chess::Board& parent,
     }
     chess::Board cb = parent;
     cb.makeMove<true>(m);
-    // `parent` is always the search root here, so children sit at ply 1: under
-    // the Stockfish rule a repetition vs pre-root game history needs a 3-fold.
-    if (cb.isRepetitionDraw(1) || cb.isHalfMoveDraw()) {
+    // Plain 2-fold repetition draw on the child's path history.
+    if (cb.isRepetition(1) || cb.isHalfMoveDraw()) {
         return {true, 0.0f, kPosInf, true};
     }
     if (const TTEntry* ce = arena.find(cb.hash(), secondary_hash(cb))) {
