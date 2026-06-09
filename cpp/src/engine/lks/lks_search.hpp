@@ -263,12 +263,12 @@ struct TimeControl {
 
     // ── Tunable constants (defaults mirror the legacy engine) ──
     int64_t reserve_ms          = 100;     // never spend below this much clock
-    float   soft_pct            = 0.01f;   // soft target as fraction of bank
-    float   hard_pct            = 0.50f;   // hard ceiling as fraction of bank
-    float   first_move_pct      = 0.08f;   // soft floor on the first move
+    float   soft_pct            = 0.03f;   // soft target as fraction of bank
+    float   hard_pct            = 0.33f;   // hard ceiling as fraction of bank
+    float   first_move_pct      = 0.07f;   // soft floor on the first move
     float   surprise_pct        = 0.04f;   // soft floor on a surprise
-    float   change_bonus_pct    = 0.02f;   // soft extension when best move changes
-    float   worsen_bonus_pct    = 0.02f;   // soft extension when score drops
+    float   change_bonus_pct    = 0.015f;   // soft extension when best move changes
+    float   worsen_bonus_pct    = 0.015f;   // soft extension when score drops
     int     worsen_threshold_cp = 10;      // cp drop that counts as "worsened"
 
     // Early-return ("ponderhit-like") chain margin, in log-depth units.

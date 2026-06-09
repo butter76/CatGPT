@@ -579,7 +579,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const int workers_per_gpu  = catgpt::env_int("LKS_WORKERS_PER_GPU", 1);
+    const int workers_per_gpu  = catgpt::env_int("LKS_WORKERS_PER_GPU", 2);
     const int coros_per_worker = catgpt::env_int("LKS_COROS_PER_WORKER", 256);
     const int max_batch_size   = catgpt::env_int("LKS_MAX_BATCH_SIZE", 112);
     const uint64_t lifetime_max_evals =
