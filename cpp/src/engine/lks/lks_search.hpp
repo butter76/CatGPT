@@ -179,6 +179,12 @@ namespace detail {
 struct SearchParams {
     float policy_temp = 1.3f;  // softmax temperature; >1 flattens, <1 sharpens
 
+    // WDL win-vs-loss sharpening temperature for the leaf value. The softmax
+    // draw prob D is held fixed; the W:L contrast is sharpened at this
+    // temperature. <1 sharpens (more optimism about the favored side, shrinking
+    // the selfplay-noise loss tail); 1.0 == plain P(W)-P(L).
+    float wl_temp = 0.7f;
+
     // Heuristic for the initial max_depth stamped onto a freshly evaluated
     // TT entry: default_max_depth = -log(variance * C). Low-variance nodes
     // get a high max_depth so early ID iterations skip re-descending them
@@ -869,7 +875,8 @@ inline constexpr auto recursive_search =
         hdr_w->variance = variance;
         hdr_w->force_expand = compute_force_expand(out, static_cast<int>(num_moves));
 
-        const float Q = catgpt::wdl_logits_to_q(out.wdl_logits);
+        const float Q = catgpt::wdl_logits_to_q_wl_tempered(
+            out.wdl_logits, ctx->params->wl_temp);
 
         // Heuristic initial max_depth for this fresh TT entry:
         //   default_max_depth = -log(variance * C)

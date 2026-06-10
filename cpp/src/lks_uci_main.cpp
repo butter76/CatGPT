@@ -28,6 +28,9 @@
  *   LKS_C_PUCT              (default 1.75; PUCT exploration constant piped
  *                            into LksSearchConfig::params.c_puct on every
  *                            `go`)
+ *   LKS_WL_TEMP             (default 0.7; WDL win-vs-loss sharpening temp
+ *                            piped into LksSearchConfig::params.wl_temp on
+ *                            every `go`; 1.0 == plain P(W)-P(L))
  *   LKS_MAX_DEPTH           (default 32; log-scale ID ceiling on every
  *                            `go` → LksSearchConfig::max_depth)
  *
@@ -172,6 +175,7 @@ public:
                  fs::path syzygy_path,
                  float delta_depth,
                  float c_puct,
+                 float wl_temp,
                  float max_depth,
                  catgpt::lks::TimeControl time_tunables)
         : search_(std::move(engine_path), lifetime_max_evals,
@@ -179,6 +183,7 @@ public:
                   std::move(syzygy_path))
         , delta_depth_(delta_depth)
         , c_puct_(c_puct)
+        , wl_temp_(wl_temp)
         , max_depth_(max_depth)
         , time_tunables_(time_tunables)
     {}
@@ -429,6 +434,7 @@ private:
         cfg.delta_depth = delta_depth_;
         cfg.max_depth = max_depth_;
         cfg.params.c_puct = c_puct_;
+        cfg.params.wl_temp = wl_temp_;
         cfg.on_uci_line = [](std::string_view s) { emit_line(s); };
 
         cfg.time = time_tunables_;
@@ -525,6 +531,7 @@ private:
     catgpt::lks::LksSearch search_;
     float delta_depth_;
     float c_puct_;
+    float wl_temp_;
     float max_depth_;
     catgpt::lks::TimeControl time_tunables_;
     std::string prev_fen_;
@@ -586,6 +593,7 @@ int main(int argc, char* argv[]) {
         catgpt::env_u64("LKS_LIFETIME_MAX_EVALS", 1ULL << 27);
     const float delta_depth = catgpt::env_float("LKS_DELTA_DEPTH", 0.2f);
     const float c_puct      = catgpt::env_float("LKS_C_PUCT", 1.75f);
+    const float wl_temp     = catgpt::env_float("LKS_WL_TEMP", 0.7f);
     const float max_depth   = catgpt::env_float("LKS_MAX_DEPTH", 32.0f);
 
     // Game-clock time-management tunables (see LksSearchConfig::TimeControl).
@@ -627,9 +635,9 @@ int main(int argc, char* argv[]) {
                      engine_path.string());
         std::println(
             stderr,
-            "Config: workers_per_gpu={} coros_per_worker={} max_batch={} arena_capacity={} delta_depth={} max_depth={} c_puct={} syzygy_path={}",
+            "Config: workers_per_gpu={} coros_per_worker={} max_batch={} arena_capacity={} delta_depth={} max_depth={} c_puct={} wl_temp={} syzygy_path={}",
             workers_per_gpu, coros_per_worker, max_batch_size, lifetime_max_evals,
-            delta_depth, max_depth, c_puct,
+            delta_depth, max_depth, c_puct, wl_temp,
             syzygy_path.empty() ? std::string{"<disabled>"} : syzygy_path.string());
         catgpt::log_arena_footprint(lifetime_max_evals);
         std::println(
@@ -643,7 +651,7 @@ int main(int argc, char* argv[]) {
         catgpt::LksUciDriver driver(engine_path, lifetime_max_evals,
                                     workers_per_gpu, coros_per_worker,
                                     max_batch_size, std::move(syzygy_path),
-                                    delta_depth, c_puct, max_depth,
+                                    delta_depth, c_puct, wl_temp, max_depth,
                                     time_tunables);
         std::println(stderr, "Engine loaded; entering UCI loop");
         driver.run();

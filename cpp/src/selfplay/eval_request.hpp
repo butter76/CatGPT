@@ -52,6 +52,31 @@ inline float wdl_logits_to_q(const std::array<float, WDL_NUM_CLASSES>& logits) n
 }
 
 /**
+ * Q in [-1, 1] from raw WDL logits with the win-vs-loss contrast
+ * temperature-sharpened while the draw probability D is held fixed.
+ *
+ * Keeps the softmax draw prob D, then re-sharpens the W:L split at
+ * `wl_temp` within the remaining (1 - D) mass. Closed form:
+ *
+ *   Q = (1 - D) * tanh((zW - zL) / (2 * wl_temp))
+ *
+ * `wl_temp == 1.0` reproduces `wdl_logits_to_q` exactly; `< 1` sharpens
+ * (more optimism about the favored side, shrinking the noisy loss tail).
+ * tanh keeps it numerically stable (no exp overflow).
+ */
+inline float wdl_logits_to_q_wl_tempered(
+    const std::array<float, WDL_NUM_CLASSES>& logits, float wl_temp) noexcept
+{
+    const float m = std::max({logits[0], logits[1], logits[2]});
+    const float ew = std::exp(logits[0] - m);
+    const float ed = std::exp(logits[1] - m);
+    const float el = std::exp(logits[2] - m);
+    const float D  = ed / (ew + ed + el);
+    const float wl_arg = (logits[0] - logits[2]) / (2.0f * wl_temp);
+    return (1.0f - D) * std::tanh(wl_arg);
+}
+
+/**
  * WDL-derived scalar in [0, 1]: P(W) + 0.5*P(D).
  */
 inline float wdl_logits_to_value(const std::array<float, WDL_NUM_CLASSES>& logits) noexcept
