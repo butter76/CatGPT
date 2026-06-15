@@ -5,15 +5,20 @@
  *
  *   Given M children with priors P_i (sum 1) and child-Q values Q_i in
  *   [-1, 1] (TT-stored, child-STM convention), total log-budget d = log N,
- *   and constant c_puct, find the dual K such that
+ *   constant c_puct, and low-N offset c, find the dual K such that
  *
- *     sum_i N_i = N,  N_i = c_puct * P_i * N^(2/3) / [3 (K - q_i)]
+ *     sum_i N_i = N,  N_i = c_puct * P_i * const(N) / [3 (K - q_i)]
  *
- *   with q_i = -Q_i (parent-loss POV). K is unique on (q_max, +inf) — LHS
- *   is strictly decreasing in K. Output is log N_i per child.
+ *   with const(N) = N / (N + c)^(1/3) and q_i = -Q_i (parent-loss POV).
+ *   const(N) -> N^(2/3) as N >> c, but stays sub-linear in N everywhere,
+ *   so per-child shares are monotone in N while the very-low-N regime
+ *   shifts allocation toward the best child (Q-following) up to a fixed
+ *   floor ~ c^(1/3) instead of collapsing to the raw prior. c = 0 recovers
+ *   plain N^(2/3). K is unique on (q_max, +inf) — LHS is strictly
+ *   decreasing in K. Output is log N_i per child.
  *
  * Solver: bracketed Halley in delta = K - q_max. The bracket is
- *   [lo, hi] = [0, c_puct / (3 N^(1/3))]
+ *   [lo, hi] = [0, c_puct * const(N) / (3 N)] = [0, c_puct / (3 (N+c)^(1/3))]
  * (lo is exclusive; hi is the Delta_i = 0 closed form, a proven upper
  * bound on delta*). Each iteration evaluates g at the current delta,
  * tightens the bracket by the sign of g (g is strictly monotone
@@ -115,9 +120,9 @@ struct Plan {
  *     since g'(d) = -sum w_i / (d + Δ_i)^2 < 0;
  *   - g(0+) > 0 (>= 0 when no Δ_i is zero) and g(+inf) = -N < 0, so the
  *     unique root d* lies in (0, +inf);
- *   - delta_hi = c_puct / (3 N^(1/3)) is a proven upper bound on d*
- *     (the Δ_i = 0 closed form; LHS is strictly decreasing in K, and any
- *     positive Δ_i only shrinks the sum).
+ *   - delta_hi = c_puct * const(N) / (3 N) = c_puct / (3 (N+c)^(1/3)) is a
+ *     proven upper bound on d* (the Δ_i = 0 closed form; LHS is strictly
+ *     decreasing in K, and any positive Δ_i only shrinks the sum).
  * So [lo=0, hi=delta_hi] is a guaranteed sign-changing bracket. Each
  * iteration evaluates g at the current d, tightens [lo, hi] by the sign,
  * and accepts the Halley step ONLY if it lands strictly inside the
@@ -141,17 +146,19 @@ struct Plan {
  * keep the release-build hot path free of the extra exp() loop.
  */
 inline void compute_log_allocations(Plan* plans, int M,
-                                    float depth, float c_puct) noexcept
+                                    float depth, float c_puct,
+                                    float lowN_offset) noexcept
 {
     if (M <= 0) return;
 
     // Floor depth well above the IEEE underflow cliff. N = exp(depth) goes
-    // subnormal at depth ~= -708 and flushes to exactly 0 at ~= -744, at
-    // which point cbrt_N = 0 ⇒ hi = +inf ⇒ every alloc collapses to -inf
-    // (silently — the debug post-check passes vacuously with N = 0). -200
-    // is far below any depth the descent legitimately reaches yet leaves
-    // ~500 units of headroom, so a runaway descent clamps here instead of
-    // emitting all-(-inf) allocations.
+    // subnormal at depth ~= -708 and flushes to exactly 0 at ~= -744. With
+    // lowN_offset == 0 that makes cbrt_Nc = 0 ⇒ hi = +inf ⇒ every alloc
+    // collapses to -inf (silently — the debug post-check passes vacuously
+    // with N = 0); a positive offset avoids the cbrt-of-zero but N = 0 still
+    // degenerates the dual. -200 is far below any depth the descent
+    // legitimately reaches yet leaves ~500 units of headroom, so a runaway
+    // descent clamps here instead of emitting all-(-inf) allocations.
     depth = std::max(depth, -200.0f);
 
     // q_max in parent-loss POV is -min(Q_i).
@@ -162,12 +169,13 @@ inline void compute_log_allocations(Plan* plans, int M,
     }
 
     const double N        = std::exp(static_cast<double>(depth));
-    const double cbrt_N   = std::cbrt(N);
-    const double w_factor = static_cast<double>(c_puct)
-                          * cbrt_N * cbrt_N / 3.0;  // c_puct*N^(2/3)/3
+    const double c_off    = static_cast<double>(lowN_offset);
+    const double cbrt_Nc  = std::cbrt(N + c_off);          // (N + c)^(1/3)
+    const double cnst     = N / cbrt_Nc;                   // const(N) = N/(N+c)^(1/3)
+    const double w_factor = static_cast<double>(c_puct) * cnst / 3.0;
     const double tol_g    = 1.0e-6 * N;
     const double log_w    = std::log(static_cast<double>(c_puct) / 3.0);
-    const double bias     = (2.0 / 3.0) * static_cast<double>(depth) + log_w;
+    const double bias     = std::log(cnst) + log_w;        // = log(c_puct*const/3)
 
     // g(d), g'(d), g''(d) at delta = d. Δ_i = qmax_neg_q - (-Q_i) >= 0.
     auto eval = [plans, M, w_factor, qmax_neg_q, N]
@@ -193,7 +201,7 @@ inline void compute_log_allocations(Plan* plans, int M,
     // there when some Δ_i == 0); we never evaluate at lo. hi is the
     // delta_hi upper bound, where g(hi) <= 0 by the proof above.
     double lo = 0.0;
-    double hi = static_cast<double>(c_puct) / (3.0 * cbrt_N);
+    double hi = static_cast<double>(c_puct) / (3.0 * cbrt_Nc);  // = c_puct*const/(3N)
     double d  = hi;
 
     constexpr int kMaxIters = 32;
@@ -226,8 +234,10 @@ inline void compute_log_allocations(Plan* plans, int M,
         d = d_new;
     }
 
-    // log N_i = log P_i + 2d/3 + log(c_puct/3) - log(e^u + Δ_i),
-    // and since u = log(d), e^u + Δ_i = d + Δ_i directly.
+    // log N_i = log P_i + log(const(N)) + log(c_puct/3) - log(e^u + Δ_i),
+    // where the first two const-dependent terms are folded into `bias`
+    // (= log(const(N)) + log(c_puct/3)); and since u = log(delta),
+    // e^u + Δ_i = delta + Δ_i directly.
     for (int i = 0; i < M; ++i) {
         const double p = static_cast<double>(plans[i].P);
         if (p <= 0.0) {
