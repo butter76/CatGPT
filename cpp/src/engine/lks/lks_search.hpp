@@ -2134,7 +2134,7 @@ private:
             auto [q, d] = v2::unpack_qd(
                 v2::SearchArena::load_qd(root).qd_packed);
             (void)d;
-            if (q < 0.0f) {
+            if (q <= 0.0f) {
                 chess::Move twofold = chess::Move::NO_MOVE;
                 for (const auto& m : legal) {
                     chess::Board cb = board_;
