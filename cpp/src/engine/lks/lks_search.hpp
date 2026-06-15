@@ -1957,7 +1957,7 @@ public:
                     } else {
                         auto [q, d] = v2::unpack_qd(
                             v2::SearchArena::load_qd(ce).qd_packed);
-                        child_Q     = clamp_q_upcoming_rep(q, cb);
+                        child_Q     = detail::clamp_q_upcoming_rep(q, cb);
                         child_depth = d;
                     }
                 }
