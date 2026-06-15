@@ -2059,10 +2059,12 @@ private:
     }
 
     /**
-     * One of the three "no search required" cases at the root:
-     *   - `move == NO_MOVE`         => no legal moves; emit `bestmove 0000`.
-     *   - `tb` empty, real move     => single-legal-move forced reply.
-     *   - `tb` set, real move       => Syzygy DTZ resolution.
+     * One of the "no search required" cases at the root:
+     *   - `move == NO_MOVE`            => no legal moves; emit `bestmove 0000`.
+     *   - `tb` empty, real move        => single-legal-move forced reply.
+     *   - `tb` set, real move          => Syzygy DTZ resolution.
+     *   - `repetition_draw`, real move => losing root TT entry; insta-play a
+     *                                     repetition-causing move to claim a draw.
      *
      * The caller is responsible for emitting the appropriate `info` /
      * `bestmove` lines and skipping the rest of `worker_main`.
@@ -2070,6 +2072,10 @@ private:
     struct RootShortcut {
         chess::Move                          move;
         std::optional<catgpt::SyzygyRootResult> tb;
+        // Set when `move` was chosen by the negative-Q repetition insta-play
+        // (a 3-fold- or 2-fold-causing move that salvages a draw). Mutually
+        // exclusive with `tb`; drives a distinct emit in emit_root_shortcut.
+        bool repetition_draw = false;
     };
 
     /**
@@ -2079,6 +2085,11 @@ private:
      *   2. Exactly one legal move — forced reply.
      *   3. Syzygy DTZ root probe (gated on prober availability +
      *      piece-count + no-castling). The probe itself is cheap.
+     *   4. Losing-root repetition insta-play: if the root has a published TT
+     *      entry whose Q < 0 (side-to-move is losing per the persisted eval),
+     *      claim a draw by insta-playing a repetition-causing move — a 3-fold-
+     *      causing move if one exists, else any 2-fold-causing move. Placed
+     *      after Syzygy so it only fires on non-TB roots.
      * Returns std::nullopt if a real search is needed.
      *
      * Must be called from `worker_main` only (single-threaded); Fathom's
@@ -2097,6 +2108,38 @@ private:
         if (syzygy_ && syzygy_->is_eligible(board_)) {
             if (auto r = syzygy_->probe_root_dtz(board_); r) {
                 return RootShortcut{r->move, std::move(r)};
+            }
+        }
+
+        // Losing-root repetition insta-play. The root TT Q is read exactly as
+        // `root_cp()` does; a negative Q means the side to move is losing, so a
+        // forceable repetition draw strictly improves the outcome. Scan the
+        // legal moves once, preferring a 3-fold-causing move (claimable draw)
+        // and falling back to the first 2-fold-causing move. `makeMove<true>`
+        // updates the hash/repetition history so `isRepetition` sees the new
+        // position (same convention as `bestmove()`).
+        const v2::TTEntry* root =
+            arena_->find(board_.hash(), v2::secondary_hash(board_));
+        if (root != nullptr) {
+            auto [q, d] = v2::unpack_qd(
+                v2::SearchArena::load_qd(root).qd_packed);
+            (void)d;
+            if (q < 0.0f) {
+                chess::Move twofold = chess::Move::NO_MOVE;
+                for (const auto& m : legal) {
+                    chess::Board cb = board_;
+                    cb.makeMove<true>(m);
+                    if (cb.isRepetition(2)) {
+                        return RootShortcut{m, std::nullopt, true};
+                    }
+                    if (twofold == chess::Move::NO_MOVE
+                        && cb.isRepetition(1)) {
+                        twofold = m;
+                    }
+                }
+                if (twofold != chess::Move::NO_MOVE) {
+                    return RootShortcut{twofold, std::nullopt, true};
+                }
             }
         }
         return std::nullopt;
@@ -2138,6 +2181,16 @@ private:
 
         const std::string uci_move = chess::uci::moveToUci(sc.move);
         char buf[256];
+
+        if (sc.repetition_draw) {
+            std::snprintf(buf, sizeof(buf),
+                          "info depth 0 score cp 0 pv %s", uci_move.c_str());
+            emit(buf);
+            emit("info string insta-play repetition draw");
+            std::snprintf(buf, sizeof(buf), "bestmove %s", uci_move.c_str());
+            emit(buf);
+            return;
+        }
 
         if (sc.tb) {
             const int cp = syzygy_wdl_to_cp(sc.tb->wdl);
