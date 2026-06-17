@@ -192,18 +192,9 @@ struct SearchParams {
     float default_depth_constant = 12.0f;
 
     // PUCT allocation constant. Feeds Halley-in-delta dual solve:
-    //   log N_i = log P_i + log(const(N)) + log(c_puct/3) - log(e^u + Δ_i),
-    // where const(N) = N/(N+alloc_lowN_offset)^(1/3) (the 2d/3 = log(N^(2/3))
-    // term generalized), u = log(K - q_max), Δ_i = q_max - q_i, q_i = -Q_i.
+    //   log N_i = log P_i + 2d/3 + log(c_puct/3) - log(e^u + Δ_i),
+    // where u = log(K - q_max), Δ_i = q_max - q_i, q_i = -Q_i.
     float c_puct = 1.75f;
-
-    // Low-N exploitation offset for the PUCT allocation constant. Instead of
-    // N^(2/3) the dual solve uses const(N) = N / (N + alloc_lowN_offset)^(1/3),
-    // which equals N^(2/3) for N >> offset but, at very low N (depth ~ -5),
-    // shifts allocation toward the best child (Q-following) up to a fixed floor
-    // ~ offset^(1/3) instead of collapsing to the raw prior. Sub-linear in N, so
-    // per-child shares stay monotone in N. Set to 0 to recover plain N^(2/3).
-    float alloc_lowN_offset = 40.0f;
 
     // FPU reduction. For unexpanded children we synthesize a parent-POV Q via
     //   Q_eff_parent_pov = parent_Q - fpu_reduction * sqrt(cumulative_P),
@@ -1223,8 +1214,7 @@ inline constexpr auto recursive_search =
         for (; iter < max_iters; ++iter) {
             compute_log_allocations(plans.data(),
                                     static_cast<int>(plans.size()),
-                                    depth, ctx->params->c_puct,
-                                    ctx->params->alloc_lowN_offset);
+                                    depth, ctx->params->c_puct);
 
             // PV pick (computed once per iter, used by both the break
             // gate and the per-plan force-fork). Only meaningful at

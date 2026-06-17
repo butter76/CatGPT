@@ -177,14 +177,13 @@ struct RootSnapshot {
  * arena reads go through `find` / `load_*` which provide the necessary
  * acquire semantics.
  *
- * `c_puct`, `fpu_reduction`, and `alloc_lowN_offset` should match the values
- * supplied in LksSearchConfig.params so the displayed allocations track what
- * the descent is actually doing.
+ * `c_puct` and `fpu_reduction` should match the values supplied in
+ * LksSearchConfig.params so the displayed allocations track what the
+ * descent is actually doing.
  */
 bool snapshot_root(const LksSearch& s,
                    float c_puct,
                    float fpu_reduction,
-                   float alloc_lowN_offset,
                    RootSnapshot& out)
 {
     using namespace catgpt::v2;
@@ -246,7 +245,7 @@ bool snapshot_root(const LksSearch& s,
     const float depth_for_alloc =
         (std::isfinite(md) && md > 0.1f) ? md : 0.1f;
     compute_log_allocations(plans.data(), static_cast<int>(plans.size()),
-                            depth_for_alloc, c_puct, alloc_lowN_offset);
+                            depth_for_alloc, c_puct);
 
     // Softmax-normalize the log allocations into [0, 1] weights. Drop
     // -inf plans (e.g. P == 0) from the sum but keep them with weight 0.
@@ -401,7 +400,6 @@ int main(int argc, char* argv[]) {
         // Capture descent-time tunables BEFORE moving cfg into search().
         const float c_puct        = cfg.params.c_puct;
         const float fpu_reduction = cfg.params.fpu_reduction;
-        const float alloc_lowN_offset = cfg.params.alloc_lowN_offset;
 
         search.search(std::move(cfg));
 
@@ -412,8 +410,7 @@ int main(int argc, char* argv[]) {
         RootSnapshot snap;
         const auto t_phase1 = std::chrono::steady_clock::now();
         while (search.is_searching()) {
-            if (snapshot_root(search, c_puct, fpu_reduction,
-                              alloc_lowN_offset, snap)) break;
+            if (snapshot_root(search, c_puct, fpu_reduction, snap)) break;
             if (std::chrono::steady_clock::now() - t_phase1
                 > std::chrono::seconds(60)) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -431,8 +428,7 @@ int main(int argc, char* argv[]) {
         while (search.is_searching()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             RootSnapshot tmp;
-            if (!snapshot_root(search, c_puct, fpu_reduction,
-                               alloc_lowN_offset, tmp)) continue;
+            if (!snapshot_root(search, c_puct, fpu_reduction, tmp)) continue;
             const auto now      = std::chrono::steady_clock::now();
             const auto since    = now - last_emit_t;
             const bool changed  = tmp.depth_centi != last_depth_centi
@@ -449,8 +445,7 @@ int main(int argc, char* argv[]) {
 
         // ── Phase 3: final snapshot + bestmove ──────────────────────
         RootSnapshot final_snap;
-        if (snapshot_root(search, c_puct, fpu_reduction,
-                          alloc_lowN_offset, final_snap)) {
+        if (snapshot_root(search, c_puct, fpu_reduction, final_snap)) {
             emit_json("search_complete", final_snap);
         }
 
