@@ -185,6 +185,12 @@ struct SearchParams {
     // the selfplay-noise loss tail); 1.0 == plain P(W)-P(L).
     float wl_temp = 0.7f;
 
+    // Root-side-dependent WDL temps. The effective value copied into
+    // `wl_temp` at search launch (see LksSearch::search): a White-to-move
+    // root uses wl_temp_white, otherwise wl_temp_black.
+    float wl_temp_white = 0.5f;
+    float wl_temp_black = 0.75f;
+
     // Heuristic for the initial max_depth stamped onto a freshly evaluated
     // TT entry: default_max_depth = -log(variance * C). Low-variance nodes
     // get a high max_depth so early ID iterations skip re-descending them
@@ -1719,6 +1725,14 @@ public:
         if (is_searching()) {
             throw std::logic_error("LksSearch::search called while a search is already in flight");
         }
+        // Resolve the effective WDL temp from the root side to move: a
+        // White-to-move root sharpens harder (wl_temp_white) than a
+        // Black-to-move root (wl_temp_black). Applied once per search so a
+        // single wl_temp is used uniformly across all leaf evals.
+        config.params.wl_temp =
+            (board_.sideToMove() == chess::Color::WHITE)
+                ? config.params.wl_temp_white
+                : config.params.wl_temp_black;
         // Reap a previous worker_main that exited but is still joinable.
         if (worker_.joinable()) {
             worker_.join();
