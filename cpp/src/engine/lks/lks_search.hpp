@@ -189,7 +189,7 @@ struct SearchParams {
     // `wl_temp` at search launch (see LksSearch::search): a White-to-move
     // root uses wl_temp_white, otherwise wl_temp_black.
     float wl_temp_white = 0.5f;
-    float wl_temp_black = 0.75f;
+    float wl_temp_black = 0.5f;
 
     // Heuristic for the initial max_depth stamped onto a freshly evaluated
     // TT entry: default_max_depth = -log(variance * C). Low-variance nodes
@@ -876,7 +876,7 @@ inline constexpr auto recursive_search =
         // Per-node variance for this fresh TT entry. alloc_node_info
         // pre-fills variance=0; overwrite with the real value before
         // publish so any reader observing this node sees it.
-        const float variance = compute_value_variance(out.value_probs);
+        const float variance = std::max(compute_value_variance(out.value_probs), 0.25f / ctx->params->default_depth_constant);
         v2::NodeInfoHeader* hdr_w = ctx->arena->info_at(off);
         hdr_w->variance = variance;
         hdr_w->force_expand = compute_force_expand(out, static_cast<int>(num_moves));

@@ -602,7 +602,7 @@ int main(int argc, char* argv[]) {
     const float delta_depth = catgpt::env_float("LKS_DELTA_DEPTH", 0.2f);
     const float c_puct      = catgpt::env_float("LKS_C_PUCT", 1.75f);
     const float wl_temp_white = catgpt::env_float("LKS_WL_TEMP_WHITE", 0.5f);
-    const float wl_temp_black = catgpt::env_float("LKS_WL_TEMP_BLACK", 0.75f);
+    const float wl_temp_black = catgpt::env_float("LKS_WL_TEMP_BLACK", 0.5f);
     const float max_depth   = catgpt::env_float("LKS_MAX_DEPTH", 32.0f);
 
     // Game-clock time-management tunables (see LksSearchConfig::TimeControl).
