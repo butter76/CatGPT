@@ -19,6 +19,7 @@ set(GIT_HASH        "unknown")
 set(GIT_HASH_SHORT  "unknown")
 set(GIT_DESCRIBE    "unknown")
 set(GIT_BRANCH      "unknown")
+set(GIT_COMMIT_DATE "unknown")
 set(GIT_DIRTY_BOOL  "false")
 
 find_program(GIT_EXECUTABLE git)
@@ -29,7 +30,7 @@ if(GIT_EXECUTABLE AND IS_DIRECTORY "${SOURCE_DIR}/.git")
         ERROR_QUIET RESULT_VARIABLE _rc)
     if(_rc EQUAL 0 AND _hash)
         set(GIT_HASH "${_hash}")
-        string(SUBSTRING "${_hash}" 0 12 GIT_HASH_SHORT)
+        string(SUBSTRING "${_hash}" 0 7 GIT_HASH_SHORT)
     endif()
 
     execute_process(
@@ -49,12 +50,34 @@ if(GIT_EXECUTABLE AND IS_DIRECTORY "${SOURCE_DIR}/.git")
     endif()
 
     execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C ${SOURCE_DIR} show -s --date=format:%Y-%m-%d --format=%cd HEAD
+        OUTPUT_VARIABLE _cdate OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET RESULT_VARIABLE _rc)
+    if(_rc EQUAL 0 AND _cdate)
+        set(GIT_COMMIT_DATE "${_cdate}")
+    endif()
+
+    execute_process(
         COMMAND ${GIT_EXECUTABLE} -C ${SOURCE_DIR} status --porcelain --untracked-files=no
         OUTPUT_VARIABLE _status OUTPUT_STRIP_TRAILING_WHITESPACE
         ERROR_QUIET RESULT_VARIABLE _rc)
     if(_rc EQUAL 0 AND _status)
         set(GIT_DIRTY_BOOL "true")
     endif()
+endif()
+
+# Canonical, human-facing version string. Labeled so the commit hash is
+# obvious wherever the engine identifies itself, e.g.
+#   commit 289e575 (2026-06-21)
+#   commit 289e575-dirty (2026-06-21)   (uncommitted changes present)
+if(GIT_HASH STREQUAL "unknown")
+    set(VERSION_STRING "nogit build")
+else()
+    set(_dirty "")
+    if(GIT_DIRTY_BOOL)
+        set(_dirty "-dirty")
+    endif()
+    set(VERSION_STRING "commit ${GIT_HASH_SHORT}${_dirty} (${GIT_COMMIT_DATE})")
 endif()
 
 set(_content
@@ -66,11 +89,15 @@ set(_content
 
 namespace catgpt::version {
 
-inline constexpr const char* GIT_HASH       = \"${GIT_HASH}\";
-inline constexpr const char* GIT_HASH_SHORT = \"${GIT_HASH_SHORT}\";
-inline constexpr const char* GIT_DESCRIBE   = \"${GIT_DESCRIBE}\";
-inline constexpr const char* GIT_BRANCH     = \"${GIT_BRANCH}\";
-inline constexpr bool        GIT_DIRTY      = ${GIT_DIRTY_BOOL};
+inline constexpr const char* GIT_HASH        = \"${GIT_HASH}\";
+inline constexpr const char* GIT_HASH_SHORT  = \"${GIT_HASH_SHORT}\";
+inline constexpr const char* GIT_DESCRIBE    = \"${GIT_DESCRIBE}\";
+inline constexpr const char* GIT_BRANCH      = \"${GIT_BRANCH}\";
+inline constexpr const char* GIT_COMMIT_DATE = \"${GIT_COMMIT_DATE}\";
+inline constexpr bool        GIT_DIRTY       = ${GIT_DIRTY_BOOL};
+
+// Canonical labeled version string, e.g. \"commit 289e575 (2026-06-21)\".
+inline constexpr const char* VERSION_STRING  = \"${VERSION_STRING}\";
 
 }  // namespace catgpt::version
 ")

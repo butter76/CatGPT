@@ -30,7 +30,7 @@
  *                            `go`)
  *   LKS_WL_TEMP_WHITE       (default 0.5; WDL win-vs-loss sharpening temp
  *                            used when the root is White-to-move)
- *   LKS_WL_TEMP_BLACK       (default 0.75; WDL win-vs-loss sharpening temp
+ *   LKS_WL_TEMP_BLACK       (default 0.5; WDL win-vs-loss sharpening temp
  *                            used when the root is Black-to-move; the
  *                            resolved value is piped into
  *                            LksSearchConfig::params.wl_temp at search
@@ -263,11 +263,12 @@ private:
     }
 
     void handle_uci() {
-        std::println("id name {} {}{}",
-                     ENGINE_NAME,
-                     catgpt::version::GIT_DESCRIBE,
-                     catgpt::version::GIT_DIRTY ? "-dirty" : "");
+        std::println("id name {} {}", ENGINE_NAME, catgpt::version::VERSION_STRING);
         std::println("id author {}", ENGINE_AUTHOR);
+        std::println("info string {} {} on branch {}",
+                     ENGINE_NAME,
+                     catgpt::version::VERSION_STRING,
+                     catgpt::version::GIT_BRANCH);
         std::println("uciok");
         std::fflush(stdout);
     }
@@ -572,10 +573,20 @@ int main(int argc, char* argv[]) {
     std::ios_base::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
-    std::println(stderr, "CatGPT lks_uci  version={}  commit={}{}  branch={}",
-                 catgpt::version::GIT_DESCRIBE,
-                 catgpt::version::GIT_HASH_SHORT,
-                 catgpt::version::GIT_DIRTY ? " (dirty)" : "",
+    if (argc > 1) {
+        std::string_view a1{argv[1]};
+        if (a1 == "--version" || a1 == "-v") {
+            std::println("{} {} on branch {}",
+                         catgpt::ENGINE_NAME,
+                         catgpt::version::VERSION_STRING,
+                         catgpt::version::GIT_BRANCH);
+            return 0;
+        }
+    }
+
+    std::println(stderr, "{} {} on branch {}",
+                 catgpt::ENGINE_NAME,
+                 catgpt::version::VERSION_STRING,
                  catgpt::version::GIT_BRANCH);
 
     fs::path engine_path;

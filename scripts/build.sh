@@ -415,6 +415,7 @@ fi
 # ---------------------------------------------------------------------------
 
 phase "Done"
+log "engine id     = $("$CATGPT_BIN" --version 2>/dev/null || echo unknown)"
 log "catgpt        = $CATGPT_BIN"
 log "lks_uci       = $LKS_UCI_BIN"
 log "trt_benchmark = $TRT_BENCH_BIN"
@@ -422,3 +423,12 @@ log "${MODEL}.network  = $NETWORK_PATH"
 log "bench log     = $TRT_BENCH_LOG"
 echo
 echo "OK: $CATGPT_BIN $NETWORK_PATH"
+
+# Final, prominent summary of the exact commit this build was produced
+# from. Mirrors the engine's own labeled version string
+# (commit <sha7> (<date>)) and is intentionally the last line printed.
+UPDATED_HASH=$(git -C "$REPO_DIR" rev-parse --short=7 HEAD 2>/dev/null || echo unknown)
+UPDATED_DATE=$(git -C "$REPO_DIR" show -s --date=format:%Y-%m-%d --format=%cd HEAD 2>/dev/null || echo unknown)
+UPDATED_BRANCH=$(git -C "$REPO_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+echo
+log "CatGPT updated to: commit ${UPDATED_HASH} (${UPDATED_DATE}) on ${UPDATED_BRANCH}"

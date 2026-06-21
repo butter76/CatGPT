@@ -1118,10 +1118,8 @@ void print_header() {
     std::println("╔════════════════════════════════════════════════════════════════╗");
     std::println("║         CatGPT Chess Engine - TensorRT Benchmark               ║");
     std::println("╚════════════════════════════════════════════════════════════════╝");
-    std::println("Version: {}  commit: {}{}  branch: {}",
-                 catgpt::version::GIT_DESCRIBE,
-                 catgpt::version::GIT_HASH_SHORT,
-                 catgpt::version::GIT_DIRTY ? " (dirty)" : "",
+    std::println("{} on branch {}",
+                 catgpt::version::VERSION_STRING,
                  catgpt::version::GIT_BRANCH);
 }
 
