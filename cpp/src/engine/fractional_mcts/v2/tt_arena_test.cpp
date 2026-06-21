@@ -108,14 +108,14 @@ constexpr const char* kind_name(TerminalKind k) {
 void test_static_layout() {
     std::printf("[1] static layout (sizeof, alignof, trivially copyable)\n");
 
-    static_assert(sizeof(MoveInfo) == 8, "MoveInfo size regression");
-    static_assert(alignof(MoveInfo) == 4, "MoveInfo alignment regression");
+    static_assert(sizeof(MoveInfo) == 4, "MoveInfo size regression");
+    static_assert(alignof(MoveInfo) == 2, "MoveInfo alignment regression");
     static_assert(std::is_trivially_copyable_v<MoveInfo>,
                   "MoveInfo must stay trivially copyable");
     static_assert(sizeof(_Float16) == 2, "_Float16 must be IEEE 754 binary16");
 
-    EXPECT(sizeof(MoveInfo) == 8);
-    EXPECT(alignof(MoveInfo) == 4);
+    EXPECT(sizeof(MoveInfo) == 4);
+    EXPECT(alignof(MoveInfo) == 2);
 }
 
 void test_non_terminal_round_trip() {
@@ -407,14 +407,13 @@ void test_exhaustive_packed_patterns_never_crash() {
     uint64_t nan_count = 0;
 
     for (uint32_t packed = 0; packed < 0x10000u; ++packed) {
-        // Bit-pack into MoveInfo's 8-byte layout:
-        //   low 32b = [_packed u16][move u16], high 32b = repetition_depth.
-        // Probe every 16-bit pattern in _packed; keep `move` fixed (and the
-        // repetition_depth half arbitrary) to make the scan one-dimensional.
-        const uint64_t word =
-              (static_cast<uint64_t>(packed) << 16)         // _packed
-            |  static_cast<uint64_t>(0x5678u)               // move
-            | (static_cast<uint64_t>(0xDEADBEEFu) << 32);   // repetition_depth
+        // Bit-pack into MoveInfo's 4-byte layout:
+        //   low 16b = move, high 16b = _packed.
+        // Probe every 16-bit pattern in _packed; keep `move` fixed to make
+        // the scan one-dimensional.
+        const uint32_t word =
+              (packed << 16)            // _packed
+            |  0x5678u;                  // move
         MoveInfo mi = std::bit_cast<MoveInfo>(word);
         EXPECT(mi.move == 0x5678u);
 

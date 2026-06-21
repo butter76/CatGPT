@@ -135,13 +135,13 @@ static float env_float(const char* name, float fallback) {
 // arena) from LKS_LIFETIME_MAX_EVALS and warn if it approaches the TCEC
 // per-engine RAM ceiling. Mirrors SearchArena::compute_capacity /
 // compute_arena_bytes (load_factor 0.5, avg_moves_per_node 40) and the
-// fixed type sizes (sizeof(TTEntry)==32, NodeInfoHeader 12, MoveInfo 8).
+// fixed type sizes (sizeof(TTEntry)==32, NodeInfoHeader 12, MoveInfo 4).
 // The bit_ceil rounding of the TT can nearly double its size near a
 // power-of-two boundary, so it is reported explicitly. TRT weights and
 // pinned host buffers are excluded (a few GB total, per GPU).
 static void log_arena_footprint(uint64_t k_max_evals) {
     constexpr uint64_t kTtEntryBytes   = 32;
-    constexpr uint64_t kPerNodeBytes   = 12 + 40 * 8;  // header + 40 MoveInfo
+    constexpr uint64_t kPerNodeBytes   = 12 + 40 * 4;  // header + 40 MoveInfo
     // load_factor 0.5 -> target capacity = 2 * K, then next pow2.
     const double   target = static_cast<double>(k_max_evals) / 0.5;
     const uint64_t want   = target < 16.0

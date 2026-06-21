@@ -691,53 +691,6 @@ struct RecurseContext {
 };
 
 /**
- * Intrusive, stack-allocated frame for the current descent path.
- *
- * Each `recursive_search` invocation owns one `PathFrame` (a local in its
- * coroutine frame) recording its position `hash` and search `depth`, and
- * links to its caller's frame via `parent`. Children receive `&frame` and
- * read the chain to locate a repeating ancestor's depth (see
- * `repeating_ancestor_depth`).
- *
- * Lifetime: a parent is suspended at `lf::join` while its children run, so
- * its coroutine frame (and thus its `PathFrame`) outlives every descendant
- * that holds a pointer to it. The frame is immutable after construction, so
- * concurrent reads by sibling subtrees are race-free without any atomics.
- *
- * The chain spans only POST-root search nodes: the root's frame has
- * `parent == nullptr`. Pre-root game-history positions (baked into the
- * board's repetition history) are therefore NOT in the chain — a repetition
- * against one of them is reported as `+inf` depth by the walk below, which
- * is exactly the "infinite depth if the repeat happened before the root"
- * semantics the repetition gate wants.
- */
-struct PathFrame {
-    uint64_t         hash;
-    float            depth;
-    const PathFrame* parent;
-};
-
-/**
- * Walk the path chain from `start` (the current node's own frame) toward the
- * root, returning the search `depth` of the nearest ancestor whose position
- * hash equals `rep_hash`. Returns +inf when no on-path ancestor matches,
- * i.e. the repetition is with a pre-root position.
- *
- * The nearest (closest-to-leaf) match is the most recent occurrence and is
- * guaranteed to lie within the half-move window whenever `isRepetition(1)`
- * fired, so this is the correct repeating position to attribute the draw to.
- * Opposite-side-to-move ancestors never match (side-to-move is folded into
- * the Zobrist key), so a plain hash compare over the whole chain is safe.
- */
-[[nodiscard]] inline float repeating_ancestor_depth(
-    const PathFrame* start, uint64_t rep_hash) noexcept {
-    for (const PathFrame* p = start; p != nullptr; p = p->parent) {
-        if (p->hash == rep_hash) return p->depth;
-    }
-    return std::numeric_limits<float>::infinity();
-}
-
-/**
  * A TT Q is stored without repetition/50-move history (Zobrist excludes it),
  * so a position scored as losing may actually be a forceable draw on THIS
  * path. When the side to move at `b` can force an upcoming repetition, floor a
@@ -803,17 +756,11 @@ inline constexpr auto recursive_search =
        float depth,
        uint32_t rec_depth,
        bool pv_mode,
-       const PathFrame* parent_frame,
        Plan* out) -> lf::task<void>
 {
     if (ctx->w->should_abort()) co_return;
 
     const uint64_t key = board.hash();
-
-    // This node's path frame, linking to the caller's. Lives for the whole
-    // descent (the coroutine stays alive across every co_await/join below),
-    // so children may safely hold `&frame`. Immutable after construction.
-    const PathFrame frame{key, depth, parent_frame};
     const uint32_t sec = v2::secondary_hash(board);
     v2::TTEntry* entry = ctx->arena->find(key, sec);
 
@@ -1029,10 +976,10 @@ inline constexpr auto recursive_search =
 
     // Set true if any of the first `hdr->force_expand` (highest-prior)
     // moves is a path-dependent draw — a 2-fold repetition draw
-    // (`isRepetition(1)`) / 50-move draw on this path, or a draw adopted via
-    // the recorded `repetition_depth`. When a top move only draws, iter-0 force-expands
-    // ALL unexpanded children (see Pass 2's force_all_unexpanded) so the
-    // descent looks past the draw for a non-drawing alternative.
+    // (`isRepetition(1)`) / 50-move draw on this path. When a top move only
+    // draws, iter-0 force-expands ALL unexpanded children (see Pass 2's
+    // force_all_unexpanded) so the descent looks past the draw for a
+    // non-drawing alternative.
     bool top_move_pathdraw = false;
 
     for (uint16_t i = 0; i < num_moves; ++i) {
@@ -1085,26 +1032,15 @@ inline constexpr auto recursive_search =
         // same reason as terminal_kind rows (see comment above).
         //
         //   50-move rule: a plain path-local draw — drawn for THIS caller
-        //   only, with no shared MoveInfo mutation.
+        //   only.
         //
         //   repetition: a path-local draw for the discoverer under a plain
         //   2-fold repetition check (`isRepetition(1)`): any position seen once
-        //   before within the half-move window draws. We also record the repeating
-        //   ancestor's search `depth` into the shared MoveInfo (+inf if the
-        //   repeat is pre-root). Other descenders of this parent that do NOT
-        //   themselves repeat consult that recorded `repetition_depth` and
-        //   treat the move as a draw iff their node's `depth` is strictly below
-        //   it (a low-budget visit is more likely to be inside the same cyclic
-        //   line). The recorded value is a non-monotonic last-writer-wins
-        //   relaxed store, so it may decrease.
+        //   before within the half-move window draws.
         bool draw_here = false;
         if (cb.isHalfMoveDraw()) {
             draw_here = true;
         } else if (cb.isRepetition(1)) {
-            if (pv_mode) {
-                moves[i].record_repetition_depth(
-                    repeating_ancestor_depth(&frame, cb.hash()));
-            }
             draw_here = true;
         }
         if (draw_here) {
@@ -1342,7 +1278,7 @@ inline constexpr auto recursive_search =
                 p.isPV = pv_mode_child;
                 co_await lf::fork[recursive_search](
                     ctx, std::move(child_permit), std::move(cb),
-                    target_depth, rec_depth + 1, pv_mode_child, &frame, &p);
+                    target_depth, rec_depth + 1, pv_mode_child, &p);
             }
 
             if (any_fork) {
@@ -1452,8 +1388,7 @@ inline constexpr auto root_search =
     lfsync::Permit p = co_await ctx->sem->acquire();
     co_await lf::call[recursive_search](
         ctx, std::move(p), std::move(board), depth,
-        /*rec_depth=*/0u, /*pv_mode=*/true,
-        /*parent_frame=*/nullptr, /*out=*/nullptr);
+        /*rec_depth=*/0u, /*pv_mode=*/true, /*out=*/nullptr);
     co_await lf::join;
 };
 
