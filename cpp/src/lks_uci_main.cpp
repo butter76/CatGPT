@@ -73,11 +73,14 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <print>
+#include <set>
 #include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -134,7 +137,7 @@ static float env_float(const char* name, float fallback) {
 // Estimate the resident footprint of the shared SearchArena (TT + node
 // arena) from LKS_LIFETIME_MAX_EVALS and warn if it approaches the TCEC
 // per-engine RAM ceiling. Mirrors SearchArena::compute_capacity /
-// compute_arena_bytes (load_factor 0.5, avg_moves_per_node 40) and the
+// compute_arena_bytes (load_factor 0.6, avg_moves_per_node 40) and the
 // fixed type sizes (sizeof(TTEntry)==32, NodeInfoHeader 12, MoveInfo 4).
 // The bit_ceil rounding of the TT can nearly double its size near a
 // power-of-two boundary, so it is reported explicitly. TRT weights and
@@ -142,8 +145,8 @@ static float env_float(const char* name, float fallback) {
 static void log_arena_footprint(uint64_t k_max_evals) {
     constexpr uint64_t kTtEntryBytes   = 32;
     constexpr uint64_t kPerNodeBytes   = 12 + 40 * 4;  // header + 40 MoveInfo
-    // load_factor 0.5 -> target capacity = 2 * K, then next pow2.
-    const double   target = static_cast<double>(k_max_evals) / 0.5;
+    // load_factor 0.6 -> target capacity = K / 0.6, then next pow2.
+    const double   target = static_cast<double>(k_max_evals) / 0.6;
     const uint64_t want   = target < 16.0
                               ? 16ULL
                               : static_cast<uint64_t>(target) + 1ULL;
@@ -569,29 +572,123 @@ private:
 
 }  // namespace catgpt
 
+// Prints CLI usage. Every flag also has an LKS_* env equivalent; the CLI
+// flag wins when both are set, and both override the built-in default.
+static void print_usage(const char* prog) {
+    std::println("{} {}", catgpt::ENGINE_NAME, catgpt::version::VERSION_STRING);
+    std::println(
+        "\n"
+        "Usage: {} [network] [options]\n"
+        "\n"
+        "Positional:\n"
+        "  network                      TensorRT .network bundle\n"
+        "                               (else $CATGPT_TRT_ENGINE, else ./S4.network)\n"
+        "\n"
+        "Options (CLI > matching LKS_* env var > default):\n"
+        "  --network PATH               network bundle path\n"
+        "  --syzygy-path PATH           Syzygy tablebase dir  [LKS_SYZYGY_PATH / SYZYGY_HOME]\n"
+        "  --workers-per-gpu N          search workers per GPU   [LKS_WORKERS_PER_GPU=2]\n"
+        "  --coros-per-worker N         coroutines per worker    [LKS_COROS_PER_WORKER=256]\n"
+        "  --max-batch N                max eval batch size      [LKS_MAX_BATCH_SIZE=112]\n"
+        "  --max-evals N                lifetime eval/arena cap  [LKS_LIFETIME_MAX_EVALS]\n"
+        "  --delta-depth F              [LKS_DELTA_DEPTH=0.2]\n"
+        "  --c-puct F                   [LKS_C_PUCT=1.75]\n"
+        "  --wl-temp-white F            [LKS_WL_TEMP_WHITE=0.5]\n"
+        "  --wl-temp-black F            [LKS_WL_TEMP_BLACK=0.5]\n"
+        "  --max-depth F                [LKS_MAX_DEPTH=32]\n"
+        "  --time-reserve-ms N          [LKS_TIME_RESERVE_MS]\n"
+        "  --time-soft-pct F            [LKS_TIME_SOFT_PCT]\n"
+        "  --time-hard-pct F            [LKS_TIME_HARD_PCT]\n"
+        "  --time-first-move-pct F      [LKS_TIME_FIRST_MOVE_PCT]\n"
+        "  --time-surprise-pct F        [LKS_TIME_SURPRISE_PCT]\n"
+        "  --time-change-bonus-pct F    [LKS_TIME_CHANGE_BONUS_PCT]\n"
+        "  --time-worsen-bonus-pct F    [LKS_TIME_WORSEN_BONUS_PCT]\n"
+        "  --time-worsen-cp N           [LKS_TIME_WORSEN_CP]\n"
+        "  --time-early-return-margin F [LKS_TIME_EARLY_RETURN_MARGIN]\n"
+        "  -v, --version                print version and exit\n"
+        "  -h, --help                   print this help and exit",
+        prog);
+}
+
 int main(int argc, char* argv[]) {
     std::ios_base::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
-    if (argc > 1) {
-        std::string_view a1{argv[1]};
-        if (a1 == "--version" || a1 == "-v") {
-            std::println("{} {} on branch {}",
-                         catgpt::ENGINE_NAME,
-                         catgpt::version::VERSION_STRING,
-                         catgpt::version::GIT_BRANCH);
-            return 0;
+    // ── CLI parsing ──────────────────────────────────────────────────
+    // Precedence is CLI flag > LKS_* env var > built-in default. Accepts
+    // "--flag value", "--flag=value", and a single positional network path.
+    std::unordered_map<std::string, std::string> cli;
+    std::optional<std::string> positional;
+    static const std::set<std::string_view> kBoolFlags =
+        {"--version", "-v", "--help", "-h"};
+    for (int i = 1; i < argc; ++i) {
+        std::string_view a{argv[i]};
+        if (a.starts_with("--") || a == "-v" || a == "-h") {
+            if (auto eq = a.find('='); eq != std::string_view::npos) {
+                cli[std::string(a.substr(0, eq))] = std::string(a.substr(eq + 1));
+            } else if (!kBoolFlags.contains(a) && i + 1 < argc
+                       && !std::string_view(argv[i + 1]).starts_with("-")) {
+                cli[std::string(a)] = argv[++i];
+            } else {
+                cli[std::string(a)] = "true";
+            }
+        } else if (!positional) {
+            positional = std::string(a);
         }
     }
+
+    if (cli.contains("--version") || cli.contains("-v")) {
+        std::println("{} {} on branch {}",
+                     catgpt::ENGINE_NAME,
+                     catgpt::version::VERSION_STRING,
+                     catgpt::version::GIT_BRANCH);
+        return 0;
+    }
+    if (cli.contains("--help") || cli.contains("-h")) {
+        print_usage(argv[0]);
+        return 0;
+    }
+
+    // CLI>env>default resolvers. `cli_str` exposes a raw flag value;
+    // numeric resolvers parse strictly and abort loudly on bad input
+    // (explicit operator intent), unlike the tolerant env_* fallbacks.
+    auto cli_str = [&](const char* flag) -> std::optional<std::string> {
+        if (auto it = cli.find(flag); it != cli.end()) return it->second;
+        return std::nullopt;
+    };
+    auto cli_int = [&](const char* flag, const char* env, int def) -> int {
+        if (auto v = cli_str(flag)) {
+            try { return std::stoi(*v); }
+            catch (...) { std::println(stderr, "Error: bad integer for {}: {}", flag, *v); std::exit(2); }
+        }
+        return catgpt::env_int(env, def);
+    };
+    auto cli_u64 = [&](const char* flag, const char* env, uint64_t def) -> uint64_t {
+        if (auto v = cli_str(flag)) {
+            try { return std::stoull(*v); }
+            catch (...) { std::println(stderr, "Error: bad integer for {}: {}", flag, *v); std::exit(2); }
+        }
+        return catgpt::env_u64(env, def);
+    };
+    auto cli_float = [&](const char* flag, const char* env, float def) -> float {
+        if (auto v = cli_str(flag)) {
+            try { return std::stof(*v); }
+            catch (...) { std::println(stderr, "Error: bad number for {}: {}", flag, *v); std::exit(2); }
+        }
+        return catgpt::env_float(env, def);
+    };
 
     std::println(stderr, "{} {} on branch {}",
                  catgpt::ENGINE_NAME,
                  catgpt::version::VERSION_STRING,
                  catgpt::version::GIT_BRANCH);
 
+    // Engine path: positional > --network > $CATGPT_TRT_ENGINE > default.
     fs::path engine_path;
-    if (argc > 1) {
-        engine_path = argv[1];
+    if (positional) {
+        engine_path = *positional;
+    } else if (auto v = cli_str("--network")) {
+        engine_path = *v;
     } else if (const char* env = std::getenv("CATGPT_TRT_ENGINE")) {
         engine_path = env;
     } else {
@@ -601,50 +698,51 @@ int main(int argc, char* argv[]) {
     if (!fs::exists(engine_path)) {
         std::println(stderr, "Error: TensorRT engine file not found: {}",
                      engine_path.string());
-        std::println(stderr, "Usage: {} [engine_path]", argv[0]);
+        std::println(stderr, "Run '{} --help' for usage.", argv[0]);
         return 1;
     }
 
-    const int workers_per_gpu  = catgpt::env_int("LKS_WORKERS_PER_GPU", 2);
-    const int coros_per_worker = catgpt::env_int("LKS_COROS_PER_WORKER", 256);
-    const int max_batch_size   = catgpt::env_int("LKS_MAX_BATCH_SIZE", 112);
+    const int workers_per_gpu  = cli_int("--workers-per-gpu", "LKS_WORKERS_PER_GPU", 2);
+    const int coros_per_worker = cli_int("--coros-per-worker", "LKS_COROS_PER_WORKER", 256);
+    const int max_batch_size   = cli_int("--max-batch", "LKS_MAX_BATCH_SIZE", 112);
     const uint64_t lifetime_max_evals =
-        catgpt::env_u64("LKS_LIFETIME_MAX_EVALS", 1ULL << 27);
-    const float delta_depth = catgpt::env_float("LKS_DELTA_DEPTH", 0.2f);
-    const float c_puct      = catgpt::env_float("LKS_C_PUCT", 1.75f);
-    const float wl_temp_white = catgpt::env_float("LKS_WL_TEMP_WHITE", 0.5f);
-    const float wl_temp_black = catgpt::env_float("LKS_WL_TEMP_BLACK", 0.5f);
-    const float max_depth   = catgpt::env_float("LKS_MAX_DEPTH", 32.0f);
+        cli_u64("--max-evals", "LKS_LIFETIME_MAX_EVALS", 1ULL << 27);
+    const float delta_depth = cli_float("--delta-depth", "LKS_DELTA_DEPTH", 0.2f);
+    const float c_puct      = cli_float("--c-puct", "LKS_C_PUCT", 1.75f);
+    const float wl_temp_white = cli_float("--wl-temp-white", "LKS_WL_TEMP_WHITE", 0.5f);
+    const float wl_temp_black = cli_float("--wl-temp-black", "LKS_WL_TEMP_BLACK", 0.5f);
+    const float max_depth   = cli_float("--max-depth", "LKS_MAX_DEPTH", 32.0f);
 
     // Game-clock time-management tunables (see LksSearchConfig::TimeControl).
     // Only the constant knobs are loaded here; per-go clock inputs and the
     // first-move/surprise flags are filled in by the driver at search time.
     catgpt::lks::TimeControl time_tunables;
     time_tunables.reserve_ms =
-        catgpt::env_int("LKS_TIME_RESERVE_MS",
-                        static_cast<int>(time_tunables.reserve_ms));
+        cli_int("--time-reserve-ms", "LKS_TIME_RESERVE_MS",
+                static_cast<int>(time_tunables.reserve_ms));
     time_tunables.soft_pct =
-        catgpt::env_float("LKS_TIME_SOFT_PCT", time_tunables.soft_pct);
+        cli_float("--time-soft-pct", "LKS_TIME_SOFT_PCT", time_tunables.soft_pct);
     time_tunables.hard_pct =
-        catgpt::env_float("LKS_TIME_HARD_PCT", time_tunables.hard_pct);
+        cli_float("--time-hard-pct", "LKS_TIME_HARD_PCT", time_tunables.hard_pct);
     time_tunables.first_move_pct =
-        catgpt::env_float("LKS_TIME_FIRST_MOVE_PCT", time_tunables.first_move_pct);
+        cli_float("--time-first-move-pct", "LKS_TIME_FIRST_MOVE_PCT", time_tunables.first_move_pct);
     time_tunables.surprise_pct =
-        catgpt::env_float("LKS_TIME_SURPRISE_PCT", time_tunables.surprise_pct);
+        cli_float("--time-surprise-pct", "LKS_TIME_SURPRISE_PCT", time_tunables.surprise_pct);
     time_tunables.change_bonus_pct =
-        catgpt::env_float("LKS_TIME_CHANGE_BONUS_PCT", time_tunables.change_bonus_pct);
+        cli_float("--time-change-bonus-pct", "LKS_TIME_CHANGE_BONUS_PCT", time_tunables.change_bonus_pct);
     time_tunables.worsen_bonus_pct =
-        catgpt::env_float("LKS_TIME_WORSEN_BONUS_PCT", time_tunables.worsen_bonus_pct);
+        cli_float("--time-worsen-bonus-pct", "LKS_TIME_WORSEN_BONUS_PCT", time_tunables.worsen_bonus_pct);
     time_tunables.worsen_threshold_cp =
-        catgpt::env_int("LKS_TIME_WORSEN_CP", time_tunables.worsen_threshold_cp);
+        cli_int("--time-worsen-cp", "LKS_TIME_WORSEN_CP", time_tunables.worsen_threshold_cp);
     time_tunables.early_return_margin =
-        catgpt::env_float("LKS_TIME_EARLY_RETURN_MARGIN",
-                          time_tunables.early_return_margin);
+        cli_float("--time-early-return-margin", "LKS_TIME_EARLY_RETURN_MARGIN",
+                  time_tunables.early_return_margin);
 
-    // Syzygy path resolution: LKS_SYZYGY_PATH overrides; otherwise fall
-    // back to $SYZYGY_HOME (the conventional name); empty = disabled.
+    // Syzygy path: --syzygy-path > $LKS_SYZYGY_PATH > $SYZYGY_HOME; empty = disabled.
     fs::path syzygy_path;
-    if (const char* p = std::getenv("LKS_SYZYGY_PATH"); p && *p) {
+    if (auto v = cli_str("--syzygy-path"); v && !v->empty()) {
+        syzygy_path = *v;
+    } else if (const char* p = std::getenv("LKS_SYZYGY_PATH"); p && *p) {
         syzygy_path = p;
     } else if (const char* p = std::getenv("SYZYGY_HOME"); p && *p) {
         syzygy_path = p;

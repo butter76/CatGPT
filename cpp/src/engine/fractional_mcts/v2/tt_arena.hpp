@@ -501,12 +501,12 @@ class SearchArena {
 public:
     /**
      * @param k_max_evals          Upper bound on number of GPU evals (== TT entries).
-     * @param load_factor          TT load factor target (e.g. 0.5).
+     * @param load_factor          TT load factor target (e.g. 0.6).
      * @param avg_moves_per_node   Used to size the arena. p99 in chess is ~80;
      *                             40 is comfortably above the median (~30).
      */
     explicit SearchArena(uint64_t k_max_evals,
-                         double load_factor = 0.5,
+                         double load_factor = 0.6,
                          uint64_t avg_moves_per_node = 40,
                          const numa::Topology* topo = nullptr)
         : capacity_(compute_capacity(k_max_evals, load_factor))
@@ -917,7 +917,7 @@ public:
 
 private:
     static uint64_t compute_capacity(uint64_t k_max_evals, double load_factor) {
-        if (load_factor <= 0.0 || load_factor >= 1.0) load_factor = 0.5;
+        if (load_factor <= 0.0 || load_factor >= 1.0) load_factor = 0.6;
         const double target = static_cast<double>(k_max_evals) / load_factor;
         uint64_t want = (target < 16.0) ? 16ULL : static_cast<uint64_t>(target) + 1ULL;
         return std::bit_ceil(want);

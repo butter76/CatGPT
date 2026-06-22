@@ -46,7 +46,7 @@ engine:
     coros_per_worker: 32    # per-worker libfork permit count
     max_batch_size: 32      # per-worker GPU batch cap
     lifetime_max_evals: 524288  # 1 << 19; SearchArena capacity. TT table is
-                                # 2 * bit_ceil(this) * 32 B and is zero-filled
+                                # bit_ceil(this / 0.6) * 32 B and is zero-filled
                                 # on every `position` command — keep small so
                                 # per-move reset() is milliseconds, not seconds.
 

@@ -1523,7 +1523,7 @@ public:
 
         {
             const auto t0 = std::chrono::steady_clock::now();
-            arena_.emplace(lifetime_max_evals_, /*load_factor=*/0.5,
+            arena_.emplace(lifetime_max_evals_, /*load_factor=*/0.6,
                            /*avg_moves_per_node=*/40, &topo_);
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - t0).count();
@@ -1625,7 +1625,7 @@ public:
         // and evaluators are NOT rebuilt. The parallel init keeps the
         // per-`ucinewgame` reallocation off the critical path for huge TTs.
         const auto t0 = std::chrono::steady_clock::now();
-        arena_.emplace(lifetime_max_evals_, /*load_factor=*/0.5,
+        arena_.emplace(lifetime_max_evals_, /*load_factor=*/0.6,
                        /*avg_moves_per_node=*/40, &topo_);
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - t0).count();
