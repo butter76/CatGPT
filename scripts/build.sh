@@ -411,6 +411,19 @@ if (( bench_rc != 0 )); then
 fi
 
 # ---------------------------------------------------------------------------
+# Phase 9: search bench (real search self-test via the engine binary)
+# ---------------------------------------------------------------------------
+
+phase "Phase 9: search bench"
+
+# EXE is the catgpt wrapper (which sets LD_LIBRARY_PATH); kept as a named var
+# so the same invocation pattern can be reused upstream (e.g. a TCEC
+# update.sh that ends in `"$EXE" bench`).
+EXE="$CATGPT_BIN"
+log "running search bench: $EXE bench --network $NETWORK_PATH"
+"$EXE" bench --network "$NETWORK_PATH"
+
+# ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 

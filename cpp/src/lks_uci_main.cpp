@@ -95,6 +95,14 @@ namespace catgpt {
 inline constexpr std::string_view ENGINE_NAME = "CatGPT-LKS";
 inline constexpr std::string_view ENGINE_AUTHOR = "CatGPT Team";
 
+// Defaults for the `catgpt bench` self-test: a middlegame position searched
+// to a fixed GPU-eval budget. The arena is deliberately small so a bench runs
+// light regardless of the much larger --max-evals used in production configs.
+inline constexpr std::string_view kBenchFen =
+    "r3rk2/1pbq1n1p/p1p1pnp1/2Pp1p2/PP1P1B1P/3BPNP1/2Q2PK1/2R4R b - - 1 21";
+inline constexpr uint64_t kBenchNodes    = 200000;
+inline constexpr uint64_t kBenchArenaCap = 1ULL << 22;
+
 // Canonical startpos FEN; chess::Board(STARTPOS_FEN) accepts this.
 inline constexpr std::string_view STARTPOS_FEN =
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -572,6 +580,55 @@ private:
 
 }  // namespace catgpt
 
+// Runs a single fixed-position search to a fixed eval budget and prints a
+// node/nps summary, then returns (self-terminating, unlike the async UCI
+// `go` loop). Mirrors the synchronous search pattern in lks_search_main.cpp.
+static int run_bench(const fs::path& engine_path, const std::string& fen,
+                     uint64_t nodes, int workers, int coros, int max_batch,
+                     fs::path syzygy) {
+    if (!fs::exists(engine_path)) {
+        std::println(stderr, "Error: TensorRT engine file not found: {}",
+                     engine_path.string());
+        return 1;
+    }
+    try {
+        catgpt::lks::LksSearch search(engine_path, catgpt::kBenchArenaCap,
+                                      workers, coros, max_batch,
+                                      std::move(syzygy));
+        search.setBoard(chess::Board(fen));
+
+        catgpt::lks::LksSearchConfig cfg;
+        cfg.max_evals = nodes;
+        cfg.on_uci_line = [](std::string_view) {};  // suppress info lines
+
+        std::println(stderr, "Engine loaded; running bench ({} eval budget)", nodes);
+        const auto t0 = std::chrono::steady_clock::now();
+        search.search(std::move(cfg));
+        while (search.is_searching()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+
+        const uint64_t evals = search.total_evals();
+        const chess::Move best = search.bestmove();
+        std::println("==========================");
+        std::println("Bench position : {}", fen);
+        std::println("Nodes searched : {}", evals);
+        std::println("Time (ms)      : {}", ms);
+        std::println("Nodes/second   : {}",
+                     ms > 0 ? evals * 1000ULL / static_cast<uint64_t>(ms) : 0);
+        std::println("Best move      : {}",
+                     best != chess::Move::NO_MOVE
+                         ? chess::uci::moveToUci(best) : std::string{"0000"});
+        std::println("==========================");
+        return 0;
+    } catch (const std::exception& e) {
+        std::println(stderr, "bench failed: {}", e.what());
+        return 1;
+    }
+}
+
 // Prints CLI usage. Every flag also has an LKS_* env equivalent; the CLI
 // flag wins when both are set, and both override the built-in default.
 static void print_usage(const char* prog) {
@@ -579,13 +636,17 @@ static void print_usage(const char* prog) {
     std::println(
         "\n"
         "Usage: {} [network] [options]\n"
+        "       {} bench [--network PATH] [--fen \"FEN\"] [--nodes N]\n"
         "\n"
         "Positional:\n"
         "  network                      TensorRT .network bundle\n"
         "                               (else $CATGPT_TRT_ENGINE, else ./S4.network)\n"
+        "  bench                        run a fixed-position search self-test and exit\n"
         "\n"
         "Options (CLI > matching LKS_* env var > default):\n"
         "  --network PATH               network bundle path\n"
+        "  --fen \"FEN\"                  bench position (bench only; default: built-in)\n"
+        "  --nodes N                    bench eval budget (bench only)  [LKS_BENCH_NODES=200000]\n"
         "  --syzygy-path PATH           Syzygy tablebase dir  [LKS_SYZYGY_PATH / SYZYGY_HOME]\n"
         "  --workers-per-gpu N          search workers per GPU   [LKS_WORKERS_PER_GPU=2]\n"
         "  --coros-per-worker N         coroutines per worker    [LKS_COROS_PER_WORKER=256]\n"
@@ -607,7 +668,7 @@ static void print_usage(const char* prog) {
         "  --time-early-return-margin F [LKS_TIME_EARLY_RETURN_MARGIN]\n"
         "  -v, --version                print version and exit\n"
         "  -h, --help                   print this help and exit",
-        prog);
+        prog, prog);
 }
 
 int main(int argc, char* argv[]) {
@@ -682,6 +743,31 @@ int main(int argc, char* argv[]) {
                  catgpt::ENGINE_NAME,
                  catgpt::version::VERSION_STRING,
                  catgpt::version::GIT_BRANCH);
+
+    // `bench` subcommand: arrives as the positional, so intercept it before
+    // it would otherwise be treated as a network path. Network resolves from
+    // --network / $CATGPT_TRT_ENGINE / default; FEN and node budget have
+    // bench-specific overrides.
+    if (positional && *positional == "bench") {
+        fs::path net;
+        if (auto v = cli_str("--network")) net = *v;
+        else if (const char* e = std::getenv("CATGPT_TRT_ENGINE")) net = e;
+        else net = "./S4.network";
+
+        const std::string fen =
+            cli_str("--fen").value_or(std::string(catgpt::kBenchFen));
+        const uint64_t nodes =
+            cli_u64("--nodes", "LKS_BENCH_NODES", catgpt::kBenchNodes);
+
+        fs::path syz;
+        if (auto v = cli_str("--syzygy-path")) syz = *v;
+
+        return run_bench(net, fen, nodes,
+                         cli_int("--workers-per-gpu", "LKS_WORKERS_PER_GPU", 2),
+                         cli_int("--coros-per-worker", "LKS_COROS_PER_WORKER", 112),
+                         cli_int("--max-batch", "LKS_MAX_BATCH_SIZE", 56),
+                         std::move(syz));
+    }
 
     // Engine path: positional > --network > $CATGPT_TRT_ENGINE > default.
     fs::path engine_path;
