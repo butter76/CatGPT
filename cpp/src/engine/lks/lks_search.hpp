@@ -275,10 +275,10 @@ struct TimeControl {
 
     // ── Tunable constants (defaults mirror the legacy engine) ──
     int64_t reserve_ms          = 100;     // never spend below this much clock
-    float   soft_pct            = 0.04f;   // soft target as fraction of bank
+    float   soft_pct            = 0.035f;   // soft target as fraction of bank
     float   hard_pct            = 0.28f;   // hard ceiling as fraction of bank
-    float   first_move_pct      = 0.075f;   // soft floor on the first move
-    float   surprise_pct        = 0.055f;   // soft floor on a surprise
+    float   first_move_pct      = 0.07f;   // soft floor on the first move
+    float   surprise_pct        = 0.05f;   // soft floor on a surprise
     float   change_bonus_pct    = 0.015f;   // soft extension when best move changes
     float   worsen_bonus_pct    = 0.02f;   // soft extension when score drops
     int     worsen_threshold_cp = 10;      // cp drop that counts as "worsened"
@@ -912,13 +912,13 @@ inline constexpr auto recursive_search =
         auto [cur_q, cur_max_d] = v2::unpack_qd(
             v2::SearchArena::load_qd(entry).qd_packed);
 
-        // PV modes ignore the TT depth, bounded by -5.0f
+        // PV modes ignore the TT depth, bounded by -4.0f
         // Also we should always descend if the current Q is positive
         // to prevent blindness to repetitions.
         const bool waive_depth_check =
             pv_mode &&
             std::atomic_ref<uint8_t>(hdr->expanded)
-                .load(std::memory_order_relaxed) != 0 && (depth > -5.0f || cur_q > 0.2f);
+                .load(std::memory_order_relaxed) != 0 && (depth > -4.0f || cur_q > 0.2f);
         if (rec_depth >= kRecursiveDepthLimit ||
             (!waive_depth_check && depth <= cur_max_d)) {
             // Hand the already-unpacked TT (Q, max_depth) back to the
