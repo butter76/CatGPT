@@ -277,9 +277,9 @@ struct TimeControl {
     int64_t reserve_ms          = 100;     // never spend below this much clock
     float   soft_pct            = 0.035f;   // soft target as fraction of bank
     float   hard_pct            = 0.28f;   // hard ceiling as fraction of bank
-    float   first_move_pct      = 0.07f;   // soft floor on the first move
-    float   surprise_pct        = 0.05f;   // soft floor on a surprise
-    float   change_bonus_pct    = 0.015f;   // soft extension when best move changes
+    float   first_move_pct      = 0.065f;   // soft floor on the first move
+    float   surprise_pct        = 0.045f;   // soft floor on a surprise
+    float   change_bonus_pct    = 0.01f;   // soft extension when best move changes
     float   worsen_bonus_pct    = 0.02f;   // soft extension when score drops
     int     worsen_threshold_cp = 10;      // cp drop that counts as "worsened"
 
