@@ -1521,16 +1521,6 @@ public:
                          w_compute_cpu_[i], w_gpu_cpu_[i]);
         }
 
-        {
-            const auto t0 = std::chrono::steady_clock::now();
-            arena_.emplace(lifetime_max_evals_, /*load_factor=*/0.6,
-                           /*avg_moves_per_node=*/40, &topo_);
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now() - t0).count();
-            std::println(stderr,
-                         "[LksSearch] arena allocated (interleaved, parallel prefault): TT {} B + node arena {} B in {} ms",
-                         arena_->table_bytes(), arena_->arena_capacity_bytes(), ms);
-        }
         root_key_ = board_.hash();
 
         // Persistent workers: build pool + evaluator + sem per worker once.
@@ -1593,6 +1583,25 @@ public:
         }  // jthreads join here
         for (auto& e : errs) {
             if (e) std::rethrow_exception(e);
+        }
+
+        // Allocate the shared SearchArena LAST, after the evaluators are up.
+        // Each BatchEvaluator ctor transiently loads the serialized network
+        // (~GB per worker) into host RAM, uploads it to the GPU, then frees
+        // the host blob. Allocating the (potentially hundreds-of-GiB) arena
+        // first would prefault all available RAM and leave no headroom for
+        // those transient weight blobs -> OOM during engine load. Building
+        // evaluators first lets the arena mmap/prefault into the RAM that is
+        // reclaimed once the weights are resident on the GPU.
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            arena_.emplace(lifetime_max_evals_, /*load_factor=*/0.6,
+                           /*avg_moves_per_node=*/40, &topo_);
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - t0).count();
+            std::println(stderr,
+                         "[LksSearch] arena allocated (interleaved, parallel prefault): TT {} B + node arena {} B in {} ms",
+                         arena_->table_bytes(), arena_->arena_capacity_bytes(), ms);
         }
     }
 
