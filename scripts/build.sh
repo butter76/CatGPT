@@ -65,6 +65,23 @@ phase() {
     echo "============================================================"
 }
 
+# Run a noisy command with its stdout+stderr captured to a dedicated log
+# file instead of the console / build.log. On failure, surface the tail so
+# problems stay debuggable without drowning the main log in compiler or
+# downloader spew.
+run_logged() {
+    local logfile=$1; shift
+    log "running: $* (full output -> $logfile)"
+    local rc=0
+    "$@" >"$logfile" 2>&1 || rc=$?
+    if (( rc != 0 )); then
+        warn "command failed (exit $rc): $*"
+        warn "----- last 60 lines of $logfile -----"
+        tail -n 60 "$logfile" >&2 || true
+    fi
+    return "$rc"
+}
+
 # Mirror stdout+stderr to a build log in WORK_DIR.
 exec > >(tee -a "$WORK_DIR/build.log") 2>&1
 log "build.sh starting at $(date -Is)"
@@ -229,10 +246,11 @@ else
     GCC_SRC_TARBALL="$WORK_DIR/.cache/gcc-${GCC_VERSION}.tar.xz"
     GCC_SRC_DIR="$WORK_DIR/.cache/gcc-${GCC_VERSION}"
     GCC_BUILD_DIR="$WORK_DIR/.cache/gcc-${GCC_VERSION}-build"
+    GCC_BUILD_LOG="$WORK_DIR/.cache/gcc-build.log"
 
     if [[ ! -s "$GCC_SRC_TARBALL" ]]; then
         log "downloading $GCC_TARBALL_URL"
-        wget -O "$GCC_SRC_TARBALL.part" "$GCC_TARBALL_URL"
+        wget -nv -O "$GCC_SRC_TARBALL.part" "$GCC_TARBALL_URL"
         mv "$GCC_SRC_TARBALL.part" "$GCC_SRC_TARBALL"
     fi
 
@@ -242,25 +260,27 @@ else
     fi
 
     if [[ ! -d "$GCC_SRC_DIR/gmp" || ! -d "$GCC_SRC_DIR/mpfr" || ! -d "$GCC_SRC_DIR/mpc" ]]; then
-        log "fetching GCC prerequisites (gmp, mpfr, mpc, isl)"
-        ( cd "$GCC_SRC_DIR" && ./contrib/download_prerequisites )
+        run_logged "$GCC_BUILD_LOG" \
+            bash -c 'cd "$1" && ./contrib/download_prerequisites' _ "$GCC_SRC_DIR" \
+            || die "GCC prerequisite download failed (see $GCC_BUILD_LOG)"
     fi
 
     rm -rf "$GCC_BUILD_DIR"
     mkdir -p "$GCC_BUILD_DIR"
     (
         cd "$GCC_BUILD_DIR"
-        log "configuring GCC ${GCC_VERSION}"
-        "$GCC_SRC_DIR/configure" \
-            --prefix="$GCC_PREFIX" \
-            --disable-multilib \
-            --disable-bootstrap \
-            --enable-languages=c,c++ \
-            --program-suffix=-14
-        log "building GCC ${GCC_VERSION} with -j${JOBS}"
-        make -j"$JOBS"
-        log "installing GCC ${GCC_VERSION} into $GCC_PREFIX"
-        make install
+        run_logged "$GCC_BUILD_LOG" \
+            "$GCC_SRC_DIR/configure" \
+                --prefix="$GCC_PREFIX" \
+                --disable-multilib \
+                --disable-bootstrap \
+                --enable-languages=c,c++ \
+                --program-suffix=-14 \
+            || die "GCC configure failed (see $GCC_BUILD_LOG)"
+        run_logged "$GCC_BUILD_LOG" make -j"$JOBS" \
+            || die "GCC build failed (see $GCC_BUILD_LOG)"
+        run_logged "$GCC_BUILD_LOG" make install \
+            || die "GCC install failed (see $GCC_BUILD_LOG)"
     )
 
     [[ -x "$GCC_PREFIX/bin/g++-14" ]] || die "GCC build finished but $GCC_PREFIX/bin/g++-14 is missing"
@@ -290,7 +310,7 @@ else
     log "downloading TensorRT 10.16.1.11 tarball"
     TRT_TAR="$WORK_DIR/.cache/TensorRT-10.16.1.11.tar.gz"
     if [[ ! -s "$TRT_TAR" ]]; then
-        wget -O "$TRT_TAR.part" "$TRT_URL"
+        wget -nv -O "$TRT_TAR.part" "$TRT_URL"
         mv "$TRT_TAR.part" "$TRT_TAR"
     fi
     log "extracting into $WORK_DIR"
@@ -311,7 +331,7 @@ if [[ -s "$ONNX_PATH" ]]; then
     log "found ONNX at $ONNX_PATH ($(stat -c %s "$ONNX_PATH") bytes)"
 elif [[ -n "$ONNX_URL" ]]; then
     log "downloading ONNX from $ONNX_URL"
-    wget -O "$ONNX_PATH.part" "$ONNX_URL"
+    wget -nv -O "$ONNX_PATH.part" "$ONNX_URL"
     mv "$ONNX_PATH.part" "$ONNX_PATH"
 else
     die "no ONNX at $ONNX_PATH and ONNX_URL is unset. Either stage ${MODEL}.onnx in WORK_DIR or set ONNX_URL and re-run."
