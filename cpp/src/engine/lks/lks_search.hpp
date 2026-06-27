@@ -228,7 +228,7 @@ struct SearchParams {
 
     // Iter-0 clamp loop: force-expand every Unexpanded child (not just the
     // top hdr->force_expand priors) when depth > depth_floor + log(this).
-    float force_all_unexpanded_log_arg = 40.0f;
+    float force_all_unexpanded_log_arg = 50.0f;
 };
 
 }  // namespace detail
