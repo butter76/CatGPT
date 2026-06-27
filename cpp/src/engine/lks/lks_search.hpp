@@ -228,7 +228,7 @@ struct SearchParams {
 
     // Iter-0 clamp loop: force-expand every Unexpanded child (not just the
     // top hdr->force_expand priors) when depth > depth_floor + log(this).
-    float force_all_unexpanded_log_arg = 50.0f;
+    float force_all_unexpanded_log_arg = 60.0f;
 };
 
 }  // namespace detail
@@ -974,14 +974,6 @@ inline constexpr auto recursive_search =
     float cumulative_P = 0.0f;
     constexpr float kPosInf = std::numeric_limits<float>::infinity();
 
-    // Set true if any of the first `hdr->force_expand` (highest-prior)
-    // moves is a path-dependent draw — a 2-fold repetition draw
-    // (`isRepetition(1)`) / 50-move draw on this path. When a top move only
-    // draws, iter-0 force-expands ALL unexpanded children (see Pass 2's
-    // force_all_unexpanded) so the descent looks past the draw for a
-    // non-drawing alternative.
-    bool top_move_pathdraw = false;
-
     for (uint16_t i = 0; i < num_moves; ++i) {
         const auto& m = moves[i];
         const v2::TerminalKind m_tk = m.terminal_kind();
@@ -1044,10 +1036,6 @@ inline constexpr auto recursive_search =
             draw_here = true;
         }
         if (draw_here) {
-            // A path-dependent draw among the top-prior moves triggers the
-            // wider iter-0 force-expand (see Pass 2). `hdr->force_expand`
-            // is the same count Pass 2 gates per-index force-expansion on.
-            if (i < hdr->force_expand) top_move_pathdraw = true;
             plans.push_back({Mode::Expanded, m_P, /*Q=*/0.0f, kPosInf,
                              /*alloc=*/0.0f, /*isPV=*/true});
             cumulative_P += m_P;
@@ -1097,9 +1085,7 @@ inline constexpr auto recursive_search =
     //      `hdr->force_expand` Unexpanded priors (per-position dynamic
     //      count, computed at first-eval from a temp-1.0 policy), or
     //      all Unexpanded when `depth > depth_floor +
-    //      log(force_all_unexpanded_log_arg)`, when in pv_mode, or when
-    //      any of the first `hdr->force_expand` moves is a path-dependent
-    //      draw (`top_move_pathdraw`), at recursion depth p.alloc.
+    //      log(force_all_unexpanded_log_arg)`, at recursion depth p.alloc.
     //      Children write (Q, depth) back through `&p`.
     //
     // PV-mode overlay (only when this coroutine runs with pv_mode=true):
@@ -1208,9 +1194,7 @@ inline constexpr auto recursive_search =
 
             const bool force_all_unexpanded =
                 (iter == 0)
-                && ((depth > depth_floor + std::log(force_all_log_arg))
-                    || pv_mode
-                    || top_move_pathdraw);
+                && (depth > depth_floor + std::log(force_all_log_arg));
 
             bool first_fork = (iter == 0);
             bool any_fork   = false;
@@ -1330,17 +1314,20 @@ inline constexpr auto recursive_search =
            "rollup found no Expanded plan; falling back to TT (Q, depth) for parent");
     if (any_expanded) {
         const float Q_new = best;
-        // Persist the child index for the PV / bestmove display walk.
-        // Prefer the best isPV plan (the move actually descended on the PV);
-        // fall back to the global best_idx when no isPV plan exists (e.g. a
-        // non-pv_mode rollup). plans[i] is built 1:1 with moves[i] in Pass 1,
-        // so the index is a valid MoveInfo index. Relaxed last-writer-wins
-        // store (display only); mirrors the `expanded` flag's
-        // weak-consistency model.
-        const int pv_store_idx = (best_pv_idx >= 0) ? best_pv_idx : best_idx;
-        std::atomic_ref<uint16_t>(hdr->pv_child)
-            .store(static_cast<uint16_t>(pv_store_idx), std::memory_order_relaxed);
         if (pv_mode) {
+            // Persist the child index for the PV / bestmove display walk —
+            // only on PV-mode rollups. A non-pv_mode rollup's global argmax
+            // can be a sibling that was never refined on the PV, so writing it
+            // here would corrupt the display walk; gating the store keeps
+            // pv_child following exclusively genuinely-explored PV children.
+            // Prefer the best isPV plan (the move actually descended on the
+            // PV); fall back to the global best_idx when no isPV plan exists.
+            // plans[i] is built 1:1 with moves[i] in Pass 1, so the index is a
+            // valid MoveInfo index. Relaxed last-writer-wins store (display
+            // only); mirrors the `expanded` flag's weak-consistency model.
+            const int pv_store_idx = (best_pv_idx >= 0) ? best_pv_idx : best_idx;
+            std::atomic_ref<uint16_t>(hdr->pv_child)
+                .store(static_cast<uint16_t>(pv_store_idx), std::memory_order_relaxed);
             // PV-mode rollup: the re-deepen waiver lets us descend on
             // an entry that already has a deeper TT (Q, max_depth)
             // snapshot, so the depth-monotonic gate in `update_qd`
