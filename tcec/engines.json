@@ -1,11 +1,11 @@
 [
     {
         "name": "CatGPT",
-        "command": "./catgpt S4.network --syzygy-path /home/syzygy --workers-per-gpu 2 --coros-per-worker 120 --max-batch 56 --max-evals 1073741824 --delta-depth 1.0",
+        "command": "./catgpt S4.network --syzygy-path /home/syzygy --workers-per-gpu 2 --coros-per-worker 120 --max-batch 56 --max-evals 1073741824 --delta-depth 1.2 --clamp-step 0.8",
         "protocol": "uci",
         "workingDirectory": "/home/tcec/Engines/CatGPT/",
         "restart": "on",
-        "rating": "3600",
+        "rating": "3550",
         "options": []
     }
 ]
