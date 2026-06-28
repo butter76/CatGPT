@@ -714,13 +714,13 @@ struct RecurseContext {
  * Recursive descent (libfork lambda).
  *
  * INVARIANT: every entry owns exactly one `Permit` on entry. The permit
- * covers any GPU eval. At fan-out the FIRST forked child of the FIRST
- * clamp-loop iteration inherits the parent's permit via std::move; every
- * other fork (later iter-0 siblings, and every fork in iter 1+) does
- * co_await sem->acquire() for its own permit. After iter 0's lf::join
- * the parent is permit-less for the remainder of the call (same state
- * the original single-shot code was in during rollup); iter 1+ forks
- * acquire on demand. On exit any permit still held is released by RAII.
+ * covers any GPU eval. At fan-out the FIRST forked child across ALL
+ * clamp-loop iterations inherits the parent's permit via std::move; every
+ * other fork does co_await sem->acquire() for its own permit. Once the
+ * parent has live children it is permit-less for the remainder of the
+ * call (same state the original single-shot code was in during rollup);
+ * later forks acquire on demand. On exit any permit still held is
+ * released by RAII.
  *
  * This preserves the property that K = sem.count bounds "concurrently
  * alive recursive_search frames that hold a permit", NOT "concurrently
@@ -1111,13 +1111,14 @@ inline constexpr auto recursive_search =
     //     early break before the PV move has been refined under
     //     pv_mode_child=true at all.
     //
-    // Permits: only iter 0's FIRST fork inherits this coroutine's
-    // entry permit (so K bounds permit-holding frames, not alive
-    // frames — keeping descent depth independent of K). Every other
-    // fork (later iter-0 siblings and every fork in iter 1+) does
-    // co_await sem->acquire(). After iter 0's lf::join this coroutine
-    // is permit-less for the rest of the call, same state the
-    // original single-shot code was in during rollup.
+    // Permits: only the FIRST fork that fires (across all iterations)
+    // inherits this coroutine's entry permit (so K bounds permit-holding
+    // frames, not alive frames — keeping descent depth independent of K).
+    // Every other fork does co_await sem->acquire(). Once this coroutine
+    // has live children it is permit-less for the rest of the call, same
+    // state the original single-shot code was in during rollup. The
+    // first_fork flag is hoisted above the iteration loop so this holds
+    // even when iter 0 forks nothing but a later iter does.
     //
     // Pre-marking: a forked child OVERWRITES p.Q / p.depth (via the
     // `&p` out-param) before this coroutine resumes from lf::join, so
@@ -1140,6 +1141,15 @@ inline constexpr auto recursive_search =
         // typical Q-noise floor; tight enough that the break_eps gate
         // remains the primary terminator on most positions.
         constexpr float kPvQEps = 0.04f;
+
+        // first_fork spans the WHOLE call, not just iter 0: the first
+        // fork that actually fires (in whatever iteration it first does)
+        // inherits this coroutine's entry permit; every later fork
+        // acquires its own. Hoisting this out of the loop fixes the case
+        // where iter 0 forks nothing but iter 1+ does — otherwise the
+        // entry permit would stay held while a child separately acquired
+        // one, re-creating the deadlock-prone parent-retains-permit state.
+        bool first_fork = true;
 
         int iter = 0;
         for (; iter < max_iters; ++iter) {
@@ -1199,7 +1209,6 @@ inline constexpr auto recursive_search =
                 (iter == 0)
                 && (depth > depth_floor + std::log(force_all_log_arg));
 
-            bool first_fork = (iter == 0);
             bool any_fork   = false;
             for (uint16_t i = 0; i < num_moves; ++i) {
                 Plan& p = plans[i];
