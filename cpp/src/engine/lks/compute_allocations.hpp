@@ -7,15 +7,22 @@
  *   [-1, 1] (TT-stored, child-STM convention), total log-budget d = log N,
  *   and constant c_puct, find the dual K such that
  *
- *     sum_i N_i = N,  N_i = c_puct * P_i * N^(2/3) / [3 (K - q_i)]
+ *     sum_i N_i = N,  N_i = c_puct * P_i * φ(N) / [3 (K - q_i)]
  *
  *   with q_i = -Q_i (parent-loss POV). K is unique on (q_max, +inf) — LHS
  *   is strictly decreasing in K. Output is log N_i per child.
  *
+ *   φ(N) is the exploration growth law: a piecewise power law that grows
+ *   as N^0.72 below the crossover N0 = e^10 and as N^1 above it, with the
+ *   two branches continuous at N0 and the lower branch anchored to the
+ *   old uniform N^(2/3) law at N=400. Define w = c_puct * φ(N) / 3; every
+ *   N-dependent quantity below derives from w, so the solver is agnostic
+ *   to the exact φ.
+ *
  * Solver: bracketed Halley in delta = K - q_max. The bracket is
- *   [lo, hi] = [0, c_puct / (3 N^(1/3))]
- * (lo is exclusive; hi is the Delta_i = 0 closed form, a proven upper
- * bound on delta*). Each iteration evaluates g at the current delta,
+ *   [lo, hi] = [0, w / N]
+ * (lo is exclusive; hi = w/N is the Delta_i = 0 closed form, a proven
+ * upper bound on delta*). Each iteration evaluates g at the current delta,
  * tightens the bracket by the sign of g (g is strictly monotone
  * decreasing), and either accepts the Halley step
  *   delta_new = delta - 2 g g' / (2 g'^2 - g g'')
@@ -115,9 +122,10 @@ struct Plan {
  *     since g'(d) = -sum w_i / (d + Δ_i)^2 < 0;
  *   - g(0+) > 0 (>= 0 when no Δ_i is zero) and g(+inf) = -N < 0, so the
  *     unique root d* lies in (0, +inf);
- *   - delta_hi = c_puct / (3 N^(1/3)) is a proven upper bound on d*
- *     (the Δ_i = 0 closed form; LHS is strictly decreasing in K, and any
- *     positive Δ_i only shrinks the sum).
+ *   - delta_hi = w / N is a proven upper bound on d* (the Δ_i = 0 closed
+ *     form with Σ P_i -> 1; LHS is strictly decreasing in K, any positive
+ *     Δ_i only shrinks the sum, and Σ P_i <= 1 keeps w/N >= the true
+ *     closed form). Holds for any φ since w = c_puct * φ(N) / 3.
  * So [lo=0, hi=delta_hi] is a guaranteed sign-changing bracket. Each
  * iteration evaluates g at the current d, tightens [lo, hi] by the sign,
  * and accepts the Halley step ONLY if it lands strictly inside the
@@ -147,11 +155,11 @@ inline void compute_log_allocations(Plan* plans, int M,
 
     // Floor depth well above the IEEE underflow cliff. N = exp(depth) goes
     // subnormal at depth ~= -708 and flushes to exactly 0 at ~= -744, at
-    // which point cbrt_N = 0 ⇒ hi = +inf ⇒ every alloc collapses to -inf
+    // which point hi = w_factor / N is 0/0 = NaN and the bracket collapses
     // (silently — the debug post-check passes vacuously with N = 0). -200
     // is far below any depth the descent legitimately reaches yet leaves
     // ~500 units of headroom, so a runaway descent clamps here instead of
-    // emitting all-(-inf) allocations.
+    // emitting degenerate allocations.
     depth = std::max(depth, -200.0f);
 
     // q_max in parent-loss POV is -min(Q_i).
@@ -161,13 +169,40 @@ inline void compute_log_allocations(Plan* plans, int M,
         if (neg_q > qmax_neg_q) qmax_neg_q = neg_q;
     }
 
-    const double N        = std::exp(static_cast<double>(depth));
-    const double cbrt_N   = std::cbrt(N);
-    const double w_factor = static_cast<double>(c_puct)
-                          * cbrt_N * cbrt_N / 3.0;  // c_puct*N^(2/3)/3
-    const double tol_g    = 1.0e-6 * N;
-    const double log_w    = std::log(static_cast<double>(c_puct) / 3.0);
-    const double bias     = (2.0 / 3.0) * static_cast<double>(depth) + log_w;
+    const double d_node = static_cast<double>(depth);  // = log N
+    const double N      = std::exp(d_node);
+    const double tol_g  = 1.0e-6 * N;
+
+    // Piecewise log-exploration law φ(N), replacing the old uniform N^(2/3):
+    //   φ(N) = A * N^0.72   for N <= e^10   (kCrossDepth = log N0)
+    //   φ(N) = B * N        for N >= e^10
+    // The two branches are continuous at the crossover, and the lower
+    // branch is anchored to the old N^(2/3) value at N=400 (so a c_puct
+    // tuned under the old law stays meaningfully calibrated). A and B are
+    // not materialized; we carry log φ directly to dodge cbrt/pow and the
+    // overflow that φ = B*N invites at large depth.
+    //
+    //   log A = (2/3)*log400 - 0.72*log400,
+    //   log φ(e^10)_lower = log A + 0.72*10,  log B = log φ(e^10) - 10.
+    constexpr double kCrossDepth = 10.0;                    // log N0, N0 = e^10
+    constexpr double kLoExp      = 0.72;                    // exponent for N <= e^10
+    constexpr double kHiExp      = 1.0;                     // exponent for N >= e^10
+    constexpr double kRefDepth   = 5.9914645471079799;      // log 400 (anchor)
+    constexpr double kOldExp     = 2.0 / 3.0;               // old uniform exponent
+
+    double log_phi;
+    if (d_node <= kCrossDepth) {
+        log_phi = kOldExp * kRefDepth + kLoExp * (d_node - kRefDepth);
+    } else {
+        const double log_phi_cross =
+            kOldExp * kRefDepth + kLoExp * (kCrossDepth - kRefDepth);
+        log_phi = log_phi_cross + kHiExp * (d_node - kCrossDepth);
+    }
+
+    // w = c_puct * φ(N) / 3; bias = log w is the per-child log-allocation
+    // offset reused in the final write.
+    const double bias     = std::log(static_cast<double>(c_puct) / 3.0) + log_phi;
+    const double w_factor = std::exp(bias);
 
     // g(d), g'(d), g''(d) at delta = d. Δ_i = qmax_neg_q - (-Q_i) >= 0.
     auto eval = [plans, M, w_factor, qmax_neg_q, N]
@@ -190,10 +225,15 @@ inline void compute_log_allocations(Plan* plans, int M,
     };
 
     // Guaranteed sign-changing bracket. lo=0 is exclusive (g may be +inf
-    // there when some Δ_i == 0); we never evaluate at lo. hi is the
-    // delta_hi upper bound, where g(hi) <= 0 by the proof above.
+    // there when some Δ_i == 0); we never evaluate at lo. hi = w/N is the
+    // delta_hi upper bound (Δ_i = 0 closed form with Σ P_i -> 1), where
+    // g(hi) <= 0 by the proof above. It is valid for ANY φ as long as the
+    // positive priors satisfy Σ P_i <= 1 (true here: P is normalized softmax
+    // from lks_search.hpp pass 1). Expressed as w_factor/N so it stays
+    // correct automatically when φ changes — never hardcode the old
+    // c_puct/(3 N^(1/3)), which only equalled w/N for φ = N^(2/3).
     double lo = 0.0;
-    double hi = static_cast<double>(c_puct) / (3.0 * cbrt_N);
+    double hi = w_factor / N;
     double d  = hi;
 
     constexpr int kMaxIters = 32;
@@ -226,8 +266,8 @@ inline void compute_log_allocations(Plan* plans, int M,
         d = d_new;
     }
 
-    // log N_i = log P_i + 2d/3 + log(c_puct/3) - log(e^u + Δ_i),
-    // and since u = log(d), e^u + Δ_i = d + Δ_i directly.
+    // log N_i = log P_i + bias - log(d + Δ_i), where bias = log w =
+    // log(c_puct/3) + log φ(N) and d = K - q_max, so d + Δ_i = K - q_i.
     for (int i = 0; i < M; ++i) {
         const double p = static_cast<double>(plans[i].P);
         if (p <= 0.0) {

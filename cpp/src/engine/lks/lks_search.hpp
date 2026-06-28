@@ -198,8 +198,11 @@ struct SearchParams {
     float default_depth_constant = 12.0f;
 
     // PUCT allocation constant. Feeds Halley-in-delta dual solve:
-    //   log N_i = log P_i + 2d/3 + log(c_puct/3) - log(e^u + Δ_i),
-    // where u = log(K - q_max), Δ_i = q_max - q_i, q_i = -Q_i.
+    //   log N_i = log P_i + log(c_puct/3) + log φ(N) - log(d + Δ_i),
+    // where d = K - q_max, Δ_i = q_max - q_i, q_i = -Q_i, and φ(N) is the
+    // piecewise exploration-growth law (N^0.72 below e^10, N^1 above; see
+    // compute_allocations.hpp). c_puct stays calibrated to the old N^(2/3)
+    // law at N=400, where the new φ is anchored.
     float c_puct = 1.75f;
 
     // FPU reduction. For unexpanded children we synthesize a parent-POV Q via
