@@ -1078,8 +1078,15 @@ inline constexpr auto recursive_search =
     //
     //   1. compute_log_allocations on the current (Q, depth) state.
     //   2. If iter > 0 and every Expanded plan satisfies
-    //      alloc - depth <= break_eps, break (in pv_mode the break is
-    //      additionally gated on PV convergence — see below).
+    //      alloc - depth <= break_eps, the state looks converged (in
+    //      pv_mode the break is additionally gated on PV convergence —
+    //      see below). Before breaking we re-probe the TT for every
+    //      finite-depth, non-isPV plan: a peer worker may have published
+    //      a strictly deeper entry since Pass 1, and adopting it (with
+    //      its fresher Q) can re-open a child's alloc gate or shift the
+    //      PV. If any plan is upgraded we recompute allocations and
+    //      re-test the gate in-place this same iteration; we break only
+    //      once the state is converged AND no deeper entry was found.
     //   3. Expanded plans fork when alloc > p.depth at
     //      min(alloc, p.depth + clamp_step * jitter), where jitter is
     //      drawn uniformly from [0.5, 1.5] per fork via
@@ -1152,57 +1159,105 @@ inline constexpr auto recursive_search =
         bool first_fork = true;
 
         int iter = 0;
+
+        // PV pick over Expanded plans (the parent-POV best child). Used by
+        // both the break gate and the per-plan force-fork below. Only
+        // meaningful at iter > 0 in pv_mode; returns -1 otherwise. Captures
+        // `iter` by reference so it reflects the current iteration.
+        auto recompute_pv_idx = [&]() -> int {
+            if (!pv_mode || iter == 0) return -1;
+            int idx = -1;
+            float best_neg_q = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < static_cast<int>(num_moves); ++i) {
+                const Plan& p = plans[i];
+                if (p.mode != Mode::Expanded) continue;
+                const float neg_q = -p.Q;
+                if (neg_q > best_neg_q) {
+                    best_neg_q = neg_q;
+                    idx = i;
+                }
+            }
+            return idx;
+        };
+
+        // Convergence test: every Expanded plan is within break_eps of its
+        // alloc AND (in pv_mode) some isPV plan's parent-POV score is within
+        // kPvQEps of the best Expanded child's score.
+        auto is_settled = [&](int pv_idx) -> bool {
+            for (const Plan& p : plans) {
+                if (p.mode != Mode::Expanded) continue;
+                if (p.alloc - p.depth > break_eps) return false;
+            }
+            if (!pv_mode) return true;
+            if (pv_idx < 0) {
+                // No Expanded plans at all; PV concept is vacuous.
+                return true;
+            }
+            const float best_neg_q = -plans[pv_idx].Q;
+            for (const Plan& p : plans) {
+                if (p.mode != Mode::Expanded || !p.isPV) continue;
+                if (std::abs(-p.Q - best_neg_q) <= kPvQEps) return true;
+            }
+            return false;
+        };
+
+        // TT re-probe at convergence: a peer worker may have published a
+        // deeper entry for one of our finite-depth, non-isPV children since
+        // Pass 1. For each such plan, re-fetch the child's TT entry and
+        // adopt it iff it is strictly deeper, taking the consistent,
+        // upcoming-rep-clamped Q alongside the deeper max_depth. isPV plans
+        // are skipped (already re-deepened every iter via the PV force);
+        // non-finite rows are terminals/draws/Unexpanded (nothing to grab).
+        // Returns true iff any plan was upgraded. Mirrors the Pass 1 TT-hit
+        // path; `find()` is synchronous, so this adds no suspension point.
+        auto refresh_from_tt = [&]() -> bool {
+            bool refreshed = false;
+            for (uint16_t i = 0; i < num_moves; ++i) {
+                Plan& p = plans[i];
+                if (p.mode != Mode::Expanded || !std::isfinite(p.depth)
+                    || p.isPV)
+                    continue;
+                chess::Board cb = board;
+                cb.makeMove<true>(chess::Move{moves[i].move});
+                if (v2::TTEntry* ce =
+                        ctx->arena->find(cb.hash(), v2::secondary_hash(cb))) {
+                    auto [q, d] = v2::unpack_qd(
+                        v2::SearchArena::load_qd(ce).qd_packed);
+                    if (d > p.depth) {
+                        p.Q     = clamp_q_upcoming_rep(q, cb);
+                        p.depth = d;
+                        refreshed = true;
+                    }
+                }
+            }
+            return refreshed;
+        };
+
         for (; iter < max_iters; ++iter) {
             compute_log_allocations(plans.data(),
                                     static_cast<int>(plans.size()),
                                     depth, ctx->params->c_puct);
 
-            // PV pick (computed once per iter, used by both the break
-            // gate and the per-plan force-fork). Only meaningful at
-            // iter > 0 in pv_mode; otherwise stays -1.
-            int pv_idx = -1;
-            if (pv_mode && iter > 0) {
-                float best_neg_q =
-                    -std::numeric_limits<float>::infinity();
-                for (int i = 0; i < static_cast<int>(num_moves); ++i) {
-                    const Plan& p = plans[i];
-                    if (p.mode != Mode::Expanded) continue;
-                    const float neg_q = -p.Q;
-                    if (neg_q > best_neg_q) {
-                        best_neg_q = neg_q;
-                        pv_idx = i;
-                    }
-                }
-            }
+            int pv_idx = recompute_pv_idx();
 
-            if (iter > 0) {
-                bool any_unsaturated = false;
-                for (const Plan& p : plans) {
-                    if (p.mode != Mode::Expanded) continue;
-                    if (p.alloc - p.depth > break_eps) {
-                        any_unsaturated = true;
-                        break;
-                    }
-                }
-                bool pv_break_ok = !pv_mode;
-                if (pv_mode) {
-                    if (pv_idx < 0) {
-                        // No Expanded plans at all; PV concept is
-                        // vacuous, let the regular gate proceed.
-                        pv_break_ok = true;
-                    } else {
-                        const float best_neg_q = -plans[pv_idx].Q;
-                        for (const Plan& p : plans) {
-                            if (p.mode != Mode::Expanded || !p.isPV)
-                                continue;
-                            if (std::abs(-p.Q - best_neg_q) <= kPvQEps) {
-                                pv_break_ok = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (!any_unsaturated && pv_break_ok) break;
+            if (iter > 0 && is_settled(pv_idx)) {
+                // Allocations look converged. Before committing to break,
+                // re-probe the TT: adopting a deeper peer entry (higher
+                // depth ⇒ fresher Q) can re-open a child's alloc gate or
+                // shift the PV, meaning more search is warranted.
+                if (!refresh_from_tt()) break;   // truly converged
+
+                // Adopted deeper entries: recompute allocations + PV pick
+                // and re-test the gate, all within this iteration (no iter
+                // spent). A single pass suffices — refresh_from_tt() already
+                // grabbed every currently-deeper entry and nothing yields
+                // between the probe and here, so the TT state is stable.
+                compute_log_allocations(plans.data(),
+                                        static_cast<int>(plans.size()),
+                                        depth, ctx->params->c_puct);
+                pv_idx = recompute_pv_idx();
+                if (is_settled(pv_idx)) break;   // refreshed but still converged
+                // else: fall through to the fork loop with refreshed state.
             }
 
             const bool force_all_unexpanded =
