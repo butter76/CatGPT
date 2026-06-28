@@ -157,6 +157,7 @@
 #include "../trt_runtime.hpp"
 #include "../fractional_mcts/search_stats.hpp"
 #include "../fractional_mcts/v2/board_secondary.hpp"
+#include "../fractional_mcts/v2/inflight_table.hpp"
 #include "../fractional_mcts/v2/tt_arena.hpp"
 #include "compute_allocations.hpp"
 
@@ -682,6 +683,7 @@ struct WorkerSearch {
  */
 struct RecurseContext {
     v2::SearchArena*          arena;
+    v2::InflightTable*        inflight;  // dedup of concurrent GPU evals
     BatchEvaluator*           evaluator;
     lfsync::LfAsyncSemaphore* sem;
     WorkerSearch*             w;
@@ -768,106 +770,143 @@ inline constexpr auto recursive_search =
     v2::TTEntry* entry = ctx->arena->find(key, sec);
 
     if (entry == nullptr) {
-        // ── unexpanded: eval, fill bytes, then claim ────────────────
-        // We already hold a Permit (entry invariant) — no separate
-        // eval-sem acquire/release, and therefore no yield point
-        // between the find() above and the find_or_claim() below
-        // where a peer could publish without us noticing. The CAS in
-        // find_or_claim is the sole source of truth for ownership;
-        // the eval-await window's race is handled there.
-        //
-        // Legal-move generation moves to BEFORE the eval submit so the
-        // GPU can gather only the legal-move logits (cuts policy D2H from
-        // POLICY_SIZE=4672 to MAX_LEGAL_MOVES=218 floats per request).
-        // The encoded flat indices ride along on the EvalRequest; the
-        // gathered logits arrive in `out.legal_policy[0..num_moves)`,
-        // already aligned with `legal[]`.
-        chess::Movelist legal;
-        chess::movegen::legalmoves(legal, board);
-        const uint16_t num_moves = static_cast<uint16_t>(legal.size());
+        // ── dedup concurrent GPU evals for this exact position ──────────
+        // The first arrival across ALL workers becomes the leader and runs
+        // the eval; every other concurrent arrival parks until the leader
+        // publishes, then reads the TT — so a transposition discovered by
+        // several workers at once costs exactly one GPU eval, not N. Match
+        // is on (key, sec), mirroring the TT: a 64-bit collision with a
+        // different secondary is a different position with its own leader.
+        const v2::InflightRole role = ctx->inflight->claim_or_join(key, sec);
 
-        std::array<std::int32_t, MAX_LEGAL_MOVES> legal_indices;
-        const bool flip = board.sideToMove() == chess::Color::BLACK;
-        build_legal_indices(legal, flip, legal_indices);
-
-        auto tokens = catgpt::tokenize<BatchEvaluator::SEQ_LENGTH>(
-            board, NO_HALFMOVE_CONFIG);
-        RawNNOutput out = co_await EvalAwaitable(
-            *ctx->evaluator, tokens, legal_indices);
-        ctx->w->evals.fetch_add(1, std::memory_order_relaxed);
-
-        // Sort moves by decreasing P up front (on compact 8-byte
-        // pairs) so the arena fill below is a single pass that
-        // writes each MoveInfo exactly once in the order descent
-        // will consume them.
-        std::vector<MoveWithPriors> sorted_moves;
-        softmax_legal_sorted(out, legal, ctx->params->policy_temp, sorted_moves);
-
-        // alloc + fill BEFORE attempting to claim — these bytes
-        // are privately owned until the CAS, and orphaned if the
-        // CAS loses.
-        const uint64_t off = ctx->arena->alloc_node_info(num_moves);
-        v2::MoveInfo* mi = ctx->arena->moves_at(off);
-        for (uint16_t i = 0; i < num_moves; ++i) {
-            const chess::Move m{sorted_moves[i].move};
-
-            // Per-move position-only terminal detection. With a Syzygy
-            // prober wired in, TB-resolved WDL also lands here (cached
-            // in the child's MoveInfo so re-visits skip the probe).
-            board.makeMove<true>(m);
-            const v2::TerminalKind tk = classify_terminal(board, ctx->syzygy);
-            board.unmakeMove(m);
-
-            mi[i] = v2::MoveInfo::pack(sorted_moves[i].move,
-                                       sorted_moves[i].P,
-                                       tk);
-        }
-
-        // Per-node variance for this fresh TT entry. alloc_node_info
-        // pre-fills variance=0; overwrite with the real value before
-        // publish so any reader observing this node sees it.
-        const float variance = std::max(compute_value_variance(out.value_probs), 0.25f / ctx->params->default_depth_constant);
-        v2::NodeInfoHeader* hdr_w = ctx->arena->info_at(off);
-        hdr_w->variance = variance;
-        hdr_w->force_expand = compute_force_expand(out, static_cast<int>(num_moves));
-
-        const float Q = catgpt::wdl_logits_to_q_wl_tempered(
-            out.wdl_logits, ctx->params->wl_temp);
-
-        // Heuristic initial max_depth for this fresh TT entry:
-        //   default_max_depth = -log(variance * C)
-        // Low-variance nodes get a HIGH max_depth so early ID iterations
-        // skip re-descending them via the re-deepen check below; trust
-        // the NN value. High-variance nodes get a LOW (possibly negative)
-        // max_depth so the very first descent proceeds and the rollup
-        // refines Q. Edge case `variance == 0` produces -inf/+inf, which
-        // is safe: the re-deepen check uses `<=` and `update_qd` is
-        // monotonic and will overwrite -inf on the first rollup that
-        // completes a descent.
-        const float default_max_depth = -std::log(
-            variance * ctx->params->default_depth_constant);
-
-        // Single 128-bit CAS installs (key, qd_packed(Q, default_max_depth))
-        // atomically, so any reader observing key == K necessarily
-        // sees the matching qd. Then a single 128-bit release-store
-        // of Cell B publishes (origQ, key_secondary, info_offset).
-        auto [ce, claimed] = ctx->arena->find_or_claim(
-            key, sec, Q, /*max_depth=*/default_max_depth);
-        if (claimed) {
-            v2::SearchArena::publish_info(
-                ce, /*origQ=*/Q, /*key_secondary=*/sec, off);
-            ctx->w->tt_claims.fetch_add(1, std::memory_order_relaxed);
+        if (!role.leader) {
+            // ── follower: park until the leader publishes, then re-find ──
+            // Parking SUSPENDS this coroutine and hands control back to the
+            // worker's pool (it does not spin), so the worker keeps doing
+            // other work while the (often cross-worker) leader's eval is in
+            // flight. The leader's wake() schedules us back onto our OWN
+            // pool. After resuming, the TT entry is provably published (the
+            // leader publishes before wake(), and pool->schedule provides
+            // the cross-thread happens-before).
+            co_await v2::EvalWaitAwaitable(role.slot, ctx->w->pool.get());
+            ctx->inflight->release(role.slot);
+            if (ctx->w->should_abort()) co_return;
+            entry = ctx->arena->find(key, sec);
+            assert(entry != nullptr &&
+                   "follower resumed but TT entry missing after leader wake");
+            // Fall through to the shared "load node info" path below.
         } else {
-            // A peer published this key while we were awaiting the
-            // GPU eval. Adopt their entry; our `off` bytes are
-            // orphaned (forever).
-        }
+            // ── leader: eval, fill bytes, then claim ────────────────────
+            // We already hold a Permit (entry invariant) — no separate
+            // eval-sem acquire/release, and therefore no yield point
+            // between the find() above and the find_or_claim() below
+            // where a peer could publish without us noticing. The CAS in
+            // find_or_claim is the sole source of truth for ownership;
+            // the eval-await window's race is handled there.
+            //
+            // Legal-move generation moves to BEFORE the eval submit so the
+            // GPU can gather only the legal-move logits (cuts policy D2H from
+            // POLICY_SIZE=4672 to MAX_LEGAL_MOVES=218 floats per request).
+            // The encoded flat indices ride along on the EvalRequest; the
+            // gathered logits arrive in `out.legal_policy[0..num_moves)`,
+            // already aligned with `legal[]`.
+            chess::Movelist legal;
+            chess::movegen::legalmoves(legal, board);
+            const uint16_t num_moves = static_cast<uint16_t>(legal.size());
 
-        // Intentionally let the thread finish putting the entry
-        // into the TT/arena before aborting.
-        if (ctx->w->should_abort()) co_return;
+            std::array<std::int32_t, MAX_LEGAL_MOVES> legal_indices;
+            const bool flip = board.sideToMove() == chess::Color::BLACK;
+            build_legal_indices(legal, flip, legal_indices);
 
-        entry = ce;
+            auto tokens = catgpt::tokenize<BatchEvaluator::SEQ_LENGTH>(
+                board, NO_HALFMOVE_CONFIG);
+            RawNNOutput out = co_await EvalAwaitable(
+                *ctx->evaluator, tokens, legal_indices);
+            ctx->w->evals.fetch_add(1, std::memory_order_relaxed);
+
+            // Sort moves by decreasing P up front (on compact 8-byte
+            // pairs) so the arena fill below is a single pass that
+            // writes each MoveInfo exactly once in the order descent
+            // will consume them.
+            std::vector<MoveWithPriors> sorted_moves;
+            softmax_legal_sorted(out, legal, ctx->params->policy_temp, sorted_moves);
+
+            // alloc + fill BEFORE attempting to claim — these bytes
+            // are privately owned until the CAS, and orphaned if the
+            // CAS loses.
+            const uint64_t off = ctx->arena->alloc_node_info(num_moves);
+            v2::MoveInfo* mi = ctx->arena->moves_at(off);
+            for (uint16_t i = 0; i < num_moves; ++i) {
+                const chess::Move m{sorted_moves[i].move};
+
+                // Per-move position-only terminal detection. With a Syzygy
+                // prober wired in, TB-resolved WDL also lands here (cached
+                // in the child's MoveInfo so re-visits skip the probe).
+                board.makeMove<true>(m);
+                const v2::TerminalKind tk = classify_terminal(board, ctx->syzygy);
+                board.unmakeMove(m);
+
+                mi[i] = v2::MoveInfo::pack(sorted_moves[i].move,
+                                           sorted_moves[i].P,
+                                           tk);
+            }
+
+            // Per-node variance for this fresh TT entry. alloc_node_info
+            // pre-fills variance=0; overwrite with the real value before
+            // publish so any reader observing this node sees it.
+            const float variance = std::max(compute_value_variance(out.value_probs), 0.25f / ctx->params->default_depth_constant);
+            v2::NodeInfoHeader* hdr_w = ctx->arena->info_at(off);
+            hdr_w->variance = variance;
+            hdr_w->force_expand = compute_force_expand(out, static_cast<int>(num_moves));
+
+            const float Q = catgpt::wdl_logits_to_q_wl_tempered(
+                out.wdl_logits, ctx->params->wl_temp);
+
+            // Heuristic initial max_depth for this fresh TT entry:
+            //   default_max_depth = -log(variance * C)
+            // Low-variance nodes get a HIGH max_depth so early ID iterations
+            // skip re-descending them via the re-deepen check below; trust
+            // the NN value. High-variance nodes get a LOW (possibly negative)
+            // max_depth so the very first descent proceeds and the rollup
+            // refines Q. Edge case `variance == 0` produces -inf/+inf, which
+            // is safe: the re-deepen check uses `<=` and `update_qd` is
+            // monotonic and will overwrite -inf on the first rollup that
+            // completes a descent.
+            const float default_max_depth = -std::log(
+                variance * ctx->params->default_depth_constant);
+
+            // Single 128-bit CAS installs (key, qd_packed(Q, default_max_depth))
+            // atomically, so any reader observing key == K necessarily
+            // sees the matching qd. Then a single 128-bit release-store
+            // of Cell B publishes (origQ, key_secondary, info_offset).
+            auto [ce, claimed] = ctx->arena->find_or_claim(
+                key, sec, Q, /*max_depth=*/default_max_depth);
+            if (claimed) {
+                v2::SearchArena::publish_info(
+                    ce, /*origQ=*/Q, /*key_secondary=*/sec, off);
+                ctx->w->tt_claims.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                // With inflight dedup we are the sole leader for this
+                // (key, sec), so find_or_claim cannot lose to a peer that
+                // evaluated the same position; this branch is effectively
+                // dead. Kept as a backstop: if it ever fires, the entry is
+                // already published, our `off` bytes are orphaned, and the
+                // logic below is unchanged.
+            }
+
+            // Release every follower parked on this position now that the TT
+            // entry is published. Done BEFORE the abort check so followers are
+            // never stranded on a slot whose leader bailed out: they resume,
+            // observe should_abort(), and unwind cleanly. The wake() also drops
+            // the leader's pin on the inflight slot.
+            ctx->inflight->wake(role.slot);
+
+            // Intentionally let the thread finish putting the entry
+            // into the TT/arena before aborting.
+            if (ctx->w->should_abort()) co_return;
+
+            entry = ce;
+        }  // end leader branch
     }
 
     // ── load node info (move list + variance + expanded flag) ──────
@@ -1657,6 +1696,11 @@ public:
                          "[LksSearch] arena allocated (interleaved, parallel prefault): TT {} B + node arena {} B in {} ms",
                          arena_->table_bytes(), arena_->arena_capacity_bytes(), ms);
         }
+
+        // Sized by peak concurrency (~= total live permits across workers),
+        // not by the lifetime eval count: live inflight slots are bounded by
+        // simultaneously in-flight evals, so this stays sub-megabyte.
+        inflight_.emplace(num_workers_ * coros_per_worker_);
     }
 
     ~LksSearch() {
@@ -2660,6 +2704,7 @@ private:
                        float depth) {
         detail::RecurseContext ctx{
             /*arena=*/&*arena_,
+            /*inflight=*/&*inflight_,
             /*evaluator=*/w.evaluator.get(),
             /*sem=*/w.sem.get(),
             /*w=*/&w,
@@ -2690,6 +2735,10 @@ private:
     std::vector<int> w_gpu_cpu_;      // GPU thread core per worker
 
     std::optional<v2::SearchArena>             arena_;
+    // Concurrent-eval dedup, shared across all workers (cross-worker dedup
+    // is the whole point). Self-empties at the end of every search, so it
+    // is built once and reused; no per-search reset needed.
+    std::optional<v2::InflightTable>           inflight_;
     std::vector<std::unique_ptr<WorkerSearch>> workers_;
     std::jthread                               worker_;
     std::atomic<bool>                          running_{false};
